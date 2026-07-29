@@ -497,7 +497,10 @@ class LabelingDockWidget(QgsDockWidget):
         run_layout.addLayout(action_layout)
         recovery_layout = QHBoxLayout()
         self.resume_btn = QPushButton("恢复上次运行")
-        self.retry_failed_btn = QPushButton("重试失败任务")
+        self.retry_failed_btn = QPushButton("重做失败包")
+        self.retry_failed_btn.setToolTip(
+            "清理失败 Work Package 及受影响下游后重新运行；保留共享 Tile 缓存"
+        )
         self.resume_btn.setEnabled(False)
         self.retry_failed_btn.setEnabled(False)
         recovery_layout.addWidget(self.resume_btn)
@@ -1821,16 +1824,20 @@ class LabelingDockWidget(QgsDockWidget):
             if int(spec.get("schema_version") or 0) == 2:
                 database = RunStateDB(spec["state_db"])
                 run = database.get_run(spec["run_id"]) or {}
-                resumable = run.get("status") in {
+                status = str(run.get("status") or "")
+                resumable = status in {
                     "planned", "stopped", "failed", "running",
                 }
-                failed = bool(database.job_counts(spec["run_id"]).get("failed"))
+                counts = database.job_counts(spec["run_id"])
+                failed = bool(counts.get("failed"))
+                if status == "resetting":
+                    failed = True
         except Exception:
             resumable = False
             failed = False
         self.resume_btn.setEnabled(resumable and not self._pipeline_running)
         self.retry_failed_btn.setEnabled(
-            resumable and failed and not self._pipeline_running
+            failed and not self._pipeline_running
         )
 
     def _resume_existing_run(self, retry_failed):
@@ -1839,6 +1846,18 @@ class LabelingDockWidget(QgsDockWidget):
         if int(spec.get("schema_version") or 0) != 2 or not spec_path.is_file():
             QMessageBox.warning(self, "恢复运行", "没有可恢复的 v5 运行")
             return
+        if retry_failed:
+            answer = QMessageBox.question(
+                self,
+                "重做失败包",
+                "将删除失败 Work Package 的独占产物、受影响空间单元结果，"
+                "以及已失效的全流组装/验收结果，然后从该包重新运行。\n\n"
+                "共享 Tile 缓存会保留，人工确认数据不会被读取或修改。是否继续？",
+                YES | NO,
+                NO,
+            )
+            if answer != YES:
+                return
         scripts_dir = self.script_path_edit.text().strip()
         try:
             self.runner = V5AsyncInferenceRunner(scripts_dir, parent=self)

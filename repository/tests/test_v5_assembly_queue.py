@@ -222,6 +222,28 @@ def test_user_stop_terminates_active_assembly_and_marks_run_stopped(monkeypatch)
     assert finishes == [(False, "Pipeline stopped by user")]
 
 
+def test_manual_retry_selects_package_reset_instead_of_job_requeue(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = module.V5AsyncInferenceRunner.__new__(
+        module.V5AsyncInferenceRunner
+    )
+    calls = []
+    runner.run_from_spec = lambda path, **kwargs: calls.append((path, kwargs))
+
+    runner.retry_failed("/tmp/run_spec.json")
+
+    assert calls == [
+        (
+            "/tmp/run_spec.json",
+            {
+                "accepted_layer": None,
+                "resume": True,
+                "reset_failed_packages": True,
+            },
+        )
+    ]
+
+
 def test_unified_plugin_version_includes_startup_hardening():
     metadata = (
         Path(__file__).resolve().parents[1]

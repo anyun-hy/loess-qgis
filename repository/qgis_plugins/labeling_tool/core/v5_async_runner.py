@@ -13,6 +13,7 @@ from pathlib import Path
 
 from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
+from .manual_package_reset import reset_failed_work_packages
 from .process_compat import configure_process, process_is_running
 from .result_catalog import artifact_sha256
 from .run_index import record_run_state
@@ -58,7 +59,7 @@ class V5AsyncInferenceRunner(QObject):
         self._processes = {}
         self._assembly_queue = []
         self._started_at = 0.0
-        self._retry_failed_on_start = False
+        self._manual_package_reset = {}
         self._scheduler = QTimer(self)
         self._scheduler.setInterval(500)
         self._scheduler.timeout.connect(self._schedule)
@@ -77,7 +78,7 @@ class V5AsyncInferenceRunner(QObject):
         *,
         accepted_layer=None,
         resume=False,
-        retry_failed=False,
+        reset_failed_packages=False,
     ):
         del accepted_layer
         if self._running:
@@ -90,8 +91,21 @@ class V5AsyncInferenceRunner(QObject):
         self._database = RunStateDB(self._spec["state_db"])
         if resume:
             self._database.interrupt_run_jobs(self._spec["run_id"])
-        if retry_failed:
-            self._database.requeue_failed_jobs(self._spec["run_id"])
+        self._manual_package_reset = {}
+        if reset_failed_packages:
+            self._manual_package_reset = reset_failed_work_packages(
+                self._spec,
+                database=self._database,
+            )
+            self.log_line.emit(
+                "system",
+                "[manual-package-reset] "
+                + json.dumps(
+                    self._manual_package_reset,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
         self._database.set_run_status(
             self._spec["run_id"],
             "running",
@@ -117,7 +131,7 @@ class V5AsyncInferenceRunner(QObject):
             run_spec_path,
             accepted_layer=accepted_layer,
             resume=True,
-            retry_failed=True,
+            reset_failed_packages=True,
         )
 
     def stop(self):
@@ -648,6 +662,8 @@ class V5AsyncInferenceRunner(QObject):
             "streams": ready_streams if success else failed_streams,
             "elapsed_sec": round(time.time() - self._started_at, 3),
         }
+        if self._manual_package_reset:
+            result["manual_package_reset"] = dict(self._manual_package_reset)
         run_dir = Path(self._spec["run_dir"])
         scale_report = run_dir / "logs" / "scale_acceptance_report.json"
         if scale_report.is_file():

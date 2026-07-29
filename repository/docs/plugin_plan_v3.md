@@ -936,7 +936,11 @@ run_sam3_interactive.sh --session-root <run/refinement/sam3>
 
 失败与重试：
 
-- 单 Tile 失败只重试该 Tile；单空间单元失败只重试或细分该单元，不重新执行已验证邻区。
+- 运行中的自动重试保持最小范围：单空间单元失败只重试或细分该单元；Work Package 子进程的瞬时失败可以在同一 Package 内自动重试，不重新执行已经提交且哈希仍有效的其他 Package。
+- 用户显式点击“重做失败包”不是继续消耗旧 Job 的 attempt，也不是只把 `failed` 改回 `queued`。调度器必须先定位失败 Work Package；如果失败发生在 Core/Seam/Junction 单元，则按该单元的 Partition 依赖反查全部所属 Package。一次人工重做以这些 Package 为边界，把 Package Job 和全部受影响空间单元 Job 的 attempt、lease、progress 和 error 原子重置后重新排队。
+- 人工重做删除目标 Package 独占的 score/package 临时目录、Partition probability、core mask/confidence、受影响单元的 raw/formal/report/fitted-edge，以及已经失效的全流 VRT、总组装和 scale acceptance 输出；同时删除相应 Artifact、报告摘要和对象连通状态，再从仍然 ready 的未受影响 Partition 重建依赖引用。操作必须可重复执行，中途失败时 Run 保持 `resetting`，不得把部分清理后的状态当作可运行或 ready。
+- `output/cache/<run_id>/tile_cache/` 是本 Run 的共享原始 Tile 缓存，人工重做失败包时不得清理、移动或重新建立另一套缓存目录。重做的 Package 直接复用其中哈希有效的 Tile；只有整个正常生命周期的最后一个依赖释放后，正式清理逻辑才可以删除对应缓存。
+- 人工重做只能用于尚未完成的 `failed/stopped/resetting` Run；存在运行中 Job、没有可定位的失败 Package，或者 Run 已经 `ready` 时必须拒绝。人工确认、分类工作区和 accepted_labels 都在 semantic Run 完整成功之后，因此失败包重做不得读取、修改或回滚人工确认数据。
 - Artifact 状态由 SQLite 事务和 SHA 决定；resume 比较 run_spec、模型/profile SHA、Tile 元数据、Partition raster、raw/formal/report、Seam/Junction 与 VRT 引用。
 - QGIS 或 worker 非正常退出后，`running` job 在恢复时变成 `interrupted`；验证临时文件后选择复用、重跑或清理，不把它直接当 failed/ready。
 - 磁盘低于预留阈值时停止产生新 score，完成可安全提交的在途单元后进入 `paused_low_disk`，不得写坏已有结果。
