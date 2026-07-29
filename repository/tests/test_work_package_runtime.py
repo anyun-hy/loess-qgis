@@ -254,8 +254,10 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assembled = assemble_stream(spec_path, "fusion:fixture_fusion")
     assert assembled["status"] == "passed"
     assert assembled["assembly_mode"] == "full"
+    assert assembled["report_queue_capacity"] == 32
     assert assembled["report_summary_source"] == "sqlite"
     assert assembled["report_processed_count"] == 1
+    assert assembled["report_peak_loaded_count"] == 0
     assert assembled["report_json_parse_count"] == 0
     assert assembled["gpkg_write_mode"] == "gdal_batch_writerecords"
     assert assembled["object_id_lookup_batch_size"] == 512
@@ -274,6 +276,8 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert completed[0]["stream_id"] == "fusion:fixture_fusion"
     assert completed[0]["assembly_mode"] == "full"
     assert completed[0]["current"] == completed[0]["total"] == 1
+    assert completed[0]["report_queue_capacity"] == 32
+    assert completed[0]["report_peak_loaded_count"] == 0
     assert completed[0]["report_summary_source"] == "sqlite"
     assert completed[0]["report_json_parse_count"] == 0
     assert completed[0]["summary_validation_peak_in_flight"] >= 1
@@ -896,6 +900,8 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     assert report["unit_count"] == 64
     assert report["object_count"] == 64
     assert report["report_processed_count"] == 64
+    assert report["report_queue_capacity"] == 32
+    assert report["report_peak_loaded_count"] == 0
     assert report["report_summary_source"] == "sqlite"
     assert report["report_json_parse_count"] == 0
     assert report["summary_validation_peak_in_flight"] <= 32

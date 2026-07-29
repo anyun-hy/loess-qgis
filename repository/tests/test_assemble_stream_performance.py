@@ -37,6 +37,79 @@ def _write_resume_gpkg(path):
         )
 
 
+def test_100_reverse_report_summaries_are_validated_in_unit_id_order(
+    monkeypatch,
+    tmp_path,
+):
+    unit_ids = [f"unit_{index:05d}" for index in range(100)]
+    artifacts = [
+        {
+            "unit_id": unit_id,
+            "path": str(tmp_path / f"{unit_id}.json"),
+            "byte_count": 1,
+            "sha256": "a" * 64,
+        }
+        for unit_id in reversed(unit_ids)
+    ]
+    summaries = [
+        {
+            "unit_id": artifact["unit_id"],
+            "report_path": artifact["path"],
+            "report_byte_count": artifact["byte_count"],
+            "report_sha256": artifact["sha256"],
+            "fitted_edge_count": 0,
+        }
+        for artifact in artifacts
+    ]
+
+    class ReverseDatabase:
+        def unit_report_summaries(self, _run_id, _stream_id):
+            return summaries
+
+        def artifacts_for_stream(
+            self,
+            _run_id,
+            _stream_id,
+            *,
+            kind=None,
+        ):
+            if kind == "unit_fitted_edges":
+                return []
+            raise AssertionError(kind)
+
+    observed = []
+
+    def validate(items, **_kwargs):
+        observed.extend(item["artifact"]["unit_id"] for item in items)
+        return {
+            "workers": 8,
+            "peak_in_flight": 32,
+            "artifact_count": len(items),
+            "elapsed_sec": 0.0,
+        }
+
+    monkeypatch.setattr(
+        assemble_stream,
+        "_parallel_validate_summary_artifacts",
+        validate,
+    )
+
+    edges, stats = assemble_stream._validated_summary_inputs(
+        {"raster": {"crs": "EPSG:4326"}},
+        ReverseDatabase(),
+        "run-1",
+        "model:a",
+        len(unit_ids),
+        artifacts,
+        {"geometry": "LineString", "properties": {}},
+    )
+
+    assert edges == []
+    assert observed == unit_ids
+    assert stats["artifact_count"] == 100
+    assert stats["peak_in_flight"] <= 32
+
+
 def test_parallel_validation_keeps_12635_artifacts_bounded(
     monkeypatch,
     tmp_path,

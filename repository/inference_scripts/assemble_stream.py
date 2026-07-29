@@ -486,6 +486,11 @@ def _reuse_ready_assembly(
         "report_processed_count",
         int(report.get("unit_count") or 0),
     )
+    report.setdefault(
+        "report_queue_capacity",
+        ASSEMBLY_VALIDATION_MAX_IN_FLIGHT,
+    )
+    report.setdefault("report_peak_loaded_count", 0)
     report.setdefault("report_summary_source", "sqlite")
     report.setdefault("report_json_parse_count", 0)
     report["object_link_count"] = database.object_link_count(run_id, stream_id)
@@ -882,8 +887,10 @@ def _assemble_stream_impl(
         "run_id": run_id,
         "stream_id": stream_id,
         "assembly_mode": "report_resume" if resume_from_reports else "full",
+        "report_queue_capacity": ASSEMBLY_VALIDATION_MAX_IN_FLIGHT,
         "report_summary_source": "sqlite",
         "report_processed_count": expected_units,
+        "report_peak_loaded_count": 0,
         "report_json_parse_count": 0,
         "summary_validation_workers": summary_validation["workers"],
         "summary_validation_peak_in_flight": summary_validation[
@@ -956,6 +963,9 @@ def _assemble_stream_impl(
                         "stream_id": stream_id,
                         "assembly_mode": aggregate["assembly_mode"],
                         "total": expected_units,
+                        "report_queue_capacity": aggregate[
+                            "report_queue_capacity"
+                        ],
                         "report_summary_source": "sqlite",
                         "report_json_parse_count": 0,
                         "summary_validation_workers": aggregate[
@@ -984,6 +994,12 @@ def _assemble_stream_impl(
                         "total": expected_units,
                         "report_processed_count": aggregate[
                             "report_processed_count"
+                        ],
+                        "report_queue_capacity": aggregate[
+                            "report_queue_capacity"
+                        ],
+                        "report_peak_loaded_count": aggregate[
+                            "report_peak_loaded_count"
                         ],
                         "report_summary_source": aggregate[
                             "report_summary_source"
