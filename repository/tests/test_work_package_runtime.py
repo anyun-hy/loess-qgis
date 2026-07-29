@@ -214,6 +214,10 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(tm
     assert probability["ref_count"] == 0
     assembled = assemble_stream(spec_path, "fusion:fixture_fusion")
     assert assembled["status"] == "passed"
+    assert assembled["assembly_mode"] == "full"
+    assert assembled["report_queue_capacity"] == 32
+    assert assembled["report_processed_count"] == 1
+    assert assembled["report_peak_loaded_count"] == 1
     assert assembled["unit_count"] == 1
     assert assembled["object_count"] == 1
     assert assembled["fit_version"] == "divider_cubic_bspline_v1"
@@ -599,4 +603,5 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     )
     assert merged.symmetric_difference(expected).area == 0
     reassembled = assemble_stream(spec_path, "model:a")
+    assert reassembled["assembly_mode"] == "reused"
     assert reassembled["object_link_count"] == report["object_link_count"]
