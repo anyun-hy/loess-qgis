@@ -145,7 +145,7 @@
       </div>
       <div class="node node-pipeline" data-tip="将每个 tile 的地理范围裁剪为 GeoTIFF 文件">
         <div class="node-title"><span class="icon">✂️</span> extract_tile()</div>
-        <div class="node-desc">逐 tile 裁剪 GeoTIFF → tmp/tiles/tile_{row}_{col}.tif</div>
+        <div class="node-desc">逐 tile 裁剪 GeoTIFF → output/cache/&lt;run_id&gt;/tile_cache/tile_{row}_{col}.tif</div>
         <div class="node-file">tile_manager.py</div>
       </div>
     </div>
@@ -325,7 +325,7 @@
 <span style="color:#10b981">切片</span> ─────────────────────────────────────────────────────────────────────────
   extent + tile_width × tile_height + overlap
     → <span style="color:#34d399">generate_grid()</span> → tile 网格 (col, row, bounds, pixel_w, pixel_h)
-    → <span style="color:#34d399">extract_tile()</span>  → tmp/tiles/tile_{row}_{col}.tif
+    → <span style="color:#34d399">extract_tile()</span>  → output/cache/&lt;run_id&gt;/tile_cache/tile_{row}_{col}.tif
 
 <span style="color:#8b5cf6">Phase 1 — 语义分割</span> ────────────────────────────────────────────────────────
   tile.tif → <span style="color:#a78bfa">run_semantic.sh</span> → predict_semantic.py

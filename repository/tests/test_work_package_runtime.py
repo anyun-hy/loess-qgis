@@ -25,7 +25,11 @@ from boundary_fitting.unit_runtime import (
 from assemble_stream import StreamAssemblyError, assemble_stream
 from finalize_partition_rasters import finalize_partition_rasters
 from scale_acceptance import build_scale_acceptance_report
-from work_package_runtime import _commit_artifact, run_work_package
+from work_package_runtime import (
+    WorkPackageRuntimeError,
+    _commit_artifact,
+    run_work_package,
+)
 
 
 def _sha(path):
@@ -88,6 +92,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         compress="deflate",
     ) as destination:
         destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
+    source_sha256 = _sha(tile)
     model_a = tmp_path / "a.pt"
     model_b = tmp_path / "b.pt"
     model_a.write_bytes(b"model-a")
@@ -162,6 +167,26 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         package_id = connection.execute(
             "SELECT package_id FROM work_packages"
         ).fetchone()[0]
+    model_a.write_bytes(b"corrupt-model-a")
+    with pytest.raises(WorkPackageRuntimeError, match="model SHA256 mismatch"):
+        run_work_package(
+            spec_path,
+            package_id,
+            device="cpu",
+            model_loader=loader,
+            infer_tile=infer,
+        )
+    assert tile.is_file()
+    assert _sha(tile) == source_sha256
+    assert (
+        Path(spec["tile_cache_dir"]) / "tile_0_0.tif"
+    ).is_file()
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
+        ).fetchone()[0] == "failed"
+
+    model_a.write_bytes(b"model-a")
     result = run_work_package(
         spec_path,
         package_id,
@@ -170,6 +195,9 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         infer_tile=infer,
     )
     assert result["status"] == "ready"
+    assert tile.is_file()
+    assert _sha(tile) == source_sha256
+    assert not Path(spec["cache_root"]).exists()
     assert loaded == ["a", "b"]
     run_dir = spec_path.parent
     for relative in (
@@ -189,6 +217,8 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert result["requested_device"] == "cpu"
     assert result["effective_device"] == "cpu"
     assert result["peak_cache_bytes"] > 0
+    assert result["tile_cache_released_count"] == 1
+    assert result["tile_cache_retained_count"] == 0
     assert result["peak_rss_bytes"] > 0
     assert result["elapsed_sec"] > 0
     with sqlite3.connect(database_path) as connection:
@@ -273,15 +303,15 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         tile,
         "w",
         driver="GTiff",
-        width=512,
-        height=512,
+        width=1472,
+        height=832,
         count=3,
         dtype="uint8",
         crs="EPSG:4490",
         transform=from_origin(0, 832, 1, 1),
         compress="deflate",
     ) as destination:
-        destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
+        destination.write(np.zeros((3, 832, 1472), dtype=np.uint8))
     model_a = tmp_path / "a.pt"
     model_b = tmp_path / "b.pt"
     model_a.write_bytes(b"model-a")
@@ -301,6 +331,12 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
             "col": col,
             "path": str(tile),
             "sha256": _sha(tile),
+            "bounds": {
+                "xmin": col * stride,
+                "ymin": 832 - row * stride - 512,
+                "xmax": col * stride + 512,
+                "ymax": 832 - row * stride,
+            },
             "pixel_window": {
                 "x0": col * stride,
                 "y0": row * stride,
@@ -375,17 +411,51 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
             )
         ]
     assert package_ids == ["package_00000", "package_00001"]
-    package_reports = [
-        run_work_package(
-            spec_path,
-            package_id,
-            device="cpu",
-            model_loader=loader,
-            infer_tile=infer,
-        )
-        for package_id in package_ids
-    ]
+    source_sha256 = _sha(tile)
+    first_tile_ids = {
+        str(item["tile_id"])
+        for item in database.package_tiles(spec["run_id"], package_ids[0])
+    }
+    second_tile_ids = {
+        str(item["tile_id"])
+        for item in database.package_tiles(spec["run_id"], package_ids[1])
+    }
+    shared_tile_ids = first_tile_ids & second_tile_ids
+    first_only_tile_ids = first_tile_ids - second_tile_ids
+    assert shared_tile_ids
+    assert first_only_tile_ids
+
+    first_report = run_work_package(
+        spec_path,
+        package_ids[0],
+        device="cpu",
+        model_loader=loader,
+        infer_tile=infer,
+    )
+    tile_cache_dir = Path(spec["tile_cache_dir"])
+    assert tile.is_file()
+    assert _sha(tile) == source_sha256
+    for tile_id in shared_tile_ids:
+        row, col = tile_id.split("_")
+        assert (tile_cache_dir / f"tile_{row}_{col}.tif").is_file()
+    for tile_id in first_only_tile_ids:
+        row, col = tile_id.split("_")
+        assert not (tile_cache_dir / f"tile_{row}_{col}.tif").exists()
+
+    second_report = run_work_package(
+        spec_path,
+        package_ids[1],
+        device="cpu",
+        model_loader=loader,
+        infer_tile=infer,
+    )
+    package_reports = [first_report, second_report]
     assert all(report["status"] == "ready" for report in package_reports)
+    assert first_report["tile_cache_retained_count"] == len(shared_tile_ids)
+    assert second_report["tile_cache_retained_count"] == 0
+    assert tile.is_file()
+    assert _sha(tile) == source_sha256
+    assert not Path(spec["cache_root"]).exists()
     assert loaded == ["a", "b", "a", "b"]
     assert database.work_package_counts(spec["run_id"]) == {"ready": 2}
     for package_id in package_ids:

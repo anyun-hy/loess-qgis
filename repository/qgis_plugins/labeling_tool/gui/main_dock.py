@@ -98,7 +98,7 @@ from ..gui.class_refinement_dialog import ClassRefinementDialog
 from ..core.v5_async_runner import V5AsyncInferenceRunner
 from ..core.model_registry import ModelRegistry
 from ..core.run_builder_v5 import create_v5_run
-from ..core.run_spec import reserve_run_directory
+from ..core.run_spec import reserve_run_directory, run_tile_cache_dir
 from ..core.work_package_planner import storage_preflight
 from ..core.environment_report import compact_problem, format_check_details
 from ..core.result_catalog import iter_ready_results
@@ -1468,7 +1468,9 @@ class LabelingDockWidget(QgsDockWidget):
                 (int(tile["row"]), int(tile["col"]))
                 for tile in self._current_tiles
             }
-            tile_tmp_dir = Path(ctx["run_dir"]) / "tmp" / "tiles"
+            tile_cache_dir = run_tile_cache_dir(
+                ctx["output_dir"], ctx["run_id"]
+            )
             normalized_tiles = []
             for tile in grid_tiles:
                 bounds = tile["bounds"]
@@ -1479,7 +1481,7 @@ class LabelingDockWidget(QgsDockWidget):
                     tile_status = "excluded"
                 else:
                     tile_path = str(
-                        tile_tmp_dir / f"tile_{tile_key[0]}_{tile_key[1]}.tif"
+                        tile_cache_dir / f"tile_{tile_key[0]}_{tile_key[1]}.tif"
                     )
                     tile_sha256 = ""
                     tile_status = (

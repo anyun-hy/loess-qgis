@@ -20,7 +20,12 @@ for import_root in (PLUGIN_ROOT, SCRIPTS_ROOT):
         sys.path.insert(0, str(import_root))
 
 from labeling_tool.core.run_builder_v5 import create_v5_run
-from labeling_tool.core.run_spec import atomic_write_json, reserve_run_directory, sha256_file
+from labeling_tool.core.run_spec import (
+    atomic_write_json,
+    reserve_run_directory,
+    run_tile_cache_dir,
+    sha256_file,
+)
 from labeling_tool.core.work_package_planner import storage_preflight
 from check_environment import _fingerprint
 from deployment_config import load_and_validate_config
@@ -104,7 +109,9 @@ def prepare(source_run: Path, output_root: Path, *, device: str, run_id: str | N
         source_path = Path(tile["path"]).resolve()
         if not source_path.is_file() or sha256_file(source_path) != str(tile["sha256"]):
             raise L0PreparationError(f"source Tile hash mismatch: {source_path}")
-        destination = run_dir / "tmp" / "tiles" / f"tile_{row}_{col}.tif"
+        destination = run_tile_cache_dir(
+            output_root, identifier
+        ) / f"tile_{row}_{col}.tif"
         _hardlink(source_path, destination)
         metadata_source = source_path.with_name(f"tile_{row}_{col}_meta.json")
         if metadata_source.is_file():

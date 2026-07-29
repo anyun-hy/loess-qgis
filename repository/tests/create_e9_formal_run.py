@@ -28,6 +28,7 @@ from deployment_config import load_and_validate_config  # noqa: E402
 from labeling_tool.core.run_spec import (  # noqa: E402
     create_run_spec,
     reserve_run_directory,
+    run_tile_cache_dir,
 )
 
 
@@ -154,7 +155,7 @@ def create_formal_run(output_root: Path, source_raster: Path, device: str) -> Pa
         )
 
     run_id, run_dir = reserve_run_directory(output_root)
-    tile_path = run_dir / "tmp" / "tiles" / "tile_0_0.tif"
+    tile_path = run_tile_cache_dir(output_root, run_id) / "tile_0_0.tif"
     tile_meta = extract_center_tile(source_raster, tile_path)
     tile = {
         "tile_id": "0_0",

@@ -54,6 +54,7 @@ CLASS_NAMES = {
 }
 SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 RESERVATION_FILE = ".run-reservation"
+RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{6}_[a-z0-9]{4,16}$")
 FUSION_STRATEGIES = {
     "equal_probability_average",
     "calibrated_global_weighted",
@@ -104,22 +105,70 @@ def new_run_id(now: _datetime.datetime | None = None, token: str | None = None) 
     return f"{moment.strftime('%Y%m%d_%H%M%S')}_{suffix.lower()}"
 
 
+def run_tile_cache_dir(
+    output_root: os.PathLike[str] | str,
+    run_id: str,
+) -> Path:
+    """Return the one canonical Tile cache directory owned by a Run."""
+    identifier = str(run_id)
+    if not RUN_ID_PATTERN.fullmatch(identifier):
+        raise RunSpecError(f"invalid run_id: {identifier!r}")
+    output = Path(output_root).expanduser().resolve()
+    return output / "cache" / identifier / "tile_cache"
+
+
+def validated_run_tile_cache_dir(spec: Mapping[str, Any]) -> Path:
+    """Validate the immutable cache-path contract without following cache symlinks."""
+    identifier = str(spec.get("run_id") or "")
+    output = Path(str(spec.get("output_root") or "")).expanduser().resolve()
+    expected = run_tile_cache_dir(output, identifier)
+    configured_root = Path(
+        os.path.abspath(os.path.expanduser(str(spec.get("cache_root") or "")))
+    )
+    configured_tiles = Path(
+        os.path.abspath(os.path.expanduser(str(spec.get("tile_cache_dir") or "")))
+    )
+    if configured_root != expected.parent or configured_tiles != expected:
+        raise RunSpecError(
+            "Run Tile cache must equal "
+            f"{expected}; got root={configured_root}, tiles={configured_tiles}"
+        )
+    for candidate in (output / "cache", expected.parent, expected):
+        if candidate.is_symlink():
+            raise RunSpecError(f"Run Tile cache cannot use a symlink: {candidate}")
+    return expected
+
+
 def reserve_run_directory(
     output_root: os.PathLike[str] | str,
     run_id: str | None = None,
 ) -> tuple[str, Path]:
-    """Reserve an isolated run directory before QGIS starts extracting tiles."""
+    """Reserve permanent Run state and its separate, disposable Tile cache."""
     output = Path(output_root).expanduser().resolve()
     identifier = run_id or new_run_id()
-    if not re.fullmatch(r"\d{8}_\d{6}_[a-z0-9]{4,16}", identifier):
+    if not RUN_ID_PATTERN.fullmatch(identifier):
         raise RunSpecError(f"invalid run_id: {identifier!r}")
     run_dir = output / "runs" / identifier
     try:
         run_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
         raise RunSpecError(f"run directory already exists; refusing to overwrite: {run_dir}") from exc
+    cache_parent = output / "cache"
+    if cache_parent.is_symlink():
+        run_dir.rmdir()
+        raise RunSpecError(f"Run Tile cache cannot use a symlink: {cache_parent}")
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    cache_root = run_tile_cache_dir(output, identifier).parent
+    try:
+        cache_root.mkdir(exist_ok=False)
+    except FileExistsError as exc:
+        run_dir.rmdir()
+        raise RunSpecError(
+            f"run cache already exists; refusing to overwrite: {cache_root}"
+        ) from exc
+    (cache_root / "tile_cache").mkdir(exist_ok=False)
     for relative in (
-        "models", "fusion", "classes", "refinement/sam3", "final", "logs", "tmp/tiles",
+        "models", "fusion", "classes", "refinement/sam3", "final", "logs",
         "tmp/streams", "tmp/work_packages", "tmp/probability_parts",
         "tmp/unit_outputs", "tmp/failed_jobs",
     ):
@@ -414,6 +463,8 @@ def create_run_spec(
         "created_at": _datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "run_dir": str(run_dir),
         "output_root": str(output),
+        "cache_root": str(run_tile_cache_dir(output, identifier).parent),
+        "tile_cache_dir": str(run_tile_cache_dir(output, identifier)),
         "raster": {"path": str(raster), "crs": str(raster_crs)},
         "requested_extent": _extent_dict(requested_extent),
         "processing_extent": _extent_dict(processing_extent),

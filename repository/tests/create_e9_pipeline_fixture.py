@@ -29,6 +29,7 @@ from labeling_tool.core.run_spec import (  # noqa: E402
     CLASS_ORDER,
     create_run_spec,
     reserve_run_directory,
+    run_tile_cache_dir,
 )
 
 
@@ -157,7 +158,7 @@ def create_fixture(output_root: Path) -> Path:
     )
 
     run_id, run_dir = reserve_run_directory(output_root)
-    tile_dir = run_dir / "tmp" / "tiles"
+    tile_dir = run_tile_cache_dir(output_root, run_id)
     overlap = 64
     pixel_size = 0.0001
     tiles = []

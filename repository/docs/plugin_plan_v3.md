@@ -273,7 +273,7 @@ linear_1x1
 
 ### 8.1 Tile、Partition 与空间所有权
 
-1. 对 requested extent 生成共享 `512 x 512` Tile 网格，边缘扩展到完整模型输入；同一个 Tile 文件被所有模型共享。
+1. 对 requested extent 生成共享 `512 x 512` Tile 网格，边缘扩展到完整模型输入；原始影像和用户传入 Tile 永远只读。运行时物化副本固定写入 `output/cache/<run_id>/tile_cache/`，同一个缓存 Tile 被本 Run 的所有模型和依赖 Work Package 共享。
 2. Tile 按空间顺序归入默认 `8 x 8` Tile 的 Partition。Partition Core 不是 Tile 外框 union，而是最终 mosaic 全局像素网格上的非重叠整数窗口；内部边界取相邻 Partition 末端/起始 Tile 有效中心线之间的确定性整数分割线。边缘 Partition 可以不足 8 x 8，Core 仍与同一全局像素网格对齐。
 3. 每个 Partition 读取 Core 加 Halo。Halo 默认 `max(tile_overlap, seam_band_px)`，用于概率拼接、边界上下文和跨分区处理，不属于该 Partition 的最终所有权范围。
 4. 矢量空间拆成互不重叠的三类所有权单元：`Core interior`、两分区之间的 `Seam corridor`、四分区交点的 `Junction patch`。每个有效像素必须且只能属于一个最终单元。
@@ -321,6 +321,8 @@ package_tile_limit = floor(
 - 不能为 500,000 Tile 创建 500,000 个常驻 Qt 行、Python Future 或内存对象。
 - Fusion 使用磁盘分块增量 accumulator。`equal_probability_average`、`calibrated_global_weighted` 和 `calibrated_class_weighted` 按模型依次累加；`linear_1x1` 保存 profile 明确要求的最小中间通道。禁止为了 Fusion 同时保留整个 run 的全部模型概率。
 - 单模型 probability 只有在其 Partition raster、raw/formal、Fusion accumulator、Seam/Junction 引用均提交后才删除。崩溃恢复按 Artifact 引用计数复用已完成缓存，不从头重跑整个工作包。
+- Work Package 只有在自身模型流、Fusion 和正式 Partition 资产全部提交后，才可释放本包引用。仍被未完成邻包 Halo、重试或恢复引用的 Tile 缓存继续保留；最后一个依赖释放时同时删除 Tile 与其 metadata。失败、停止或未提交状态保留缓存用于安全恢复。
+- Tile 清理只能删除经路径归属校验、直接位于本 Run `tile_cache` 下的文件；来源影像、用户 Tile、其他 Run cache 和 `runs/<run_id>/` 永久结果均不得成为清理目标。
 
 ### 8.3 分区概率拼接和永久栅格
 
@@ -414,6 +416,11 @@ E5S 自动验收必须覆盖：两面共享同一开放拟合线、一个环依�
 ```text
 output/
 ├── accepted_labels.gpkg
+├── cache/
+│   └── <run_id>/
+│       └── tile_cache/
+│           ├── tile_<row>_<col>.tif
+│           └── tile_<row>_<col>_meta.json
 └── runs/
     └── <run_id>/
         ├── run_spec.json
@@ -459,14 +466,13 @@ output/
         │   ├── seam_band_report.json
         │   └── failures.json
         └── tmp/
-            ├── tiles/
             ├── work_packages/
             ├── probability_parts/
             ├── unit_outputs/
             └── failed_jobs/
 ```
 
-`run_id` 使用时间戳加随机短标识，跨进程、跨日期不撞车。禁止新运行覆盖旧 run 目录。`run_state.sqlite` 是运行明细真值源；`run_manifest.json` 是从数据库生成的小型结果摘要，不复制 Tile 明细。数据库启用 WAL、外键和事务，任何 Artifact 只有在临时文件 fsync、原子重命名、SHA256 写入成功后才可标记 ready。
+`run_id` 使用时间戳加随机短标识，跨进程、跨日期不撞车。禁止新运行覆盖旧 run 目录或同名 cache。`runs/<run_id>/` 只保存运行状态、正式结果和可恢复的非 Tile 工作资产；可删除的输入 Tile 物化副本只允许位于 `cache/<run_id>/tile_cache/`。Run 规范必须冻结 `cache_root` 和 `tile_cache_dir` 的绝对路径；运行时拒绝路径漂移和符号链接。`run_state.sqlite` 是运行明细真值源；`run_manifest.json` 是从数据库生成的小型结果摘要，不复制 Tile 明细。数据库启用 WAL、外键和事务，任何 Artifact 只有在临时文件 fsync、原子重命名、SHA256 写入成功后才可标记 ready。
 
 `semantic_polygons_raw.gpkg`、`semantic_polygons.gpkg` 和诊断 GPKG 都按空间单元使用 GDAL/Fiona 批量事务流式追加并创建 RTree 索引；禁止逐要素提交事务，写入过程不得回读全部要素。`object_id` 必须按有界要素批次从 SQLite 查询，禁止每个要素单独建立数据库连接。每个空间单元完成时同时把报告标量摘要写入 SQLite，并把需要保留的诊断边写入单元诊断 GPKG；最终组装只从数据库聚合摘要并直接批量追加单元诊断 GPKG，不再保留重新解析全部 JSON 报告的旧组装路径。缺少摘要或诊断分片的旧 Run 必须明确拒绝组装，不能静默回退。最终文件只有在所有事务提交、`PRAGMA integrity_check`、图层字段/CRS/feature count 和 SHA256 通过后才进入 Artifact `ready`。
 
@@ -1057,6 +1063,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 - 500,000 Tile、对应 Partition/Seam/Junction 元数据压力测试；分页查询每页不超过 500，禁止把全部行实例化到 UI。
 - 任意行列数的 Partition/Halo/Core 规划测试；Core interior、Seam 和 Junction 的 union 等于 processing extent，pairwise intersection 面积为 0。
 - Work Package 预算、队列背压、低磁盘暂停、引用计数清理、单元失败重试和停止/resume 测试。
+- `output/cache/<run_id>/tile_cache/` 路径冻结、来源影像/用户 Tile 不可删除、跨 Package 共享 Tile 最后引用释放及 cache 符号链接拒绝测试。
 - 两个模拟模型、多 Work Package 的端到端测试；每个模型独立输出，Fusion 增量 accumulator 与一次性数学参考逐像素一致。
 - 峰值 Tile probability 数不超过计划预算；已提交且无依赖的缓存被清理，仍被 Fusion/Seam/retry 引用的缓存不会提前删除。
 - mosaic 重叠区按二维 cosine window 在 14 类概率空间加权，归一化后再统一生成 mask/confidence；Partition 结果与小范围整幅参考一致，禁止回退到中心线硬切。

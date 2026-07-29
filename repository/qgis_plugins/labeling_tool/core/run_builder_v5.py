@@ -13,6 +13,7 @@ from .run_spec import (
     RESERVATION_FILE,
     atomic_write_json,
     reserve_run_directory,
+    run_tile_cache_dir,
     sha256_file,
 )
 from .run_state_db import RunStateDB
@@ -217,6 +218,8 @@ def create_v5_run(
         "created_at": _datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "run_dir": str(run_dir),
         "output_root": str(output),
+        "cache_root": str(run_tile_cache_dir(output, identifier).parent),
+        "tile_cache_dir": str(run_tile_cache_dir(output, identifier)),
         "raster": {
             "path": str(Path(str(raster["path"])).expanduser().resolve()),
             "crs": str(raster["crs"]),
@@ -303,6 +306,7 @@ def create_v5_run(
                 raise RunBuilderV5Error(f"Tile is outside declared grid: {row}_{col}")
             partition_row = min(row // part_tile_rows, partition_rows - 1)
             partition_col = min(col // part_tile_cols, partition_cols - 1)
+            status = str(item.get("status") or "ready")
             yield {
                 **dict(item),
                 "tile_id": str(item.get("tile_id") or f"{row}_{col}"),
@@ -311,7 +315,16 @@ def create_v5_run(
                 "width": int(item.get("width", 512)),
                 "height": int(item.get("height", 512)),
                 "partition_id": f"partition_{partition_row:05d}_{partition_col:05d}",
-                "status": str(item.get("status") or "ready"),
+                "raster_path": (
+                    str(
+                        run_tile_cache_dir(output, identifier)
+                        / f"tile_{row}_{col}.tif"
+                    )
+                    if status != "excluded"
+                    else ""
+                ),
+                "sha256": "",
+                "status": status,
             }
 
     inserted = database.insert_tiles(identifier, normalized_tiles())

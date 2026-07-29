@@ -16,6 +16,8 @@ from labeling_tool.core.run_spec import (
     create_run_spec,
     new_run_id,
     reserve_run_directory,
+    run_tile_cache_dir,
+    validated_run_tile_cache_dir,
 )
 
 
@@ -117,7 +119,7 @@ def test_reserved_run_accepts_extracted_tiles_then_becomes_immutable(tmp_path):
     run_id, run_dir = reserve_run_directory(
         tmp_path / "output", "20260713_120102_a1b2c3"
     )
-    tile = run_dir / "tmp" / "tiles" / "tile_0_0.tif"
+    tile = run_tile_cache_dir(tmp_path / "output", run_id) / "tile_0_0.tif"
     _file(tile, b"raster")
     spec, path = create_run_spec(
         output_root=tmp_path / "output",
@@ -147,6 +149,32 @@ def test_reserved_run_accepts_extracted_tiles_then_becomes_immutable(tmp_path):
             models=[_model(tmp_path, "model_b")],
             effective_device="cpu",
         )
+
+
+def test_run_tile_cache_rejects_path_drift_and_symlinks(tmp_path):
+    output_root = tmp_path / "output"
+    run_id, _run_dir = reserve_run_directory(
+        output_root, "20260713_120102_a1b2c3"
+    )
+    tile_cache = run_tile_cache_dir(output_root, run_id)
+    spec = {
+        "run_id": run_id,
+        "output_root": str(output_root.resolve()),
+        "cache_root": str(tile_cache.parent),
+        "tile_cache_dir": str(tile_cache),
+    }
+    assert validated_run_tile_cache_dir(spec) == tile_cache
+
+    drifted = {**spec, "tile_cache_dir": str(tmp_path / "user_tile")}
+    with pytest.raises(RunSpecError, match="must equal"):
+        validated_run_tile_cache_dir(drifted)
+
+    tile_cache.rmdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    tile_cache.symlink_to(external, target_is_directory=True)
+    with pytest.raises(RunSpecError, match="cannot use a symlink"):
+        validated_run_tile_cache_dir(spec)
 
 
 def test_model_sha_mismatch_is_rejected(tmp_path):

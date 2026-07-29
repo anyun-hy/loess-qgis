@@ -19,7 +19,11 @@ PLUGIN_ROOT = ROOT / "qgis_plugins"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from labeling_tool.core.run_spec import sha256_file
+from labeling_tool.core.run_spec import (
+    RunSpecError,
+    sha256_file,
+    validated_run_tile_cache_dir,
+)
 from labeling_tool.core.run_state_db import RunStateDB
 
 from _device import resolve_device, validate_device
@@ -97,6 +101,29 @@ def _remove_tree_with_count(path: Path) -> int:
     return byte_count
 
 
+def _owned_tile_cache_file(path: str | Path, tile_cache_dir: Path) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise WorkPackageRuntimeError(
+            f"refusing to use symlinked Tile cache entry: {candidate}"
+        )
+    resolved = candidate.resolve()
+    cache_root = tile_cache_dir.resolve()
+    if resolved.parent != cache_root:
+        raise WorkPackageRuntimeError(
+            f"refusing to delete non-cache Tile path: {resolved}"
+        )
+    return resolved
+
+
+def _prune_empty_tile_cache(tile_cache_dir: Path) -> None:
+    for directory in (tile_cache_dir, tile_cache_dir.parent):
+        try:
+            directory.rmdir()
+        except (FileNotFoundError, OSError):
+            break
+
+
 def _commit_artifact(
     database: RunStateDB,
     run_id: str,
@@ -155,6 +182,10 @@ def run_work_package(
         raise WorkPackageRuntimeError("Work Package runtime requires run_spec schema_version 2")
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"]).resolve()
+    try:
+        tile_cache_dir = validated_run_tile_cache_dir(spec)
+    except RunSpecError as error:
+        raise WorkPackageRuntimeError(str(error)) from error
     database = RunStateDB(spec["state_db"])
     package = database.get_work_package(run_id, package_id)
     if package is None:
@@ -207,6 +238,8 @@ def run_work_package(
     cleaned_bytes = 0
     model_load_count = 0
     peak_cache_bytes = 0
+    tile_cache_released_count = 0
+    tile_cache_retained_count = len(active_tiles)
     try:
         io_workers = int((spec.get("scaling") or {}).get("tile_io_workers", 8))
 
@@ -341,7 +374,8 @@ def run_work_package(
                 )
 
             peak_cache_bytes = max(
-                peak_cache_bytes, directory_size(package_root)
+                peak_cache_bytes,
+                directory_size(package_root) + directory_size(tile_cache_dir),
             )
 
             for partition in partitions:
@@ -466,17 +500,38 @@ def run_work_package(
         if not bool((spec.get("runtime") or {}).get("keep_score_cache", False)):
             cleaned_bytes += _remove_tree_with_count(package_root / "accepted_scores")
             tile_cleaned_bytes = 0
-            for tile in active_tiles:
-                tile_cleaned_bytes += _unlink_with_count(Path(tile["raster_path"]))
+            releasable_tile_ids = set(
+                database.releasable_package_tile_ids(run_id, package_id)
+            )
+            released_tile_count = 0
+            for item in materialized:
+                if str(item["tile_id"]) not in releasable_tile_ids:
+                    continue
+                tile_cleaned_bytes += _unlink_with_count(
+                    _owned_tile_cache_file(item["tile_path"], tile_cache_dir)
+                )
+                tile_cleaned_bytes += _unlink_with_count(
+                    _owned_tile_cache_file(item["metadata_path"], tile_cache_dir)
+                )
+                released_tile_count += 1
             cleaned_bytes += tile_cleaned_bytes
+            tile_cache_released_count = released_tile_count
+            tile_cache_retained_count = len(active_tiles) - released_tile_count
+            _prune_empty_tile_cache(tile_cache_dir)
             emit(
                 "package_tiles_cleaned",
                 run_id=run_id,
                 package_id=package_id,
-                tile_count=len(active_tiles),
+                tile_count=released_tile_count,
+                dependency_retained_count=(
+                    len(active_tiles) - released_tile_count
+                ),
                 cleaned_bytes=tile_cleaned_bytes,
             )
-        peak_cache_bytes = max(peak_cache_bytes, directory_size(package_root))
+        peak_cache_bytes = max(
+            peak_cache_bytes,
+            directory_size(package_root) + directory_size(tile_cache_dir),
+        )
         database.set_work_package_status(run_id, package_id, "ready", expected="running")
         result = {
             "run_id": run_id,
@@ -493,6 +548,8 @@ def run_work_package(
             "peak_cache_bytes": peak_cache_bytes,
             "peak_rss_bytes": peak_rss_bytes(),
             "cleaned_bytes": cleaned_bytes,
+            "tile_cache_released_count": tile_cache_released_count,
+            "tile_cache_retained_count": tile_cache_retained_count,
             "elapsed_sec": round(time.monotonic() - started_at, 3),
             "status": "ready",
         }

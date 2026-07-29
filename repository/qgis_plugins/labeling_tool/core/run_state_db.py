@@ -590,6 +590,51 @@ class RunStateDB:
             )
         return result
 
+    def releasable_package_tile_ids(
+        self,
+        run_id: str,
+        completing_package_id: str,
+    ) -> list[str]:
+        """Return current Package Tiles with no unfinished Package consumers."""
+        current_tiles = self.package_tiles(run_id, completing_package_id)
+        candidates = {
+            (int(tile["row_no"]), int(tile["col_no"])): str(tile["tile_id"])
+            for tile in current_tiles
+            if str(tile.get("status")) != "excluded"
+        }
+        candidate_ids = set(candidates.values())
+        blocked: set[str] = set()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT package_id, status, metadata_json
+                   FROM work_packages
+                   WHERE run_id=? AND package_id!=? AND status!='ready'
+                   ORDER BY sequence_no""",
+                (str(run_id), str(completing_package_id)),
+            ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            windows = list(metadata.get("tile_windows") or [])
+            for raw_window in windows:
+                if not isinstance(raw_window, list) or len(raw_window) != 4:
+                    raise RunStateError(
+                        "invalid Tile window in Work Package: "
+                        f"{row['package_id']}={raw_window}"
+                    )
+                row_start, row_stop, col_start, col_stop = map(int, raw_window)
+                for (tile_row, tile_col), tile_id in candidates.items():
+                    if (
+                        row_start <= tile_row < row_stop
+                        and col_start <= tile_col < col_stop
+                    ):
+                        blocked.add(tile_id)
+        return [
+            str(tile["tile_id"])
+            for tile in current_tiles
+            if str(tile["tile_id"]) in candidate_ids
+            and str(tile["tile_id"]) not in blocked
+        ]
+
     def work_package_counts(self, run_id: str) -> dict[str, int]:
         with self._connect() as connection:
             return {
