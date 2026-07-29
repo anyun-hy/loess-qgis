@@ -403,7 +403,7 @@ def _reuse_ready_assembly(
             raise StreamAssemblyError(
                 f"ready assembled Artifact changed on disk: {path}"
             )
-    report = load_json(paths["boundary_fitting_report"])
+    report = dict(load_json(paths["boundary_fitting_report"]))
     if (
         report.get("status") != "passed"
         or (report.get("validation") or {}).get("passed") is not True
@@ -411,6 +411,13 @@ def _reuse_ready_assembly(
         raise StreamAssemblyError(
             f"ready stream has a failed boundary report: {stream_id}"
         )
+    report["assembly_mode"] = "reused"
+    report.setdefault("report_queue_capacity", REPORT_QUEUE_CAPACITY)
+    report.setdefault(
+        "report_processed_count",
+        int(report.get("unit_count") or 0),
+    )
+    report.setdefault("report_peak_loaded_count", None)
     report["object_link_count"] = database.object_link_count(run_id, stream_id)
     print(
         json.dumps(
@@ -455,7 +462,7 @@ def _link_neighbor_parts(
     return linked
 
 
-def assemble_stream(
+def _assemble_stream_impl(
     run_spec_path: str | Path,
     stream_id: str,
     *,
@@ -484,6 +491,12 @@ def assemble_stream(
     reused = _reuse_ready_assembly(spec, stream, database)
     if reused is not None:
         return reused
+    database.set_stream_status(
+        run_id,
+        stream_id,
+        "assembling",
+        error="",
+    )
     counts = database.stream_unit_counts(run_id, stream_id)
     expected_units = sum(counts.values())
     if expected_units < 1 or counts != {"ready": expected_units}:
@@ -759,6 +772,10 @@ def assemble_stream(
         "schema_version": 1,
         "run_id": run_id,
         "stream_id": stream_id,
+        "assembly_mode": "report_resume" if resume_from_reports else "full",
+        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
+        "report_processed_count": 0,
+        "report_peak_loaded_count": 0,
         "status": "passed",
         "smoothing_enabled": smoothing_enabled,
         "unit_count": expected_units,
@@ -861,8 +878,10 @@ def assemble_stream(
                         "event": "report_assembly_started",
                         "run_id": run_id,
                         "stream_id": stream_id,
+                        "assembly_mode": aggregate["assembly_mode"],
                         "total": expected_units,
                         "queue_capacity": REPORT_QUEUE_CAPACITY,
+                        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
                     },
                     separators=(",", ":"),
                 ),
@@ -885,6 +904,34 @@ def assemble_stream(
                     "report queue exceeded its fixed capacity: "
                     f"{queue_stats['max_loaded_count']}/{REPORT_QUEUE_CAPACITY}"
                 )
+            aggregate["report_processed_count"] = int(
+                queue_stats["processed_count"]
+            )
+            aggregate["report_peak_loaded_count"] = int(
+                queue_stats["max_loaded_count"]
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "report_assembly_completed",
+                        "run_id": run_id,
+                        "stream_id": stream_id,
+                        "assembly_mode": aggregate["assembly_mode"],
+                        "current": aggregate["report_processed_count"],
+                        "total": expected_units,
+                        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
+                        "report_processed_count": aggregate[
+                            "report_processed_count"
+                        ],
+                        "report_peak_loaded_count": aggregate[
+                            "report_peak_loaded_count"
+                        ],
+                        "failed_unit_count": aggregate["failed_unit_count"],
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
             fitting_passed = aggregate["failed_unit_count"] == 0
             aggregate["status"] = "passed" if fitting_passed else "failed"
             aggregate["validation"]["passed"] = bool(
@@ -966,6 +1013,33 @@ def assemble_stream(
     return aggregate
 
 
+def assemble_stream(
+    run_spec_path: str | Path,
+    stream_id: str,
+    *,
+    resume_from_reports: bool = False,
+) -> dict[str, Any]:
+    try:
+        return _assemble_stream_impl(
+            run_spec_path,
+            stream_id,
+            resume_from_reports=resume_from_reports,
+        )
+    except Exception as error:
+        try:
+            spec = load_json(Path(run_spec_path).resolve())
+            if spec.get("schema_version") == 2:
+                RunStateDB(spec["state_db"]).set_stream_status(
+                    str(spec["run_id"]),
+                    str(stream_id),
+                    "failed",
+                    error=str(error),
+                )
+        except Exception:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Assemble one completed result stream")
     parser.add_argument("--run-spec", required=True)
@@ -987,6 +1061,12 @@ def main(argv=None) -> int:
                 json.dumps(
                     {
                         "event": "stream_assembly_failed",
+                        "assembly_mode": report.get("assembly_mode")
+                        or (
+                            "report_resume"
+                            if args.resume_from_reports
+                            else "full"
+                        ),
                         "error": "boundary fitting contains failed units",
                     }
                 )
@@ -994,7 +1074,16 @@ def main(argv=None) -> int:
             return 2
         return 0
     except Exception as error:
-        print(json.dumps({"event": "stream_assembly_failed", "error": str(error)}))
+        failure = {
+            "event": "stream_assembly_failed",
+            "assembly_mode": (
+                "report_resume" if args.resume_from_reports else "full"
+            ),
+            "error": str(error),
+        }
+        if args.resume_from_reports:
+            failure["safe_retry"] = "rerun_without_resume_from_reports"
+        print(json.dumps(failure))
         return 2
 
 

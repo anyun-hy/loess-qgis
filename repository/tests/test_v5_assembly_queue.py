@@ -21,6 +21,19 @@ class _QProcess:
     NotRunning = 0
 
 
+class _FinishedProcess:
+    def deleteLater(self):
+        return None
+
+
+class _StopTimer:
+    def __init__(self):
+        self.stop_count = 0
+
+    def stop(self):
+        self.stop_count += 1
+
+
 class _QProcessEnvironment:
     @staticmethod
     def systemEnvironment():
@@ -70,6 +83,7 @@ def _runner(module):
     runner._processes = {}
     runner._phase = "assembly"
     runner._spec_path = "/tmp/run_spec.json"
+    runner.log_line = _Signal()
     return runner
 
 
@@ -105,17 +119,19 @@ def test_active_assembly_process_blocks_second_stream(monkeypatch):
         }
     }
     starts = []
-    failures = []
+    messages = []
     runner._start_process = lambda *args: starts.append(args)
-    runner._finish = lambda success, error: failures.append((success, error))
+    runner.log_line = types.SimpleNamespace(
+        emit=lambda level, message: messages.append((level, message))
+    )
 
     runner._start_assembly()
 
     assert starts == []
-    assert failures == [
+    assert messages == [
         (
-            False,
-            "assembly queue invariant violated: another stream assembly is active",
+            "system",
+            "[assembly-queue] waiting for active stream: model:a",
         )
     ]
     assert [item["stream_id"] for item in runner._assembly_queue] == [
@@ -123,6 +139,87 @@ def test_active_assembly_process_blocks_second_stream(monkeypatch):
         "model:b",
         "fusion:approved",
     ]
+
+
+def test_failed_stream_stops_queue_before_fusion_and_acceptance(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._processes = {
+        "failed": {
+            "process": _FinishedProcess(),
+            "context": {
+                "kind": "assemble",
+                "label": "assemble_stream:model:a",
+                "stream_id": "model:a",
+            },
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+        }
+    }
+    finishes = []
+    starts = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._finish = lambda success, error: finishes.append((success, error))
+    runner._start_assembly = lambda: starts.append("continued")
+    runner.step_finished = _Signal()
+
+    runner._process_finished("failed", 2, None)
+
+    assert starts == []
+    assert finishes == [
+        (False, "assemble_stream:model:a failed (rc=2)"),
+    ]
+    assert [item["stream_id"] for item in runner._assembly_queue] == [
+        "model:a",
+        "model:b",
+        "fusion:approved",
+    ]
+
+
+def test_user_stop_terminates_active_assembly_and_marks_run_stopped(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._processes = {
+        "active": {
+            "context": {
+                "kind": "assemble",
+                "label": "assemble_stream:model:a",
+                "stream_id": "model:a",
+            }
+        }
+    }
+    terminated = []
+    status_updates = []
+    finishes = []
+    runner._terminate_entry = lambda entry, graceful: terminated.append(
+        (entry["context"]["stream_id"], graceful)
+    )
+    runner._database = types.SimpleNamespace(
+        set_run_status=lambda run_id, status, expected: status_updates.append(
+            (run_id, status, expected)
+        )
+    )
+    runner._finish = lambda success, error: finishes.append((success, error))
+
+    runner.stop()
+
+    assert runner._stopped is True
+    assert runner._processes == {}
+    assert runner._scheduler.stop_count == 1
+    assert runner._watchdog.stop_count == 1
+    assert terminated == [("model:a", True)]
+    assert status_updates == [
+        ("run-1", "stopped", ("running", "raster_ready")),
+    ]
+    assert finishes == [(False, "Pipeline stopped by user")]
 
 
 def test_ubuntu_plugin_version_marks_queue_hardening():
@@ -134,4 +231,3 @@ def test_ubuntu_plugin_version_marks_queue_hardening():
     ).read_text(encoding="utf-8")
 
     assert "version=0.3.0-linux.2" in metadata
-

@@ -245,6 +245,22 @@ class V5AsyncInferenceRunner(QObject):
             )
 
     def _start_assembly(self):
+        active_assemblies = [
+            entry
+            for entry in self._processes.values()
+            if (entry.get("context") or {}).get("kind") == "assemble"
+        ]
+        if active_assemblies:
+            active_stream = str(
+                (active_assemblies[0].get("context") or {}).get("stream_id")
+                or "unknown"
+            )
+            self.log_line.emit(
+                "system",
+                "[assembly-queue] waiting for active stream: "
+                + active_stream,
+            )
+            return
         if not self._assembly_queue:
             self._phase = "acceptance"
             self._start_process(

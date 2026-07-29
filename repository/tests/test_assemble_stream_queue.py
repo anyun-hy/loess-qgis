@@ -7,6 +7,7 @@ from pathlib import Path
 import fiona
 import pytest
 from fiona.crs import CRS
+from shapely.geometry import MultiPolygon, box, mapping
 
 import assemble_stream
 
@@ -58,6 +59,33 @@ def _write_line_gpkg(path):
         crs=CRS.from_epsg(4326),
     ):
         pass
+
+
+def _write_resume_gpkg(path):
+    schema = {
+        "geometry": "MultiPolygon",
+        "properties": {
+            "run_id": "str:48",
+            "stream_id": "str:96",
+        },
+    }
+    with fiona.open(
+        path,
+        "w",
+        driver="GPKG",
+        layer="semantic_polygons_raw",
+        schema=schema,
+        crs=CRS.from_epsg(4326),
+    ) as destination:
+        destination.write(
+            {
+                "geometry": mapping(MultiPolygon([box(0, 0, 1, 1)])),
+                "properties": {
+                    "run_id": "run-1",
+                    "stream_id": "model:a",
+                },
+            }
+        )
 
 
 def test_report_queue_is_ordered_and_bounded(tmp_path):
@@ -222,6 +250,84 @@ def test_resume_input_fingerprint_change_is_rejected(tmp_path):
         assemble_stream._assert_fingerprint_unchanged(path, fingerprint)
 
 
+def test_resume_gpkg_requires_matching_schema_crs_identity_and_count(tmp_path):
+    path = tmp_path / "semantic_polygons_raw.gpkg"
+    _write_resume_gpkg(path)
+    schema = {
+        "geometry": "MultiPolygon",
+        "properties": {
+            "run_id": "str:48",
+            "stream_id": "str:96",
+        },
+    }
+    common = {
+        "layer": "semantic_polygons_raw",
+        "schema": schema,
+        "crs": "EPSG:4326",
+        "identity": {
+            "run_id": "run-1",
+            "stream_id": "model:a",
+        },
+        "expected_feature_count": 1,
+    }
+
+    fingerprint = assemble_stream._validate_existing_gpkg(path, **common)
+    assert fingerprint["feature_count"] == 1
+    assert fingerprint["byte_count"] == path.stat().st_size
+    assert len(fingerprint["sha256"]) == 64
+
+    with pytest.raises(
+        assemble_stream.StreamAssemblyError,
+        match="fields changed",
+    ):
+        assemble_stream._validate_existing_gpkg(
+            path,
+            **{
+                **common,
+                "schema": {
+                    **schema,
+                    "properties": {
+                        **schema["properties"],
+                        "class_code": "int",
+                    },
+                },
+            },
+        )
+
+    with pytest.raises(
+        assemble_stream.StreamAssemblyError,
+        match="CRS changed",
+    ):
+        assemble_stream._validate_existing_gpkg(
+            path,
+            **{**common, "crs": "EPSG:3857"},
+        )
+
+    with pytest.raises(
+        assemble_stream.StreamAssemblyError,
+        match="another run or stream",
+    ):
+        assemble_stream._validate_existing_gpkg(
+            path,
+            **{
+                **common,
+                "identity": {
+                    "run_id": "run-2",
+                    "stream_id": "model:a",
+                },
+            },
+        )
+
+    with pytest.raises(
+        assemble_stream.StreamAssemblyError,
+        match="feature count changed",
+    ):
+        assemble_stream._validate_existing_gpkg(
+            path,
+            **{**common, "expected_feature_count": 2},
+        )
+
+
 def test_resume_failure_event_is_actionable(monkeypatch, capsys):
     def fail(*_args, **_kwargs):
         raise assemble_stream.StreamAssemblyError(
@@ -246,3 +352,47 @@ def test_resume_failure_event_is_actionable(monkeypatch, capsys):
     assert event["assembly_mode"] == "report_resume"
     assert event["safe_retry"] == "rerun_without_resume_from_reports"
 
+
+def test_assembly_exception_marks_stream_failed(monkeypatch, tmp_path):
+    state_path = tmp_path / "run_state.sqlite"
+    database = assemble_stream.RunStateDB(state_path)
+    database.initialize()
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "run_id": "run-1",
+                "state_db": str(state_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    database.create_run("run-1", "0" * 64)
+    database.register_streams(
+        "run-1",
+        [
+            {
+                "stream_id": "model:a",
+                "kind": "model",
+                "model_id": "a",
+                "version": "fixture",
+                "status": "ready",
+            }
+        ],
+    )
+
+    def fail(*_args, **_kwargs):
+        raise assemble_stream.StreamAssemblyError("assembled artifact changed")
+
+    monkeypatch.setattr(assemble_stream, "_assemble_stream_impl", fail)
+
+    with pytest.raises(
+        assemble_stream.StreamAssemblyError,
+        match="assembled artifact changed",
+    ):
+        assemble_stream.assemble_stream(spec_path, "model:a")
+
+    stream = database.stream_rows("run-1")[0]
+    assert stream["status"] == "failed"
+    assert stream["error"] == "assembled artifact changed"
