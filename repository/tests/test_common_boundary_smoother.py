@@ -35,6 +35,22 @@ def _one_line(geometry):
     raise AssertionError(geometry.geom_type)
 
 
+def _closed_ring_allclose(expected, actual):
+    expected = np.asarray(expected)
+    actual = np.asarray(actual)
+    if np.allclose(expected[0], expected[-1]):
+        expected = expected[:-1]
+    if np.allclose(actual[0], actual[-1]):
+        actual = actual[:-1]
+    if expected.shape != actual.shape:
+        return False
+    for candidate in (actual, actual[::-1]):
+        for offset in range(len(candidate)):
+            if np.allclose(expected, np.roll(candidate, offset, axis=0)):
+                return True
+    return False
+
+
 def test_common_divider_is_fitted_once_and_reused_by_both_polygons():
     raw_shared, records = _adjacent_staircase_polygons()
     formal, report = smooth_common_boundaries(
@@ -156,7 +172,7 @@ def test_closed_island_divider_is_fitted_once_for_outer_hole_and_inner_polygon()
     )
     expected = np.asarray(report["diagnostics"][0]["fitted_points"])
     actual = np.asarray(shared_after.coords)
-    assert np.allclose(expected, actual) or np.allclose(expected, actual[::-1])
+    assert _closed_ring_allclose(expected, actual)
 
 
 def test_tiny_closed_divider_keeps_original_geometry_when_spline_collapses_it():
