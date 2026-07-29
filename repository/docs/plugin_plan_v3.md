@@ -48,7 +48,45 @@ Ubuntu: ~/.local/share/QGIS/QGIS3/profiles/<profile>/python/plugins
 macOS:  ~/Library/Application Support/QGIS/QGIS4/profiles/<profile>/python/plugins
 ```
 
-仓库根目录唯一部署入口 `install.sh` 必须支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；失败不得改变现有安装，也不得留下源码备份或 `.stage`。推理配置采用一份共享 Schema v2 和两个最小平台覆盖，`config.sh` 默认 `CONDA_ENV=qgis`。
+插件安装和项目目录初始化是两个独立操作，统一放在仓库 `bash/` 目录：
+
+```text
+bash/install_plugin.sh
+bash/init_project.sh
+```
+
+`install_plugin.sh` 只负责把 QGIS 插件安装到指定 platform/profile，支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。它不得询问或创建项目目录，不得部署推理脚本、创建权重/输入/输出目录，也不得创建或更新 Conda 推理环境。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；失败不得改变现有安装，也不得留下源码备份或 `.stage`。
+
+`init_project.sh` 只负责用户选择的项目根目录，支持交互选择或 `--project-root`，以及 `--platform`、`--conda-exe`、`--create-env`、`--check-only` 和 `--check-assets`。它不得读取、安装或修改任何 QGIS profile。项目初始化后固定形成：
+
+```text
+<project_root>/
+├── project_manifest.json
+├── inference_scripts/
+├── runtime/
+│   └── labeling_tool/
+│       └── core/
+│           ├── run_spec.py
+│           ├── run_state_db.py
+│           └── ownership_neighbors.py
+├── weights/
+│   └── README_WEIGHTS.md
+├── input/
+│   ├── README.md
+│   ├── rasters/
+│   └── ranges/
+├── qgis/
+│   └── README.md
+└── output/
+    ├── runs/
+    └── cache/
+```
+
+权重文件、原始影像、范围矢量、GeoPackage、旧 Run 和缓存均不随仓库发布。初始化只创建说明和空目录；用户仍在 QGIS 中选择实际 raster/range 图层，插件中的推理脚本、输出工作区和 accepted 路径继续允许人工选择，不被项目清单锁死。`accepted_labels.gpkg` 不在初始化阶段创建，因为其 CRS 必须来自实际 Run 的 raster。
+
+`qgis_plugins/labeling_tool/core/run_spec.py`、`run_state_db.py` 和 `ownership_neighbors.py` 是当前插件与推理进程共用的唯一维护源码。推理源码继续使用 `labeling_tool.core.*` 导入；项目初始化把这三个文件按原名部署到 `<project_root>/runtime/labeling_tool/core/`，Shell 通过 `PYTHONPATH` 使用该只读运行副本，不在部署时改写 Python 源码或 import。插件部署清单和项目清单必须记录相同 Git SHA、三个共享文件的逐文件 SHA256 和聚合 SHA256；插件环境检查发现任一提交、清单或实际文件不一致时必须阻止启动并提示重新部署项目。两套 Python 进程可以各有同一提交的运行副本，但仓库内禁止出现第二份可独立修改的共享源码。
+
+`init_project.sh` 更新时只原子替换其管理的 `inference_scripts/` 和 `runtime/`，保留 `weights/`、`input/`、`qgis/`、`output/` 及其中用户数据；目标已有同名受管目录但缺少合法 `project_manifest.json` 时必须拒绝覆盖。推理配置采用一份共享 Schema v2 和两个最小平台覆盖，`config.sh` 默认 `CONDA_ENV=qgis`。
 
 ## 2. 原方案输入输出核对
 
@@ -1077,7 +1115,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 12. 重构监控为数据库聚合和分页查询，默认显示 Partition/Seam/Junction；Tile 每页最多 500 条。所有阶段必须发出可计算进度和心跳，结束、失败、停止后进度条退出忙碌状态。
 13. 用新 formal Fusion 回归 E8：14 类拆分、SAM3 单对象候选、人工修边、确认、final、topology 和 accepted 全部保持原契约。
 14. 依次完成 238 Tile 故障 run 回归、1k、10k、500k 分级验收。每一级失败都先修复同一级，不通过跳过小规模直接宣称 500k。
-15. 每次修改插件源码后执行 `./install.sh --platform auto --profile <隔离profile>` 并在当前平台 QGIS 重载；只有安装副本与仓库 Git SHA、版本和逐文件 SHA256 一致，才记录 QGIS 证据。
+15. 每次修改插件源码后执行 `./bash/install_plugin.sh --platform auto --profile <隔离profile>` 并在当前平台 QGIS 重载；每次修改推理或共享模块后另在隔离项目执行 `./bash/init_project.sh --project-root <隔离项目>`。只有插件安装清单、项目清单、仓库 Git SHA、版本和共享模块逐文件 SHA256 一致，才记录 QGIS 证据。
 
 ## 19. 自动测试与实际验收
 
@@ -1156,7 +1194,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 
 ### QGIS 实际交互验收
 
-1. 在 Ubuntu 与 macOS 分别执行 `./install.sh --platform auto --profile <隔离profile>`，不手动复制；部署入口必须从同一 Git 提交安装。
+1. 在 Ubuntu 与 macOS 分别执行 `./bash/install_plugin.sh --platform auto --profile <隔离profile>`，并用 `./bash/init_project.sh --platform auto --project-root <隔离项目>` 初始化独立项目，不手动复制；插件与项目部署必须来自同一 Git 提交。
 2. 在 QGIS 3.44.7 与 QGIS 4.2 中重新加载插件，确认 `labeling_tool 0.4.0` 已启用，`__file__`、Git SHA 和逐文件 SHA256 与主仓一致。
 3. 当前视图按钮能捕获范围并显示；手绘完成后恢复原平移工具。
 4. 配置弹窗能显示 QGIS/Python/PyQt/Qt 版本、Conda Python 路径、模型、profile、真实路径、哈希、设备和错误修改位置。

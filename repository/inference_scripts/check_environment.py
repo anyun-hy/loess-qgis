@@ -35,6 +35,10 @@ from torchscript_runtime import load_torchscript_model
 
 
 FINGERPRINT_FILES = (
+    "../project_manifest.json",
+    "../runtime/labeling_tool/core/run_spec.py",
+    "../runtime/labeling_tool/core/run_state_db.py",
+    "../runtime/labeling_tool/core/ownership_neighbors.py",
     "config.sh",
     "config.yaml",
     "_device.py",
@@ -479,7 +483,7 @@ def build_report(args):
             f"{runtime_platform} deployment requires exact PyTorch "
             f"{expected_torch_version}"
         ),
-        "run ./install.sh --platform auto --create-env",
+        "run <repository>/bash/init_project.sh --project-root <project> --create-env",
     )
 
     if runtime_platform == "ubuntu":

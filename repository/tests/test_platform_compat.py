@@ -51,18 +51,31 @@ def test_business_modules_use_the_shared_qt_compatibility_facade():
     assert offenders == []
 
 
-def test_one_installer_selects_both_platform_profiles_and_is_atomic():
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+def test_plugin_install_and_project_initialization_are_independent():
+    installer = (ROOT / "bash" / "install_plugin.sh").read_text(encoding="utf-8")
+    initializer = (ROOT / "bash" / "init_project.sh").read_text(encoding="utf-8")
     assert "--platform" in installer
     assert "--profile" in installer
     assert "--plugin-dir" in installer
     assert "--check-only" in installer
     assert "QGIS/QGIS3/profiles/${PROFILE}/python/plugins" in installer
     assert "QGIS/QGIS4/profiles/${PROFILE}/python/plugins" in installer
-    assert "environment-ubuntu-cu124.yml" in installer
-    assert "environment-macos-qgis4.yml" in installer
     assert "deployment_manifest.json" in installer
     assert 'mv "${STAGED_DEST}" "${DEST_PLUGIN}"' in installer
+    assert "--project-root" not in installer
+    assert "--create-env" not in installer
+
+    assert "--project-root" in initializer
+    assert "--create-env" in initializer
+    assert "--check-assets" in initializer
+    assert "environment-ubuntu-cu124.yml" in initializer
+    assert "environment-macos-qgis4.yml" in initializer
+    assert "project_manifest.json" in initializer
+    assert "runtime/labeling_tool/core" in initializer
+    assert "--profile" not in initializer
+    assert "--plugin-dir" not in initializer
+
+    assert not (ROOT / "install.sh").exists()
     assert not (ROOT / "qgis_plugins" / "install_qgis_plugin.sh").exists()
 
 

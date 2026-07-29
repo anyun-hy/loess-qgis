@@ -14,6 +14,7 @@ from qgis.PyQt.QtCore import (
 )
 from qgis.core import Qgis
 
+from .deployment_contract import verify_project_runtime
 from .process_compat import configure_process, process_is_running
 
 
@@ -53,6 +54,10 @@ REQUIRED_FILES = PIPELINE_FILES + (
     "run_env_check.sh",
 )
 FINGERPRINT_FILES = (
+    "../project_manifest.json",
+    "../runtime/labeling_tool/core/run_spec.py",
+    "../runtime/labeling_tool/core/run_state_db.py",
+    "../runtime/labeling_tool/core/ownership_neighbors.py",
     "config.sh",
     "config.yaml",
     "_device.py",
@@ -147,6 +152,7 @@ def static_check(scripts_dir):
             "fix": f"修复 {file_path}",
         })
 
+    checks.append(verify_project_runtime(path))
     status = "error" if any(item["status"] == "error" for item in checks) else "ready"
     return _report(status, checks, config_fingerprint(path))
 

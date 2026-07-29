@@ -1,6 +1,17 @@
 # Shared launcher config for Ubuntu/QGIS 3.44 and macOS/QGIS 4.2.
 CONDA_ENV="${CONDA_ENV:-qgis}"
 LOESS_PLATFORM="${LOESS_PLATFORM:-auto}"
+LOESS_INFERENCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOESS_PROJECT_ROOT="$(cd "${LOESS_INFERENCE_DIR}/.." && pwd)"
+LOESS_RUNTIME_ROOT="${LOESS_PROJECT_ROOT}/runtime"
+
+# An initialized project carries a minimal, hash-bound copy of the three pure
+# Python modules shared with the QGIS plugin.  Source checkouts continue to use
+# their adjacent qgis_plugins tree; deployed projects resolve the same import
+# names from this runtime root without rewriting Python files.
+if [ -d "${LOESS_RUNTIME_ROOT}/labeling_tool/core" ]; then
+  export PYTHONPATH="${LOESS_RUNTIME_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 if [ "$LOESS_PLATFORM" = "auto" ]; then
   case "$(uname -s)" in
@@ -54,6 +65,7 @@ unset CONDA_PYTHON_EXE CONDA_ROOT _CE_CONDA _CE_M
 export CONDA_SHLVL=0
 
 export CONDA_ENV CONDA_EXE LOESS_PLATFORM LOESS_ENV_LOCK
+export LOESS_INFERENCE_DIR LOESS_PROJECT_ROOT LOESS_RUNTIME_ROOT
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
 if [ "$LOESS_PLATFORM" = "ubuntu" ]; then
