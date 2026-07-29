@@ -762,6 +762,10 @@ sam_session_id | sam_score | reviewed | created_at | updated_at
 
 环境检查必须是用户明确点击的操作。推理脚本目录、输出工作区或 accepted 路径变化时，主面板只标记“配置已变化，请检查推理环境”，禁止自动启动耗时检查；环境检查完成前禁用“选择模型与 Fusion”和“开始标注”。环境检查通过后必须在推理方案弹窗中应用本次模型与 Fusion 选择，“开始标注”才可启用。“查看完整检查结果”是检查后的诊断入口，不属于正常必点步骤，复制命令放在详情窗口内部。
 
+QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在创建、进入运行态和终止时原子更新 `output/run_index.json`，索引只记录最新 Run、状态和最新 Ready Run 的合法 `run_id`。启动时最多读取该索引及其明确指向的 `run_spec.json`、`run_manifest.json` 小型元数据；禁止枚举 `output/runs/`，禁止读取 `run_state.sqlite`，禁止在启动路径校验模型权重、VRT、GeoTIFF、GeoPackage、Tile cache 或历史 Artifact 哈希。索引缺失、损坏、超限或指向无效时直接视为没有自动恢复候选，不得回退全目录扫描。
+
+索引中的可恢复 Run 只用于显示状态和启用显式恢复动作；点击恢复后才读取该 Run 的 SQLite。索引中的 Ready Run 只显示为“验证并打开最近 Run”，点击后才对这一个 Run 执行完整输入、结果、边界报告、Fusion approval 和 SHA256 校验；校验通过前不得把它设置为当前正式结果或初始化分类工作区。用户仍可通过“加载已有 Run 人工整理”明确选择未进入索引的历史 Run。
+
 “打开分类修整与组装”只在当前 run 存在边界拟合与全部 Seam/Junction `passed`、`ready` 且 `approved` 的 Fusion 流时启用。未选择 Fusion、缺少 report、存在 failed unit 或 formal hash 不匹配时，按钮必须显示具体阻塞原因，不能退回 raw 或某个模型层偷偷初始化工作区。
 
 ### 15.2 推理配置弹窗

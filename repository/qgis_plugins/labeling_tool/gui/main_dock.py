@@ -100,9 +100,10 @@ from ..core.v5_async_runner import V5AsyncInferenceRunner
 from ..core.model_registry import ModelRegistry
 from ..core.run_builder_v5 import create_v5_run
 from ..core.run_spec import reserve_run_directory, run_tile_cache_dir
+from ..core import run_index
 from ..core.work_package_planner import storage_preflight
 from ..core.environment_report import compact_problem, format_check_details
-from ..core.result_catalog import iter_ready_results
+from ..core.result_catalog import valid_ready_stream_ids
 from ..core.run_state_db import RunStateDB
 from ..core.spatial_planner import plan_spatial_units
 
@@ -193,6 +194,8 @@ class LabelingDockWidget(QgsDockWidget):
         self._last_run_result = None
         self._last_run_spec = None
         self._recovery_run_spec = None
+        self._startup_ready_candidate = None
+        self._startup_recovery_status = None
         self._env_details_dialog = None
         self._rect_tool = RectangleMapTool(iface.mapCanvas()) if iface else None
         if self._rect_tool:
@@ -588,7 +591,10 @@ class LabelingDockWidget(QgsDockWidget):
         self._last_run_result = None
         self._last_run_spec = None
         self._recovery_run_spec = None
+        self._startup_ready_candidate = None
+        self._startup_recovery_status = None
         self.open_refinement_btn.setEnabled(False)
+        self.open_refinement_btn.setText("打开分类修整与组装")
         self.result_summary_label.setText("尚无运行结果")
         self._mark_env_check_required()
 
@@ -654,55 +660,38 @@ class LabelingDockWidget(QgsDockWidget):
         if self._pipeline_running:
             return
         output_root = self.workspace_edit.text().strip()
-        recovery_state = None
+        candidates = run_index.load_startup_candidates(output_root)
         self._recovery_run_spec = None
-        runs_dir = Path(output_root).expanduser() / "runs"
-        if runs_dir.is_dir():
-            for run_dir in sorted(
-                (path for path in runs_dir.iterdir() if path.is_dir()),
-                key=lambda path: path.name,
-                reverse=True,
-            ):
-                spec_path = run_dir / "run_spec.json"
-                try:
-                    with open(spec_path, "r", encoding="utf-8") as handle:
-                        spec = __import__("json").load(handle)
-                    if int(spec.get("schema_version") or 0) != 2:
-                        continue
-                    state = RunStateDB(spec["state_db"]).get_run(spec["run_id"]) or {}
-                    if state.get("status") not in {
-                        "planned", "stopped", "failed", "running",
-                    }:
-                        continue
-                except (OSError, ValueError, KeyError):
-                    continue
-                self._recovery_run_spec = spec
-                recovery_state = state
-                self.result_summary_label.setText(
-                    f"发现可恢复 Run {spec['run_id']}；状态 {state['status']}"
-                )
-                break
-
+        self._startup_recovery_status = None
         if not self._last_run_result:
-            for result, spec in iter_ready_results(output_root):
-                try:
-                    eligible = class_workspace.approved_fusion_streams(
-                        spec, result.get("ready_streams") or []
-                    )
-                except (OSError, KeyError, TypeError, ValueError):
-                    continue
-                if not eligible:
-                    continue
-                self._last_run_result = result
-                self._last_run_spec = spec
-                fusion_ids = ", ".join(item["stream_id"] for item in eligible)
-                if recovery_state is None:
+            self.open_refinement_btn.setEnabled(False)
+            self.open_refinement_btn.setText("打开分类修整与组装")
+        latest = candidates.get("latest") or {}
+        latest_status = str(latest.get("indexed_status") or "")
+        if latest_status in run_index.RECOVERABLE_RUN_STATES:
+            self._recovery_run_spec = latest["spec"]
+            self._startup_recovery_status = latest_status
+            self.result_summary_label.setText(
+                f"发现可恢复 Run {latest['run_id']}；状态 {latest_status}"
+            )
+
+        self._startup_ready_candidate = None
+        if not self._last_run_result:
+            ready = candidates.get("latest_ready")
+            try:
+                result = run_index.lightweight_ready_result(ready) if ready else None
+            except (KeyError, TypeError, run_index.RunIndexError):
+                result = None
+            if result is not None:
+                self._startup_ready_candidate = (result, ready["spec"])
+                if self._recovery_run_spec is None:
                     self.result_summary_label.setText(
-                        f"已恢复 Run {result['run_id']}；approved Fusion: {fusion_ids}"
+                        f"发现最近 Ready Run {result['run_id']}；"
+                        "打开时再校验正式结果"
                     )
+                self.open_refinement_btn.setText("验证并打开最近 Run")
                 self.open_refinement_btn.setEnabled(True)
-                break
-        self._update_recovery_buttons()
+        self._update_recovery_buttons(lightweight=True)
 
     def _render_last_env_report(self, *_args):
         self._save_settings()
@@ -1749,6 +1738,9 @@ class LabelingDockWidget(QgsDockWidget):
             logger.error("图层分组失败: %s", e)
 
         self._last_run_result = dict(result)
+        self._startup_ready_candidate = None
+        self._startup_recovery_status = None
+        self.open_refinement_btn.setText("打开分类修整与组装")
         try:
             with open(result.get("run_spec", ""), "r", encoding="utf-8") as handle:
                 self._last_run_spec = __import__("json").load(handle)
@@ -1789,7 +1781,15 @@ class LabelingDockWidget(QgsDockWidget):
                 msg += f"\n\n运行报告: {run_report}"
             QMessageBox.warning(self, "推理失败", msg)
 
-    def _update_recovery_buttons(self):
+    def _update_recovery_buttons(self, *, lightweight=False):
+        if lightweight:
+            status = str(self._startup_recovery_status or "")
+            resumable = status in run_index.RECOVERABLE_RUN_STATES
+            self.resume_btn.setEnabled(resumable and not self._pipeline_running)
+            self.retry_failed_btn.setEnabled(
+                status == "failed" and not self._pipeline_running
+            )
+            return
         resumable = False
         failed = False
         spec = self._recovery_run_spec or self._last_run_spec or {}
@@ -1850,6 +1850,50 @@ class LabelingDockWidget(QgsDockWidget):
             QMessageBox.critical(self, "恢复运行失败", str(error))
 
     def _on_open_refinement(self):
+        if (
+            self._last_run_result is None
+            and self._last_run_spec is None
+            and self._startup_ready_candidate is not None
+        ):
+            result, spec = self._startup_ready_candidate
+            try:
+                valid_ids = set(valid_ready_stream_ids(result))
+                declared_streams = list(result.get("ready_streams") or [])
+                valid_streams = [
+                    item for item in declared_streams
+                    if str(item.get("stream_id") or "") in valid_ids
+                ]
+                if len(valid_streams) != len(declared_streams):
+                    raise ValueError(
+                        "最近 Run 存在未通过正式文件或 SHA256 校验的结果流"
+                    )
+                eligible = class_workspace.approved_fusion_streams(
+                    spec, valid_streams
+                )
+                if not eligible:
+                    raise ValueError(
+                        "最近 Run 的 Fusion 正式文件、哈希或 approval 校验未通过"
+                    )
+                result = {
+                    **result,
+                    "streams": valid_streams,
+                    "ready_streams": valid_streams,
+                }
+                self._last_run_result = result
+                self._last_run_spec = spec
+                self._startup_ready_candidate = None
+                self.open_refinement_btn.setText("打开分类修整与组装")
+                self.result_summary_label.setText(
+                    f"已验证 Run {result['run_id']}；approved Fusion: "
+                    + ", ".join(item["stream_id"] for item in eligible)
+                )
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "最近 Run 校验失败",
+                    str(exc) + "\n\n可使用“加载已有 Run 人工整理”明确选择其他 Run。",
+                )
+                return
         if self.refinement_dialog is None or not self._last_run_result or not self._last_run_spec:
             QMessageBox.warning(self, "分类修整", "当前没有可用的 semantic_ready 运行结果")
             return
@@ -1899,6 +1943,9 @@ class LabelingDockWidget(QgsDockWidget):
             self._last_run_result = result
             self._last_run_spec = run_spec
             self._recovery_run_spec = None
+            self._startup_ready_candidate = None
+            self._startup_recovery_status = None
+            self.open_refinement_btn.setText("打开分类修整与组装")
             self.open_refinement_btn.setEnabled(True)
             self.result_summary_label.setText(
                 f"已加载人工 Run {result['run_id']}；"

@@ -15,6 +15,7 @@ from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyq
 
 from .process_compat import configure_linux_process
 from .result_catalog import artifact_sha256
+from .run_index import record_run_state
 from .run_spec import atomic_write_json, sha256_file
 from .run_state_db import RunStateDB
 
@@ -96,6 +97,7 @@ class V5AsyncInferenceRunner(QObject):
             "running",
             expected=("planned", "running", "stopped", "failed", "raster_ready"),
         )
+        self._record_startup_index("running")
         self._running = True
         self._stopped = False
         self._phase = "jobs"
@@ -686,4 +688,17 @@ class V5AsyncInferenceRunner(QObject):
             self._database.set_run_status(
                 self._spec["run_id"], "failed", expected=("running", "raster_ready")
             )
+        self._record_startup_index(result["status"])
         self.pipeline_finished.emit(result)
+
+    def _record_startup_index(self, status):
+        try:
+            record_run_state(
+                self._spec["output_root"],
+                self._spec["run_id"],
+                status=str(status),
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            self.log_line.emit(
+                "system", f"[run-index-warning] 无法更新轻量 Run 启动索引: {exc}"
+            )

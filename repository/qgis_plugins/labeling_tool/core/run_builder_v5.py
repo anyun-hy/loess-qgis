@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import datetime as _datetime
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .run_index import record_run_state
 from .run_spec import (
     CLASS_NAMES,
     CLASS_ORDER,
@@ -22,6 +24,7 @@ from .work_package_planner import plan_work_packages
 
 
 RUN_SPEC_SCHEMA_VERSION = 2
+logger = logging.getLogger("labeling_tool.run_builder_v5")
 
 
 class RunBuilderV5Error(ValueError):
@@ -378,4 +381,8 @@ def create_v5_run(
         (run_dir / RESERVATION_FILE).unlink()
     except FileNotFoundError:
         pass
+    try:
+        record_run_state(output, identifier, status="planned")
+    except (OSError, ValueError) as exc:
+        logger.warning("无法更新轻量 Run 启动索引: %s", exc)
     return spec, spec_path, database_path

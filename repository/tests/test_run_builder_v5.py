@@ -110,6 +110,12 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         "overlap_pair_count": 0,
         "overlap_tolerance": 0.000001,
     }
+    startup_index = json.loads(
+        (tmp_path / "output" / "run_index.json").read_text(encoding="utf-8")
+    )
+    assert startup_index["latest_run_id"] == spec["run_id"]
+    assert startup_index["latest_run_status"] == "planned"
+    assert startup_index["latest_ready_run_id"] == ""
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM tiles").fetchone()[0] == 100_000
