@@ -1,0 +1,397 @@
+............................F..............................s............ [ 45%]
+FFFFFF...............F...F.............................................. [ 90%]
+.........FF..F.                                                          [100%]
+=================================== FAILURES ===================================
+________ test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x15c0fb320>
+
+    def test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility(monkeypatch):
+        checks = []
+        monkeypatch.setenv("LOESS_QGIS_VERSION", "3.44.7-Solothurn")
+        monkeypatch.setenv("LOESS_QGIS_PYTHON_VERSION", "3.12.5")
+        monkeypatch.setenv("LOESS_PYQT_VERSION", "5.15.10")
+        monkeypatch.setenv("LOESS_QT_VERSION", "5.15.13")
+        monkeypatch.setenv("LOESS_QGIS_PYTHON_EXECUTABLE", "/opt/qgis3/bin/python3")
+        monkeypatch.setattr(
+            check_environment.sys,
+            "executable",
+            "/home/example/anaconda3/envs/qgis/bin/python",
+            raising=False,
+        )
+    
+        add_runtime_boundary_checks(checks, "qgis")
+    
+        by_id = {item["id"]: item for item in checks}
+        assert by_id["qgis_version"]["status"] == "ready"
+        assert by_id["pyqt_version"]["status"] == "ready"
+        assert by_id["qt_version"]["status"] == "ready"
+>       assert "compatibility" in by_id["qgis_version"]["message"].lower()
+E       AssertionError: assert 'compatibility' in 'qgis host runtime detected'
+E        +  where 'qgis host runtime detected' = <built-in method lower of str object at 0x15c1eda70>()
+E        +    where <built-in method lower of str object at 0x15c1eda70> = 'QGIS host runtime detected'.lower
+
+tests/test_environment_status.py:72: AssertionError
+________________________ test_plugin_targets_qgis4_only ________________________
+
+    def test_plugin_targets_qgis4_only():
+        metadata = (PLUGIN_ROOT / "metadata.txt").read_text(encoding="utf-8")
+>       assert "qgisMinimumVersion=4.2" in metadata
+E       AssertionError: assert 'qgisMinimumVersion=4.2' in '[general]\nname=半自动标注工具\nqgisMinimumVersion=3.44\nqgisMaximumVersion=3.44.99\ndescription=Ubuntu/QGIS 3.44 半自动矢量标注插件，...ry=\ntags=semantic,labeling,SAM3,landuse\nhomepage=\nhasProcessingProvider=no\ncategory=Plugin\nplugin_dependencies=\n'
+
+tests/test_qgis4_migration.py:32: AssertionError
+___________ test_plugin_contains_no_known_qt5_or_qgis3_enum_spelling ___________
+
+    def test_plugin_contains_no_known_qt5_or_qgis3_enum_spelling():
+        offenders = []
+        for path in PLUGIN_ROOT.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for pattern in LEGACY_ENUM_PATTERNS:
+                if re.search(pattern, text):
+                    offenders.append(f"{path.relative_to(ROOT)}: {pattern}")
+>       assert offenders == []
+E       AssertionError: assert ['qgis_plugin...Running', ...] == []
+E         
+E         Left contains 18 more items, first extra item: 'qgis_plugins/labeling_tool/plugin.py: Qt\\.(?:RightDockWidgetArea|AlignLeft|AlignVCenter|TextSelectableByMouse)'
+E         Use -v to get more diff
+
+tests/test_qgis4_migration.py:43: AssertionError
+________ test_installer_defaults_to_qgis4_profile_and_qgis_conda_python ________
+
+    def test_installer_defaults_to_qgis4_profile_and_qgis_conda_python():
+>       installer = (ROOT / "qgis_plugins" / "install_qgis_plugin.sh").read_text(
+            encoding="utf-8"
+        )
+
+tests/test_qgis4_migration.py:47: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/anaconda3/envs/qgis/lib/python3.12/pathlib.py:1027: in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = PosixPath('/Users/example/Desktop/loess-data/ubuntu/repository/qgis_plugins/install_qgis_plugin.sh')
+mode = 'r', buffering = -1, encoding = 'utf-8', errors = None, newline = None
+
+    def open(self, mode='r', buffering=-1, encoding=None,
+             errors=None, newline=None):
+        """
+        Open the file pointed to by this path and return a file object, as
+        the built-in open() function does.
+        """
+        if "b" not in mode:
+            encoding = io.text_encoding(encoding)
+>       return io.open(self, mode, buffering, encoding, errors, newline)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       FileNotFoundError: [Errno 2] No such file or directory: '/Users/example/Desktop/loess-data/ubuntu/repository/qgis_plugins/install_qgis_plugin.sh'
+
+/opt/anaconda3/envs/qgis/lib/python3.12/pathlib.py:1013: FileNotFoundError
+________ test_inference_environment_contract_is_qgis_without_conda_qgis ________
+
+    def test_inference_environment_contract_is_qgis_without_conda_qgis():
+        config_sh = (ROOT / "inference_scripts" / "config.sh").read_text(
+            encoding="utf-8"
+        )
+        assert 'CONDA_ENV="${CONDA_ENV:-qgis}"' in config_sh
+>       assert 'CONDA_EXE="${CONDA_EXE:-/opt/anaconda3/bin/conda}"' in config_sh
+E       assert 'CONDA_EXE="${CONDA_EXE:-/opt/anaconda3/bin/conda}"' in '# Shared launcher config for Ubuntu/QGIS 3.44 inference scripts.\nCONDA_ENV="${CONDA_ENV:-qgis}"\nCONDA_EXE="${CONDA_...\nexport PYTHONNOUSERSITE=1\nexport CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"\nexport CUDA_LAUNCH_BLOCKING=0\n'
+
+tests/test_qgis4_migration.py:62: AssertionError
+_________ test_environment_check_owns_and_terminates_its_process_group _________
+
+    def test_environment_check_owns_and_terminates_its_process_group():
+        source = (
+            PLUGIN_ROOT / "core" / "inference_config.py"
+        ).read_text(encoding="utf-8")
+>       assert "QProcess.UnixProcessFlag.CreateNewSession" in source
+E       AssertionError: assert 'QProcess.UnixProcessFlag.CreateNewSession' in 'import hashlib\nimport json\nimport os\nimport signal\nimport sys\n\nfrom qgis.PyQt.QtCore import (\n    PYQT_VERSION...      process.deleteLater()\n        self.report_ready.emit(report)\n\n    def cleanup(self):\n        self.cancel()\n'
+
+tests/test_qgis4_migration.py:84: AssertionError
+________ test_plugin_and_checker_fingerprint_the_environment_lock_file _________
+
+    def test_plugin_and_checker_fingerprint_the_environment_lock_file():
+        plugin_source = (
+            PLUGIN_ROOT / "core" / "inference_config.py"
+        ).read_text(encoding="utf-8")
+        plugin_fingerprint_block = plugin_source.split(
+            "FINGERPRINT_FILES =", 1
+        )[1].split("def config_fingerprint", 1)[0]
+        checker_source = (
+            ROOT / "inference_scripts" / "check_environment.py"
+        ).read_text(encoding="utf-8")
+        checker_fingerprint_block = checker_source.split(
+            "FINGERPRINT_FILES =", 1
+        )[1].split("def add_check", 1)[0]
+>       assert '"environment-qgis.yml"' in plugin_fingerprint_block
+E       assert '"environment-qgis.yml"' in ' (\n    "config.sh",\n    "config.yaml",\n    "_device.py",\n    "deployment_config.py",\n    "check_environment.py",...y",\n    "sam3_interactive_worker.py",\n    "sam3_refine.py",\n    "run_polyline_smooth.sh",\n) + PIPELINE_FILES\n\n\n'
+
+tests/test_qgis4_migration.py:103: AssertionError
+_______ test_quick_redraw_uses_native_polybezier_preview_and_edit_buffer _______
+
+    def test_quick_redraw_uses_native_polybezier_preview_and_edit_buffer():
+        source = (
+            PLUGIN_ROOT / "gui" / "class_refinement_dialog.py"
+        ).read_text(encoding="utf-8")
+        assert 'addAction("快速重画现有面")' in source
+        assert 'addAction("新增人工面")' in source
+        assert 'addAction("保存当前编辑")' in source
+        assert 'addAction("取消当前编辑")' in source
+    
+        capture = source.split(
+            "def _start_redraw_capture", 1
+        )[1].split("def _disconnect_redraw_capture", 1)[0]
+        assert "QgsMapToolDigitizeFeature(" in capture
+        assert "QgsMapToolCapture.CaptureMode.CapturePolygon" in capture
+        assert "Qgis.CaptureTechnique.PolyBezier" in capture
+        assert "digitizingCompleted.connect" in capture
+    
+        preview = source.split(
+            "def _update_redraw_preview", 1
+        )[1].split("def _set_redraw_controls", 1)[0]
+        assert "redraw_smooth_spin.value()" in preview
+        assert "raw.smooth(iterations, 0.25, -1.0, 180.0)" in preview
+    
+        adopt = source.split(
+            "def _adopt_quick_redraw", 1
+        )[1].split("def _cancel_quick_redraw", 1)[0]
+        assert "layer.changeGeometry(feature_id, geometry)" in adopt
+        assert "layer.commitChanges" not in adopt
+        assert "保存当前编辑" in adopt
+        assert "取消当前编辑" in adopt
+    
+        reference = source.split(
+            "def _show_redraw_reference", 1
+        )[1].split("def _show_redraw_candidate", 1)[0]
+        assert "QColor(105, 105, 105, 230)" in reference
+>       assert "Qt.PenStyle.DashLine" in reference
+E       AssertionError: assert 'Qt.PenStyle.DashLine' in '(self, geometry, layer):\n        self._clear_redraw_bands()\n        self._redraw_reference_band = QgsRubberBand(\n ...   self._redraw_reference_band.setWidth(2)\n        self._redraw_reference_band.setToGeometry(geometry, layer)\n\n    '
+
+tests/test_qgis4_migration.py:391: AssertionError
+____________ test_monitor_tables_use_stable_user_resizable_columns _____________
+
+    def test_monitor_tables_use_stable_user_resizable_columns():
+        source = (
+            PLUGIN_ROOT / "gui" / "inference_monitor.py"
+        ).read_text(encoding="utf-8")
+        assert "((1, 92), (2, 86), (3, 70), (4, 76), (5, 62))" in source
+        assert "((0, 96), (1, 72), (2, 88))" in source
+>       assert "QHeaderView.ResizeMode.Interactive" in source
+E       assert 'QHeaderView.ResizeMode.Interactive' in '"""Modeless result-stream monitor with on-demand tile details."""\n\nfrom __future__ import annotations\n\nimport re\...r_btn"):\n            parent.show_monitor_btn.setChecked(False)\n            parent.show_monitor_btn.setText("推理监控")\n'
+
+tests/test_qgis4_migration.py:457: AssertionError
+______ test_storage_preflight_uses_measured_values_and_preserves_reserve _______
+
+tmp_path = PosixPath('/private/var/folders/pn/61vtb_713d5c7xns_cv4m2hc0000gn/T/pytest-of-anyun/pytest-205/test_storage_preflight_uses_me0')
+
+    def test_storage_preflight_uses_measured_values_and_preserves_reserve(tmp_path):
+        report = storage_preflight(
+            tmp_path,
+            tile_count=1000,
+            stream_count=4,
+            permanent_bytes_per_tile_per_stream=2048,
+            input_tile_bytes_per_tile=512,
+            score_cache_budget_gb=1,
+            min_free_disk_gb=1,
+            current_model_probability_bytes=4096,
+            fusion_accumulator_bytes=2048,
+            mask_confidence_workspace_bytes=1024,
+            safety_margin_bytes=1024,
+            available_disk_bytes=10 * GIB,
+        )
+        assert report["status"] == "passed"
+        assert report["estimated_input_tile_bytes"] == 1000 * 512
+        assert report["estimated_permanent_output_bytes"] == 1000 * 4 * 2048
+>       assert report["estimated_permanent_bytes"] == 1000 * (4 * 2048 + 512)
+E       assert 8192000 == (1000 * ((4 * 2048) + 512))
+
+tests/test_work_package_planner.py:97: AssertionError
+__________ test_storage_preflight_blocks_when_not_even_one_tile_fits ___________
+
+tmp_path = PosixPath('/private/var/folders/pn/61vtb_713d5c7xns_cv4m2hc0000gn/T/pytest-of-anyun/pytest-205/test_storage_preflight_blocks_0')
+
+    def test_storage_preflight_blocks_when_not_even_one_tile_fits(tmp_path):
+>       with pytest.raises(WorkPackagePlanError, match="cannot hold one"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'cannot hold one'
+E         Actual message: '磁盘空间预检失败：可用 2.00 GiB，永久结果预计 3.91 GiB，安全预留 2.00 GiB，单 Tile 工作集 0.00 GiB，最低需要 5.91 GiB，还缺 3.91 GiB。'
+
+tests/test_work_package_planner.py:102: AssertionError
+___ test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly ___
+
+tmp_path = PosixPath('/private/var/folders/pn/61vtb_713d5c7xns_cv4m2hc0000gn/T/pytest-of-anyun/pytest-205/test_two_models_multiple_work_0')
+
+    def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp_path):
+        tile = tmp_path / "shared_tile.tif"
+        with rasterio.open(
+            tile,
+            "w",
+            driver="GTiff",
+            width=512,
+            height=512,
+            count=3,
+            dtype="uint8",
+            crs="EPSG:4490",
+            transform=from_origin(0, 832, 1, 1),
+            compress="deflate",
+        ) as destination:
+            destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
+        model_a = tmp_path / "a.pt"
+        model_b = tmp_path / "b.pt"
+        model_a.write_bytes(b"model-a")
+        model_b.write_bytes(b"model-b")
+        profile = {
+            "profile_id": "fixture_fusion",
+            "status": "approved",
+            "approval": {"passed": True},
+            "strategy": "equal_probability_average",
+            "models": [{"model_id": "a"}, {"model_id": "b"}],
+            "weights": [[0.5, 0.5] for _ in range(14)],
+        }
+        stride = 320
+        tiles = [
+            {
+                "row": row,
+                "col": col,
+                "path": str(tile),
+                "sha256": _sha(tile),
+                "pixel_window": {
+                    "x0": col * stride,
+                    "y0": row * stride,
+                    "x1": col * stride + 512,
+                    "y1": row * stride + 512,
+                },
+            }
+            for row in range(2)
+            for col in range(4)
+        ]
+        scaling = {
+            **_scaling(),
+            "partition_tile_rows": 2,
+            "partition_tile_cols": 2,
+        }
+        spec, spec_path, database_path = create_v5_run(
+            output_root=tmp_path / "output",
+            raster={
+                "path": tile,
+                "crs": "EPSG:4490",
+                "transform": [1, 0, 0, 0, -1, 832],
+                "nodata": None,
+            },
+            requested_extent={"xmin": 0, "ymin": 0, "xmax": 1472, "ymax": 832},
+            processing_extent={"xmin": 0, "ymin": 0, "xmax": 1472, "ymax": 832},
+            tile_rows=2,
+            tile_cols=4,
+            tiles=tiles,
+            models=[
+                {
+                    "model_id": "a",
+                    "artifact_path": str(model_a),
+                    "sha256": _sha(model_a),
+                    "version": "fixture",
+                },
+                {
+                    "model_id": "b",
+                    "artifact_path": str(model_b),
+                    "sha256": _sha(model_b),
+                    "version": "fixture",
+                },
+            ],
+            effective_device="cpu",
+            overlap=192,
+            scaling=scaling,
+            boundary_fitting=_boundary(),
+            storage_report={
+                "package_tile_limit": 6,
+                "working_bytes_per_tile": 4096,
+                "status": "passed",
+            },
+            fusion={"profile_id": "fixture_fusion", "profile": profile},
+            run_id="20260717_221000_multipkg",
+        )
+        loaded = []
+    
+        def loader(model_entry, _device):
+            loaded.append(model_entry["model_id"])
+            return model_entry["model_id"]
+    
+        def infer(model_id, _tile_path, _device):
+            probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+            probabilities[0 if model_id == "a" else 1] = 1.0
+            return probabilities
+    
+        database = RunStateDB(database_path)
+        with sqlite3.connect(database_path) as connection:
+            package_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT package_id FROM work_packages ORDER BY sequence_no"
+                )
+            ]
+        assert package_ids == ["package_00000", "package_00001"]
+        package_reports = [
+>           run_work_package(
+                spec_path,
+                package_id,
+                device="cpu",
+                model_loader=loader,
+                infer_tile=infer,
+            )
+            for package_id in package_ids
+        ]
+
+tests/test_work_package_runtime.py:345: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+inference_scripts/work_package_runtime.py:224: in run_work_package
+    materialized = materialize_package_tiles(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+spec = {'accepted_gpkg': '', 'accepted_gpkg_sha256': '', 'boundary_fitting': {'diagnostic_level': 'changed_and_failed', 'enab...nyun/pytest-205/test_two_models_multiple_work_0/output/runs/20260717_221000_multipkg/class_mapping_snapshot.json', ...}
+tiles = [{'run_id': '20260717_221000_multipkg', 'tile_id': '0_1', 'row_no': 0, 'col_no': 1, ...}, {'run_id': '20260717_221000_...row_no': 1, 'col_no': 2, ...}, {'run_id': '20260717_221000_multipkg', 'tile_id': '1_3', 'row_no': 1, 'col_no': 3, ...}]
+workers = 8
+progress = <function run_work_package.<locals>.tile_progress at 0x15c268220>
+
+    def materialize_package_tiles(spec: Mapping[str, Any], tiles: Sequence[Mapping[str, Any]], *, workers: int = 4, progress: Callable[[int, int, Mapping[str, Any]], None] | None = None) -> list[dict[str, Any]]:
+        source_path = Path(str((spec.get("raster") or {}).get("path") or "")).resolve()
+        if not source_path.is_file():
+>           raise TileMaterializationError(f"source image is missing: {source_path}")
+E           tile_materializer.TileMaterializationError: source image is missing: /private/var/folders/pn/61vtb_713d5c7xns_cv4m2hc0000gn/T/pytest-of-anyun/pytest-205/test_two_models_multiple_work_0/shared_tile.tif
+
+inference_scripts/tile_materializer.py:123: TileMaterializationError
+----------------------------- Captured stdout call -----------------------------
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"0_0","current":1,"total":6,"reused":true}
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"0_1","current":2,"total":6,"reused":true}
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"0_2","current":3,"total":6,"reused":true}
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"1_0","current":4,"total":6,"reused":true}
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"1_1","current":5,"total":6,"reused":true}
+{"event":"package_tile_materialized","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_id":"1_2","current":6,"total":6,"reused":true}
+{"event":"package_model_loading","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","current":1,"total":2}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"0_0","current":1,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"0_1","current":2,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"0_2","current":3,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"1_0","current":4,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"1_1","current":5,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:a","tile_id":"1_2","current":6,"total":6}
+{"event":"package_model_loading","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","current":2,"total":2}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"0_0","current":1,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"0_1","current":2,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"0_2","current":3,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"1_0","current":4,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"1_1","current":5,"total":6}
+{"event":"package_tile_completed","run_id":"20260717_221000_multipkg","package_id":"package_00000","stream_id":"model:b","tile_id":"1_2","current":6,"total":6}
+{"event":"package_tiles_cleaned","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_count":6,"cleaned_bytes":4330}
+{"event":"work_package_finished","run_id":"20260717_221000_multipkg","package_id":"package_00000","tile_count":6,"grid_tile_count":6,"excluded_tile_count":0,"partition_count":1,"models":[{"model_id":"a","tile_count":6,"inferred_count":6,"accepted_count":0,"excluded_count":0,"reused_count":0},{"model_id":"b","tile_count":6,"inferred_count":6,"accepted_count":0,"excluded_count":0,"reused_count":0}],"fusion_profile_id":"fixture_fusion","requested_device":"cpu","effective_device":"cpu","model_load_count":2,"peak_cache_bytes":43285389,"peak_rss_bytes":985563136,"cleaned_bytes":43337422,"elapsed_sec":1.253,"status":"ready"}
+=========================== short test summary info ============================
+FAILED tests/test_environment_status.py::test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility
+FAILED tests/test_qgis4_migration.py::test_plugin_targets_qgis4_only - Assert...
+FAILED tests/test_qgis4_migration.py::test_plugin_contains_no_known_qt5_or_qgis3_enum_spelling
+FAILED tests/test_qgis4_migration.py::test_installer_defaults_to_qgis4_profile_and_qgis_conda_python
+FAILED tests/test_qgis4_migration.py::test_inference_environment_contract_is_qgis_without_conda_qgis
+FAILED tests/test_qgis4_migration.py::test_environment_check_owns_and_terminates_its_process_group
+FAILED tests/test_qgis4_migration.py::test_plugin_and_checker_fingerprint_the_environment_lock_file
+FAILED tests/test_qgis4_migration.py::test_quick_redraw_uses_native_polybezier_preview_and_edit_buffer
+FAILED tests/test_qgis4_migration.py::test_monitor_tables_use_stable_user_resizable_columns
+FAILED tests/test_work_package_planner.py::test_storage_preflight_uses_measured_values_and_preserves_reserve
+FAILED tests/test_work_package_planner.py::test_storage_preflight_blocks_when_not_even_one_tile_fits
+FAILED tests/test_work_package_runtime.py::test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly
+12 failed, 146 passed, 1 skipped in 10.04s

@@ -1,0 +1,10 @@
+{
+  "installed_plugin_source": "/home/example/.local/share/QGIS/QGIS3/profiles/default/python/plugins/labeling_tool",
+  "live_module_file_reason": "QGIS MCP execute_code was cancelled by the remote confirmation mechanism; the active profile, enabled state, and plugin version were read successfully.",
+  "live_module_file_status": "unavailable",
+  "plugin_enabled": true,
+  "plugin_name": "labeling_tool",
+  "plugin_version": "0.3.0-linux.1",
+  "profile_folder": "/home/example/.local/share/QGIS/QGIS3/profiles/default/",
+  "qgis_version": "3.44.7-Solothurn"
+}

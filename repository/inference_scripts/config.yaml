@@ -1,0 +1,84 @@
+schema_version: 2
+
+runtime:
+  device: cuda:0
+  model_artifacts_dir: ../weights
+  keep_score_cache: false
+  tile_batch_size: 1
+
+scaling:
+  partition_tile_rows: 8
+  partition_tile_cols: 8
+  partition_halo_px: auto
+  seam_band_px: 64
+  score_cache_budget_gb: 8
+  min_free_disk_gb: 50
+  tile_io_workers: 8
+  max_cpu_partition_workers: 6
+  max_open_frontier_units: 64
+  max_partition_segments: 250000
+  max_partition_features: 100000
+  max_partition_runtime_sec: 900
+  max_job_retries: 2
+  tile_page_size: 500
+
+# Formal runtime registry mirrors the approved l2_fusion_v1 deployment bundle.
+semantic_models:
+  - model_id: upernet_swin_b
+    display_name: UPerNet Swin-B
+    version: l2-20260630
+    artifact: upernet_swin_b.torchscript.pt
+    sha256: "e1b28d88821f0a35e17e399c89d01ef010c8a73dd1dce797f4db2f2b17425214"
+    enabled: true
+
+  - model_id: setr_vit
+    display_name: SETR ViT
+    version: l2-20260424
+    artifact: setr_vit.torchscript.pt
+    sha256: "7e47de54db003a802a36f78bb26295954201467234fbb084e00db4925a74a12f"
+    enabled: true
+
+  - model_id: upernet_mambaout_b
+    display_name: UPerNet MambaOut-B
+    version: l2-20260711
+    artifact: upernet_mambaout_b.torchscript.pt
+    sha256: "76819fa558ce4261033fc6b0d65353778ec2a86cb4b0a0ce4a5ba8fd03ae1054"
+    enabled: true
+
+fusion_profiles:
+  - profile_id: l2_fusion_v1
+    file: ../weights/fusion_profile.json
+    enabled: true
+
+sam3:
+  enabled: true
+  checkpoint: ../weights/sam3.pt
+  version: sam3-v1
+  device: cuda:0
+  buffer_px: 32
+
+boundary_fitting:
+  enabled: true
+  mode: divider_cubic_bspline_v1
+  smoothing_factor: 1.0
+  output_spacing_px: 0.5
+  diagnostic_level: changed_and_failed
+
+classes:
+  # -1 is only the no-result/nodata sentinel. It is not a model class.
+  background_index: -1
+  index_to_code:
+    0: 12
+    1: 13
+    2: 21
+    3: 31
+    4: 32
+    5: 33
+    6: 43
+    7: 51
+    8: 52
+    9: 53
+    10: 54
+    11: 61
+    12: 62
+    13: 71

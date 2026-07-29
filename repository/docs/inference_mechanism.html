@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>labeling_tool 推理配置运行机制</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', sans-serif; background: #0f172a; color: #e2e8f0; padding: 32px; min-height: 100vh; }
+  h1 { text-align: center; font-size: 22px; margin-bottom: 8px; color: #f8fafc; }
+  .subtitle { text-align: center; font-size: 13px; color: #94a3b8; margin-bottom: 32px; }
+  .diagram { max-width: 960px; margin: 0 auto; position: relative; }
+
+  /* Layers */
+  .layer { margin-bottom: 24px; border-radius: 12px; padding: 20px 24px; position: relative; }
+  .layer-label { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 14px; opacity: 0.7; }
+  .layer-ui { background: linear-gradient(135deg, #1e3a5f 0%, #1e293b 100%); border: 1px solid #334155; }
+  .layer-core { background: linear-gradient(135deg, #1a2e1a 0%, #1e293b 100%); border: 1px solid #334155; }
+  .layer-shell { background: linear-gradient(135deg, #2d1f0e 0%, #1e293b 100%); border: 1px solid #334155; }
+  .layer-python { background: linear-gradient(135deg, #1a1a3e 0%, #1e293b 100%); border: 1px solid #334155; }
+  .layer-output { background: linear-gradient(135deg, #2d1a2e 0%, #1e293b 100%); border: 1px solid #334155; }
+
+  /* Nodes */
+  .nodes { display: flex; flex-wrap: wrap; gap: 12px; align-items: stretch; }
+  .node { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 180px; cursor: default; transition: all 0.2s; position: relative; }
+  .node:hover { background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.25); transform: translateY(-1px); }
+  .node-title { font-size: 13px; font-weight: 600; color: #f1f5f9; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+  .node-title .icon { font-size: 14px; }
+  .node-desc { font-size: 11px; color: #94a3b8; line-height: 1.5; }
+  .node-file { font-size: 10px; color: #64748b; margin-top: 6px; font-family: 'SF Mono', 'Fira Code', monospace; }
+  .node-file::before { content: '📄 '; }
+  .node-config { border-color: #f59e0b33; background: rgba(245, 158, 11, 0.06); }
+  .node-config:hover { border-color: #f59e0b66; }
+  .node-config .node-title { color: #fbbf24; }
+  .node-entry { border-color: #3b82f633; background: rgba(59, 130, 246, 0.06); }
+  .node-entry:hover { border-color: #3b82f666; }
+  .node-entry .node-title { color: #60a5fa; }
+  .node-pipeline { border-color: #10b98133; background: rgba(16, 185, 129, 0.06); }
+  .node-pipeline:hover { border-color: #10b98166; }
+  .node-pipeline .node-title { color: #34d399; }
+  .node-subprocess { border-color: #8b5cf633; background: rgba(139, 92, 246, 0.06); }
+  .node-subprocess:hover { border-color: #8b5cf666; }
+  .node-subprocess .node-title { color: #a78bfa; }
+  .node-output { border-color: #f472b633; background: rgba(244, 114, 182, 0.06); }
+  .node-output:hover { border-color: #f472b666; }
+  .node-output .node-title { color: #f472b6; }
+
+  /* Arrows */
+  .arrow-container { display: flex; justify-content: center; padding: 8px 0; position: relative; }
+  .arrow-container::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: linear-gradient(to bottom, #334155, #475569, #334155); transform: translateX(-50%); }
+  .arrow-label { background: #1e293b; border: 1px solid #475569; border-radius: 4px; padding: 3px 10px; font-size: 10px; color: #94a3b8; position: relative; z-index: 1; white-space: nowrap; }
+
+  /* Phase badge */
+  .phase-badge { display: inline-block; background: rgba(255,255,255,0.1); border-radius: 4px; padding: 2px 8px; font-size: 10px; color: #cbd5e1; margin-right: 6px; font-weight: 600; }
+
+  /* Config detail panel */
+  .config-detail { background: rgba(0,0,0,0.3); border: 1px solid #334155; border-radius: 8px; padding: 16px; margin-top: 12px; display: none; }
+  .config-detail.open { display: block; }
+  .config-detail pre { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; color: #94a3b8; line-height: 1.6; overflow-x: auto; }
+  .config-detail pre .key { color: #fbbf24; }
+  .config-detail pre .val { color: #34d399; }
+  .config-detail pre .comment { color: #475569; }
+
+  /* Flow annotation */
+  .flow-note { font-size: 10px; color: #64748b; text-align: center; margin: -4px 0 8px; font-style: italic; }
+
+  /* Tooltip */
+  .tooltip { position: fixed; background: #1e293b; border: 1px solid #475569; border-radius: 6px; padding: 8px 12px; font-size: 11px; color: #e2e8f0; max-width: 280px; pointer-events: none; z-index: 100; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+
+  /* Clickable toggle */
+  .toggle-detail { cursor: pointer; user-select: none; }
+  .toggle-detail::after { content: ' ▸'; font-size: 10px; color: #64748b; }
+  .toggle-detail.open::after { content: ' ▾'; }
+
+  /* Legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 24px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #94a3b8; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 3px; }
+
+  /* Separator */
+  .sep { height: 1px; background: linear-gradient(90deg, transparent, #334155, transparent); margin: 4px 0; }
+</style>
+</head>
+<body>
+
+<h1>🔧 推理配置运行机制</h1>
+<p class="subtitle">labeling_tool — 从 UI 配置到推理执行的完整数据流</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>UI 入口</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>配置层</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div>编排层</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div>子进程</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div>产出</div>
+</div>
+
+<div class="diagram">
+
+  <!-- ═══ Layer 1: UI ═══ -->
+  <div class="layer layer-ui">
+    <div class="layer-label">① UI 层 — 用户配置面板 (main_dock.py)</div>
+    <div class="nodes">
+      <div class="node node-entry" data-tip="推理脚本的目录路径，包含 4 个 shell wrapper + Python 脚本">
+        <div class="node-title"><span class="icon">📁</span> 推理脚本路径</div>
+        <div class="node-desc">用户选择 inference_scripts/ 目录</div>
+        <div class="node-file">script_path_edit (QLineEdit)</div>
+      </div>
+      <div class="node node-entry" data-tip="输出 GeoPackage 路径，存储已确认的标注面">
+        <div class="node-title"><span class="icon">💾</span> 输出 GPKG</div>
+        <div class="node-desc">用户选择 .gpkg 保存位置</div>
+        <div class="node-file">output_path_edit (QLineEdit)</div>
+      </div>
+      <div class="node" data-tip="Tile 宽度像素，64-4096，默认 512">
+        <div class="node-title"><span class="icon">📐</span> Tile 宽度 × 高度</div>
+        <div class="node-desc">512 × 512 (默认)，支持非正方形</div>
+        <div class="node-file">tile_width_spin / tile_height_spin</div>
+      </div>
+      <div class="node" data-tip="相邻 tile 重叠像素数，用于 mosaic 时消除接缝">
+        <div class="node-title"><span class="icon">🔗</span> 重叠 (overlap)</div>
+        <div class="node-desc">默认 64px，tile 间 overlap</div>
+        <div class="node-file">overlap_spin</div>
+      </div>
+      <div class="node node-config" data-tip="启用后，完全被 accepted_labels 覆盖的 tile 会被跳过，不重复推理">
+        <div class="node-title"><span class="icon">✅</span> 跳过已确认区域</div>
+        <div class="node-desc">skip_accepted_check，默认开启</div>
+        <div class="node-file">skip_accepted_check (QCheckBox)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-container"><span class="arrow-label">用户点击「开始标注」→ _on_start()</span></div>
+
+  <!-- ═══ Layer 2: Validation + Tiling ═══ -->
+  <div class="layer layer-core">
+    <div class="layer-label">② 校验 + 切片 (main_dock._on_start)</div>
+    <div class="nodes">
+      <div class="node" data-tip="检查影像图层有效、脚本目录存在、输出路径合法、范围有效">
+        <div class="node-title"><span class="icon">🔍</span> 输入校验</div>
+        <div class="node-desc">影像 CRS 有效？脚本目录存在？输出路径合法？范围有效？</div>
+      </div>
+      <div class="node node-pipeline" data-tip="根据 extent + tile_width + tile_height + overlap 生成 tile 网格">
+        <div class="node-title"><span class="icon">🧮</span> generate_grid()</div>
+        <div class="node-desc">extent → tile 网格 (col, row, bounds, pixel_w, pixel_h)</div>
+        <div class="node-file">tile_manager.py</div>
+      </div>
+      <div class="node node-pipeline" data-tip="将每个 tile 的地理范围裁剪为 GeoTIFF 文件">
+        <div class="node-title"><span class="icon">✂️</span> extract_tile()</div>
+        <div class="node-desc">逐 tile 裁剪 GeoTIFF → tmp/tiles/tile_{row}_{col}.tif</div>
+        <div class="node-file">tile_manager.py</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-container"><span class="arrow-label">创建 InferenceRunner(scripts_dir) → run_full_pipeline()</span></div>
+
+  <!-- ═══ Layer 3: Script Config ═══ -->
+  <div class="layer layer-shell">
+    <div class="layer-label">③ 脚本配置层 (inference_scripts/)</div>
+    <div class="nodes">
+      <div class="node node-config toggle-detail" onclick="toggleConfig('configsh')" data-tip="环境变量：PYTHONUNBUFFERED=1, CUDA_LAUNCH_BLOCKING=0">
+        <div class="node-title"><span class="icon">⚙️</span> config.sh</div>
+        <div class="node-desc">Bash 环境变量，所有 .sh 脚本 source 此文件</div>
+        <div class="node-file">config.sh</div>
+      </div>
+      <div class="node node-config toggle-detail" onclick="toggleConfig('configyaml')" data-tip="模型权重路径、设备、tile_size、14 类映射表">
+        <div class="node-title"><span class="icon">📋</span> config.yaml</div>
+        <div class="node-desc">模型路径、设备、类别映射（14 类）</div>
+        <div class="node-file">config.yaml</div>
+      </div>
+      <div class="node node-entry" data-tip="4 个 shell wrapper，每个接收位置参数，source config.sh 后调用 conda run -n geoai">
+        <div class="node-title"><span class="icon">🐚</span> 4 个 Shell Wrapper</div>
+        <div class="node-desc">run_semantic.sh → run_mosaic.sh → run_polygonize.sh → run_sam3.sh</div>
+        <div class="node-file">每个 wrapper: source config.sh → conda run -n geoai python *.py</div>
+      </div>
+    </div>
+
+    <div id="configsh" class="config-detail">
+      <pre><span class="comment"># Shared config for inference bash scripts</span>
+<span class="key">export</span> <span class="val">PYTHONUNBUFFERED=1</span>     <span class="comment"># 实时输出日志</span>
+<span class="key">export</span> <span class="val">CUDA_LAUNCH_BLOCKING=0</span>  <span class="comment"># CUDA 异步</span></pre>
+    </div>
+    <div id="configyaml" class="config-detail">
+      <pre><span class="key">model</span>:
+  <span class="key">semantic_weight</span>: <span class="val">"/path/to/semantic_14class.pt"</span>
+  <span class="key">sam3_checkpoint</span>: <span class="val">"/path/to/sam3_checkpoint.pt"</span>
+  <span class="key">device</span>: <span class="val">"cuda"</span>
+  <span class="key">tile_size</span>: <span class="val">512</span>
+  <span class="key">tile_overlap</span>: <span class="val">64</span>
+
+<span class="key">classes</span>:
+  <span class="key">mapping</span>:
+    <span class="val">12</span>: <span class="val">"水浇地"</span>    <span class="val">13</span>: <span class="val">"旱地"</span>      <span class="val">21</span>: <span class="val">"果园"</span>
+    <span class="val">31</span>: <span class="val">"有林地"</span>    <span class="val">32</span>: <span class="val">"灌木林地"</span>  <span class="val">33</span>: <span class="val">"其他林地"</span>
+    <span class="val">43</span>: <span class="val">"其他草地"</span>
+    <span class="val">51</span>: <span class="val">"城镇建设用地"</span> <span class="val">52</span>: <span class="val">"农村建设用地"</span>
+    <span class="val">53</span>: <span class="val">"人为扰动用地"</span> <span class="val">54</span>: <span class="val">"其他建设用地"</span>
+    <span class="val">61</span>: <span class="val">"农村道路"</span>    <span class="val">62</span>: <span class="val">"其他交通用地"</span>
+    <span class="val">71</span>: <span class="val">"河湖库塘"</span></pre>
+    </div>
+  </div>
+
+  <div class="arrow-container"><span class="arrow-label">InferenceRunner 通过 subprocess.run() 逐阶段调用</span></div>
+
+  <!-- ═══ Layer 4: 4-Phase Pipeline ═══ -->
+  <div class="layer layer-python">
+    <div class="layer-label">④ 4 阶段推理管线 (inference_runner.py → subprocess → Python)</div>
+
+    <!-- Phase 1 -->
+    <div style="margin-bottom: 16px;">
+      <div class="nodes">
+        <div class="node node-subprocess" data-tip="Phase 1: 逐 tile 调用 run_semantic.sh → predict_semantic.py，输出 mask + confidence GeoTIFF">
+          <div class="node-title"><span class="phase-badge">P1</span><span class="icon">🧠</span> run_semantic.sh</div>
+          <div class="node-desc">逐 tile 语义分割<br>输入: tile_{row}_{col}.tif<br>输出: mask.tif + conf.tif</div>
+          <div class="node-file">predict_semantic.py — torch.jit.load → model(tile) → argmax → mask</div>
+        </div>
+        <div class="node" data-tip="支持 3 种加载方式：torch.jit.load → torch.load → mock（--mock 标志）">
+          <div class="node-title"><span class="icon">📦</span> 模型加载策略</div>
+          <div class="node-desc">① torch.jit.load (TorchScript)<br>② torch.load (checkpoint)<br>③ mock 合成数据（测试用）</div>
+          <div class="node-file">predict_semantic.py load_model()</div>
+        </div>
+        <div class="node" data-tip="tile_is_fully_accepted() — 检查 tile bounds 是否完全被 accepted_labels 覆盖">
+          <div class="node-title"><span class="icon">⏭️</span> 跳过逻辑</div>
+          <div class="node-desc">tile 范围完全在 accepted 区域内 → 跳过推理</div>
+          <div class="node-file">difference_filter.tile_is_fully_accepted()</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow-note">所有 tile 完成后进入 Phase 2</div>
+
+    <!-- Phase 2 -->
+    <div style="margin-bottom: 16px;">
+      <div class="nodes">
+        <div class="node node-subprocess" data-tip="Phase 2a: 将所有 tile 的 mask 合并为完整镶嵌影像，处理 overlap 区域">
+          <div class="node-title"><span class="phase-badge">P2a</span><span class="icon">🗺️</span> run_mosaic.sh</div>
+          <div class="node-desc">多 tile mask → 单一镶嵌<br>处理 overlap 拼接</div>
+          <div class="node-file">mosaic_builder.py</div>
+        </div>
+        <div class="node node-subprocess" data-tip="Phase 2b: 将镶嵌 mask 转为矢量多边形，输出 GeoPackage">
+          <div class="node-title"><span class="phase-badge">P2b</span><span class="icon">🔷</span> run_polygonize.sh</div>
+          <div class="node-desc">mask 栅格 → 矢量多边形<br>输出 semantic_polygons.gpkg</div>
+          <div class="node-file">polygonize_mosaic.py — rasterio contours → shapely → fiona</div>
+        </div>
+        <div class="node node-output" data-tip="中间产物：语义分割的矢量多边形">
+          <div class="node-title"><span class="icon">📄</span> semantic_polygons.gpkg</div>
+          <div class="node-desc">14 类语义多边形<br>字段: object_id, part_id, class_code, confidence_mean...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow-note">差分过滤（Phase 3）在 InferenceRunner 内部用 PyQGIS 完成，不走 shell</div>
+
+    <!-- Phase 3 -->
+    <div style="margin-bottom: 16px;">
+      <div class="nodes">
+        <div class="node node-pipeline" data-tip="Phase 3: 用 QGIS 原生 API 做几何差分，从候选面中剔除已确认区域">
+          <div class="node-title"><span class="phase-badge">P3</span><span class="icon">🔪</span> difference_filter</div>
+          <div class="node-desc">semantic_polygons − accepted_labels<br>→ diff_candidates.gpkg</div>
+          <div class="node-file">difference_filter.py — QgsGeometry.difference()</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow-note">逐候选面调用 SAM3 修边（Phase 4）</div>
+
+    <!-- Phase 4 -->
+    <div style="margin-bottom: 16px;">
+      <div class="nodes">
+        <div class="node node-subprocess" data-tip="Phase 4: 对每个候选面调用 SAM3 进行边界精细化">
+          <div class="node-title"><span class="phase-badge">P4</span><span class="icon">🎯</span> run_sam3.sh</div>
+          <div class="node-desc">逐对象 SAM3 修边<br>输入: 原始影像 + 候选 GPKG<br>输出: sam_refined_polygons.gpkg</div>
+          <div class="node-file">sam3_refine.py — SAM 点提示 → mask → contour → 精细化多边形</div>
+        </div>
+        <div class="node" data-tip="SAM3 失败时保留原始几何，永不造假边界">
+          <div class="node-title"><span class="icon">🛡️</span> 失败兜底</div>
+          <div class="node-desc">SAM3 返回 None → 保留原始几何<br>永不伪造 refined boundary</div>
+        </div>
+        <div class="node node-output" data-tip="最终候选面：SAM3 精细化后的多边形">
+          <div class="node-title"><span class="icon">📄</span> sam_refined_polygons.gpkg</div>
+          <div class="node-desc">SAM3 修边后的候选面<br>字段: refined_id, class_code, sam_version...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-container"><span class="arrow-label">管线完成 → 加载图层到 QGIS → 用户审查</span></div>
+
+  <!-- ═══ Layer 5: Output ═══ -->
+  <div class="layer layer-output">
+    <div class="layer-label">⑤ 产出 + 审查 (LayerManager + 用户交互)</div>
+    <div class="nodes">
+      <div class="node node-output" data-tip="加载语义 mask 镶嵌结果到 QGIS 地图">
+        <div class="node-title"><span class="icon">🗺️</span> semantic_mask_mosaic.tif</div>
+        <div class="node-desc">语义分割 mask 镶嵌</div>
+      </div>
+      <div class="node node-output" data-tip="加载置信度镶嵌到 QGIS 地图">
+        <div class="node-title"><span class="icon">📊</span> confidence_mosaic.tif</div>
+        <div class="node-desc">置信度图镶嵌</div>
+      </div>
+      <div class="node node-output" data-tip="语义多边形 + SAM3 修边结果叠加显示">
+        <div class="node-title"><span class="icon">🔷</span> semantic_polygons</div>
+        <div class="node-desc">语义多边形图层</div>
+      </div>
+      <div class="node node-output" data-tip="SAM3 精细化后的候选面图层，用户可选择接受">
+        <div class="node-title"><span class="icon">🎯</span> sam_refined_polygons</div>
+        <div class="node-desc">SAM3 修边图层</div>
+      </div>
+      <div class="node node-entry" data-tip="用户点击接受按钮后，选中面写入 accepted_labels">
+        <div class="node-title"><span class="icon">✅</span> accepted_labels</div>
+        <div class="node-desc">已确认标注面<br>接受选中 / 接受全部 / 手动编辑后入库</div>
+        <div class="node-file">accepted_writer.py — write_feature_to_accepted()</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Data flow summary -->
+<div style="max-width: 960px; margin: 32px auto 0; background: rgba(255,255,255,0.04); border: 1px solid #334155; border-radius: 12px; padding: 20px 24px;">
+  <div class="layer-label" style="color: #60a5fa;">📊 数据流总结</div>
+  <pre style="font-size: 12px; color: #94a3b8; line-height: 1.8; font-family: 'SF Mono', 'Fira Code', monospace; overflow-x: auto;">
+<span style="color:#60a5fa">UI 配置</span> ──────────────────────────────────────────────────────────────────────
+  脚本路径 / 输出路径 / Tile 尺寸 / Overlap / 跳过已确认
+
+<span style="color:#10b981">切片</span> ─────────────────────────────────────────────────────────────────────────
+  extent + tile_width × tile_height + overlap
+    → <span style="color:#34d399">generate_grid()</span> → tile 网格 (col, row, bounds, pixel_w, pixel_h)
+    → <span style="color:#34d399">extract_tile()</span>  → tmp/tiles/tile_{row}_{col}.tif
+
+<span style="color:#8b5cf6">Phase 1 — 语义分割</span> ────────────────────────────────────────────────────────
+  tile.tif → <span style="color:#a78bfa">run_semantic.sh</span> → predict_semantic.py
+    → torch.jit.load(weight) → model(tile_tensor) → argmax → mask.tif + conf.tif
+
+<span style="color:#8b5cf6">Phase 2 — 镶嵌 + 矢量化</span> ──────────────────────────────────────────────────
+  masks/*.tif → <span style="color:#a78bfa">run_mosaic.sh</span>   → semantic_mask_mosaic.tif
+  mosaic.tif → <span style="color:#a78bfa">run_polygonize.sh</span> → polygonize_mosaic.py → semantic_polygons.gpkg
+
+<span style="color:#10b981">Phase 3 — 差分过滤</span> ────────────────────────────────────────────────────────
+  semantic_polygons − accepted_labels → <span style="color:#34d399">difference_filter.py</span> → diff_candidates.gpkg
+
+<span style="color:#8b5cf6">Phase 4 — SAM3 修边</span> ────────────────────────────────────────────────────────
+  raster + diff_candidates → <span style="color:#a78bfa">run_sam3.sh</span> → sam3_refine.py
+    → SAM 点提示(centroid) → mask → contour → refined polygon
+    → 失败时保留原始几何 → sam_refined_polygons.gpkg
+
+<span style="color:#f472b6">审查 + 入库</span> ────────────────────────────────────────────────────────────────
+  用户选择候选面 → 接受 → <span style="color:#f472b6">accepted_writer.py</span> → accepted_labels.gpkg
+  下次运行时: skip_accepted → tile_is_fully_accepted() → 跳过已确认区域</pre>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const tooltip = document.getElementById('tooltip');
+document.querySelectorAll('[data-tip]').forEach(el => {
+  el.addEventListener('mouseenter', e => {
+    tooltip.textContent = el.getAttribute('data-tip');
+    tooltip.style.display = 'block';
+  });
+  el.addEventListener('mousemove', e => {
+    tooltip.style.left = (e.clientX + 12) + 'px';
+    tooltip.style.top = (e.clientY + 12) + 'px';
+  });
+  el.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+});
+
+function toggleConfig(id) {
+  const el = document.getElementById(id);
+  el.classList.toggle('open');
+}
+</script>
+</body>
+</html>

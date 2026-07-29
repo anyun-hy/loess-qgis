@@ -1,0 +1,21 @@
+name: qgis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy=1.26.4
+  - pillow=12.3.0
+  - rasterio=1.4.4
+  - fiona=1.10.1
+  - shapely=2.1.2
+  # Provides gdalinfo/gdalbuildvrt; Python osgeo bindings are intentionally not required.
+  - libgdal-core=3.12.3
+  - sqlite=3.53.3
+  - scikit-image=0.26.0
+  - scipy=1.17.1
+  - pyyaml=6.0.3
+  - pytest=9.1.1
+  - pip=26.1.2
+
+# PyTorch is installed separately from the official cu124 wheel index by
+# install.sh so Conda cannot silently replace it with a CPU build.
