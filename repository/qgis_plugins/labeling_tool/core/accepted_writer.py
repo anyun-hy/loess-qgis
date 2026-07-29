@@ -6,8 +6,9 @@ from qgis.core import (
     QgsProject, QgsVectorLayer, QgsVectorFileWriter, QgsFeature,
     QgsField,
 )
-from qgis.PyQt.QtCore import Qt, QVariant, QDateTime
+from qgis.PyQt.QtCore import QVariant, QDateTime
 
+from ..qt_compat import ISO_DATE
 from .layer_names import LAYER_NAMES
 from .qgis_writer import write_vector_layer
 from .run_spec import CLASS_NAMES, sha256_file
@@ -217,7 +218,7 @@ def append_final_to_accepted(final_path, accepted_path, run_manifest_path):
                 value = "class_working"
             elif name == "created_at":
                 value = feature.attribute(name) or QDateTime.currentDateTime().toString(
-                    Qt.ISODate
+                    ISO_DATE
                 )
             else:
                 index = feature.fieldNameIndex(name)

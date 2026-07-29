@@ -1,7 +1,7 @@
 schema_version: 2
 
 runtime:
-  device: cuda:0
+  device: auto
   model_artifacts_dir: ../weights
   keep_score_cache: false
   tile_batch_size: 1
@@ -54,7 +54,7 @@ sam3:
   enabled: true
   checkpoint: ../weights/sam3.pt
   version: sam3-v1
-  device: cuda:0
+  device: auto
   buffer_px: 32
 
 boundary_fitting:

@@ -1,9 +1,10 @@
-from qgis.PyQt.QtCore import QObject, Qt
+from qgis.PyQt.QtCore import QObject
 from qgis.PyQt.QtWidgets import QAction, QToolBar
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import QgsApplication
 
 from .gui.main_dock import LabelingDockWidget
+from .qt_compat import RIGHT_DOCK_WIDGET_AREA
 
 
 class LabelingTool(QObject):
@@ -27,7 +28,7 @@ class LabelingTool(QObject):
 
         self.dock_widget = LabelingDockWidget(self.iface.mainWindow(), iface=self.iface)
         self.iface.addDockWidget(
-            Qt.RightDockWidgetArea,
+            RIGHT_DOCK_WIDGET_AREA,
             self.dock_widget,
         )
 

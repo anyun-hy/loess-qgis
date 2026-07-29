@@ -5,17 +5,15 @@ from __future__ import annotations
 import hashlib
 import os
 
-from qgis.PyQt.QtCore import Qt, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
-    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -27,6 +25,20 @@ from qgis.PyQt.QtWidgets import (
 
 from ..core.fusion_profile import profile_summary
 from ..core.model_registry import ModelRegistry
+from ..qt_compat import (
+    APPLY,
+    CANCEL,
+    CHECKED,
+    ITEM_IS_ENABLED,
+    ITEM_IS_USER_CHECKABLE,
+    NO_EDIT_TRIGGERS,
+    RESIZE_TO_CONTENTS,
+    SELECT_ROWS,
+    STRETCH,
+    TEXT_SELECTABLE_BY_MOUSE,
+    UNCHECKED,
+    USER_ROLE,
+)
 
 
 def _file_sha256(path):
@@ -68,17 +80,17 @@ class InferenceConfigDialog(QDialog):
         )
         self.model_table.verticalHeader().setVisible(False)
         self.model_table.setAlternatingRowColors(True)
-        self.model_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.model_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.model_table.setSelectionBehavior(SELECT_ROWS)
+        self.model_table.setEditTriggers(NO_EDIT_TRIGGERS)
         header = self.model_table.horizontalHeader()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(1, STRETCH)
+        header.setSectionResizeMode(2, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(3, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(4, STRETCH)
+        header.setSectionResizeMode(5, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(6, RESIZE_TO_CONTENTS)
         root.addWidget(self.model_table, stretch=1)
 
         profile_group = QGroupBox("融合方案")
@@ -105,7 +117,7 @@ class InferenceConfigDialog(QDialog):
         self.scaling_label = QLabel("尚未加载")
         self.scaling_label.setWordWrap(True)
         self.scaling_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
+            TEXT_SELECTABLE_BY_MOUSE
         )
         advanced_form.addRow("分区与存储:", self.scaling_label)
         self.boundary_smoothing_check = QCheckBox("对类别边界进行光滑处理")
@@ -117,7 +129,7 @@ class InferenceConfigDialog(QDialog):
         self.boundary_label = QLabel("尚未加载")
         self.boundary_label.setWordWrap(True)
         self.boundary_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
+            TEXT_SELECTABLE_BY_MOUSE
         )
         advanced_form.addRow("边界拟合:", self.boundary_label)
         advanced_note = QLabel(
@@ -132,12 +144,11 @@ class InferenceConfigDialog(QDialog):
         root.addWidget(self.sam_label)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.Apply
-            | QDialogButtonBox.Cancel
+            APPLY | CANCEL
         )
-        buttons.button(QDialogButtonBox.Apply).setText("应用")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.button(QDialogButtonBox.Apply).clicked.connect(self._apply)
+        buttons.button(APPLY).setText("应用")
+        buttons.button(CANCEL).setText("取消")
+        buttons.button(APPLY).clicked.connect(self._apply)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
@@ -214,13 +225,13 @@ class InferenceConfigDialog(QDialog):
             check = checks.get(f"semantic_model_{model.model_id}", {})
             status = str(check.get("status") or "error")
             run_item = QTableWidgetItem()
-            run_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            run_item.setFlags(ITEM_IS_ENABLED | ITEM_IS_USER_CHECKABLE)
             run_item.setCheckState(
-                Qt.Checked
+                CHECKED
                 if model.model_id in self._selected_ids
-                else Qt.Unchecked
+                else UNCHECKED
             )
-            run_item.setData(Qt.UserRole, model.model_id)
+            run_item.setData(USER_ROLE, model.model_id)
             self.model_table.setItem(row, 0, run_item)
             values = [
                 model.display_name,
@@ -294,11 +305,11 @@ class InferenceConfigDialog(QDialog):
             item = self.model_table.item(row, 0)
             role = self.model_table.item(row, 3)
             if model_id in required:
-                item.setCheckState(Qt.Checked)
-                item.setFlags(Qt.ItemIsUserCheckable)
+                item.setCheckState(CHECKED)
+                item.setFlags(ITEM_IS_USER_CHECKABLE)
                 role.setText("融合必需 + 独立结果")
             else:
-                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                item.setFlags(ITEM_IS_ENABLED | ITEM_IS_USER_CHECKABLE)
                 role.setText("额外模型 + 独立结果" if required else "独立结果")
 
     def _open_profile(self):
@@ -311,7 +322,7 @@ class InferenceConfigDialog(QDialog):
             return
         selected = []
         for model_id, row in self._row_by_model.items():
-            if self.model_table.item(row, 0).checkState() == Qt.Checked:
+            if self.model_table.item(row, 0).checkState() == CHECKED:
                 selected.append(model_id)
         profile_id = self.profile_combo.currentData()
         try:

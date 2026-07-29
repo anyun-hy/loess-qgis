@@ -222,7 +222,7 @@ def test_user_stop_terminates_active_assembly_and_marks_run_stopped(monkeypatch)
     assert finishes == [(False, "Pipeline stopped by user")]
 
 
-def test_ubuntu_plugin_version_marks_startup_hardening():
+def test_unified_plugin_version_includes_startup_hardening():
     metadata = (
         Path(__file__).resolve().parents[1]
         / "qgis_plugins"
@@ -230,4 +230,5 @@ def test_ubuntu_plugin_version_marks_startup_hardening():
         / "metadata.txt"
     ).read_text(encoding="utf-8")
 
-    assert "version=0.3.0-linux.5" in metadata
+    assert "version=0.4.0" in metadata
+    assert "-linux" not in metadata

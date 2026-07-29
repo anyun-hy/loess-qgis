@@ -13,7 +13,7 @@ from pathlib import Path
 
 from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
-from .process_compat import configure_linux_process
+from .process_compat import configure_process, process_is_running
 from .result_catalog import artifact_sha256
 from .run_index import record_run_state
 from .run_spec import atomic_write_json, sha256_file
@@ -284,7 +284,7 @@ class V5AsyncInferenceRunner(QObject):
         token = uuid.uuid4().hex
         path = str(Path(self.scripts_dir) / script)
         process = QProcess(self)
-        owns_process_group = configure_linux_process(
+        owns_process_group = configure_process(
             process, "/bin/bash", [path, *arguments]
         )
         process.setWorkingDirectory(self.scripts_dir)
@@ -470,7 +470,7 @@ class V5AsyncInferenceRunner(QObject):
 
     def _terminate_entry(self, entry, *, graceful):
         process = entry["process"]
-        if process.state() == QProcess.NotRunning:
+        if not process_is_running(process):
             return
         pid = int(process.processId())
         try:

@@ -1,49 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PLUGIN_NAME="labeling_tool"
+PLATFORM="${LOESS_PLATFORM:-auto}"
 PROFILE="${QGIS_PROFILE:-default}"
 PLUGIN_DIR_OVERRIDE="${QGIS_PLUGIN_DIR:-}"
-CONDA_EXE="${CONDA_EXE:-${HOME}/anaconda3/bin/conda}"
-ENV_NAME="qgis"
+CONDA_EXE="${CONDA_EXE:-}"
+ENV_NAME="${CONDA_ENV:-qgis}"
 CREATE_ENV=0
-DRY_RUN=0
-WEIGHTS_SOURCE=""
+CHECK_ONLY=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_SRC="${SCRIPT_DIR}/qgis_plugins/labeling_tool"
+PLUGIN_SRC="${SCRIPT_DIR}/qgis_plugins/${PLUGIN_NAME}"
 INFERENCE_DIR="${SCRIPT_DIR}/inference_scripts"
-WEIGHTS_DIR="${SCRIPT_DIR}/weights"
-ENV_FILE="${INFERENCE_DIR}/environment-linux-cu124.yml"
 
 usage() {
   cat <<EOF
 Usage: ./install.sh [options]
 
-Install the Ubuntu QGIS 3.44 plugin and verify the RTX 3090 inference runtime.
+Install the shared QGIS plugin from this Ubuntu Git repository.
 
 Options:
-  --profile NAME       QGIS3 profile name. Default: default
-  --plugin-dir PATH    Override the QGIS3 plugin directory
-  --conda-exe PATH     Conda executable
-  --create-env         Create/update ${ENV_NAME} and install Torch 2.6 cu124
-  --weights-dir PATH   Link formal model files from PATH into linux/weights
-  --dry-run            Print actions without changing files
+  --platform NAME      auto, ubuntu, or macos. Default: auto
+  --profile NAME       QGIS profile name. Default: default
+  --plugin-dir PATH    Override the QGIS plugin directory
+  --conda-exe PATH     Override the Conda executable
+  --create-env         Create or update the platform inference environment
+  --check-only         Validate source, host, environment, and manifest only
   -h, --help           Show this help
 EOF
 }
 
-run_cmd() {
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    printf '[dry-run]'
-    printf ' %q' "$@"
-    printf '\n'
-  else
-    "$@"
-  fi
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --platform)
+      PLATFORM="${2:?Missing value for --platform}"
+      shift 2
+      ;;
     --profile)
       PROFILE="${2:?Missing value for --profile}"
       shift 2
@@ -60,12 +53,8 @@ while [[ $# -gt 0 ]]; do
       CREATE_ENV=1
       shift
       ;;
-    --weights-dir)
-      WEIGHTS_SOURCE="${2:?Missing value for --weights-dir}"
-      shift 2
-      ;;
-    --dry-run)
-      DRY_RUN=1
+    --check-only)
+      CHECK_ONLY=1
       shift
       ;;
     -h|--help)
@@ -85,13 +74,39 @@ done
   exit 2
 }
 
-if [[ "$(uname -s)" != "Linux" && "${DRY_RUN}" -ne 1 ]]; then
-  echo "This installer only runs on Linux." >&2
-  exit 1
+if [[ "${PLATFORM}" == "auto" ]]; then
+  case "$(uname -s)" in
+    Darwin) PLATFORM="macos" ;;
+    Linux) PLATFORM="ubuntu" ;;
+    *)
+      echo "Unsupported operating system: $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
 fi
 
-QGIS_PLUGIN_ROOT="${PLUGIN_DIR_OVERRIDE:-${HOME}/.local/share/QGIS/QGIS3/profiles/${PROFILE}/python/plugins}"
-DEST_PLUGIN="${QGIS_PLUGIN_ROOT}/labeling_tool"
+case "${PLATFORM}" in
+  ubuntu)
+    EXPECTED_QGIS="3.44."
+    ENV_FILE="${INFERENCE_DIR}/environment-ubuntu-cu124.yml"
+    DEFAULT_PLUGIN_ROOT="${HOME}/.local/share/QGIS/QGIS3/profiles/${PROFILE}/python/plugins"
+    DEFAULT_CONDA_EXE="${HOME}/anaconda3/bin/conda"
+    ;;
+  macos)
+    EXPECTED_QGIS="4.2."
+    ENV_FILE="${INFERENCE_DIR}/environment-macos-qgis4.yml"
+    DEFAULT_PLUGIN_ROOT="${HOME}/Library/Application Support/QGIS/QGIS4/profiles/${PROFILE}/python/plugins"
+    DEFAULT_CONDA_EXE="/opt/anaconda3/bin/conda"
+    ;;
+  *)
+    echo "Invalid platform: ${PLATFORM}; expected auto, ubuntu, or macos" >&2
+    exit 2
+    ;;
+esac
+
+QGIS_PLUGIN_ROOT="${PLUGIN_DIR_OVERRIDE:-${DEFAULT_PLUGIN_ROOT}}"
+DEST_PLUGIN="${QGIS_PLUGIN_ROOT}/${PLUGIN_NAME}"
+
 case "${DEST_PLUGIN}" in
   ""|"/"|"${HOME}"|"${HOME}/"|"/usr"|"/usr/"|"/opt"|"/opt/")
     echo "Refusing unsafe plugin destination: ${DEST_PLUGIN}" >&2
@@ -99,121 +114,142 @@ case "${DEST_PLUGIN}" in
     ;;
 esac
 
-if [[ "${DRY_RUN}" -eq 0 ]]; then
-  qgis_version=""
-  for executable in qgis qgis_process; do
-    if command -v "${executable}" >/dev/null 2>&1; then
-      qgis_version="$("${executable}" --version 2>&1 | head -n 1)"
-      [[ -n "${qgis_version}" ]] && break
+[[ -d "${PLUGIN_SRC}" ]] || { echo "Plugin source not found: ${PLUGIN_SRC}" >&2; exit 1; }
+[[ -f "${PLUGIN_SRC}/metadata.txt" ]] || { echo "Missing plugin metadata" >&2; exit 1; }
+[[ -f "${PLUGIN_SRC}/__init__.py" ]] || { echo "Missing plugin entry point" >&2; exit 1; }
+[[ -f "${ENV_FILE}" ]] || { echo "Missing platform environment: ${ENV_FILE}" >&2; exit 1; }
+grep -q '^version=0\.4\.0$' "${PLUGIN_SRC}/metadata.txt" || {
+  echo "Plugin metadata is not the unified 0.4.0 release" >&2
+  exit 1
+}
+grep -q '^qgisMinimumVersion=3\.44$' "${PLUGIN_SRC}/metadata.txt"
+grep -q '^qgisMaximumVersion=4\.99$' "${PLUGIN_SRC}/metadata.txt"
+
+detect_qgis_version() {
+  local candidate version
+  for candidate in \
+    "${QGIS_PROCESS_EXE:-}" \
+    "$(command -v qgis_process 2>/dev/null || true)" \
+    "$(command -v qgis 2>/dev/null || true)" \
+    /Applications/QGIS*.app/Contents/MacOS/qgis_process; do
+    [[ -n "${candidate}" && -x "${candidate}" ]] || continue
+    version="$("${candidate}" --version 2>&1 | grep -Eo 'QGIS [0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+    if [[ -n "${version}" ]]; then
+      printf '%s\n' "${version}"
+      return 0
     fi
   done
-  if [[ "${qgis_version}" != *"3.44."* ]]; then
-    echo "QGIS 3.44 was not detected: ${qgis_version:-command not found}" >&2
-    exit 1
-  fi
-  echo "Detected ${qgis_version}"
+  return 1
+}
+
+qgis_version="$(detect_qgis_version || true)"
+if [[ "${qgis_version}" != *"${EXPECTED_QGIS}"* ]]; then
+  echo "Expected QGIS ${EXPECTED_QGIS}x for ${PLATFORM}; detected: ${qgis_version:-none}" >&2
+  exit 1
 fi
 
-if [[ ! -x "${CONDA_EXE}" ]]; then
-  if command -v conda >/dev/null 2>&1; then
-    CONDA_EXE="$(command -v conda)"
-  elif [[ "${DRY_RUN}" -eq 0 ]]; then
-    echo "Conda executable not found: ${CONDA_EXE}" >&2
-    exit 1
-  fi
+if [[ -z "${CONDA_EXE}" ]]; then
+  CONDA_EXE="${DEFAULT_CONDA_EXE}"
 fi
+if [[ ! -x "${CONDA_EXE}" ]]; then
+  CONDA_EXE="$(command -v conda 2>/dev/null || true)"
+fi
+[[ -x "${CONDA_EXE}" ]] || { echo "Conda executable not found" >&2; exit 1; }
 
 if [[ "${CREATE_ENV}" -eq 1 ]]; then
-  if [[ "${DRY_RUN}" -eq 1 ]] || ! "${CONDA_EXE}" run -n "${ENV_NAME}" python -V >/dev/null 2>&1; then
-    run_cmd "${CONDA_EXE}" env create -n "${ENV_NAME}" -f "${ENV_FILE}"
+  if "${CONDA_EXE}" run -n "${ENV_NAME}" python -V >/dev/null 2>&1; then
+    "${CONDA_EXE}" env update -n "${ENV_NAME}" -f "${ENV_FILE}"
   else
-    run_cmd "${CONDA_EXE}" env update -n "${ENV_NAME}" -f "${ENV_FILE}"
+    "${CONDA_EXE}" env create -n "${ENV_NAME}" -f "${ENV_FILE}"
   fi
-  run_cmd "${CONDA_EXE}" run -n "${ENV_NAME}" python -m pip install --upgrade \
-    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cu124
-  run_cmd "${CONDA_EXE}" run -n "${ENV_NAME}" python -m pip install --upgrade \
-    sam3==0.1.4 timm==1.0.28 tqdm==4.67.3 ftfy==6.3.1 \
-    regex==2026.7.10 iopath==0.1.10 typing_extensions==4.15.0 \
-    huggingface-hub==1.23.0 einops==0.8.2 pycocotools==2.0.11 \
-    safetensors==0.8.0 psutil==7.2.2
+  if [[ "${PLATFORM}" == "ubuntu" ]]; then
+    "${CONDA_EXE}" run -n "${ENV_NAME}" python -m pip install --upgrade \
+      torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+      --index-url https://download.pytorch.org/whl/cu124
+  fi
 fi
 
-if [[ "${DRY_RUN}" -eq 0 ]]; then
-  "${CONDA_EXE}" run -n "${ENV_NAME}" python -c '
-import sys
-import torch
-assert sys.version_info[:2] == (3, 12), sys.version
-assert torch.__version__.split("+", 1)[0] == "2.6.0", torch.__version__
-assert torch.version.cuda == "12.4", torch.version.cuda
-assert torch.cuda.is_available(), "CUDA is unavailable"
-name = torch.cuda.get_device_name(0)
-assert "3090" in name, name
-print(f"Inference runtime: Python {sys.version.split()[0]}, Torch {torch.__version__}, GPU {name}")
-'
-fi
+PYTHON_BIN="$("${CONDA_EXE}" run -n "${ENV_NAME}" python -c 'import sys; print(sys.executable)')"
+"${PYTHON_BIN}" -m compileall -q "${PLUGIN_SRC}" "${INFERENCE_DIR}"
 
-required_assets=(
-  upernet_swin_b.torchscript.pt
-  setr_vit.torchscript.pt
-  upernet_mambaout_b.torchscript.pt
-  sam3.pt
+STAGE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/loess-plugin-install.XXXXXX")"
+STAGE_PLUGIN="${STAGE_PARENT}/${PLUGIN_NAME}"
+cleanup() {
+  rm -rf "${STAGE_PARENT}"
+}
+trap cleanup EXIT
+
+mkdir -p "${STAGE_PLUGIN}"
+rsync -rl --delete --omit-dir-times \
+  --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude '._*' \
+  "${PLUGIN_SRC}/" "${STAGE_PLUGIN}/"
+
+GIT_SHA="${LOESS_GIT_SHA:-}"
+if [[ -z "${GIT_SHA}" ]] && git -C "${SCRIPT_DIR}/.." rev-parse HEAD >/dev/null 2>&1; then
+  GIT_SHA="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD)"
+fi
+[[ "${GIT_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "Cannot determine canonical Git SHA; run from the Ubuntu repository or set LOESS_GIT_SHA" >&2
+  exit 1
+}
+
+LOESS_STAGE_PLUGIN="${STAGE_PLUGIN}" \
+LOESS_GIT_SHA="${GIT_SHA}" \
+LOESS_PLATFORM="${PLATFORM}" \
+LOESS_PROFILE="${PROFILE}" \
+"${PYTHON_BIN}" -c '
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["LOESS_STAGE_PLUGIN"])
+files = {}
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    rel = path.relative_to(root).as_posix()
+    files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+payload = {
+    "schema_version": 1,
+    "git_sha": os.environ["LOESS_GIT_SHA"],
+    "plugin_version": "0.4.0",
+    "platform": os.environ["LOESS_PLATFORM"],
+    "qgis_profile": os.environ["LOESS_PROFILE"],
+    "files": files,
+}
+(root / "deployment_manifest.json").write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
 )
+'
 
-if [[ -n "${WEIGHTS_SOURCE}" ]]; then
-  for asset in "${required_assets[@]}"; do
-    source_path="${WEIGHTS_SOURCE}/${asset}"
-    if [[ "${DRY_RUN}" -eq 0 && ! -f "${source_path}" ]]; then
-      echo "Missing formal asset: ${source_path}" >&2
-      exit 1
-    fi
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      source_abs="${source_path}"
-    else
-      source_abs="$(realpath "${source_path}")"
-    fi
-    run_cmd ln -sfn "${source_abs}" "${WEIGHTS_DIR}/${asset}"
-  done
+echo "Validated ${PLUGIN_NAME} 0.4.0"
+echo "  platform: ${PLATFORM}"
+echo "  QGIS: ${qgis_version}"
+echo "  Git SHA: ${GIT_SHA}"
+echo "  environment: ${ENV_FILE}"
+
+if [[ "${CHECK_ONLY}" -eq 1 ]]; then
+  echo "Check-only complete; installed plugin was not changed."
+  exit 0
 fi
 
-if [[ "${DRY_RUN}" -eq 0 ]]; then
-  declare -A expected_sha=(
-    [upernet_swin_b.torchscript.pt]="e1b28d88821f0a35e17e399c89d01ef010c8a73dd1dce797f4db2f2b17425214"
-    [setr_vit.torchscript.pt]="7e47de54db003a802a36f78bb26295954201467234fbb084e00db4925a74a12f"
-    [upernet_mambaout_b.torchscript.pt]="76819fa558ce4261033fc6b0d65353778ec2a86cb4b0a0ce4a5ba8fd03ae1054"
-    [sam3.pt]="9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
-    [fusion_profile.json]="1e4a3086d016b26c074499a2035fea28ad0a4056e1cf3539fb04eb5e2f8c615d"
-  )
-  for asset in "${required_assets[@]}" fusion_profile.json; do
-    path="${WEIGHTS_DIR}/${asset}"
-    [[ -f "${path}" ]] || { echo "Missing formal asset: ${path}" >&2; exit 1; }
-    actual="$(sha256sum "${path}" | awk '{print $1}')"
-    [[ "${actual}" == "${expected_sha[${asset}]}" ]] || {
-      echo "SHA256 mismatch: ${path}" >&2
-      exit 1
-    }
-  done
-fi
+mkdir -p "${QGIS_PLUGIN_ROOT}"
+STAGED_DEST="${QGIS_PLUGIN_ROOT}/.${PLUGIN_NAME}.new.$$"
+OLD_DEST="${QGIS_PLUGIN_ROOT}/.${PLUGIN_NAME}.old.$$"
+rm -rf "${STAGED_DEST}" "${OLD_DEST}"
+mv "${STAGE_PLUGIN}" "${STAGED_DEST}"
 
-run_cmd find "${PLUGIN_SRC}" "${INFERENCE_DIR}" -type f -name '._*' -delete
-run_cmd find "${INFERENCE_DIR}" -type f -name '*.sh' -exec chmod +x '{}' +
-run_cmd "${CONDA_EXE}" run -n "${ENV_NAME}" python -m compileall -q \
-  "${PLUGIN_SRC}" "${INFERENCE_DIR}"
-run_cmd mkdir -p "${QGIS_PLUGIN_ROOT}"
-if command -v rsync >/dev/null 2>&1 || [[ "${DRY_RUN}" -eq 1 ]]; then
-  run_cmd rsync -rl --delete --omit-dir-times \
-    --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude '._*' \
-    "${PLUGIN_SRC}/" "${DEST_PLUGIN}/"
+if [[ -e "${DEST_PLUGIN}" ]]; then
+  mv "${DEST_PLUGIN}" "${OLD_DEST}"
+fi
+if mv "${STAGED_DEST}" "${DEST_PLUGIN}"; then
+  rm -rf "${OLD_DEST}"
 else
-  run_cmd rm -rf "${DEST_PLUGIN}"
-  run_cmd mkdir -p "${DEST_PLUGIN}"
-  run_cmd cp -a "${PLUGIN_SRC}/." "${DEST_PLUGIN}/"
+  [[ ! -e "${DEST_PLUGIN}" && -e "${OLD_DEST}" ]] && mv "${OLD_DEST}" "${DEST_PLUGIN}"
+  echo "Atomic plugin installation failed; previous installation was restored" >&2
+  exit 1
 fi
 
-if [[ "${DRY_RUN}" -eq 1 ]]; then
-  echo "Dry run complete; no files were changed."
-else
-  echo "Installed Linux plugin: ${DEST_PLUGIN}"
-  echo "Inference scripts: ${INFERENCE_DIR}"
-  echo "Restart QGIS 3.44, enable '半自动标注工具', then select the inference_scripts path above."
-fi
+test -f "${DEST_PLUGIN}/metadata.txt"
+test -f "${DEST_PLUGIN}/deployment_manifest.json"
+echo "Installed shared plugin: ${DEST_PLUGIN}"

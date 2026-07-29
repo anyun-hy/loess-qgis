@@ -5,15 +5,13 @@ from __future__ import annotations
 import re
 import time
 
-from qgis.PyQt.QtCore import QObject, Qt, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QDialog,
     QComboBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QProgressBar,
@@ -23,6 +21,16 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+
+from ..qt_compat import (
+    HORIZONTAL,
+    INTERACTIVE,
+    NO_EDIT_TRIGGERS,
+    SELECT_ROWS,
+    SINGLE_SELECTION,
+    STRETCH,
+    WINDOW,
 )
 
 from .log_panel import LogPanel
@@ -63,7 +71,7 @@ class InferenceMonitorDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("推理监控")
-        self.setWindowFlags(Qt.Window)
+        self.setWindowFlags(WINDOW)
         self.resize(1180, 720)
         self.setMinimumSize(900, 560)
         self._connected = []
@@ -87,7 +95,7 @@ class InferenceMonitorDialog(QDialog):
         self._phase.setWordWrap(True)
         root.addWidget(self._phase)
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(HORIZONTAL)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -96,15 +104,15 @@ class InferenceMonitorDialog(QDialog):
             ["结果流", "阶段", "当前/总数", "状态", "耗时", "失败数"]
         )
         self._streams.verticalHeader().setVisible(False)
-        self._streams.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._streams.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._streams.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._streams.setEditTriggers(NO_EDIT_TRIGGERS)
+        self._streams.setSelectionBehavior(SELECT_ROWS)
+        self._streams.setSelectionMode(SINGLE_SELECTION)
         self._streams.itemSelectionChanged.connect(self._render_selected_tiles)
         header = self._streams.horizontalHeader()
         header.setMinimumSectionSize(56)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, STRETCH)
         for column, width in ((1, 92), (2, 86), (3, 70), (4, 76), (5, 62)):
-            header.setSectionResizeMode(column, QHeaderView.Interactive)
+            header.setSectionResizeMode(column, INTERACTIVE)
             header.resizeSection(column, width)
         left_layout.addWidget(self._streams, stretch=2)
 
@@ -133,13 +141,13 @@ class InferenceMonitorDialog(QDialog):
         self._tiles = QTableWidget(0, 4)
         self._tiles.setHorizontalHeaderLabels(["空间单元", "类型", "状态", "失败原因"])
         self._tiles.verticalHeader().setVisible(False)
-        self._tiles.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._tiles.setEditTriggers(NO_EDIT_TRIGGERS)
         tile_header = self._tiles.horizontalHeader()
         tile_header.setMinimumSectionSize(60)
         for column, width in ((0, 96), (1, 72), (2, 88)):
-            tile_header.setSectionResizeMode(column, QHeaderView.Interactive)
+            tile_header.setSectionResizeMode(column, INTERACTIVE)
             tile_header.resizeSection(column, width)
-        tile_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        tile_header.setSectionResizeMode(3, STRETCH)
         left_layout.addWidget(self._tiles, stretch=1)
         self._detail_kind.currentIndexChanged.connect(self._reset_detail_page)
         self._detail_status.currentIndexChanged.connect(self._reset_detail_page)

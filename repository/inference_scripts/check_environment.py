@@ -40,7 +40,8 @@ FINGERPRINT_FILES = (
     "_device.py",
     "deployment_config.py",
     "check_environment.py",
-    "environment-linux-cu124.yml",
+    "environment-ubuntu-cu124.yml",
+    "environment-macos-qgis4.yml",
     "semantic_batch.py",
     "torchscript_runtime.py",
     "work_package_runtime.py",
@@ -305,16 +306,36 @@ def add_runtime_boundary_checks(checks, conda_env):
     )
 
     host_fields = (
-        ("qgis_version", "LOESS_QGIS_VERSION", "QGIS", lambda value: _version_tuple(value)[:2] == (3, 44)),
-        ("qgis_python", "LOESS_QGIS_PYTHON_VERSION", "QGIS Python", lambda value: _version_tuple(value)[:1] == (3,)),
-        ("pyqt_version", "LOESS_PYQT_VERSION", "PyQt", lambda value: _version_tuple(value)[:1] == (5,)),
-        ("qt_version", "LOESS_QT_VERSION", "Qt", lambda value: _version_tuple(value)[:1] == (5,)),
+        (
+            "qgis_version",
+            "LOESS_QGIS_VERSION",
+            "QGIS",
+            lambda value: _version_tuple(value)[:2] in {(3, 44), (4, 2)},
+        ),
+        (
+            "qgis_python",
+            "LOESS_QGIS_PYTHON_VERSION",
+            "QGIS Python",
+            lambda value: _version_tuple(value)[:1] == (3,),
+        ),
+        (
+            "pyqt_version",
+            "LOESS_PYQT_VERSION",
+            "PyQt",
+            lambda value: _version_tuple(value)[:1] in {(5,), (6,)},
+        ),
+        (
+            "qt_version",
+            "LOESS_QT_VERSION",
+            "Qt",
+            lambda value: _version_tuple(value)[:1] in {(5,), (6,)},
+        ),
     )
     for check_id, env_name, label, validator in host_fields:
         value = str(os.environ.get(env_name) or "").strip()
         if value:
             status = "ready" if validator(value) else "error"
-            message = f"{label} host runtime detected"
+            message = f"{label} shared-platform compatibility runtime detected"
         else:
             status = "warning"
             value = "not provided"
@@ -326,8 +347,41 @@ def add_runtime_boundary_checks(checks, conda_env):
             value,
             "QGIS plugin host runtime",
             message,
-            "use QGIS 3.44 with its bundled Python 3 and PyQt5/Qt5 runtime",
+            "use QGIS 3.44/PyQt5/Qt5 or QGIS 4.2/PyQt6/Qt6",
         )
+
+    qgis_major = _version_tuple(
+        os.environ.get("LOESS_QGIS_VERSION", "")
+    )[:1]
+    pyqt_major = _version_tuple(
+        os.environ.get("LOESS_PYQT_VERSION", "")
+    )[:1]
+    qt_major = _version_tuple(
+        os.environ.get("LOESS_QT_VERSION", "")
+    )[:1]
+    if qgis_major and pyqt_major and qt_major:
+        pair = (qgis_major[0], pyqt_major[0], qt_major[0])
+        pair_ok = pair in {(3, 5, 5), (4, 6, 6)}
+        pair_status = "ready" if pair_ok else "error"
+        pair_value = f"QGIS {pair[0]} / PyQt {pair[1]} / Qt {pair[2]}"
+        pair_message = (
+            "host runtime matches a supported platform profile"
+            if pair_ok
+            else "host runtime mixes unsupported QGIS and Qt major versions"
+        )
+    else:
+        pair_status = "warning"
+        pair_value = "not provided"
+        pair_message = "run the check from QGIS to verify the host runtime pair"
+    add_check(
+        checks,
+        "qgis_qt_profile",
+        pair_status,
+        pair_value,
+        "QGIS plugin host runtime",
+        pair_message,
+        "use QGIS 3.44 with Qt5 or QGIS 4.2 with Qt6",
+    )
 
     host_executable = str(
         os.environ.get("LOESS_QGIS_PYTHON_EXECUTABLE") or ""
@@ -405,10 +459,13 @@ def build_report(args):
             f"install {name} in Conda environment {args.conda_env}",
         )
 
+    runtime_platform = "macos" if sys.platform == "darwin" else "ubuntu"
     torch_module = dependencies.get("torch")
     torch_version = str(getattr(torch_module, "__version__", "not installed"))
+    expected_torch_version = "2.7.1" if runtime_platform == "macos" else "2.6.0"
     torch_version_ok = (
-        torch_module is not None and torch_version.split("+", 1)[0] == "2.6.0"
+        torch_module is not None
+        and torch_version.split("+", 1)[0] == expected_torch_version
     )
     add_check(
         checks,
@@ -416,48 +473,105 @@ def build_report(args):
         "ready" if torch_version_ok else "error",
         torch_version,
         f"Conda environment {args.conda_env}",
-        "formal Linux runtime uses PyTorch 2.6.0"
-        if torch_version_ok else "Linux deployment requires the exact PyTorch 2.6.0 runtime",
-        "run ./install.sh --create-env to install the official cu124 wheels",
+        f"formal {runtime_platform} runtime uses PyTorch {expected_torch_version}"
+        if torch_version_ok
+        else (
+            f"{runtime_platform} deployment requires exact PyTorch "
+            f"{expected_torch_version}"
+        ),
+        "run ./install.sh --platform auto --create-env",
     )
 
-    cuda_build = str(
-        getattr(getattr(torch_module, "version", None), "cuda", "") or ""
-    )
-    cuda_build_ok = torch_module is not None and _version_tuple(cuda_build)[:2] == (12, 4)
-    add_check(
-        checks,
-        "torch_cuda_build",
-        "ready" if cuda_build_ok else "error",
-        cuda_build or "not available",
-        "torch.version.cuda",
-        "PyTorch CUDA 12.4 runtime is installed"
-        if cuda_build_ok else "the installed PyTorch build is not the required cu124 build",
-        "install torch 2.6.0 from https://download.pytorch.org/whl/cu124",
-    )
+    if runtime_platform == "ubuntu":
+        cuda_build = str(
+            getattr(getattr(torch_module, "version", None), "cuda", "") or ""
+        )
+        cuda_build_ok = (
+            torch_module is not None
+            and _version_tuple(cuda_build)[:2] == (12, 4)
+        )
+        add_check(
+            checks,
+            "torch_cuda_build",
+            "ready" if cuda_build_ok else "error",
+            cuda_build or "not available",
+            "torch.version.cuda",
+            "PyTorch CUDA 12.4 runtime is installed"
+            if cuda_build_ok
+            else "the installed PyTorch build is not the required cu124 build",
+            "install torch 2.6.0 from the official cu124 wheel index",
+        )
 
-    cuda_available = bool(torch_module is not None and torch_module.cuda.is_available())
-    gpu_name = "not available"
-    capability = "not available"
-    if cuda_available:
-        try:
-            gpu_name = str(torch_module.cuda.get_device_name(0))
-            capability = ".".join(
-                str(value) for value in torch_module.cuda.get_device_capability(0)
-            )
-        except Exception as exc:
-            gpu_name = f"query failed: {exc}"
-    gpu_ok = cuda_available and "3090" in gpu_name
-    add_check(
-        checks,
-        "cuda_gpu",
-        "ready" if gpu_ok else "error",
-        f"{gpu_name}; compute capability {capability}",
-        "CUDA device 0",
-        "RTX 3090 is available to PyTorch"
-        if gpu_ok else "CUDA device 0 is unavailable or is not an RTX 3090",
-        "check the NVIDIA driver, CUDA_VISIBLE_DEVICES=0 and RTX 3090 visibility",
-    )
+        cuda_available = bool(
+            torch_module is not None and torch_module.cuda.is_available()
+        )
+        gpu_name = "not available"
+        capability = "not available"
+        if cuda_available:
+            try:
+                gpu_name = str(torch_module.cuda.get_device_name(0))
+                capability = ".".join(
+                    str(value)
+                    for value in torch_module.cuda.get_device_capability(0)
+                )
+            except Exception as exc:
+                gpu_name = f"query failed: {exc}"
+        gpu_ok = cuda_available and "3090" in gpu_name
+        add_check(
+            checks,
+            "cuda_gpu",
+            "ready" if gpu_ok else "error",
+            f"{gpu_name}; compute capability {capability}",
+            "CUDA device 0",
+            "RTX 3090 is available to PyTorch"
+            if gpu_ok
+            else "CUDA device 0 is unavailable or is not an RTX 3090",
+            "check the NVIDIA driver, CUDA_VISIBLE_DEVICES=0 and RTX 3090",
+        )
+        add_check(
+            checks,
+            "mps_device",
+            "ready",
+            "not required",
+            "Ubuntu platform profile",
+            "Ubuntu formal inference uses CUDA",
+            "",
+        )
+    else:
+        mps_available = bool(
+            torch_module is not None
+            and hasattr(torch_module.backends, "mps")
+            and torch_module.backends.mps.is_available()
+        )
+        add_check(
+            checks,
+            "torch_cuda_build",
+            "ready",
+            "not required",
+            "macOS platform profile",
+            "macOS formal inference uses MPS",
+            "",
+        )
+        add_check(
+            checks,
+            "cuda_gpu",
+            "ready",
+            "not required",
+            "macOS platform profile",
+            "macOS formal inference uses MPS",
+            "",
+        )
+        add_check(
+            checks,
+            "mps_device",
+            "ready" if mps_available else "error",
+            "available" if mps_available else "not available",
+            "torch.backends.mps",
+            "MPS is available to PyTorch"
+            if mps_available
+            else "MPS is unavailable in the macOS inference environment",
+            "install the macOS platform environment and verify Apple GPU access",
+        )
 
     shapely_module = dependencies.get("shapely")
     if shapely_module is not None:

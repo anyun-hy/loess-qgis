@@ -8,7 +8,7 @@ auto-scroll, save-to-file, and clipboard copy functionality.
 from datetime import datetime
 
 from qgis.PyQt.QtCore import QTimer
-from qgis.PyQt.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
+from qgis.PyQt.QtGui import QColor, QFont, QTextCharFormat
 from qgis.PyQt.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,6 +20,7 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ..qt_compat import FONT_BOLD, TEXT_CURSOR_END
 
 # ── Design Tokens ──────────────────────────────────────────────────────────
 LOG_BG = "#f6f6f6"
@@ -217,7 +218,7 @@ class LogPanel(QWidget):
     def _render_event(self, text: str, level: str, timestamp: str) -> None:
         """Insert a single timestamped line at the end of the log edit."""
         cursor = self.log_edit.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(TEXT_CURSOR_END)
 
         base_font = QFont(LOG_FONT, LOG_FONT_SIZE)
 
@@ -233,7 +234,7 @@ class LogPanel(QWidget):
         elif level == "stderr":
             txt_fmt.setForeground(QColor(STDERR_TEXT))
             txt_fmt.setBackground(QColor(STDERR_BG))
-            txt_fmt.setFontWeight(QFont.Bold)
+            txt_fmt.setFontWeight(FONT_BOLD)
         else:  # system
             txt_fmt.setForeground(QColor(SYSTEM_TEXT))
             txt_fmt.setFontItalic(True)

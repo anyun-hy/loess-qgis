@@ -1,12 +1,12 @@
 [general]
 name=半自动标注工具
 qgisMinimumVersion=3.44
-qgisMaximumVersion=3.44.99
-description=Ubuntu/QGIS 3.44 半自动矢量标注插件，使用RTX 3090 CUDA推理，实现14类土地利用的Tile推理、Fusion、矢量化和审核入库。
-version=0.3.0-linux.5
+qgisMaximumVersion=4.99
+description=Ubuntu 与 macOS 共用的半自动矢量标注插件，支持 QGIS 3.44/Qt5/CUDA 与 QGIS 4.2/Qt6/MPS。
+version=0.4.0
 author=QGIS Plugin Contributor
 email=
-about=面向Ubuntu 24.04、QGIS 3.44、PyQt5和独立PyTorch 2.6 CUDA环境的半自动标注工具。
+about=单仓双平台半自动标注工具，共用队列、缓存、恢复、人工精修和审核入库实现。
 tracker=
 repository=
 tags=semantic,labeling,SAM3,landuse

@@ -1,6 +1,29 @@
-# Shared launcher config for Ubuntu/QGIS 3.44 inference scripts.
+# Shared launcher config for Ubuntu/QGIS 3.44 and macOS/QGIS 4.2.
 CONDA_ENV="${CONDA_ENV:-qgis}"
-CONDA_EXE="${CONDA_EXE:-$HOME/miniconda3/bin/conda}"
+LOESS_PLATFORM="${LOESS_PLATFORM:-auto}"
+
+if [ "$LOESS_PLATFORM" = "auto" ]; then
+  case "$(uname -s)" in
+    Darwin) LOESS_PLATFORM="macos" ;;
+    Linux) LOESS_PLATFORM="ubuntu" ;;
+    *) LOESS_PLATFORM="unsupported" ;;
+  esac
+fi
+
+case "$LOESS_PLATFORM" in
+  macos)
+    CONDA_EXE="${CONDA_EXE:-/opt/anaconda3/bin/conda}"
+    LOESS_ENV_LOCK="environment-macos-qgis4.yml"
+    ;;
+  ubuntu)
+    CONDA_EXE="${CONDA_EXE:-$HOME/anaconda3/bin/conda}"
+    LOESS_ENV_LOCK="environment-ubuntu-cu124.yml"
+    ;;
+  *)
+    echo "Unsupported LOESS_PLATFORM: $LOESS_PLATFORM" >&2
+    return 2 2>/dev/null || exit 2
+    ;;
+esac
 
 if [ ! -x "$CONDA_EXE" ]; then
   CONDA_EXE=""
@@ -30,8 +53,10 @@ unset CONDA_PREFIX CONDA_PREFIX_1 CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER
 unset CONDA_PYTHON_EXE CONDA_ROOT _CE_CONDA _CE_M
 export CONDA_SHLVL=0
 
-export CONDA_ENV CONDA_EXE
+export CONDA_ENV CONDA_EXE LOESS_PLATFORM LOESS_ENV_LOCK
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export CUDA_LAUNCH_BLOCKING=0
+if [ "$LOESS_PLATFORM" = "ubuntu" ]; then
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+  export CUDA_LAUNCH_BLOCKING=0
+fi

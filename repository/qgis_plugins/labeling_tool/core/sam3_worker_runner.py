@@ -9,7 +9,7 @@ import signal
 
 from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, pyqtSignal
 
-from .process_compat import configure_linux_process
+from .process_compat import configure_process, process_is_running
 
 
 class Sam3WorkerRunner(QObject):
@@ -33,7 +33,7 @@ class Sam3WorkerRunner(QObject):
     def is_running(self):
         return bool(
             self._process is not None
-            and self._process.state() != QProcess.NotRunning
+            and process_is_running(self._process)
         )
 
     @property
@@ -64,7 +64,7 @@ class Sam3WorkerRunner(QObject):
         ]
         self.log_line.emit("system", "[cmd] " + shlex.join(["/bin/bash", *args]))
         process = QProcess(self)
-        self._owns_process_group = configure_linux_process(
+        self._owns_process_group = configure_process(
             process, "/bin/bash", args
         )
         process.setWorkingDirectory(self.scripts_dir)
@@ -117,7 +117,7 @@ class Sam3WorkerRunner(QObject):
         if process is None:
             return
         self._stopping = True
-        if process.state() != QProcess.NotRunning:
+        if process_is_running(process):
             try:
                 self._write({"command": "shutdown"})
                 process.waitForBytesWritten(1000)

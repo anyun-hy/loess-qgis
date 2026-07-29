@@ -16,7 +16,7 @@ from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyq
 from qgis.core import QgsVectorFileWriter, QgsVectorLayer, QgsProject
 
 from . import difference_filter
-from .process_compat import configure_linux_process
+from .process_compat import configure_process, process_is_running
 from .layer_names import LAYER_NAMES
 from .pipeline_plan import build_pipeline_steps
 from .result_catalog import (
@@ -180,7 +180,7 @@ class AsyncInferenceRunner(QObject):
         self._proc = None
         if proc is not None:
             proc.blockSignals(True)
-            if proc.state() != QProcess.NotRunning:
+            if process_is_running(proc):
                 pid = int(proc.processId())
                 if pid > 0 and self._owns_process_group:
                     try:
@@ -279,7 +279,7 @@ class AsyncInferenceRunner(QObject):
         self._stdout_pending = bytearray()
         self._stderr_pending = bytearray()
         proc = QProcess(self)
-        self._owns_process_group = configure_linux_process(
+        self._owns_process_group = configure_process(
             proc, "/bin/bash", [script_path, *args]
         )
         proc.setWorkingDirectory(self.scripts_dir)

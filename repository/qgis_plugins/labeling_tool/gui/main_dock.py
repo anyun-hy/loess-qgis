@@ -4,14 +4,13 @@ from datetime import datetime
 from pathlib import Path
 import re
 
-from qgis.PyQt.QtCore import Qt, QSize, QTimer, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import QSize, QTimer, QUrl, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QApplication, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QFormLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox,
     QRadioButton, QCheckBox, QProgressBar,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem,
     QWidget, QButtonGroup, QFileDialog, QMessageBox, QScrollArea,
-    QAbstractItemView,
 )
 from qgis.PyQt.QtGui import QColor, QDesktopServices
 from qgis.gui import QgsDockWidget, QgsMapLayerComboBox, QgsMapTool, QgsRubberBand
@@ -23,6 +22,31 @@ from qgis.core import (
 )
 
 from ..core.layer_names import LAYER_NAMES
+from ..qt_compat import (
+    ALIGN_LEFT,
+    ALIGN_VCENTER,
+    EXTENDED_SELECTION,
+    NO,
+    NO_EDIT_TRIGGERS,
+    RESIZE_TO_CONTENTS,
+    SCROLLBAR_AS_NEEDED,
+    SELECT_ROWS,
+    STRETCH,
+    TEXT_SELECTABLE_BY_MOUSE,
+    USER_ROLE,
+    WA_DELETE_ON_CLOSE,
+    YES,
+)
+
+
+class _FixedMapLayerComboBox(QgsMapLayerComboBox):
+    """Keep the native layer popup anchored inside a macOS dock widget."""
+
+    def showPopup(self):
+        super().showPopup()
+        popup = self.view().window()
+        if popup:
+            popup.move(self.mapToGlobal(self.rect().bottomLeft()))
 
 
 class RectangleMapTool(QgsMapTool):
@@ -228,7 +252,7 @@ class LabelingDockWidget(QgsDockWidget):
         source_grid.setColumnStretch(0, 0)
         source_grid.setColumnStretch(1, 1)
 
-        self.raster_combo = QgsMapLayerComboBox()
+        self.raster_combo = _FixedMapLayerComboBox()
         self.raster_combo.setFilters(Qgis.LayerFilter.RasterLayer)
 
         raster_label = QLabel("影像层:")
@@ -237,7 +261,7 @@ class LabelingDockWidget(QgsDockWidget):
             raster_label,
             0,
             0,
-            Qt.AlignLeft | Qt.AlignVCenter,
+            ALIGN_LEFT | ALIGN_VCENTER,
         )
         source_grid.addWidget(self.raster_combo, 0, 1)
 
@@ -265,7 +289,7 @@ class LabelingDockWidget(QgsDockWidget):
             QLabel("范围:"),
             1,
             0,
-            Qt.AlignLeft | Qt.AlignVCenter,
+            ALIGN_LEFT | ALIGN_VCENTER,
         )
         source_grid.addWidget(extent_row, 1, 1)
 
@@ -278,7 +302,7 @@ class LabelingDockWidget(QgsDockWidget):
         source_grid.addWidget(QLabel("操作:"), 2, 0)
         source_grid.addWidget(extent_actions, 2, 1)
 
-        self.vector_range_combo = QgsMapLayerComboBox()
+        self.vector_range_combo = _FixedMapLayerComboBox()
         self.vector_range_combo.setFilters(Qgis.LayerFilter.PolygonLayer)
         self.vector_range_combo.setEnabled(False)
         self.vector_range_combo.setToolTip(
@@ -290,7 +314,7 @@ class LabelingDockWidget(QgsDockWidget):
             self.vector_range_label,
             3,
             0,
-            Qt.AlignLeft | Qt.AlignVCenter,
+            ALIGN_LEFT | ALIGN_VCENTER,
         )
         source_grid.addWidget(self.vector_range_combo, 3, 1)
 
@@ -301,7 +325,7 @@ class LabelingDockWidget(QgsDockWidget):
             QLabel("状态:"),
             4,
             0,
-            Qt.AlignLeft | Qt.AlignVCenter,
+            ALIGN_LEFT | ALIGN_VCENTER,
         )
         source_grid.addWidget(self.extent_status_label, 4, 1)
 
@@ -388,7 +412,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.config_path_label = QLabel("未选择")
         self.config_path_label.setWordWrap(True)
         self.config_path_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
+            TEXT_SELECTABLE_BY_MOUSE
         )
         self.open_config_btn = QPushButton("打开")
         self.open_config_btn.setToolTip("打开当前 inference_scripts/config.yaml")
@@ -400,7 +424,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.env_status_label = QLabel("未检查")
         self.env_status_label.setWordWrap(True)
         self.env_status_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
+            TEXT_SELECTABLE_BY_MOUSE
         )
         self.env_status_label.setStyleSheet(
             "padding: 5px; border: 1px solid #b8b8b8; background: #f4f4f4;"
@@ -419,22 +443,22 @@ class LabelingDockWidget(QgsDockWidget):
         self.env_table.setHorizontalHeaderLabels(
             ["检查项", "当前有效值", "状态", "来源 / 修改位置"]
         )
-        self.env_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.env_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.env_table.setSelectionBehavior(
-            QAbstractItemView.SelectRows
+            SELECT_ROWS
         )
         self.env_table.verticalHeader().setVisible(False)
         self.env_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeToContents
+            0, RESIZE_TO_CONTENTS
         )
         self.env_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.Stretch
+            1, STRETCH
         )
         self.env_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeToContents
+            2, RESIZE_TO_CONTENTS
         )
         self.env_table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.Stretch
+            3, STRETCH
         )
         self.env_table.setMinimumHeight(190)
         self.env_table.setVisible(False)
@@ -505,7 +529,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.tile_table = QTableWidget(0, 4)
         self.tile_table.setHorizontalHeaderLabels(["Tile", "状态", "语义", "SAM3"])
         self.tile_table.horizontalHeader().setStretchLastSection(True)
-        self.tile_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tile_table.setEditTriggers(NO_EDIT_TRIGGERS)
         layout.addWidget(self.tile_table)
         self.tile_table.setVisible(False)
 
@@ -514,9 +538,9 @@ class LabelingDockWidget(QgsDockWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarAsNeeded
+            SCROLLBAR_AS_NEEDED
         )
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)
         scroll_area.setWidget(main_widget)
         self.setWidget(scroll_area)
 
@@ -893,7 +917,7 @@ class LabelingDockWidget(QgsDockWidget):
         dialog.resize(980, 650)
         dialog.setMinimumSize(760, 480)
         dialog.setModal(False)
-        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.setAttribute(WA_DELETE_ON_CLOSE)
         self._env_details_dialog = dialog
 
         layout = QVBoxLayout(dialog)
@@ -922,21 +946,21 @@ class LabelingDockWidget(QgsDockWidget):
         checks_table.setHorizontalHeaderLabels(
             ["状态", "检查项", "当前值", "说明", "来源 / 修改位置"]
         )
-        checks_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        checks_table.setEditTriggers(NO_EDIT_TRIGGERS)
         checks_table.setSelectionBehavior(
-            QAbstractItemView.SelectRows
+            SELECT_ROWS
         )
         checks_table.setSelectionMode(
-            QAbstractItemView.ExtendedSelection
+            EXTENDED_SELECTION
         )
         checks_table.verticalHeader().setVisible(False)
         checks_table.verticalHeader().setDefaultSectionSize(30)
         header = checks_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(1, RESIZE_TO_CONTENTS)
+        header.setSectionResizeMode(2, STRETCH)
+        header.setSectionResizeMode(3, STRETCH)
+        header.setSectionResizeMode(4, STRETCH)
 
         status_priority = {"error": 0, "warning": 1, "ready": 2}
         ordered_checks = sorted(
@@ -964,7 +988,7 @@ class LabelingDockWidget(QgsDockWidget):
                 tooltip = (tooltip + "\n" if tooltip else "") + "修改位置: " + fix
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setData(Qt.UserRole, original_index)
+                item.setData(USER_ROLE, original_index)
                 item.setToolTip(tooltip)
                 if column == 0:
                     item.setForeground(QColor(status_color.get(status, "#333333")))
@@ -1016,7 +1040,7 @@ class LabelingDockWidget(QgsDockWidget):
                 item = checks_table.item(row, 0)
                 if item is not None:
                     selected_checks.append(
-                        checks[item.data(Qt.UserRole)]
+                        checks[item.data(USER_ROLE)]
                     )
             QApplication.clipboard().setText(
                 format_check_details(selected_checks) if selected_checks else full_text
@@ -1168,10 +1192,10 @@ class LabelingDockWidget(QgsDockWidget):
                 "推理环境警告",
                 (self._first_problem(report) or "当前配置存在警告。")
                 + "\n\n是否继续本次推理？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                YES | NO,
+                NO,
             )
-            if answer != QMessageBox.Yes:
+            if answer != YES:
                 return
         effective = report.get("effective", {})
         try:

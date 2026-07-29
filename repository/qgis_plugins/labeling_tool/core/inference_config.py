@@ -14,7 +14,7 @@ from qgis.PyQt.QtCore import (
 )
 from qgis.core import Qgis
 
-from .process_compat import configure_linux_process
+from .process_compat import configure_process, process_is_running
 
 
 PIPELINE_FILES = (
@@ -48,7 +48,8 @@ REQUIRED_FILES = PIPELINE_FILES + (
     "run_polyline_smooth.sh",
     "sam3_interactive_worker.py",
     "check_environment.py",
-    "environment-linux-cu124.yml",
+    "environment-ubuntu-cu124.yml",
+    "environment-macos-qgis4.yml",
     "run_env_check.sh",
 )
 FINGERPRINT_FILES = (
@@ -57,7 +58,8 @@ FINGERPRINT_FILES = (
     "_device.py",
     "deployment_config.py",
     "check_environment.py",
-    "environment-linux-cu124.yml",
+    "environment-ubuntu-cu124.yml",
+    "environment-macos-qgis4.yml",
     "semantic_batch.py",
     "torchscript_runtime.py",
     "work_package_runtime.py",
@@ -178,7 +180,7 @@ class InferenceConfigManager(QObject):
         arguments = [os.path.join(self._scripts_dir, "run_env_check.sh")]
         if output_dir:
             arguments.append(output_dir)
-        self._owns_process_group = configure_linux_process(
+        self._owns_process_group = configure_process(
             self._process, "/bin/bash", arguments
         )
         self._process.setWorkingDirectory(self._scripts_dir)
@@ -211,7 +213,7 @@ class InferenceConfigManager(QObject):
         self._process = None
         if process is not None:
             process.blockSignals(True)
-            if process.state() != QProcess.NotRunning:
+            if process_is_running(process):
                 pid = int(process.processId())
                 if pid > 0 and self._owns_process_group:
                     try:
@@ -285,7 +287,7 @@ class InferenceConfigManager(QObject):
         process = self._process
         if (
             process is None
-            or process.state() != QProcess.NotRunning
+            or process_is_running(process)
         ):
             return
         message = process.errorString() or "无法启动环境检查进程"

@@ -92,14 +92,16 @@ def test_storage_preflight_uses_measured_values_and_preserves_reserve(tmp_path):
         available_disk_bytes=10 * GIB,
     )
     assert report["status"] == "passed"
-    assert report["estimated_input_tile_bytes"] == 1000 * 512
+    assert 0 < report["estimated_input_tile_bytes"] <= 1000 * 512
+    assert report["input_tile_storage_mode"] == "work_package_temporary"
     assert report["estimated_permanent_output_bytes"] == 1000 * 4 * 2048
-    assert report["estimated_permanent_bytes"] == 1000 * (4 * 2048 + 512)
+    assert report["estimated_permanent_bytes"] == 1000 * 4 * 2048
+    assert report["input_tile_bytes"] == 512
     assert report["estimated_required_bytes"] <= report["available_disk_bytes"]
 
 
 def test_storage_preflight_blocks_when_not_even_one_tile_fits(tmp_path):
-    with pytest.raises(WorkPackagePlanError, match="cannot hold one"):
+    with pytest.raises(WorkPackagePlanError, match="磁盘空间预检失败"):
         storage_preflight(
             tmp_path,
             tile_count=1000,
