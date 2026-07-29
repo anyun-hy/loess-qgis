@@ -19,26 +19,36 @@
 
 SAM3 不是语义推理的必选步骤，也不参与类别判断。它不是独立结果来源，不生成单独的最终类别层，只为当前类别工作层中的当前地物提供可选几何。融合结果是多个模型分数的算法融合，不是多个矢量层的几何叠加。500,000 Tile 是本地单机正式设计上限；1,000,000 Tile 需要分布式调度和远程对象存储，不属于本方案验收范围。
 
-### 1.1 QGIS4 迁移目标与运行边界
+### 1.1 Ubuntu 单仓双平台目标与运行边界
 
-本轮正式桌面目标固定为 QGIS 4.2，不继续承担 QGIS3 或 Qt5 兼容成本。插件元数据必须为 `version=0.3.0`、`qgisMinimumVersion=4.2`，所有 Qt 枚举使用 PyQt6/Qt6 的 scoped enum 写法。
+唯一开发主仓固定为 `/Users/example/Desktop/loess-data/ubuntu/`，实际源码位于 `repository/`。macOS 与 Ubuntu 必须从同一 Git 提交安装同一份插件、推理运行时和部署入口；禁止维护完整的 macOS/Linux 双份源码。统一插件版本为 `0.4.0`，元数据兼容范围固定为 `qgisMinimumVersion=3.44`、`qgisMaximumVersion=4.99`。
+
+正式桌面支持矩阵固定为：
+
+| 平台 | QGIS 插件进程 | 推理子进程与设备 |
+|---|---|---|
+| Ubuntu 24.04 | QGIS 3.44.7、PyQt5/Qt5 | `qgis` Conda、Python 3.12、PyTorch 2.6/cu124、RTX 3090 CUDA |
+| macOS | QGIS 4.2、PyQt6/Qt6 | `/opt/anaconda3/envs/qgis`、Python 3.12、PyTorch 2.7、MPS；SAM3 不支持 MPS 时使用 CPU |
+
+Qt5/Qt6 枚举、QGIS3/QGIS4 API、`QProcess` 进程组和操作系统路径差异只能位于平台兼容层和部署配置。业务 UI、状态机、队列、缓存、数据库、推理、组装和入库代码不得按平台复制或散布平台判断。
 
 运行时严格分为两个进程边界：
 
-| 边界 | 正式运行时 | 职责 |
-|---|---|---|
-| QGIS 插件进程 | QGIS 4.2 DMG 自带 Python 3.12.11、PyQt 6.11.0、Qt 6.11.1 | 地图、UI、范围捕获、图层管理和任务调度 |
-| 推理子进程 | `/opt/anaconda3/envs/qgis`，Python 3.12.13、PyTorch 2.7.1 | TorchScript、融合、mosaic、polygonize 和 SAM3 CPU |
+| 边界 | 职责 |
+|---|---|
+| QGIS 插件进程 | 使用宿主 QGIS 自带 Python/Qt，负责地图、UI、范围捕获、图层管理和任务调度 |
+| 推理子进程 | 使用当前平台的独立 `qgis` Conda 环境，负责 TorchScript、融合、mosaic、polygonize 和 SAM3 |
 
-两套 Python 只能通过 Shell 命令、JSON/JSONL、GeoTIFF 和 GeoPackage 通信。禁止向 QGIS DMG Python 注入 Conda `site-packages`，也禁止向 `qgis` Conda 环境安装 Conda 版 QGIS。
+两套 Python 只能通过 Shell 命令、JSON/JSONL、GeoTIFF 和 GeoPackage 通信。禁止向 QGIS 宿主 Python 注入 Conda `site-packages`，也禁止向推理环境安装 Conda 版 QGIS。
 
-正式安装目录默认为：
+正式安装目录按平台和 profile 计算：
 
 ```text
-/Users/example/Library/Application Support/QGIS/QGIS4/profiles/default/python/plugins
+Ubuntu: ~/.local/share/QGIS/QGIS3/profiles/<profile>/python/plugins
+macOS:  ~/Library/Application Support/QGIS/QGIS4/profiles/<profile>/python/plugins
 ```
 
-安装脚本必须支持 `--profile` 和 `--plugin-dir`，并默认使用 `/opt/anaconda3/envs/qgis/bin/python` 做仓库 Python 语法检查。推理环境由 `inference_scripts/environment-qgis.yml` 描述，`config.sh` 默认 `CONDA_ENV=qgis`。
+仓库根目录唯一部署入口 `install.sh` 必须支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；失败不得改变现有安装，也不得留下源码备份或 `.stage`。推理配置采用一份共享 Schema v2 和两个最小平台覆盖，`config.sh` 默认 `CONDA_ENV=qgis`。
 
 ## 2. 原方案输入输出核对
 
@@ -606,7 +616,7 @@ SAM3 从语义主流程中拆出。语义运行成功不依赖 SAM3 是否启用
 快速重画按以下固定交互执行：
 
 1. 用户点击当前类别行的“快速重画现有面”；若当前层已唯一选中一个面则直接使用，否则插件进入一次性地图点选，点击必须唯一命中当前类别中的一个面。
-2. 插件保留原 geometry 不变，以灰色轮廓作为参考，并通过 QGIS 4.2 原生 `QgsMapToolDigitizeFeature` 的 `Qgis.CaptureTechnique.PolyBezier` 捕获一个完整新 Polygon。用户右键结束捕获；捕获期间不向工作层新增要素，也不弹属性表。
+2. 插件保留原 geometry 不变，以灰色轮廓作为参考，并通过宿主 QGIS 的 `QgsMapToolDigitizeFeature` 与 `Qgis.CaptureTechnique.PolyBezier` 捕获一个完整新 Polygon。用户右键结束捕获；捕获期间不向工作层新增要素，也不弹属性表。
 3. 捕获完成后显示类别色候选预览和“平滑次数”整数控件，范围固定为 `0–5`、默认 `1`。`0` 保留分段化后的 Bézier 结果；`1–5` 使用 QGIS `QgsGeometry.smooth(iterations, 0.25)` 生成实时预览。平滑只作用于本次候选，不修改原面。
 4. 候选操作固定为“采用”“重画”“取消”。“重画”清除候选并重新进入 PolyBezier 捕获，原面继续保留；“取消”清除全部临时覆盖物并保持工作层完全不变。
 5. “采用”只把候选 geometry 替换到原要素的 QGIS edit buffer，保留 `object_id`、`part_id`、类别和其他不可变字段，不立即提交 GPKG。随后必须由“保存当前编辑”正式提交，或由“取消当前编辑”回滚到上次保存状态。
@@ -1040,7 +1050,7 @@ qgis_plugins/labeling_tool/core/sam3_job_runner.py
 | E6 | Seam/Junction 重建、磁盘连通图和流式组装 | 空间所有权完整且互斥；跨分区无 gap/overlap；对象 ID 跨单元一致 |
 | E7 | 主面板、配置、监控、分页 Tile 查询和真实状态聚合 | 50 万 Tile 不创建 50 万 UI 行；进度不会停在 N/N 假运行 |
 | E8 | 现有 Fusion 类别工作区、交互式 SAM3、final/topology/accepted 回归 | 新 formal 流仍能完成已确认的分类修整闭环 |
-| E9 | 正式模型、QSDK 边界 A/B、QGIS4 安装与真实运行 | 三模型/Fusion 的精度、边界、拓扑、停止恢复和地图交互通过 |
+| E9 | 正式模型、QSDK 边界 A/B、Ubuntu/macOS 安装与真实运行 | 两平台同一 Git SHA 的三模型/Fusion 精度、边界、拓扑、停止恢复和地图交互通过 |
 | E10 | 1k、10k、500k 分级规模验收 | 达到第 19 节规模门槛后才能声明相应规模已支持 |
 
 E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式资产和真实影像。E10 中的调度与状态压力测试可以使用 fixture，但不能代替同规模正式端到端运行。
@@ -1063,7 +1073,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 12. 重构监控为数据库聚合和分页查询，默认显示 Partition/Seam/Junction；Tile 每页最多 500 条。所有阶段必须发出可计算进度和心跳，结束、失败、停止后进度条退出忙碌状态。
 13. 用新 formal Fusion 回归 E8：14 类拆分、SAM3 单对象候选、人工修边、确认、final、topology 和 accepted 全部保持原契约。
 14. 依次完成 238 Tile 故障 run 回归、1k、10k、500k 分级验收。每一级失败都先修复同一级，不通过跳过小规模直接宣称 500k。
-15. 每次修改插件源码后执行 `./qgis_plugins/install_qgis_plugin.sh --profile default` 并在 QGIS4 重载；只有实际安装副本与仓库一致，才记录 QGIS 证据。
+15. 每次修改插件源码后执行 `./install.sh --platform auto --profile <隔离profile>` 并在当前平台 QGIS 重载；只有安装副本与仓库 Git SHA、版本和逐文件 SHA256 一致，才记录 QGIS 证据。
 
 ## 19. 自动测试与实际验收
 
@@ -1142,8 +1152,8 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 
 ### QGIS 实际交互验收
 
-1. 执行 `./qgis_plugins/install_qgis_plugin.sh --profile default`，不手动复制；默认目标必须是 QGIS4 profile。
-2. 在 QGIS 4.2 中重新加载插件，确认 `labeling_tool 0.3.0` 已启用且源码同步。
+1. 在 Ubuntu 与 macOS 分别执行 `./install.sh --platform auto --profile <隔离profile>`，不手动复制；部署入口必须从同一 Git 提交安装。
+2. 在 QGIS 3.44.7 与 QGIS 4.2 中重新加载插件，确认 `labeling_tool 0.4.0` 已启用，`__file__`、Git SHA 和逐文件 SHA256 与主仓一致。
 3. 当前视图按钮能捕获范围并显示；手绘完成后恢复原平移工具。
 4. 配置弹窗能显示 QGIS/Python/PyQt/Qt 版本、Conda Python 路径、模型、profile、真实路径、哈希、设备和错误修改位置。
 5. 先使用两模型小范围运行，再执行 L0/L1；地图 UI 不冻结。
@@ -1182,8 +1192,8 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 - 主面板与三个弹窗状态同步，关闭弹窗不破坏运行或地图操作。
 - 停止、重试、resume 和 QGIS 关闭没有残留进程或主程序崩溃。
 - 安装脚本同步后通过自动测试和 QGIS 实际交互验收。
-- QGIS 插件只使用 QGIS4 自带 PyQt6/Qt6；推理只使用独立 `qgis` Conda 环境，两边没有 `site-packages` 混用。
-- 三份正式语义模型在 `qgis` 环境使用 MPS，SAM3 0.1.4 通过现有 compatibility 路径使用 CPU。
+- QGIS 插件只使用宿主 QGIS 自带的 PyQt/Qt；推理只使用当前平台独立 `qgis` Conda 环境，两边没有 `site-packages` 混用。
+- 三份正式语义模型在 Ubuntu `qgis` 环境使用 CUDA、在 macOS `qgis` 环境使用 MPS；SAM3 按平台使用 CUDA 或现有 CPU compatibility 路径。
 - L0、L1、L2、L3 均取得第 19 节规定的正式证据后，才能声明完整的 500,000 Tile 目标完成；未完成 L3 时必须明确当前只通过到哪个等级。
 
 任何仅能运行单模型、只保存 Fusion、不保存各模型结果、把五十万 Tile 明细写入 JSON/Qt 表、保存全 run 多模型概率、在 Tile 内矢量化、构建整幅亚像元线网、执行整幅 dissolve、只看顶点减少率就宣称边界成功、逐 Polygon 独立平滑、使用 raw/失败 Fusion 初始化工作区、自动对整个类别执行 SAM3、把 SAM3 结果另建为最终类别层、未经人工决定就覆盖几何、不能在原类别工作层继续人工修边、或仍会覆盖旧 run 的实现，都不符合本文目标。
