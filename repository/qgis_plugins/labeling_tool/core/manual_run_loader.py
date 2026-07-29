@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-from .run_spec import CLASS_ORDER
+from .run_spec import CLASS_ORDER, atomic_write_json, sha256_file
 
 
 class ManualRunLoadError(RuntimeError):
@@ -154,6 +154,9 @@ def load_manual_run(run_directory) -> dict:
     manifest_path = run_root / "run_manifest.json"
     original_spec = _read_json(spec_path, "run_spec.json")
     manifest = _read_json(manifest_path, "run_manifest.json")
+    expected_spec_sha = str(manifest.get("run_spec_sha256") or "")
+    if not expected_spec_sha or sha256_file(spec_path) != expected_spec_sha:
+        raise ManualRunLoadError("复制 Run 的 run_spec SHA256 与 run_manifest 不一致")
     run_id = str(original_spec.get("run_id") or "").strip()
     manifest_run_id = str(manifest.get("run_id") or "").strip()
     if not run_id or run_id != manifest_run_id:
@@ -184,16 +187,37 @@ def load_manual_run(run_directory) -> dict:
     spec["manual_only"] = True
     spec["workflow_mode"] = "manual_run_copy"
     spec["accepted_target_gpkg"] = str(run_root / "accepted_labels.gpkg")
+    snapshot = _rebound_candidate(
+        original_spec.get("accepted_gpkg"), old_root, run_root, run_id
+    )
+    if snapshot is not None and snapshot.is_file():
+        spec["accepted_gpkg"] = str(snapshot)
+        spec["accepted_gpkg_sha256"] = _sha256(snapshot)
+    else:
+        spec["accepted_gpkg"] = ""
+        spec["accepted_gpkg_sha256"] = ""
     state_db = run_root / "state.sqlite"
     if state_db.is_file():
         spec["state_db"] = str(state_db)
     fusion = dict(spec.get("fusion") or {})
-    snapshot = run_root / "fusion_profile_snapshot.json"
-    if snapshot.is_file():
-        fusion["snapshot_path"] = str(snapshot.resolve())
+    fusion_snapshot = run_root / "fusion_profile_snapshot.json"
+    if fusion_snapshot.is_file():
+        fusion["snapshot_path"] = str(fusion_snapshot.resolve())
     spec["fusion"] = fusion
 
     workspace = _prepare_workspace(run_root, run_id, fusion_streams)
+    spec.pop("run_spec_content_sha256", None)
+    accepted_write_spec = run_root / "classes" / "accepted_write_run_spec.json"
+    atomic_write_json(accepted_write_spec, spec)
+    accepted_write_manifest = (
+        run_root / "classes" / "accepted_write_run_manifest.json"
+    )
+    manual_manifest = copy.deepcopy(manifest)
+    manual_manifest["run_spec"] = str(accepted_write_spec)
+    manual_manifest["run_spec_sha256"] = sha256_file(accepted_write_spec)
+    manual_manifest["streams"] = fusion_streams
+    atomic_write_json(accepted_write_manifest, manual_manifest)
+    spec["accepted_write_manifest"] = str(accepted_write_manifest)
     result = {
         "run_id": run_id,
         "run_dir": str(run_root),

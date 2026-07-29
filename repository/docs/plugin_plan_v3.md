@@ -410,6 +410,8 @@ E5S 自动验收必须覆盖：两面共享同一开放拟合线、一个环依�
 
 推理使用的 `accepted_gpkg` 固定为 Run 内只读 `accepted_snapshot.gpkg`，并冻结 SHA256；长期写入位置单独记录为 `accepted_target_gpkg`。快照只服务于本次 skip/difference，任何最终入库路径都不得指向快照。`accepted_target_gpkg` 是可增长的长期标签库，因此不冻结文件哈希；最终写入前必须重新读取和审计当前文件，覆盖 Run 执行期间可能发生的外部变化。
 
+“加载已有 Run 人工整理”不得改写复制来的原始 `run_spec.json/run_manifest.json`，也不得只在内存中替换写入路径。加载器先校验原始规范哈希，再在 `classes/` 生成只服务于本副本入库的 `accepted_write_run_spec.json/accepted_write_run_manifest.json`，冻结副本内快照和 `accepted_target_gpkg`；写入器继续执行相同的 manifest/spec 哈希、目标路径、全库审计和重叠硬门槛。
+
 模型流可以继续作为地图对照层，但“分类修整与组装”只能从一个 `ready` 且 `approved` 的 Fusion 流初始化。difference 后的 Fusion 矢量是类别工作层的不可变基准快照。
 
 ## 9. 单次运行输出目录

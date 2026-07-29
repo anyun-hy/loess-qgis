@@ -117,6 +117,12 @@ def test_accepted_labels_are_audited_and_snapshot_is_not_the_write_target():
     assert '"accepted_target_gpkg":' in builder
     assert 'get("accepted_target_gpkg")' in dialog
     assert "append_final_to_accepted" in dialog
+    manual_loader = (
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "manual_run_loader.py"
+    ).read_text(encoding="utf-8")
+    assert "accepted_write_run_spec.json" in manual_loader
+    assert "accepted_write_run_manifest.json" in manual_loader
+    assert 'spec["accepted_write_manifest"]' in manual_loader
 
 
 def test_final_overlap_with_accepted_is_blocked_twice():

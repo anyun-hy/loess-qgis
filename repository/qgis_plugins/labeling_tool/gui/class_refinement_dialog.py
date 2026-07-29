@@ -2105,7 +2105,10 @@ class ClassRefinementDialog(QDialog):
             count = accepted_writer.append_final_to_accepted(
                 self._final_path,
                 str(self._run_spec.get("accepted_target_gpkg") or ""),
-                str(Path(self._run_spec["run_dir"]) / "run_manifest.json"),
+                str(
+                    self._run_spec.get("accepted_write_manifest")
+                    or Path(self._run_spec["run_dir"]) / "run_manifest.json"
+                ),
             )
             self.baseline_label.setText(f"已写入 accepted_labels: {count} 个面")
         except Exception as exc:
