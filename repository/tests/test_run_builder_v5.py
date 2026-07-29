@@ -79,6 +79,13 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         scaling=_scaling(),
         boundary_fitting=_boundary(),
         storage_report=storage,
+        accepted_target_gpkg=tmp_path / "output" / "accepted.gpkg",
+        accepted_validation={
+            "status": "passed",
+            "feature_count": 7,
+            "overlap_pair_count": 0,
+            "overlap_tolerance": 0.000001,
+        },
         run_id="20260717_210000_fixture",
     )
     assert spec["schema_version"] == 2
@@ -94,6 +101,15 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
     assert Path(spec["cache_root"]) == expected_tile_cache.parent
     assert Path(spec["tile_cache_dir"]) == expected_tile_cache
     assert expected_tile_cache.is_dir()
+    assert Path(spec["accepted_target_gpkg"]) == (
+        tmp_path / "output" / "accepted.gpkg"
+    ).resolve()
+    assert spec["accepted_validation"] == {
+        "status": "passed",
+        "feature_count": 7,
+        "overlap_pair_count": 0,
+        "overlap_tolerance": 0.000001,
+    }
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM tiles").fetchone()[0] == 100_000

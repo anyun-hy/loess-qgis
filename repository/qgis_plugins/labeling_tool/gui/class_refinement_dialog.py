@@ -2064,13 +2064,15 @@ class ClassRefinementDialog(QDialog):
             QMessageBox.warning(self, "组装失败", str(exc))
 
     def _accepted_layer_for_check(self):
-        path = str(self._run_spec.get("accepted_gpkg") or "")
+        path = str(self._run_spec.get("accepted_target_gpkg") or "")
         if not path or not Path(path).is_file():
             return None
         layer = QgsVectorLayer(
             f"{path}|layername={LAYER_NAMES.ACCEPTED}", "accepted_for_topology", "ogr"
         )
-        return layer if layer.isValid() else None
+        if not layer.isValid():
+            raise ValueError(f"无法打开长期 accepted_labels: {path}")
+        return layer
 
     def _check_topology(self):
         if not self._final_path:
@@ -2102,7 +2104,7 @@ class ClassRefinementDialog(QDialog):
         try:
             count = accepted_writer.append_final_to_accepted(
                 self._final_path,
-                str(self._run_spec.get("accepted_gpkg") or ""),
+                str(self._run_spec.get("accepted_target_gpkg") or ""),
                 str(Path(self._run_spec["run_dir"]) / "run_manifest.json"),
             )
             self.baseline_label.setText(f"已写入 accepted_labels: {count} 个面")

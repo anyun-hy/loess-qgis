@@ -183,7 +183,7 @@ def load_manual_run(run_directory) -> dict:
     spec["run_dir"] = str(run_root)
     spec["manual_only"] = True
     spec["workflow_mode"] = "manual_run_copy"
-    spec["accepted_gpkg"] = str(run_root / "accepted_labels.gpkg")
+    spec["accepted_target_gpkg"] = str(run_root / "accepted_labels.gpkg")
     state_db = run_root / "state.sqlite"
     if state_db.is_file():
         spec["state_db"] = str(state_db)

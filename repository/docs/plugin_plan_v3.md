@@ -402,10 +402,13 @@ E5S 自动验收必须覆盖：两面共享同一开放拟合线、一个环依�
 
 所有模型流和 Fusion 流在进入审核前都执行同一规则：
 
+- Run 创建前先对长期 `accepted_labels` 做全库审计：标准字段、Polygon/MultiPolygon、CRS 与影像一致、几何有效且正面积、14 类映射、`reviewed=1`、`(run_id, object_id, part_id)` 身份唯一，以及同类/异类不得发生超过数值噪声阈值的面积重叠。任一项失败就阻止创建 Run，不能把无效确认库静默当成空库。
 - accepted 完全覆盖的 tile 已在推理前跳过。
 - 部分重叠 tile 的候选面在 polygonize 后与 accepted 做 difference。
 - 一个对象被切成多个残片时保留 object_id，重新分配 part_id。
 - 跨 accepted 边界的地物允许被截断，依赖人工修正。
+
+推理使用的 `accepted_gpkg` 固定为 Run 内只读 `accepted_snapshot.gpkg`，并冻结 SHA256；长期写入位置单独记录为 `accepted_target_gpkg`。快照只服务于本次 skip/difference，任何最终入库路径都不得指向快照。`accepted_target_gpkg` 是可增长的长期标签库，因此不冻结文件哈希；最终写入前必须重新读取和审计当前文件，覆盖 Run 执行期间可能发生的外部变化。
 
 模型流可以继续作为地图对照层，但“分类修整与组装”只能从一个 `ready` 且 `approved` 的 Fusion 流初始化。difference 后的 Fusion 矢量是类别工作层的不可变基准快照。
 
@@ -428,6 +431,7 @@ output/
         ├── run_state.sqlite
         ├── config_snapshot.json
         ├── class_mapping_snapshot.json
+        ├── accepted_snapshot.gpkg
         ├── models/
         │   └── <model_id>/
         │       ├── mask_mosaic.vrt
@@ -666,9 +670,10 @@ SAM3 失败时不得生成 fallback 成功结果，也不得修改工作层。UI
 2. 修复可安全修复的基础几何有效性，但不自动决定类别边界归属。
 3. 追加为 `final_composite`，保留来源追溯字段。
 4. 检查同类重复、异类重叠、目标范围内缝隙、无效几何和空几何。
-5. 所有问题写入 `topology_issues`，不自动裁掉某一类别。
-6. 用户在 QGIS 中修复 final_composite 后重新检查。
-7. 拓扑检查通过或用户明确带问题确认后，才允许写入 accepted_labels。
+5. 重新读取当前长期 `accepted_target_gpkg`；`final_composite` 与既有确认面的任何实质面积重叠写为高严重度 `accepted_overlap`，不自动裁掉新旧任一侧。
+6. 所有问题写入 `topology_issues`，不自动裁掉某一类别。
+7. 用户在 QGIS 中修复 final_composite 后重新检查。
+8. 普通拓扑问题通过或用户明确带问题确认后才允许尝试写入；`accepted_overlap` 属于不可覆盖的写入硬门槛，写入器必须独立复查并拒绝，不能由“带问题入库”绕过。
 
 `topology_issues` 字段至少包括：
 
@@ -696,10 +701,14 @@ sam_session_id | sam_score | reviewed | created_at | updated_at
 
 - class_code 与 class_name 一致。
 - geometry 有效且非空。
-- object_id 在库内不冲突。
+- `(run_id, object_id, part_id)` 在库内不冲突；同一逻辑对象允许因 difference 保留相同 object_id 和不同 part_id。
 - 同一 run 的 feature 不重复接受。
 - source_stream_id 必须是初始化类别工作区的 Fusion 基准，并可追溯到 run_manifest。
 - geometry_source 与 revision、edit_base、sam_session_id 的组合符合第 11.1 节契约。
+- `run_manifest` 必须为 ready，且其中 `run_spec_sha256` 与磁盘上的 Schema v2 `run_spec.json` 一致。
+- 传入写入路径必须与 `accepted_target_gpkg` 完全一致，并且不得等于 `accepted_gpkg` 只读快照。
+- 写入器重新执行当前长期确认库的全库完整性审计，并验证其 CRS 与 `final_composite` 一致。
+- `final_composite` 与既有确认面不得发生超过 `abs(pixel_width * pixel_height) * 1e-6`（下限 `1e-18`）的面积重叠；该阈值只吸收坐标计算噪声，不使用常规“一像素”拓扑容差。
 
 写入后 `source=class_working`，`source_stream_id` 保留 Fusion 基准；真正的边界来源由 `geometry_source/edit_base/sam_session_id` 表达，禁止再用 `refined_id` 或独立 SAM3 图层推断。
 
@@ -1069,6 +1078,9 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 - mosaic 重叠区按二维 cosine window 在 14 类概率空间加权，归一化后再统一生成 mask/confidence；Partition 结果与小范围整幅参考一致，禁止回退到中心线硬切。
 - Core raster 分块、VRT、scale、CRS、完整 affine、类别顺序、nodata、哈希和量化误差测试。
 - raw/formal/report 齐全性、哈希和 resume 失效测试；SQLite 报告摘要与 JSON Artifact 哈希必须一致，摘要完整时最终组装不得重复解析无诊断 JSON；任一拟合或 Seam/Junction 失败时不得留下 ready formal。
+- accepted 全库审计测试覆盖字段缺失、错误类别映射、`reviewed!=1`、无效几何、重复复合身份、同类重叠和异类重叠；Run 创建前任一错误必须阻止。
+- accepted 快照/长期目标分离测试冻结 `accepted_gpkg` 快照 SHA，同时验证最终写入只允许 `accepted_target_gpkg`，目标路径不一致或等于快照时必须阻止。
+- final/accepted 重叠双门测试同时验证 `topology_issues.accepted_overlap` 和写入器独立拒绝；即使跳过拓扑或勾选带问题入库，长期确认库哈希也不得变化。
 - 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 SQLite 连接。
 - raster affine 像素坐标往返测试，覆盖 EPSG:4490、负像元高、旋转/剪切 transform，禁止直接把 px 当地图单位。
 - Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致，输出间距稳定。

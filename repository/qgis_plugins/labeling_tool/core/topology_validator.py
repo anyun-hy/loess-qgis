@@ -24,6 +24,7 @@ from qgis.core import (
 from .layer_names import LAYER_NAMES
 from .qgis_writer import write_vector_layer
 from .run_state_db import RunStateDB
+from . import accepted_integrity
 
 
 ISSUE_FIELDS = [
@@ -200,7 +201,32 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
             )
 
     target = _selected_tile_target(run_spec)
-    if accepted_layer is not None and accepted_layer.isValid() and accepted_layer.featureCount() > 0:
+    if accepted_layer is not None and accepted_layer.isValid():
+        accepted_tolerance = accepted_integrity.strict_overlap_tolerance(run_spec)
+        accepted_integrity.audit_accepted_layer(
+            accepted_layer,
+            overlap_tolerance=accepted_tolerance,
+            expected_crs=final.crs(),
+        )
+        for final_feature, accepted_feature, intersection in (
+            accepted_integrity.assert_no_accepted_overlap(
+                final,
+                accepted_layer,
+                overlap_tolerance=accepted_tolerance,
+                raise_on_overlap=False,
+            )
+        ):
+            add_issue(
+                "accepted_overlap",
+                intersection,
+                final_feature,
+                accepted_feature,
+                severity="high",
+                message=(
+                    "final_composite overlaps the existing accepted_labels; "
+                    "this issue cannot be overridden during accepted write"
+                ),
+            )
         accepted_geometries = []
         transform = None
         if accepted_layer.crs() != final.crs():

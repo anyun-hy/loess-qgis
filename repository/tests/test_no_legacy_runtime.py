@@ -96,3 +96,39 @@ def test_accepted_labels_has_no_direct_candidate_bypass():
     ):
         assert forbidden not in dock
         assert forbidden not in writer
+
+
+def test_accepted_labels_are_audited_and_snapshot_is_not_the_write_target():
+    dock = (ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py").read_text(
+        encoding="utf-8"
+    )
+    builder = (
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "run_builder_v5.py"
+    ).read_text(encoding="utf-8")
+    dialog = (
+        ROOT
+        / "qgis_plugins"
+        / "labeling_tool"
+        / "gui"
+        / "class_refinement_dialog.py"
+    ).read_text(encoding="utf-8")
+    assert "audit_accepted_layer(" in dock
+    assert '"accepted_validation":' in builder
+    assert '"accepted_target_gpkg":' in builder
+    assert 'get("accepted_target_gpkg")' in dialog
+    assert "append_final_to_accepted" in dialog
+
+
+def test_final_overlap_with_accepted_is_blocked_twice():
+    topology = (
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "topology_validator.py"
+    ).read_text(encoding="utf-8")
+    writer = (
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "accepted_writer.py"
+    ).read_text(encoding="utf-8")
+    assert '"accepted_overlap"' in topology
+    assert "assert_no_accepted_overlap(" in topology
+    assert "audit_accepted_layer(" in writer
+    assert "assert_no_accepted_overlap(" in writer
+    assert "accepted_target_gpkg" in writer
+    assert "run_spec_sha256" in writer

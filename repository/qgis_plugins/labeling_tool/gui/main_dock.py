@@ -86,6 +86,7 @@ class RectangleMapTool(QgsMapTool):
 from ..core import (
     tile_manager,
     difference_filter,
+    accepted_integrity,
     class_workspace,
     manual_run_loader,
 )
@@ -1220,6 +1221,7 @@ class LabelingDockWidget(QgsDockWidget):
         if not output_gpkg:
             QMessageBox.warning(self, "错误", "请设置输出 GPKG 路径")
             return
+        output_gpkg = os.path.abspath(os.path.expanduser(output_gpkg))
 
         try:
             extent = self._get_extent_in_raster_crs(raster)
@@ -1280,16 +1282,43 @@ class LabelingDockWidget(QgsDockWidget):
         os.makedirs(output_dir, exist_ok=True)
 
         accepted_layer = None
-        if self.skip_accepted_check.isChecked():
-            acc_path = output_gpkg
-            if os.path.exists(acc_path):
-                accepted_layer = QgsVectorLayer(
-                    f"{acc_path}|layername={LAYER_NAMES.ACCEPTED}",
-                    "accepted",
-                    "ogr",
+        accepted_validation = {
+            "status": "passed",
+            "feature_count": 0,
+            "overlap_pair_count": 0,
+            "overlap_tolerance": max(
+                abs(
+                    float(raster.rasterUnitsPerPixelX())
+                    * float(raster.rasterUnitsPerPixelY())
                 )
-                if not accepted_layer.isValid():
-                    accepted_layer = None
+                * 1.0e-6,
+                1.0e-18,
+            ),
+            "crs": raster.crs().authid(),
+            "source": "not_present",
+        }
+        if os.path.exists(output_gpkg):
+            target_accepted_layer = QgsVectorLayer(
+                f"{output_gpkg}|layername={LAYER_NAMES.ACCEPTED}",
+                "accepted",
+                "ogr",
+            )
+            try:
+                accepted_validation = accepted_integrity.audit_accepted_layer(
+                    target_accepted_layer,
+                    overlap_tolerance=accepted_validation["overlap_tolerance"],
+                    expected_crs=raster.crs(),
+                )
+                accepted_validation["source"] = "existing_target"
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "已确认区域审计失败",
+                    "本次 Run 尚未创建。请先修复 accepted_labels：\n" + str(exc),
+                )
+                return
+            if self.skip_accepted_check.isChecked():
+                accepted_layer = target_accepted_layer
 
         skipped_tiles = []
         if accepted_layer is not None:
@@ -1337,6 +1366,7 @@ class LabelingDockWidget(QgsDockWidget):
             "effective": effective,
             "report": report,
             "accepted_layer": accepted_layer,
+            "accepted_validation": accepted_validation,
             "selected_model_ids": list(resolved_ids),
             "fusion_profile_id": self._fusion_profile_id,
             "boundary_smoothing_enabled": self._boundary_smoothing_enabled,
@@ -1536,6 +1566,8 @@ class LabelingDockWidget(QgsDockWidget):
                 storage_report=storage,
                 fusion=fusion,
                 accepted_gpkg=ctx.get("accepted_snapshot") or "",
+                accepted_target_gpkg=ctx["output_gpkg"],
+                accepted_validation=ctx.get("accepted_validation") or {},
                 skip_accepted=self.skip_accepted_check.isChecked(),
                 config_fingerprint=report.get("config_fingerprint", ""),
                 range_selection=ctx.get("range_selection") or {},

@@ -62,6 +62,8 @@ def create_v5_run(
     storage_report: Mapping[str, Any],
     fusion: Mapping[str, Any] | None = None,
     accepted_gpkg: str | Path = "",
+    accepted_target_gpkg: str | Path = "",
+    accepted_validation: Mapping[str, Any] | None = None,
     skip_accepted: bool = True,
     config_fingerprint: str = "",
     range_selection: Mapping[str, Any] | None = None,
@@ -199,6 +201,11 @@ def create_v5_run(
     accepted_path = (
         Path(accepted_gpkg).expanduser().resolve() if accepted_gpkg else None
     )
+    accepted_target_path = (
+        Path(accepted_target_gpkg).expanduser().resolve()
+        if accepted_target_gpkg
+        else None
+    )
     accepted_sha256 = (
         sha256_file(accepted_path) if accepted_path is not None and accepted_path.is_file() else ""
     )
@@ -259,6 +266,10 @@ def create_v5_run(
         "streams": stream_values,
         "accepted_gpkg": str(accepted_path) if accepted_path is not None else "",
         "accepted_gpkg_sha256": accepted_sha256,
+        "accepted_target_gpkg": (
+            str(accepted_target_path) if accepted_target_path is not None else ""
+        ),
+        "accepted_validation": dict(accepted_validation or {}),
         "skip_accepted": bool(skip_accepted),
         "class_mapping_snapshot": str(class_path),
         "config_snapshot": str(config_snapshot_path),

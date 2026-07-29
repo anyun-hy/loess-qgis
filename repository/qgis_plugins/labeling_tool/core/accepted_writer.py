@@ -1,4 +1,6 @@
+import json
 import os
+from pathlib import Path
 
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsVectorFileWriter, QgsFeature,
@@ -8,6 +10,8 @@ from qgis.PyQt.QtCore import Qt, QVariant, QDateTime
 
 from .layer_names import LAYER_NAMES
 from .qgis_writer import write_vector_layer
+from .run_spec import CLASS_NAMES, sha256_file
+from . import accepted_integrity
 
 ACCEPTED_FIELDS = [
     ("run_id", QVariant.String),
@@ -36,23 +40,6 @@ ACCEPTED_FIELDS = [
 ACCEPTED_FIELDS_QGS = [QgsField(name, typ) for name, typ in ACCEPTED_FIELDS]
 
 
-def _ensure_accepted_schema(layer):
-    existing = {field.name() for field in layer.fields()}
-    missing = [QgsField(name, typ) for name, typ in ACCEPTED_FIELDS if name not in existing]
-    if not missing:
-        return layer
-    if not layer.startEditing():
-        raise RuntimeError("cannot start accepted_labels schema migration")
-    for field in missing:
-        if not layer.addAttribute(field):
-            layer.rollBack()
-            raise RuntimeError(f"cannot add accepted_labels field: {field.name()}")
-    if not layer.commitChanges():
-        errors = "; ".join(layer.commitErrors())
-        layer.rollBack()
-        raise RuntimeError(f"cannot commit accepted_labels schema migration: {errors}")
-    return layer
-
 def _build_accepted_fields_qgs():
     fields = []
     for name, typ in ACCEPTED_FIELDS:
@@ -68,7 +55,10 @@ def get_accepted_layer(gpkg_path, crs=None):
         uri = f"{gpkg_path}|layername={LAYER_NAMES.ACCEPTED}"
         layer = QgsVectorLayer(uri, LAYER_NAMES.ACCEPTED, "ogr")
         if layer.isValid():
-            return _ensure_accepted_schema(layer)
+            return layer
+        raise RuntimeError(
+            f"existing GeoPackage has no valid {LAYER_NAMES.ACCEPTED} layer: {gpkg_path}"
+        )
 
     mem_layer = QgsVectorLayer(
         f"MultiPolygon?crs={crs}", LAYER_NAMES.ACCEPTED, "memory"
@@ -93,16 +83,52 @@ def get_accepted_layer(gpkg_path, crs=None):
 
     uri = f"{gpkg_path}|layername={LAYER_NAMES.ACCEPTED}"
     layer = QgsVectorLayer(uri, LAYER_NAMES.ACCEPTED, "ogr")
-    return _ensure_accepted_schema(layer) if layer.isValid() else layer
+    return layer
+
+
+def _verified_run_spec(manifest, run_manifest_path):
+    run_spec_value = str(manifest.get("run_spec") or "").strip()
+    if not run_spec_value:
+        raise ValueError("run_manifest 缺少 run_spec 路径")
+    run_spec_path = Path(run_spec_value).expanduser()
+    if not run_spec_path.is_absolute():
+        run_spec_path = Path(run_manifest_path).resolve().parent / run_spec_path
+    run_spec_path = run_spec_path.resolve()
+    expected_sha = str(manifest.get("run_spec_sha256") or "")
+    if (
+        not run_spec_path.is_file()
+        or not expected_sha
+        or sha256_file(run_spec_path) != expected_sha
+    ):
+        raise ValueError("run_spec 不存在或 SHA256 与 run_manifest 不一致")
+    with open(run_spec_path, "r", encoding="utf-8") as handle:
+        run_spec = json.load(handle)
+    if str(run_spec.get("run_id") or "") != str(manifest.get("run_id") or ""):
+        raise ValueError("run_spec 与 run_manifest 的 run_id 不一致")
+    return run_spec
 
 
 def append_final_to_accepted(final_path, accepted_path, run_manifest_path):
-    import json
-
     with open(run_manifest_path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     if manifest.get("status") != "ready":
         raise ValueError("run_manifest must be ready before accepted_labels write")
+    run_spec = _verified_run_spec(manifest, run_manifest_path)
+    expected_target_value = str(run_spec.get("accepted_target_gpkg") or "").strip()
+    if not expected_target_value:
+        raise ValueError("run_spec 缺少 accepted_target_gpkg，禁止写入 Run 快照")
+    if not str(accepted_path or "").strip():
+        raise ValueError("accepted_labels 写入目标为空")
+    expected_target = Path(expected_target_value).expanduser().resolve()
+    actual_target = Path(accepted_path).expanduser().resolve()
+    if actual_target != expected_target:
+        raise ValueError(
+            f"accepted_labels 写入目标与 run_spec 不一致: {actual_target}/{expected_target}"
+        )
+    snapshot_value = str(run_spec.get("accepted_gpkg") or "").strip()
+    if snapshot_value and Path(snapshot_value).expanduser().resolve() == actual_target:
+        raise ValueError("accepted_labels 长期写入目标不得等于 Run 只读快照")
+
     manifest_run_id = str(manifest.get("run_id") or "")
     valid_streams = {
         str(item.get("stream_id"))
@@ -114,24 +140,38 @@ def append_final_to_accepted(final_path, accepted_path, run_manifest_path):
     )
     if not final.isValid():
         raise RuntimeError(f"cannot open final_composite: {final_path}")
-    accepted = get_accepted_layer(accepted_path, final.crs().authid())
-    if not accepted.isValid():
-        raise RuntimeError(f"cannot open accepted_labels: {accepted_path}")
-    accepted = _ensure_accepted_schema(accepted)
-    existing_object_ids = {
-        str(feature.attribute("object_id") or "")
-        for feature in accepted.getFeatures()
-        if str(feature.attribute("object_id") or "")
-    }
+    overlap_tolerance = accepted_integrity.strict_overlap_tolerance(run_spec)
+    accepted = None
+    existing_identities = set()
+    if actual_target.is_file():
+        accepted = get_accepted_layer(str(actual_target), final.crs().authid())
+        accepted_integrity.audit_accepted_layer(
+            accepted,
+            overlap_tolerance=overlap_tolerance,
+            expected_crs=final.crs(),
+        )
+        accepted_integrity.assert_no_accepted_overlap(
+            final,
+            accepted,
+            overlap_tolerance=overlap_tolerance,
+        )
+        existing_identities = {
+            (
+                str(feature.attribute("run_id") or ""),
+                str(feature.attribute("object_id") or ""),
+                str(feature.attribute("part_id") or ""),
+            )
+            for feature in accepted.getFeatures()
+            if str(feature.attribute("object_id") or "")
+        }
     accepted_in_run = set()
-    pending = []
+    validated_features = []
     for feature in final.getFeatures():
         geometry = feature.geometry()
         if geometry is None or geometry.isNull() or geometry.isEmpty() or not geometry.isGeosValid():
             raise ValueError(f"invalid final geometry for feature {feature.id()}")
         class_code = int(feature.attribute("class_code"))
         class_name = str(feature.attribute("class_name"))
-        from .run_spec import CLASS_NAMES
         if CLASS_NAMES.get(class_code) != class_name:
             raise ValueError(f"class mapping mismatch: {class_code}/{class_name}")
         feature_run_id = str(feature.attribute("run_id") or "")
@@ -145,13 +185,31 @@ def append_final_to_accepted(final_path, accepted_path, run_manifest_path):
         object_id = str(feature.attribute("object_id") or "")
         part_id = str(feature.attribute("part_id") or "000")
         run_key = (feature_run_id, object_id, part_id)
-        if not object_id or object_id in existing_object_ids or run_key in accepted_in_run:
+        if (
+            not object_id
+            or not part_id
+            or run_key in existing_identities
+            or run_key in accepted_in_run
+        ):
             raise ValueError(f"duplicate or empty accepted object identity: {run_key}")
         _validate_provenance(feature)
-        existing_object_ids.add(object_id)
+        existing_identities.add(run_key)
         accepted_in_run.add(run_key)
+        validated_features.append(QgsFeature(feature))
+    if accepted is None:
+        actual_target.parent.mkdir(parents=True, exist_ok=True)
+        accepted = get_accepted_layer(str(actual_target), final.crs().authid())
+        if not accepted.isValid():
+            raise RuntimeError(f"cannot open accepted_labels: {actual_target}")
+        accepted_integrity.audit_accepted_layer(
+            accepted,
+            overlap_tolerance=overlap_tolerance,
+            expected_crs=final.crs(),
+        )
+    pending = []
+    for feature in validated_features:
         output = QgsFeature(accepted.fields())
-        output.setGeometry(geometry)
+        output.setGeometry(feature.geometry())
         for name, _type in ACCEPTED_FIELDS:
             if name == "reviewed":
                 value = 1

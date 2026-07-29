@@ -230,4 +230,4 @@ def test_ubuntu_plugin_version_marks_queue_hardening():
         / "metadata.txt"
     ).read_text(encoding="utf-8")
 
-    assert "version=0.3.0-linux.3" in metadata
+    assert "version=0.3.0-linux.4" in metadata
