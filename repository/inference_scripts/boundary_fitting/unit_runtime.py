@@ -18,7 +18,7 @@ from fiona.crs import CRS
 from rasterio.features import geometry_mask, shapes
 from rasterio.windows import Window
 from shapely.affinity import affine_transform
-from shapely.geometry import MultiPolygon, Polygon, mapping, shape
+from shapely.geometry import LineString, MultiPolygon, Polygon, mapping, shape
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_ROOT = ROOT / "qgis_plugins"
@@ -229,6 +229,34 @@ def _write_gpkg(
             }
         )
     schema = {"geometry": "MultiPolygon", "properties": properties}
+
+    def feature_records():
+        for record in records:
+            values = {
+                "polygon_id": str(record["polygon_id"]),
+                "class_code": int(record["class_code"]),
+                "conf_mean": float(record.get("confidence_mean", 0.0)),
+                "conf_std": float(record.get("confidence_std", 0.0)),
+            }
+            if include_fit:
+                values.update(
+                    {
+                        "fit_method": str(record["fit_method"]),
+                        "fit_status": str(record["fit_status"]),
+                        "fit_version": str(record["fit_version"]),
+                        "vtx_before": int(record["vertex_count_before"]),
+                        "vtx_after": int(record["vertex_count_after"]),
+                        "max_shift": float(record["max_shift_px"]),
+                        "mean_shift": float(record["mean_shift_px"]),
+                        "area_ratio": float(record["area_change_ratio"]),
+                    }
+                )
+            map_geometry = _to_map_geometry(record["geometry"], transform)
+            yield {
+                "geometry": mapping(_multipolygon(map_geometry)),
+                "properties": values,
+            }
+
     try:
         with fiona.open(
             temporary,
@@ -238,34 +266,100 @@ def _write_gpkg(
             schema=schema,
             crs=CRS.from_user_input(crs),
         ) as destination:
-            for record in records:
-                values = {
-                    "polygon_id": str(record["polygon_id"]),
-                    "class_code": int(record["class_code"]),
-                    "conf_mean": float(record.get("confidence_mean", 0.0)),
-                    "conf_std": float(record.get("confidence_std", 0.0)),
-                }
-                if include_fit:
-                    values.update(
-                        {
-                            "fit_method": str(record["fit_method"]),
-                            "fit_status": str(record["fit_status"]),
-                            "fit_version": str(record["fit_version"]),
-                            "vtx_before": int(record["vertex_count_before"]),
-                            "vtx_after": int(record["vertex_count_after"]),
-                            "max_shift": float(record["max_shift_px"]),
-                            "mean_shift": float(record["mean_shift_px"]),
-                            "area_ratio": float(record["area_change_ratio"]),
-                        }
-                    )
-                map_geometry = _to_map_geometry(record["geometry"], transform)
-                destination.write(
-                    {
-                        "geometry": mapping(_multipolygon(map_geometry)),
-                        "properties": values,
-                    }
-                )
+            destination.writerecords(feature_records())
         os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _diagnostic_feature_records(
+    report: Mapping[str, Any],
+    *,
+    run_id: str,
+    stream_id: str,
+    unit_id: str,
+    transform: Affine,
+):
+    for edge in report.get("diagnostics") or []:
+        if edge.get("method") not in {"line", "spline", "cubic_bspline"} and not str(
+            edge.get("status") or ""
+        ).startswith("failed"):
+            continue
+        points = edge.get("fitted_points") or []
+        if len(points) < 2:
+            continue
+        yield {
+            "geometry": mapping(_to_map_geometry(LineString(points), transform)),
+            "properties": {
+                "run_id": str(run_id),
+                "stream_id": str(stream_id),
+                "unit_id": str(unit_id),
+                "chain_id": str(edge.get("chain_id") or ""),
+                "method": str(edge.get("method") or "unchanged"),
+                "status": str(edge.get("status") or ""),
+                "max_shift": float(edge.get("max_displacement_px") or 0.0),
+            },
+        }
+
+
+def _write_diagnostic_gpkg(
+    path: Path,
+    report: Mapping[str, Any],
+    *,
+    run_id: str,
+    stream_id: str,
+    unit_id: str,
+    transform: Affine,
+    crs: str,
+) -> int:
+    edge_count = sum(
+        1
+        for _item in _diagnostic_feature_records(
+            report,
+            run_id=run_id,
+            stream_id=stream_id,
+            unit_id=unit_id,
+            transform=transform,
+        )
+    )
+    if edge_count == 0:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
+    temporary.unlink(missing_ok=True)
+    schema = {
+        "geometry": "LineString",
+        "properties": {
+            "run_id": "str:48",
+            "stream_id": "str:96",
+            "unit_id": "str:96",
+            "chain_id": "str:96",
+            "method": "str:24",
+            "status": "str:32",
+            "max_shift": "float",
+        },
+    }
+    try:
+        with fiona.open(
+            temporary,
+            "w",
+            driver="GPKG",
+            layer="fitted_edges",
+            schema=schema,
+            crs=CRS.from_user_input(crs),
+        ) as destination:
+            destination.writerecords(
+                _diagnostic_feature_records(
+                    report,
+                    run_id=run_id,
+                    stream_id=stream_id,
+                    unit_id=unit_id,
+                    transform=transform,
+                )
+            )
+        os.replace(temporary, path)
+        return edge_count
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -616,6 +710,7 @@ def run_unit_fit(
         raw_path = output_root / f"{unit_id}_raw.gpkg"
         formal_path = output_root / f"{unit_id}_formal.gpkg"
         report_path = output_root / f"{unit_id}_report.json"
+        fitted_edges_path = output_root / f"{unit_id}_fitted_edges.gpkg"
         _write_gpkg(
             raw_path,
             raw_records,
@@ -643,15 +738,28 @@ def run_unit_fit(
                 "elapsed_sec": round(time.monotonic() - started_at, 3),
             }
         )
+        fitted_edge_count = _write_diagnostic_gpkg(
+            fitted_edges_path,
+            report,
+            run_id=run_id,
+            stream_id=stream_id,
+            unit_id=unit_id,
+            transform=transform,
+            crs=spec["raster"]["crs"],
+        )
+        report["fitted_edge_count"] = fitted_edge_count
         from semantic_batch import _atomic_json
 
         _atomic_json(report_path, report)
         emit("rebuild_finished", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
-        for kind, path in (
+        artifacts = [
             ("unit_raw", raw_path),
             ("unit_formal", formal_path),
             ("unit_boundary_report", report_path),
-        ):
+        ]
+        if fitted_edge_count:
+            artifacts.append(("unit_fitted_edges", fitted_edges_path))
+        for kind, path in artifacts:
             _commit_artifact(
                 database,
                 run_id,
@@ -660,6 +768,13 @@ def run_unit_fit(
                 stream_id=stream_id,
                 unit_id=unit_id,
             )
+        database.upsert_unit_report_summary(
+            run_id,
+            stream_id,
+            unit_id,
+            report,
+            fitted_edge_count=fitted_edge_count,
+        )
         database.set_stream_unit_status(run_id, stream_id, unit_id, "ready")
         if not database.finish_job(job_id, lease_token, status="ready"):
             raise UnitRuntimeError("unit job lease expired before commit")

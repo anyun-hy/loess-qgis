@@ -8,16 +8,14 @@ import json
 import os
 import sqlite3
 import sys
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from queue import Empty, Full, Queue
-from threading import BoundedSemaphore, Event, Lock, Thread
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import fiona
-from affine import Affine
 from fiona.crs import CRS
-from shapely.geometry import LineString, mapping, shape
-from shapely.affinity import affine_transform
+from shapely.geometry import shape
 from shapely.strtree import STRtree
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,8 +37,8 @@ class StreamAssemblyError(RuntimeError):
     pass
 
 
-REPORT_QUEUE_CAPACITY = 32
-_REPORT_QUEUE_SENTINEL = object()
+ASSEMBLY_VALIDATION_MAX_IN_FLIGHT = 32
+OBJECT_ID_BATCH_SIZE = 512
 
 
 def _stream_root(spec: Mapping[str, Any], stream: Mapping[str, Any]) -> Path:
@@ -104,6 +102,7 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
     return {
         "byte_count": int(after.st_size),
         "sha256": str(digest),
+        "mtime_ns": int(after.st_mtime_ns),
     }
 
 
@@ -246,123 +245,194 @@ def _assert_fingerprint_unchanged(
         raise StreamAssemblyError(f"resume input changed during report assembly: {path}")
 
 
-def _queue_put(queue: Queue, item: Any, stop_event: Event) -> bool:
-    while not stop_event.is_set():
-        try:
-            queue.put(item, timeout=0.1)
-            return True
-        except Full:
-            continue
-    return False
+def _feature_batches(path: str | Path, *, size: int = OBJECT_ID_BATCH_SIZE):
+    batch = []
+    with fiona.open(path, layer="polygons") as source:
+        for feature in source:
+            batch.append(feature)
+            if len(batch) >= int(size):
+                yield batch
+                batch = []
+    if batch:
+        yield batch
 
 
-def _consume_reports(
-    report_artifacts: list[Mapping[str, Any]],
-    consumer: Callable[[str, Mapping[str, Any]], None],
-) -> dict[str, int]:
-    """Read reports in one producer and process them in one ordered consumer."""
-    queue: Queue = Queue(maxsize=REPORT_QUEUE_CAPACITY)
-    loaded_slots = BoundedSemaphore(REPORT_QUEUE_CAPACITY)
-    stop_event = Event()
-    counter_lock = Lock()
-    producer_errors: list[tuple[Path, Exception]] = []
-    loaded_count = 0
-    max_loaded_count = 0
-    processed_count = 0
-    ordered_artifacts = sorted(
-        report_artifacts,
-        key=lambda item: (str(item["unit_id"]), int(item.get("artifact_id") or 0)),
+def _assembly_validation_workers(
+    spec: Mapping[str, Any],
+    item_count: int,
+) -> int:
+    configured = int(
+        (spec.get("scaling") or {}).get("assembly_validation_workers")
+        or min(8, max(2, (os.cpu_count() or 2) - 2))
     )
+    return max(1, min(configured, ASSEMBLY_VALIDATION_MAX_IN_FLIGHT, item_count))
 
-    def update_loaded(delta: int) -> None:
-        nonlocal loaded_count, max_loaded_count
-        with counter_lock:
-            loaded_count += int(delta)
-            max_loaded_count = max(max_loaded_count, loaded_count)
 
-    def acquire_loaded_slot() -> bool:
-        while not stop_event.is_set():
-            if loaded_slots.acquire(timeout=0.1):
-                return True
-        return False
+def _parallel_validate_summary_artifacts(
+    items: list[Mapping[str, Any]],
+    *,
+    workers: int,
+    edge_schema: Mapping[str, Any],
+    crs: Any,
+    run_id: str,
+    stream_id: str,
+) -> dict[str, Any]:
+    """Validate immutable report/edge shards with a bounded future window."""
+    if not items:
+        return {
+            "workers": 0,
+            "peak_in_flight": 0,
+            "artifact_count": 0,
+            "elapsed_sec": 0.0,
+        }
+    started_at = time.monotonic()
+    peak_in_flight = 0
 
-    def producer() -> None:
-        for artifact in ordered_artifacts:
-            if not acquire_loaded_slot():
-                return
-            path = Path(str(artifact["path"]))
+    def validate(item: Mapping[str, Any]) -> None:
+        artifact = item["artifact"]
+        path = Path(str(artifact["path"]))
+        if str(item["kind"]) == "edge":
+            fingerprint = _validate_existing_gpkg(
+                path,
+                layer="fitted_edges",
+                schema=edge_schema,
+                crs=crs,
+                identity={
+                    "run_id": run_id,
+                    "stream_id": stream_id,
+                    "unit_id": str(artifact["unit_id"]),
+                },
+                expected_feature_count=int(item["expected_feature_count"]),
+            )
+        else:
+            if not path.is_file():
+                raise StreamAssemblyError(f"unit report Artifact is missing: {path}")
+            fingerprint = _file_fingerprint(path)
+        if (
+            int(artifact["byte_count"]) != int(fingerprint["byte_count"])
+            or str(artifact["sha256"]) != str(fingerprint["sha256"])
+        ):
+            raise StreamAssemblyError(
+                f"unit {item['kind']} Artifact changed: {path}"
+            )
+
+    iterator = iter(items)
+    pending = set()
+    with ThreadPoolExecutor(
+        max_workers=max(1, int(workers)),
+        thread_name_prefix="assembly-validator",
+    ) as executor:
+        while len(pending) < ASSEMBLY_VALIDATION_MAX_IN_FLIGHT:
             try:
-                report = load_json(path)
-                if not isinstance(report, Mapping):
-                    raise StreamAssemblyError(
-                        f"unit boundary report must be a JSON object: {path}"
-                    )
-                update_loaded(1)
-            except Exception as error:
-                loaded_slots.release()
-                producer_errors.append((path, error))
-                _queue_put(queue, _REPORT_QUEUE_SENTINEL, stop_event)
-                return
-            if not _queue_put(
-                queue,
-                (str(artifact["unit_id"]), report),
-                stop_event,
-            ):
-                del report
-                update_loaded(-1)
-                loaded_slots.release()
-                return
-            del report
-        _queue_put(queue, _REPORT_QUEUE_SENTINEL, stop_event)
-
-    thread = Thread(
-        target=producer,
-        name="boundary-report-producer",
-        daemon=True,
-    )
-    thread.start()
-    try:
-        while True:
-            item = queue.get()
-            if item is _REPORT_QUEUE_SENTINEL:
+                pending.add(executor.submit(validate, next(iterator)))
+            except StopIteration:
                 break
-            unit_id, report = item
-            try:
-                consumer(unit_id, report)
-                processed_count += 1
-            finally:
-                del report
-                del item
-                update_loaded(-1)
-                loaded_slots.release()
-    finally:
-        stop_event.set()
-        thread.join()
-        while True:
-            try:
-                queued = queue.get_nowait()
-            except Empty:
-                break
-            if queued is _REPORT_QUEUE_SENTINEL:
-                continue
-            del queued
-            update_loaded(-1)
-            loaded_slots.release()
-    if producer_errors:
-        path, error = producer_errors[0]
-        raise StreamAssemblyError(
-            f"cannot read unit boundary report: {path}: {error}"
-        ) from error
+        peak_in_flight = max(peak_in_flight, len(pending))
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                future.result()
+            while len(pending) < ASSEMBLY_VALIDATION_MAX_IN_FLIGHT:
+                try:
+                    pending.add(executor.submit(validate, next(iterator)))
+                except StopIteration:
+                    break
+            peak_in_flight = max(peak_in_flight, len(pending))
     return {
-        "processed_count": int(processed_count),
-        "max_loaded_count": int(max_loaded_count),
+        "workers": int(workers),
+        "peak_in_flight": int(peak_in_flight),
+        "artifact_count": len(items),
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
     }
 
 
-def _to_map_geometry(geometry, transform: Affine):
-    return affine_transform(
-        geometry,
-        [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f],
+def _validated_summary_inputs(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    run_id: str,
+    stream_id: str,
+    expected_units: int,
+    report_artifacts: list[Mapping[str, Any]],
+    edge_schema: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    summaries = database.unit_report_summaries(run_id, stream_id)
+    if len(summaries) != int(expected_units):
+        raise StreamAssemblyError(
+            "unit report summaries are incomplete; rerun unit fitting with the "
+            f"current Ubuntu runtime: {len(summaries)}/{expected_units}"
+        )
+    reports_by_unit = {
+        str(artifact["unit_id"]): dict(artifact)
+        for artifact in report_artifacts
+    }
+    summaries_by_unit = {
+        str(summary["unit_id"]): dict(summary)
+        for summary in summaries
+    }
+    if set(reports_by_unit) != set(summaries_by_unit):
+        raise StreamAssemblyError(
+            "unit report summaries do not match ready report Artifacts"
+        )
+    validation_items: list[dict[str, Any]] = []
+    for unit_id in sorted(summaries_by_unit):
+        summary = summaries_by_unit[unit_id]
+        artifact = reports_by_unit[unit_id]
+        if (
+            Path(str(summary["report_path"])).resolve()
+            != Path(str(artifact["path"])).resolve()
+            or int(summary["report_byte_count"]) != int(artifact["byte_count"])
+            or str(summary["report_sha256"]) != str(artifact["sha256"])
+        ):
+            raise StreamAssemblyError(
+                f"unit report summary fingerprint changed: {unit_id}"
+            )
+        validation_items.append(
+            {"kind": "report", "artifact": artifact}
+        )
+
+    edge_artifacts = database.artifacts_for_stream(
+        run_id,
+        stream_id,
+        kind="unit_fitted_edges",
+    )
+    edges_by_unit = {
+        str(artifact["unit_id"]): dict(artifact)
+        for artifact in edge_artifacts
+    }
+    expected_edge_units = {
+        unit_id
+        for unit_id, summary in summaries_by_unit.items()
+        if int(summary["fitted_edge_count"]) > 0
+    }
+    if set(edges_by_unit) != expected_edge_units:
+        missing = sorted(expected_edge_units - set(edges_by_unit))
+        unexpected = sorted(set(edges_by_unit) - expected_edge_units)
+        raise StreamAssemblyError(
+            "unit fitted-edge Artifacts do not match SQLite summaries; "
+            f"missing={missing[:3]}, unexpected={unexpected[:3]}"
+        )
+    for unit_id in sorted(edges_by_unit):
+        validation_items.append(
+            {
+                "kind": "edge",
+                "artifact": edges_by_unit[unit_id],
+                "expected_feature_count": int(
+                    summaries_by_unit[unit_id]["fitted_edge_count"]
+                ),
+            }
+        )
+    workers = _assembly_validation_workers(spec, len(validation_items))
+    validation = _parallel_validate_summary_artifacts(
+        validation_items,
+        workers=workers,
+        edge_schema=edge_schema,
+        crs=spec["raster"]["crs"],
+        run_id=run_id,
+        stream_id=stream_id,
+    )
+    return (
+        [edges_by_unit[unit_id] for unit_id in sorted(edges_by_unit)],
+        validation,
     )
 
 
@@ -412,12 +482,12 @@ def _reuse_ready_assembly(
             f"ready stream has a failed boundary report: {stream_id}"
         )
     report["assembly_mode"] = "reused"
-    report.setdefault("report_queue_capacity", REPORT_QUEUE_CAPACITY)
     report.setdefault(
         "report_processed_count",
         int(report.get("unit_count") or 0),
     )
-    report.setdefault("report_peak_loaded_count", None)
+    report.setdefault("report_summary_source", "sqlite")
+    report.setdefault("report_json_parse_count", 0)
     report["object_link_count"] = database.object_link_count(run_id, stream_id)
     print(
         json.dumps(
@@ -517,7 +587,6 @@ def _assemble_stream_impl(
     raw_by_unit = {str(item["unit_id"]): str(item["path"]) for item in raw_artifacts}
 
     transform = spec["raster"]["transform"]
-    affine = Affine(*[float(value) for value in transform])
     root = _stream_root(spec, stream)
     raw_path = root / "semantic_polygons_raw.gpkg"
     formal_path = root / "semantic_polygons.gpkg"
@@ -565,6 +634,35 @@ def _assemble_stream_impl(
             "created_at": "str:40",
         },
     }
+    edge_schema = {
+        "geometry": "LineString",
+        "properties": {
+            "run_id": "str:48",
+            "stream_id": "str:96",
+            "unit_id": "str:96",
+            "chain_id": "str:96",
+            "method": "str:24",
+            "status": "str:32",
+            "max_shift": "float",
+        },
+    }
+    edge_artifacts, summary_validation = _validated_summary_inputs(
+        spec,
+        database,
+        run_id,
+        stream_id,
+        expected_units,
+        report_artifacts,
+        edge_schema,
+    )
+    summary_aggregate = database.unit_report_summary_aggregate(
+        run_id,
+        stream_id,
+    )
+    if int(summary_aggregate["unit_count"]) != expected_units:
+        raise StreamAssemblyError(
+            "SQLite report aggregate does not cover every ready unit"
+        )
     model_id = str(stream.get("model_id") or "")
     profile_id = str(stream.get("profile_id") or "")
     version = str(stream.get("version") or "")
@@ -616,19 +714,19 @@ def _assemble_stream_impl(
     else:
         for artifact in formal_artifacts:
             unit_id = str(artifact["unit_id"])
-            features = _read_features(artifact["path"])
-            database.register_object_parts(
-                run_id,
-                stream_id,
-                (
-                    {
-                        "part_id": str(feature["properties"]["polygon_id"]),
-                        "class_code": int(feature["properties"]["class_code"]),
-                        "unit_id": unit_id,
-                    }
-                    for feature in features
-                ),
-            )
+            for features in _feature_batches(artifact["path"]):
+                database.register_object_parts(
+                    run_id,
+                    stream_id,
+                    (
+                        {
+                            "part_id": str(feature["properties"]["polygon_id"]),
+                            "class_code": int(feature["properties"]["class_code"]),
+                            "unit_id": unit_id,
+                        }
+                        for feature in features
+                    ),
+                )
         pixel_tolerance = (
             max(abs(float(transform[0])), abs(float(transform[4]))) * 1e-6
         )
@@ -646,25 +744,30 @@ def _assemble_stream_impl(
         class_names = class_snapshot["class_mapping"]
 
         def write_raw(destination):
-            for unit in units:
-                unit_id = str(unit["unit_id"])
-                for feature in _read_features(raw_by_unit[unit_id]):
-                    destination.write(
-                        {
-                            "geometry": feature["geometry"].__geo_interface__,
-                            "properties": {
-                                "run_id": run_id,
-                                "stream_id": stream_id,
-                                "unit_id": unit_id,
-                                "polygon_id": str(
-                                    feature["properties"]["polygon_id"]
-                                ),
-                                "class_code": int(
-                                    feature["properties"]["class_code"]
-                                ),
-                            },
-                        }
-                    )
+            def records():
+                for unit in units:
+                    unit_id = str(unit["unit_id"])
+                    with fiona.open(
+                        raw_by_unit[unit_id],
+                        layer="polygons",
+                    ) as source:
+                        for feature in source:
+                            yield {
+                                "geometry": feature["geometry"],
+                                "properties": {
+                                    "run_id": run_id,
+                                    "stream_id": stream_id,
+                                    "unit_id": unit_id,
+                                    "polygon_id": str(
+                                        feature["properties"]["polygon_id"]
+                                    ),
+                                    "class_code": int(
+                                        feature["properties"]["class_code"]
+                                    ),
+                                },
+                            }
+
+            destination.writerecords(records())
 
         _atomic_gpkg(
             raw_path,
@@ -675,78 +778,96 @@ def _assemble_stream_impl(
         )
 
         def write_formal(destination):
-            for unit in units:
-                unit_id = str(unit["unit_id"])
-                for feature in _read_features(formal_by_unit[unit_id]):
-                    geometry = feature["geometry"]
-                    if geometry.is_empty or not geometry.is_valid or geometry.area <= 0:
-                        raise StreamAssemblyError(
-                            f"formal output contains invalid geometry: {unit_id}"
+            def records():
+                for unit in units:
+                    unit_id = str(unit["unit_id"])
+                    for features in _feature_batches(formal_by_unit[unit_id]):
+                        part_ids = [
+                            str(feature["properties"]["polygon_id"])
+                            for feature in features
+                        ]
+                        object_ids = database.object_ids_for_parts(
+                            run_id,
+                            stream_id,
+                            part_ids,
                         )
-                    properties = feature["properties"]
-                    part_id = str(properties["polygon_id"])
-                    class_code = int(properties["class_code"])
-                    destination.write(
-                        {
-                            "geometry": geometry.__geo_interface__,
-                            "properties": {
-                                "run_id": run_id,
-                                "result_stream_id": stream_id,
-                                "result_kind": str(stream["kind"]),
-                                "model_id": model_id,
-                                "fusion_profile_id": profile_id,
-                                "object_id": database.object_id_for_part(
-                                    run_id,
-                                    stream_id,
-                                    part_id,
-                                ),
-                                "part_id": part_id,
-                                "class_code": class_code,
-                                "class_name": str(class_names[str(class_code)]),
-                                "confidence_mean": float(
-                                    properties.get("conf_mean", 0.0)
-                                ),
-                                "confidence_std": float(
-                                    properties.get("conf_std", 0.0)
-                                ),
-                                "model_version": version,
-                                "source": (
-                                    "semantic_model"
-                                    if stream["kind"] == "model"
-                                    else "semantic_fusion"
-                                ),
-                                "fit_changed": int(
-                                    str(properties.get("fit_status")) == "changed"
-                                ),
-                                "fit_methods": str(
-                                    properties.get("fit_method") or "unchanged"
-                                ),
-                                "fit_version": str(
-                                    properties.get("fit_version") or fit_version
-                                ),
-                                "fit_status": str(
-                                    properties.get("fit_status") or "unchanged"
-                                ),
-                                "origin_unit_ids": unit_id,
-                                "vertex_count_before": int(
-                                    properties.get("vtx_before", 0)
-                                ),
-                                "vertex_count_after": int(
-                                    properties.get("vtx_after", 0)
-                                ),
-                                "max_shift_px": float(
-                                    properties.get("max_shift", 0.0)
-                                ),
-                                "mean_shift_px": float(
-                                    properties.get("mean_shift", 0.0)
-                                ),
-                                "area_change_ratio": float(
-                                    properties.get("area_ratio", 0.0)
-                                ),
-                                "created_at": now,
-                            },
-                        }
-                    )
+                        for feature in features:
+                            geometry = shape(feature["geometry"])
+                            if (
+                                geometry.is_empty
+                                or not geometry.is_valid
+                                or geometry.area <= 0
+                            ):
+                                raise StreamAssemblyError(
+                                    "formal output contains invalid geometry: "
+                                    f"{unit_id}"
+                                )
+                            properties = feature["properties"]
+                            part_id = str(properties["polygon_id"])
+                            class_code = int(properties["class_code"])
+                            yield {
+                                "geometry": feature["geometry"],
+                                "properties": {
+                                    "run_id": run_id,
+                                    "result_stream_id": stream_id,
+                                    "result_kind": str(stream["kind"]),
+                                    "model_id": model_id,
+                                    "fusion_profile_id": profile_id,
+                                    "object_id": object_ids[part_id],
+                                    "part_id": part_id,
+                                    "class_code": class_code,
+                                    "class_name": str(
+                                        class_names[str(class_code)]
+                                    ),
+                                    "confidence_mean": float(
+                                        properties.get("conf_mean", 0.0)
+                                    ),
+                                    "confidence_std": float(
+                                        properties.get("conf_std", 0.0)
+                                    ),
+                                    "model_version": version,
+                                    "source": (
+                                        "semantic_model"
+                                        if stream["kind"] == "model"
+                                        else "semantic_fusion"
+                                    ),
+                                    "fit_changed": int(
+                                        str(properties.get("fit_status"))
+                                        == "changed"
+                                    ),
+                                    "fit_methods": str(
+                                        properties.get("fit_method")
+                                        or "unchanged"
+                                    ),
+                                    "fit_version": str(
+                                        properties.get("fit_version")
+                                        or fit_version
+                                    ),
+                                    "fit_status": str(
+                                        properties.get("fit_status")
+                                        or "unchanged"
+                                    ),
+                                    "origin_unit_ids": unit_id,
+                                    "vertex_count_before": int(
+                                        properties.get("vtx_before", 0)
+                                    ),
+                                    "vertex_count_after": int(
+                                        properties.get("vtx_after", 0)
+                                    ),
+                                    "max_shift_px": float(
+                                        properties.get("max_shift", 0.0)
+                                    ),
+                                    "mean_shift_px": float(
+                                        properties.get("mean_shift", 0.0)
+                                    ),
+                                    "area_change_ratio": float(
+                                        properties.get("area_ratio", 0.0)
+                                    ),
+                                    "created_at": now,
+                                },
+                            }
+
+            destination.writerecords(records())
 
         _atomic_gpkg(
             formal_path,
@@ -756,107 +877,62 @@ def _assemble_stream_impl(
             write_formal,
         )
 
-    edge_schema = {
-        "geometry": "LineString",
-        "properties": {
-            "run_id": "str:48",
-            "stream_id": "str:96",
-            "unit_id": "str:96",
-            "chain_id": "str:96",
-            "method": "str:24",
-            "status": "str:32",
-            "max_shift": "float",
-        },
-    }
     aggregate = {
         "schema_version": 1,
         "run_id": run_id,
         "stream_id": stream_id,
         "assembly_mode": "report_resume" if resume_from_reports else "full",
-        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
-        "report_processed_count": 0,
-        "report_peak_loaded_count": 0,
+        "report_summary_source": "sqlite",
+        "report_processed_count": expected_units,
+        "report_json_parse_count": 0,
+        "summary_validation_workers": summary_validation["workers"],
+        "summary_validation_peak_in_flight": summary_validation[
+            "peak_in_flight"
+        ],
+        "summary_validation_artifact_count": summary_validation[
+            "artifact_count"
+        ],
+        "summary_validation_elapsed_sec": summary_validation["elapsed_sec"],
+        "gpkg_write_mode": "gdal_batch_writerecords",
+        "object_id_lookup_batch_size": OBJECT_ID_BATCH_SIZE,
+        "fitted_edge_shard_count": len(edge_artifacts),
         "status": "passed",
         "smoothing_enabled": smoothing_enabled,
         "unit_count": expected_units,
         "object_count": object_count,
         "object_link_count": link_count,
         "fit_version": fit_version,
-        "chain_count": 0,
-        "shared_chain_count": 0,
-        "spline_count": 0,
-        "unchanged_count": 0,
-        "skipped_invalid_count": 0,
-        "failed_unit_count": 0,
-        "max_displacement_px": 0.0,
+        "chain_count": int(summary_aggregate["chain_count"]),
+        "shared_chain_count": int(summary_aggregate["shared_chain_count"]),
+        "spline_count": int(summary_aggregate["spline_count"]),
+        "unchanged_count": int(summary_aggregate["unchanged_count"]),
+        "skipped_invalid_count": int(
+            summary_aggregate["skipped_invalid_count"]
+        ),
+        "failed_unit_count": int(summary_aggregate["failed_unit_count"]),
+        "max_displacement_px": float(
+            summary_aggregate["max_displacement_px"]
+        ),
+        "diagnostic_count": int(summary_aggregate["diagnostic_count"]),
+        "fitted_edge_count": int(summary_aggregate["fitted_edge_count"]),
         "validation": ownership_validation,
         "topology_checks_performed": False,
     }
-    report_progress = 0
-
-    def consume_report(unit_id: str, report: Mapping[str, Any], destination) -> None:
-        nonlocal report_progress
-        for key in (
-            "chain_count",
-            "shared_chain_count",
-            "spline_count",
-            "unchanged_count",
-            "skipped_invalid_count",
-        ):
-            aggregate[key] += int(report.get(key, 0))
-        aggregate["failed_unit_count"] += int(
-            str(report.get("status") or "") != "passed"
-        )
-        aggregate["max_displacement_px"] = max(
-            aggregate["max_displacement_px"],
-            float(report.get("max_displacement_px", 0.0)),
-        )
-        for edge in report.get("diagnostics") or []:
-            if edge.get("method") not in {"line", "spline", "cubic_bspline"} and not str(
-                edge.get("status") or ""
-            ).startswith("failed"):
-                continue
-            points = edge.get("fitted_points") or []
-            if len(points) < 2:
-                continue
-            destination.write(
-                {
-                    "geometry": mapping(_to_map_geometry(LineString(points), affine)),
-                    "properties": {
-                        "run_id": run_id,
-                        "stream_id": stream_id,
-                        "unit_id": unit_id,
-                        "chain_id": str(edge.get("chain_id") or ""),
-                        "method": str(edge.get("method") or "unchanged"),
-                        "status": str(edge.get("status") or ""),
-                        "max_shift": float(edge.get("max_displacement_px") or 0.0),
-                    },
-                }
-            )
-        report_progress += 1
-        if report_progress % 100 == 0 or report_progress == expected_units:
-            print(
-                json.dumps(
-                    {
-                        "event": "report_assembly_progress",
-                        "run_id": run_id,
-                        "stream_id": stream_id,
-                        "current": report_progress,
-                        "total": expected_units,
-                    },
-                    separators=(",", ":"),
-                ),
-                flush=True,
-            )
-
-    queue_stats: dict[str, int] = {}
 
     def write_edges(destination):
-        stats = _consume_reports(
-            report_artifacts,
-            lambda unit_id, report: consume_report(unit_id, report, destination),
-        )
-        queue_stats.update(stats)
+        def records():
+            for artifact in edge_artifacts:
+                with fiona.open(
+                    artifact["path"],
+                    layer="fitted_edges",
+                ) as source:
+                    for feature in source:
+                        yield {
+                            "geometry": feature["geometry"],
+                            "properties": dict(feature["properties"]),
+                        }
+
+        destination.writerecords(records())
 
     candidate_path = root / "semantic_candidates.gpkg"
     staged_edges_path = root / f".fitted_edges.{os.getpid()}.stage.gpkg"
@@ -880,8 +956,11 @@ def _assemble_stream_impl(
                         "stream_id": stream_id,
                         "assembly_mode": aggregate["assembly_mode"],
                         "total": expected_units,
-                        "queue_capacity": REPORT_QUEUE_CAPACITY,
-                        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
+                        "report_summary_source": "sqlite",
+                        "report_json_parse_count": 0,
+                        "summary_validation_workers": aggregate[
+                            "summary_validation_workers"
+                        ],
                     },
                     separators=(",", ":"),
                 ),
@@ -894,22 +973,6 @@ def _assemble_stream_impl(
                 spec["raster"]["crs"],
                 write_edges,
             )
-            if queue_stats.get("processed_count") != expected_units:
-                raise StreamAssemblyError(
-                    "report queue did not process every unit: "
-                    f"{queue_stats.get('processed_count', 0)}/{expected_units}"
-                )
-            if queue_stats.get("max_loaded_count", 0) > REPORT_QUEUE_CAPACITY:
-                raise StreamAssemblyError(
-                    "report queue exceeded its fixed capacity: "
-                    f"{queue_stats['max_loaded_count']}/{REPORT_QUEUE_CAPACITY}"
-                )
-            aggregate["report_processed_count"] = int(
-                queue_stats["processed_count"]
-            )
-            aggregate["report_peak_loaded_count"] = int(
-                queue_stats["max_loaded_count"]
-            )
             print(
                 json.dumps(
                     {
@@ -919,12 +982,17 @@ def _assemble_stream_impl(
                         "assembly_mode": aggregate["assembly_mode"],
                         "current": aggregate["report_processed_count"],
                         "total": expected_units,
-                        "report_queue_capacity": REPORT_QUEUE_CAPACITY,
                         "report_processed_count": aggregate[
                             "report_processed_count"
                         ],
-                        "report_peak_loaded_count": aggregate[
-                            "report_peak_loaded_count"
+                        "report_summary_source": aggregate[
+                            "report_summary_source"
+                        ],
+                        "report_json_parse_count": aggregate[
+                            "report_json_parse_count"
+                        ],
+                        "summary_validation_peak_in_flight": aggregate[
+                            "summary_validation_peak_in_flight"
                         ],
                         "failed_unit_count": aggregate["failed_unit_count"],
                     },

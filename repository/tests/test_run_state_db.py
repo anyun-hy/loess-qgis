@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import time
 
@@ -26,7 +27,7 @@ def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
     pragmas = database.pragmas()
     assert str(pragmas["journal_mode"]).lower() == "wal"
     assert pragmas["foreign_keys"] == 1
-    assert pragmas["user_version"] == 1
+    assert pragmas["user_version"] == 2
     assert pragmas["integrity_check"] == "ok"
 
     with sqlite3.connect(database.path) as connection:
@@ -46,9 +47,84 @@ def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
         "jobs",
         "artifacts",
         "artifact_dependencies",
+        "unit_report_summaries",
         "object_links",
         "events",
     }.issubset(tables)
+
+
+def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path):
+    database = _database(tmp_path)
+    database.register_streams(
+        RUN_ID,
+        [
+            {
+                "stream_id": "model:test",
+                "kind": "model",
+                "model_id": "test",
+            }
+        ],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "core_00000",
+                "unit_type": "core",
+                "owner_key": "core_00000",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [],
+            }
+        ],
+    )
+    database.insert_stream_units(
+        RUN_ID,
+        ["model:test"],
+        ["core_00000"],
+    )
+    report_path = tmp_path / "core_00000_report.json"
+    report_path.write_text('{"status":"passed"}', encoding="utf-8")
+    artifact_id = database.register_artifact(
+        RUN_ID,
+        "unit_boundary_report",
+        report_path,
+        stream_id="model:test",
+        unit_id="core_00000",
+    )
+    assert database.mark_artifact_ready(
+        artifact_id,
+        byte_count=report_path.stat().st_size,
+        sha256=hashlib.sha256(report_path.read_bytes()).hexdigest(),
+    )
+    report = {
+        "status": "passed",
+        "fit_version": "divider_cubic_bspline_v1",
+        "chain_count": 8,
+        "shared_chain_count": 4,
+        "spline_count": 3,
+        "unchanged_count": 1,
+        "skipped_invalid_count": 0,
+        "max_displacement_px": 1.25,
+        "diagnostics": [{}, {}],
+    }
+    database.upsert_unit_report_summary(
+        RUN_ID,
+        "model:test",
+        "core_00000",
+        report,
+        fitted_edge_count=1,
+    )
+
+    rows = database.unit_report_summaries(RUN_ID, "model:test")
+    assert len(rows) == 1
+    assert rows[0]["chain_count"] == 8
+    assert rows[0]["diagnostic_count"] == 2
+    assert rows[0]["fitted_edge_count"] == 1
+    assert rows[0]["report_sha256"] == database.get_artifact(artifact_id)["sha256"]
+    aggregate = database.unit_report_summary_aggregate(RUN_ID, "model:test")
+    assert aggregate["unit_count"] == 1
+    assert aggregate["chain_count"] == 8
+    assert aggregate["max_displacement_px"] == 1.25
 
 
 def test_run_status_compare_and_set(tmp_path):

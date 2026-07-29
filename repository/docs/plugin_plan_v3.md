@@ -468,7 +468,7 @@ output/
 
 `run_id` 使用时间戳加随机短标识，跨进程、跨日期不撞车。禁止新运行覆盖旧 run 目录。`run_state.sqlite` 是运行明细真值源；`run_manifest.json` 是从数据库生成的小型结果摘要，不复制 Tile 明细。数据库启用 WAL、外键和事务，任何 Artifact 只有在临时文件 fsync、原子重命名、SHA256 写入成功后才可标记 ready。
 
-`semantic_polygons_raw.gpkg`、`semantic_polygons.gpkg` 和诊断 GPKG 都按空间单元使用批量事务流式追加并创建 RTree 索引；写入过程不得回读全部要素。最终文件只有在所有事务提交、`PRAGMA integrity_check`、图层字段/CRS/feature count 和 SHA256 通过后才进入 Artifact `ready`。
+`semantic_polygons_raw.gpkg`、`semantic_polygons.gpkg` 和诊断 GPKG 都按空间单元使用 GDAL/Fiona 批量事务流式追加并创建 RTree 索引；禁止逐要素提交事务，写入过程不得回读全部要素。`object_id` 必须按有界要素批次从 SQLite 查询，禁止每个要素单独建立数据库连接。每个空间单元完成时同时把报告标量摘要写入 SQLite，并把需要保留的诊断边写入单元诊断 GPKG；最终组装只从数据库聚合摘要并直接批量追加单元诊断 GPKG，不再保留重新解析全部 JSON 报告的旧组装路径。缺少摘要或诊断分片的旧 Run 必须明确拒绝组装，不能静默回退。最终文件只有在所有事务提交、`PRAGMA integrity_check`、图层字段/CRS/feature count 和 SHA256 通过后才进入 Artifact `ready`。
 
 ## 10. 结果流与图层命名
 
@@ -873,6 +873,7 @@ Work Package、Partition stream、Seam 和 Junction 各自拥有独立状态；�
 | `jobs` | `job_id, job_type, stream_id, tile_id/unit_id, status, attempt, progress, heartbeat_at, pid, error` | 最小可重试执行单元 |
 | `artifacts` | `artifact_id, stream_id, unit_id, kind, path, bytes, sha256, status, ref_count` | 原子产物提交与清理 |
 | `artifact_dependencies` | `consumer_job_id, artifact_id` | Fusion、Seam、重试和报告依赖 |
+| `unit_report_summaries` | `stream_id, unit_id, status, count/max fields, diagnostic_count, report bytes/sha256` | 单元完成时固化报告标量，最终组装不重复解析全部 JSON |
 | `object_links` | `stream_id, left_part_id, right_part_id, class_code` | 跨所有权单元连通分量 |
 | `events` | `event_id, timestamp, level, event_type, stream_id, job_id, message` | 可复制日志和审计事件 |
 
@@ -1060,7 +1061,8 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 - 峰值 Tile probability 数不超过计划预算；已提交且无依赖的缓存被清理，仍被 Fusion/Seam/retry 引用的缓存不会提前删除。
 - mosaic 重叠区按二维 cosine window 在 14 类概率空间加权，归一化后再统一生成 mask/confidence；Partition 结果与小范围整幅参考一致，禁止回退到中心线硬切。
 - Core raster 分块、VRT、scale、CRS、完整 affine、类别顺序、nodata、哈希和量化误差测试。
-- raw/formal/report 齐全性、哈希和 resume 失效测试；任一拟合或 Seam/Junction 失败时不得留下 ready formal。
+- raw/formal/report 齐全性、哈希和 resume 失效测试；SQLite 报告摘要与 JSON Artifact 哈希必须一致，摘要完整时最终组装不得重复解析无诊断 JSON；任一拟合或 Seam/Junction 失败时不得留下 ready formal。
+- 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 SQLite 连接。
 - raster affine 像素坐标往返测试，覆盖 EPSG:4490、负像元高、旋转/剪切 transform，禁止直接把 px 当地图单位。
 - Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致，输出间距稳定。
 - 两个相邻面的台阶分界只产生一份拟合坐标；两侧重建后提取到的公共线与该坐标正向或反向完全一致。

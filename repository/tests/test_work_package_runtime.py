@@ -16,7 +16,12 @@ from labeling_tool.core.run_builder_v5 import create_v5_run
 from labeling_tool.core.run_state_db import RunStateDB
 from labeling_tool.core.run_spec import atomic_write_json
 from labeling_tool.core.spatial_planner import plan_spatial_units
-from boundary_fitting.unit_runtime import _polygonize, _write_gpkg, run_unit_fit
+from boundary_fitting.unit_runtime import (
+    _polygonize,
+    _write_diagnostic_gpkg,
+    _write_gpkg,
+    run_unit_fit,
+)
 from assemble_stream import StreamAssemblyError, assemble_stream
 from finalize_partition_rasters import finalize_partition_rasters
 from scale_acceptance import build_scale_acceptance_report
@@ -219,9 +224,11 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assembled = assemble_stream(spec_path, "fusion:fixture_fusion")
     assert assembled["status"] == "passed"
     assert assembled["assembly_mode"] == "full"
-    assert assembled["report_queue_capacity"] == 32
+    assert assembled["report_summary_source"] == "sqlite"
     assert assembled["report_processed_count"] == 1
-    assert assembled["report_peak_loaded_count"] == 1
+    assert assembled["report_json_parse_count"] == 0
+    assert assembled["gpkg_write_mode"] == "gdal_batch_writerecords"
+    assert assembled["object_id_lookup_batch_size"] == 512
     events = [
         json.loads(line)
         for line in capsys.readouterr().out.splitlines()
@@ -232,20 +239,15 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         for event in events
         if event.get("event") == "report_assembly_completed"
     ]
-    assert completed == [
-        {
-            "event": "report_assembly_completed",
-            "run_id": spec["run_id"],
-            "stream_id": "fusion:fixture_fusion",
-            "assembly_mode": "full",
-            "current": 1,
-            "total": 1,
-            "report_queue_capacity": 32,
-            "report_processed_count": 1,
-            "report_peak_loaded_count": 1,
-            "failed_unit_count": 0,
-        }
-    ]
+    assert len(completed) == 1
+    assert completed[0]["run_id"] == spec["run_id"]
+    assert completed[0]["stream_id"] == "fusion:fixture_fusion"
+    assert completed[0]["assembly_mode"] == "full"
+    assert completed[0]["current"] == completed[0]["total"] == 1
+    assert completed[0]["report_summary_source"] == "sqlite"
+    assert completed[0]["report_json_parse_count"] == 0
+    assert completed[0]["summary_validation_peak_in_flight"] >= 1
+    assert completed[0]["failed_unit_count"] == 0
     assert assembled["unit_count"] == 1
     assert assembled["object_count"] == 1
     assert assembled["fit_version"] == "divider_cubic_bspline_v1"
@@ -576,31 +578,53 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             crs="EPSG:4490",
             include_fit=True,
         )
-        report_path.write_text(
-            json.dumps(
+        diagnostics = (
+            [
                 {
-                    "status": "passed",
-                    "fit_version": "divider_cubic_bspline_v1",
-                    "chain_count": 0,
-                    "shared_chain_count": 0,
-                    "spline_count": 0,
-                    "unchanged_count": 1,
-                    "max_displacement_px": 0.0,
-                    "diagnostics": [],
-                    "validation": {
-                        "passed": True,
-                        "scope": "all_output_polygons",
-                        "invalid_count": 0,
-                    },
+                    "chain_id": "fixture_edge",
+                    "method": "cubic_bspline",
+                    "status": "changed",
+                    "fitted_points": [[0.0, 0.0], [1.0, 1.0]],
+                    "max_displacement_px": 0.25,
                 }
-            ),
-            encoding="utf-8",
+            ]
+            if unit["unit_id"] == plan["spatial_units"][0]["unit_id"]
+            else []
         )
-        for kind, path in (
+        unit_report = {
+            "status": "passed",
+            "fit_version": "divider_cubic_bspline_v1",
+            "chain_count": 0,
+            "shared_chain_count": 0,
+            "spline_count": 0,
+            "unchanged_count": 1,
+            "max_displacement_px": 0.0,
+            "diagnostics": diagnostics,
+            "validation": {
+                "passed": True,
+                "scope": "all_output_polygons",
+                "invalid_count": 0,
+            },
+        }
+        report_path.write_text(json.dumps(unit_report), encoding="utf-8")
+        fitted_edges_path = output_root / f"{unit['unit_id']}_fitted_edges.gpkg"
+        fitted_edge_count = _write_diagnostic_gpkg(
+            fitted_edges_path,
+            unit_report,
+            run_id=run_id,
+            stream_id="model:a",
+            unit_id=unit["unit_id"],
+            transform=affine,
+            crs="EPSG:4490",
+        )
+        artifacts = [
             ("unit_raw", raw_path),
             ("unit_formal", formal_path),
             ("unit_boundary_report", report_path),
-        ):
+        ]
+        if fitted_edge_count:
+            artifacts.append(("unit_fitted_edges", fitted_edges_path))
+        for kind, path in artifacts:
             _commit_artifact(
                 database,
                 run_id,
@@ -609,6 +633,13 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
                 stream_id="model:a",
                 unit_id=unit["unit_id"],
             )
+        database.upsert_unit_report_summary(
+            run_id,
+            "model:a",
+            unit["unit_id"],
+            unit_report,
+            fitted_edge_count=fitted_edge_count,
+        )
         database.set_stream_unit_status(run_id, "model:a", unit["unit_id"], "ready")
 
     report = assemble_stream(spec_path, "model:a")
@@ -620,6 +651,8 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     assert report["validation"]["invalid_count"] == 0
     with fiona.open(run_dir / "models/a/semantic_polygons.gpkg") as source:
         features = list(source)
+    with fiona.open(run_dir / "models/a/fitted_edges.gpkg") as source:
+        assert len(source) == 1
     assert len({feature["properties"]["object_id"] for feature in features}) == 1
     merged = unary_union([shape(feature["geometry"]) for feature in features])
     processing = plan["processing_window"]
@@ -744,26 +777,22 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
             crs="EPSG:4490",
             include_fit=True,
         )
-        report_path.write_text(
-            json.dumps(
-                {
-                    "status": "passed",
-                    "fit_version": "divider_cubic_bspline_v1",
-                    "chain_count": 0,
-                    "shared_chain_count": 0,
-                    "spline_count": 0,
-                    "unchanged_count": 1,
-                    "max_displacement_px": 0.0,
-                    "diagnostics": [],
-                    "validation": {
-                        "passed": True,
-                        "scope": "all_output_polygons",
-                        "invalid_count": 0,
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
+        unit_report = {
+            "status": "passed",
+            "fit_version": "divider_cubic_bspline_v1",
+            "chain_count": 0,
+            "shared_chain_count": 0,
+            "spline_count": 0,
+            "unchanged_count": 1,
+            "max_displacement_px": 0.0,
+            "diagnostics": [],
+            "validation": {
+                "passed": True,
+                "scope": "all_output_polygons",
+                "invalid_count": 0,
+            },
+        }
+        report_path.write_text(json.dumps(unit_report), encoding="utf-8")
         for kind, path in (
             ("unit_raw", raw_path),
             ("unit_formal", formal_path),
@@ -777,6 +806,12 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
                 stream_id="model:a",
                 unit_id=unit["unit_id"],
             )
+        database.upsert_unit_report_summary(
+            run_id,
+            "model:a",
+            unit["unit_id"],
+            unit_report,
+        )
         database.set_stream_unit_status(
             run_id,
             "model:a",
@@ -791,7 +826,9 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     assert report["unit_count"] == 64
     assert report["object_count"] == 64
     assert report["report_processed_count"] == 64
-    assert 1 <= report["report_peak_loaded_count"] <= 32
+    assert report["report_summary_source"] == "sqlite"
+    assert report["report_json_parse_count"] == 0
+    assert report["summary_validation_peak_in_flight"] <= 32
     stream_root = run_dir / "models" / "a"
     raw_path = stream_root / "semantic_polygons_raw.gpkg"
     formal_path = stream_root / "semantic_polygons.gpkg"
@@ -799,6 +836,8 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     fitted_edges_path = stream_root / "fitted_edges.gpkg"
     with fiona.open(formal_path) as source:
         assert len(source) == 64
+    with fiona.open(fitted_edges_path) as source:
+        assert len(source) == 0
     assert not list(stream_root.glob(".*.stage.*"))
     assert not list(stream_root.glob(".*.tmp.*"))
 
@@ -820,7 +859,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
 
     with pytest.raises(
         StreamAssemblyError,
-        match="cannot read unit boundary report",
+        match="unit report Artifact changed",
     ):
         assemble_stream(spec_path, "model:a", resume_from_reports=True)
 
@@ -848,7 +887,8 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     assert resumed["status"] == "passed"
     assert resumed["assembly_mode"] == "report_resume"
     assert resumed["report_processed_count"] == 64
-    assert 1 <= resumed["report_peak_loaded_count"] <= 32
+    assert resumed["report_summary_source"] == "sqlite"
+    assert resumed["report_json_parse_count"] == 0
     assert _sha(raw_path) == output_hashes["raw"]
     assert _sha(formal_path) == output_hashes["formal"]
     assert not list(stream_root.glob(".*.stage.*"))
