@@ -69,6 +69,25 @@ def test_common_divider_is_fitted_once_and_reused_by_both_polygons():
     assert report["fit_version"] == "divider_cubic_bspline_adaptive_v2"
     assert report["spline_count"] == 1
     assert report["curve_sampling_spacing_px"] == 0.5
+    assert report["curve_sampling_mode"] == "direct_adaptive_bezier_bounds"
+    assert report["dense_curve_materialized"] is False
+    assert (
+        report["dense_curve_point_count_kind"]
+        == "equivalent_at_configured_spacing"
+    )
+    assert (
+        report["chord_error_certification"]
+        == "bezier_control_hull_upper_bound"
+    )
+    assert (
+        report["arc_length_certification"]
+        == "bezier_control_polygon_upper_bound"
+    )
+    assert report["curve_evaluation_count"] > 0
+    assert (
+        report["curve_evaluation_count"]
+        < report["dense_curve_point_count"]
+    )
     assert report["max_chord_error_limit_px"] == 0.25
     assert report["max_segment_arc_length_limit_px"] == 8.0
     assert report["max_chord_error_px"] <= 0.25 + 1e-12

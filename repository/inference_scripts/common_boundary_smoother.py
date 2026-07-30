@@ -399,6 +399,9 @@ def smooth_common_boundaries(
                             "point_count_before": result.input_point_count,
                             "point_count_dense": result.dense_point_count,
                             "point_count_after": result.output_point_count,
+                            "curve_evaluation_count": (
+                                result.curve_evaluation_count
+                            ),
                             "max_chord_error_px": result.max_chord_error,
                             "max_segment_arc_length_px": (
                                 result.max_segment_arc_length
@@ -518,6 +521,17 @@ def smooth_common_boundaries(
         "curve_sampling_spacing_px": float(
             config.curve_sampling_spacing
         ),
+        "curve_sampling_mode": "direct_adaptive_bezier_bounds",
+        "dense_curve_materialized": False,
+        "dense_curve_point_count_kind": (
+            "equivalent_at_configured_spacing"
+        ),
+        "chord_error_certification": (
+            "bezier_control_hull_upper_bound"
+        ),
+        "arc_length_certification": (
+            "bezier_control_polygon_upper_bound"
+        ),
         "max_chord_error_limit_px": float(config.max_chord_error),
         "max_segment_arc_length_limit_px": float(
             config.max_segment_arc_length
@@ -534,6 +548,10 @@ def smooth_common_boundaries(
         ),
         "sparse_curve_point_count": sum(
             int(item["point_count_after"]) for item in changed_diagnostics
+        ),
+        "curve_evaluation_count": sum(
+            int(item["curve_evaluation_count"])
+            for item in changed_diagnostics
         ),
         "max_chord_error_px": max(
             (

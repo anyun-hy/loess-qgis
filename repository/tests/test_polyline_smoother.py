@@ -4,11 +4,13 @@ import time
 
 import fiona
 import numpy as np
+from scipy.interpolate import splprep, splev
+from shapely import distance, points as shapely_points
 from shapely.geometry import LineString, MultiLineString, mapping, shape
 
 from polyline_smoother import (
     SmoothingConfig,
-    adaptive_sample_curve,
+    _adaptive_sample_spline,
     smooth_polyline,
     smooth_vector_file,
 )
@@ -43,36 +45,120 @@ def test_cubic_bspline_visibly_reduces_staircase_direction_changes():
     assert _direction_change_energy(result.points) < _direction_change_energy(points) * 0.15
 
 
-def test_adaptive_curve_sampling_enforces_error_and_arc_bounds():
-    x = np.linspace(0.0, 1000.0, 20_001)
-    dense = np.column_stack((x, 4.0 * np.sin(x / 35.0)))
-    sparse, chord_error, arc_length = adaptive_sample_curve(
-        dense,
-        max_chord_error=0.25,
-        max_segment_arc_length=8.0,
+def test_direct_adaptive_spline_enforces_certified_error_and_arc_bounds():
+    x = np.linspace(0.0, 1000.0, 1001)
+    source = np.column_stack((x, 4.0 * np.sin(x / 35.0)))
+    spline, _ = splprep(
+        [source[:, 0], source[:, 1]],
+        u=np.linspace(0.0, 1.0, len(source)),
+        k=3,
+        s=len(source),
+    )
+    sparse, chord_error, arc_length, evaluation_count = (
+        _adaptive_sample_spline(
+            spline,
+            first_point=source[0],
+            last_point=source[-1],
+            closed=False,
+            max_chord_error=0.25,
+            max_segment_arc_length=8.0,
+        )
+    )
+    dense = np.column_stack(
+        splev(np.linspace(0.0, 1.0, 100_001), spline)
+    )
+    fractions = np.linspace(0.0, 1.0, len(dense))[:, None]
+    dense += (
+        (1.0 - fractions) * (source[0] - dense[0])
+        + fractions * (source[-1] - dense[-1])
+    )
+    sampled_error = float(
+        np.max(distance(shapely_points(dense), LineString(sparse)))
     )
 
-    assert np.array_equal(sparse[0], dense[0])
-    assert np.array_equal(sparse[-1], dense[-1])
+    assert np.array_equal(sparse[0], source[0])
+    assert np.array_equal(sparse[-1], source[-1])
+    assert sampled_error <= chord_error + 1e-9
     assert chord_error <= 0.25 + 1e-12
     assert arc_length <= 8.0 + 1e-12
-    assert len(sparse) < len(dense) * 0.02
+    assert evaluation_count < len(dense) * 0.02
 
 
-def test_adaptive_closed_curve_remains_closed_with_structural_points():
-    angles = np.linspace(0.0, 2.0 * math.pi, 4001)
-    dense = np.column_stack((20.0 * np.cos(angles), 20.0 * np.sin(angles)))
-    dense[-1] = dense[0]
-    sparse, chord_error, arc_length = adaptive_sample_curve(
-        dense,
-        max_chord_error=0.25,
-        max_segment_arc_length=8.0,
+def test_direct_adaptive_closed_spline_remains_closed():
+    angles = np.linspace(0.0, 2.0 * math.pi, 129)
+    source = np.column_stack(
+        (20.0 * np.cos(angles), 20.0 * np.sin(angles))
+    )
+    source[-1] = source[0]
+    spline, _ = splprep(
+        [source[:, 0], source[:, 1]],
+        u=np.linspace(0.0, 1.0, len(source)),
+        k=3,
+        s=len(source),
+        per=True,
+    )
+    sparse, chord_error, arc_length, _evaluation_count = (
+        _adaptive_sample_spline(
+            spline,
+            first_point=source[0],
+            last_point=source[0],
+            closed=True,
+            max_chord_error=0.25,
+            max_segment_arc_length=8.0,
+        )
     )
 
     assert len(sparse) >= 4
     assert np.array_equal(sparse[0], sparse[-1])
     assert chord_error <= 0.25 + 1e-12
     assert arc_length <= 8.0 + 1e-12
+
+
+def test_smoothing_does_not_materialize_equivalent_dense_curve():
+    x = np.linspace(0.0, 20_000.0, 20_001)
+    source = np.column_stack(
+        (x, np.sin(x / 20.0) + (np.arange(len(x)) % 2) * 0.3)
+    )
+    result = smooth_polyline(
+        source,
+        SmoothingConfig(curve_sampling_spacing=0.5),
+    )
+
+    assert result.status == "smoothed"
+    assert result.curve_evaluation_count < result.dense_point_count * 0.2
+
+
+def test_adaptive_curve_sampling_enforces_error_and_arc_bounds():
+    result = smooth_polyline(
+        np.column_stack(
+            (
+                np.linspace(0.0, 1000.0, 1001),
+                4.0 * np.sin(np.linspace(0.0, 1000.0, 1001) / 35.0),
+            )
+        )
+    )
+    sparse = result.points
+    assert result.status == "smoothed"
+    assert result.max_chord_error <= 0.25 + 1e-12
+    assert result.max_segment_arc_length <= 8.0 + 1e-12
+    assert len(sparse) < result.dense_point_count * 0.1
+
+
+def test_adaptive_closed_curve_remains_closed_with_structural_points():
+    angles = np.linspace(0.0, 2.0 * math.pi, 4001)
+    dense = np.column_stack((20.0 * np.cos(angles), 20.0 * np.sin(angles)))
+    dense[-1] = dense[0]
+    result = smooth_polyline(
+        dense,
+        SmoothingConfig(curve_sampling_spacing=0.5),
+    )
+    sparse = result.points
+
+    assert result.status == "smoothed"
+    assert len(sparse) >= 4
+    assert np.array_equal(sparse[0], sparse[-1])
+    assert result.max_chord_error <= 0.25 + 1e-12
+    assert result.max_segment_arc_length <= 8.0 + 1e-12
 
 
 def test_sparse_four_point_staircase_does_not_overshoot():

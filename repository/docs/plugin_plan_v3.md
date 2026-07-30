@@ -309,7 +309,7 @@ linear_1x1
 | partition_grid | scaling | 默认每个 Core 为 `8 x 8` Tile |
 | partition_halo | scaling | `auto=max(overlap,seam_band_px)`，默认 192 px |
 | work_package_budget | scaling | 以临时 score cache 预算限制同时在途 Tile 数 |
-| boundary_fitting | 固定运行契约 | 公共分界 Polyline 提取一次、Cubic B-Spline 拟合一次，以 `0.5 px` 内部曲线样本执行 `0.25 px` 最大弦误差和 `8 px` 最大弧长的自适应稀疏，再同时重建两侧 Polygon；有效、正面积且总面积守恒才提交，否则共同回退原边 |
+| boundary_fitting | 固定运行契约 | 公共分界 Polyline 提取一次、Cubic B-Spline 拟合一次，将同一条样条精确转换成分段 Bézier，以控制凸包和控制多边形分别证明 `0.25 px` 最大弦误差和 `8 px` 最大弧长上界，再同时重建两侧 Polygon；生产路径不得先物化完整 `0.5 px` 密集曲线；有效、正面积且总面积守恒才提交，否则共同回退原边 |
 | output_root | 主面板 | 所有 run 的工作区，启动前验证可用空间 |
 | accepted_gpkg | 主面板 | 长期保存的已确认标签库 |
 | selected_model_ids | 配置弹窗 | 所有实际执行的模型 |
@@ -408,8 +408,9 @@ Tile 14-class probabilities
   -> A.boundary 与 B.boundary 的公共分界 Polyline
   -> 按弦长参数化
   -> 公共线只执行一次 Cubic B-Spline 拟合
-  -> 以 0.5 px 间距生成内部拟合曲线样本
-  -> 在同一拟合曲线上按最大弦误差 0.25 px、最大弧长 8 px 自适应保留坐标
+  -> 将同一拟合曲线精确转换为分段 Bézier
+  -> 以控制凸包/控制多边形上界按最大弦误差 0.25 px、最大弧长 8 px
+     直接向量化自适应细分（不物化完整 0.5 px 密集曲线）
   -> 同一组稀疏拟合坐标写回 A 与 B（其中一侧可反向）
   -> 重建 Polygon A / B
   -> 检查两侧均有效、面积均大于 0、两侧总面积基本守恒
@@ -449,7 +450,7 @@ max_deviation = null
 
 公共分界至少 4 个点即可拟合。为避免 4–7 点稀疏折线退化成不稳定的精确三次插值，拟合前先沿原折线按 `1 px` 均匀加密样本，再执行 Cubic B-Spline；这一步不改变原折线，只改变拟合输入的采样密度。长度不足 `3 px` 或少于 4 点的微小分界保持原样。
 
-最终坐标稀疏只允许在线性化同一条 B-Spline 曲线时执行：每段必须同时满足相对内部密集曲线样本的最大弦误差和沿曲线最大弧长约束；开放线端点严格保留，闭合线保持闭合，并至少保留构成合法线环所需的结构点。禁止先稀疏 raw 像元边界再拟合，也禁止左右 Polygon 分别稀疏。
+最终坐标稀疏只允许在线性化同一条 B-Spline 曲线时执行。生产实现必须把 SciPy B-Spline 精确转换为分段 Bézier，通过 de Casteljau 细分；每段以 Bézier 控制凸包到弦的距离作为最大弦误差上界，以控制多边形长度作为曲线弧长上界，两个上界分别不超过 `0.25 px` 和 `8 px` 才能保留。该实现不得先物化完整 `0.5 px` 密集曲线；`curve_sampling_spacing_px=0.5` 仅保留为既有配置/报告的等价密集点计数基准，以及显式位移硬门槛或独立测试时的验证采样。开放线端点严格保留，闭合线保持闭合，并至少保留构成合法线环所需的结构点。禁止先稀疏 raw 像元边界再拟合，也禁止左右 Polygon 分别稀疏。
 
 当前 E5S 明确不实现：raw 边界 RDP、直线/圆弧自适应分类、独立 Shared Edge 图、Topology Repair、Gap/Overlap/Coverage 检测、单面面积约束、自交修复和 Polygon valid 修复。只执行上述拟合结果的简单通过/回退判断；`Seam/Junction` 只属于大规模分区调度，不参与本节曲线算法。
 
@@ -839,7 +840,7 @@ QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在�
 - 显示 profile 策略、模型数量、基线 mIoU、融合 mIoU、approval、路径和 SHA 状态。
 - rejected profile 显示为不可运行。
 - SAM3 只显示为后处理能力，不作为语义启动必选项。
-- 显示只读摘要“边界拟合：公共分界线单次 Cubic B-Spline + 误差受限稀疏；两侧 Polygon 共用最终坐标”；显示平滑因子、内部曲线采样间距、最大弦误差、最大弧长和诊断级别，不展示旧 RDP、面积、Gap/Overlap 或拓扑参数。
+- 显示只读摘要“边界拟合：公共分界线单次 Cubic B-Spline + 误差受限稀疏；两侧 Polygon 共用最终坐标”；显示平滑因子、`0.5 px` 等价密集计数基准、最大弦误差、最大弧长和诊断级别，不把该基准描述成生产路径会物化的密集曲线，也不展示旧 RDP、面积、Gap/Overlap 或拓扑参数。
 - “应用”后将有效方案摘要同步回主面板。
 
 ### 15.3 推理监控弹窗
@@ -1161,9 +1162,10 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
 
 - `argmax` mask 直接 polygonize，进入矢量阶段前没有按类别和物理面积执行
   小连通域清理；机器噪声会变成大量独立 Polygon。
-- 公共分界固定 `0.5 px` 密集重采样已经由
-  `divider_cubic_bspline_adaptive_v2` 直接替换；正式输出只保留满足
-  `0.25 px` 最大弦误差和 `8 px` 最大弧长的坐标。
+- 公共分界固定 `0.5 px` 正式输出已经由
+  `divider_cubic_bspline_adaptive_v2` 直接替换；生产路径也不得先物化
+  `0.5 px` 密集曲线，而应在同一 B-Spline 的精确 Bézier 分段上直接保留
+  满足 `0.25 px` 最大弦误差和 `8 px` 最大弧长上界的坐标。
 - 单元报告可保存完整 `raw_points/fitted_points` 坐标，报告 JSON 与诊断
   GPKG 重复承载同一类明细。
 - Stream ready 后，单元 raw/formal/report/fitted-edge 仍长期保留，与流级
@@ -1234,7 +1236,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - final/accepted 重叠双门测试同时验证 `topology_issues.accepted_overlap` 和写入器独立拒绝；即使跳过拓扑或勾选带问题入库，长期确认库哈希也不得变化。
 - 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 SQLite 连接。
 - raster affine 像素坐标往返测试，覆盖 EPSG:4490、负像元高、旋转/剪切 transform，禁止直接把 px 当地图单位。
-- Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致；内部曲线按 `0.5 px` 采样，最终每段最大弦误差 `<=0.25 px`、最大弧长 `<=8 px`，并验证顶点数不随曲线长度按固定 `0.5 px` 线性膨胀。
+- Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致；生产路径不物化完整 `0.5 px` 曲线，直接 Bézier 自适应细分的每段控制凸包弦误差上界 `<=0.25 px`、控制多边形弧长上界 `<=8 px`；另用高密度独立采样验证实际曲线到输出折线的距离不超过报告上界，并验证曲线求值数和最终顶点数不随曲线长度按固定 `0.5 px` 线性膨胀。
 - 两个相邻面的台阶分界只产生一份拟合坐标；两侧重建后提取到的公共线与该坐标正向或反向完全一致。
 - 同一 Polygon 环同时连接两个邻面时，每条公共分界必须基于当前已提交几何依次尝试；前一条通过后，后一条仍能正确定位并独立通过或回退。
 - 岛状面闭合外环和包围面的孔环复用同一份 periodic B-Spline 坐标。
@@ -1266,7 +1268,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 
 ### 公共分界线拟合真实验收
 
-从现有真实语义分割 Core 中选择至少三个包含明显台阶的相邻类别区域。A 为 raw Polygon，B 为 `divider_cubic_bspline_adaptive_v2` formal Polygon；保存 raw/formal 叠加截图、公共线输入/密集曲线/最终稀疏坐标点数、最大/平均偏移、实际最大弦误差、实际最大弧长和耗时。
+从现有真实语义分割 Core 中选择至少三个包含明显台阶的相邻类别区域。A 为 raw Polygon，B 为 `divider_cubic_bspline_adaptive_v2` formal Polygon；保存 raw/formal 叠加截图、公共线输入点数、`0.5 px` 等价密集点数、实际自适应段检查数、最终稀疏坐标点数、最大/平均偏移、认证最大弦误差上界、认证最大弧长上界和耗时。
 
 正式通过条件为：公共线只拟合一次，两侧 Polygon 提取出的分界与该拟合线坐标一致；默认拟合强度为 1，开放线端点位移为 0，闭合线保持闭合；实际偏移只供人工判断，不设置统一像素硬门槛。每条拟合线必须通过左右面有效、正面积和总面积守恒判断，否则共同回退原分界；最终 formal 不得包含 invalid、empty 或非正面积 Polygon。本验收不运行 topology、gap、overlap、coverage 或自交修复。人工必须目视确认台阶显著减少、整体轮廓基本一致；否则调整曲线参数或停止，不用复杂 GIS 系统补救。
 
@@ -1316,7 +1318,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - 每个执行模型和 Fusion 都有独立且永久保存的 Core mask/confidence 分块、VRT、raw polygons、formal polygons 和 boundary fitting report；临时概率只在全部依赖提交后按引用计数清理。
 - 每个模型流和 Fusion 流都完成 14 类概率空间 cosine 加权 Partition mosaic；Fusion 使用增量 accumulator，不能要求全 run 多模型概率同时常驻。
 - 每条 formal 流都对相邻 Polygon 的公共分界线执行一次 Cubic B-Spline，并把同一拟合坐标写回两侧；禁止两个 Polygon 整环分别平滑。
-- 曲线拟合报告记录实际偏移、密集/稀疏点数、实际最大弦误差、实际最大弧长、逐边回退数和耗时；除同一拟合曲线的误差受限线性化以及左右面有效、正面积和总面积守恒的简单提交门槛外，不执行 raw 边界 RDP、单面面积约束、Gap/Overlap/Coverage 或 Topology Repair；最终视觉效果由真实 QGIS raw/formal A/B 验收。
+- 曲线拟合报告记录实际偏移、`0.5 px` 等价密集点数、实际自适应段检查数、稀疏点数、认证最大弦误差上界、认证最大弧长上界、是否物化密集曲线、逐边回退数和耗时；除同一拟合曲线的误差受限线性化以及左右面有效、正面积和总面积守恒的简单提交门槛外，不执行 raw 边界 RDP、单面面积约束、Gap/Overlap/Coverage 或 Topology Repair；最终视觉效果由真实 QGIS raw/formal A/B 验收。
 - approved profile 能生成独立 fusion 结果，数学实现与 profile 契约一致。
 - approved Fusion 能无损初始化 14 个独立类别工作层，原始 Fusion 始终只读且哈希不变。
 - SAM3 只对用户点击的当前类别地物生成一个临时候选，不批量扫整类、不自动采用、不创建独立最终层；失败和取消不修改数据。

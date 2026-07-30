@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 import fiona
 import numpy as np
-from scipy.interpolate import splprep, splev
+from scipy.interpolate import PPoly, splprep, splev
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, mapping, shape
 
@@ -70,6 +70,7 @@ class SmoothingResult:
     closed: bool
     max_chord_error: float
     max_segment_arc_length: float
+    curve_evaluation_count: int
     reason: str = ""
 
 
@@ -109,7 +110,14 @@ def _resample(points: np.ndarray, parameter: np.ndarray, samples: np.ndarray) ->
     )
 
 
-def _deviation(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float]:
+def _deviation(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> tuple[float, float]:
+    """Measure symmetric sampled distance between source and fitted curves."""
+
+    if reference.shape != candidate.shape:
+        raise ValueError("deviation samples must have equal shapes")
     reference_tree = cKDTree(reference)
     candidate_tree = cKDTree(candidate)
     candidate_distances = reference_tree.query(candidate, workers=1)[0]
@@ -124,16 +132,12 @@ def _deviation(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, flo
     return maximum, mean
 
 
-def _point_to_chord_distances(
-    points: np.ndarray,
-    first: int,
-    last: int,
-) -> np.ndarray:
-    values = points[first + 1 : last]
+def _point_to_chord_distances(points: np.ndarray) -> np.ndarray:
+    values = points[1:-1]
     if not len(values):
         return np.empty(0, dtype=np.float64)
-    start = points[first]
-    stop = points[last]
+    start = points[0]
+    stop = points[-1]
     vector = stop - start
     squared = float(np.dot(vector, vector))
     if squared <= 1e-24:
@@ -143,71 +147,243 @@ def _point_to_chord_distances(
     return np.linalg.norm(values - projections, axis=1)
 
 
-def adaptive_sample_curve(
-    dense_points: Iterable[Iterable[float]],
+def _power_to_bernstein_controls(
+    power_coefficients: np.ndarray,
+) -> np.ndarray:
+    """Convert normalized ascending power coefficients to Bézier controls."""
+
+    degree = len(power_coefficients) - 1
+    controls = np.zeros_like(power_coefficients)
+    for control_index in range(degree + 1):
+        for power in range(control_index + 1):
+            controls[control_index] += (
+                math.comb(control_index, power)
+                / math.comb(degree, power)
+            ) * power_coefficients[power]
+    return controls
+
+
+def _spline_bezier_spans(
+    spline,
     *,
+    first_point: np.ndarray,
+    last_point: np.ndarray,
+) -> list[np.ndarray]:
+    """Return exact Bézier spans, including a linear endpoint correction."""
+
+    knots, coefficients, degree = spline
+    coordinate_coefficients = np.asarray(coefficients, dtype=np.float64)
+    if coordinate_coefficients.ndim != 2 or coordinate_coefficients.shape[0] != 2:
+        raise ValueError("fitted spline must contain exactly two coordinates")
+    pieces = [
+        PPoly.from_spline((knots, coordinate_coefficients[axis], degree))
+        for axis in range(2)
+    ]
+    breaks = pieces[0].x
+    domain_start = float(knots[degree])
+    domain_stop = float(knots[-degree - 1])
+    domain_length = domain_stop - domain_start
+    if not math.isfinite(domain_length) or domain_length <= 0:
+        raise ValueError("fitted spline has an invalid parameter domain")
+
+    spans: list[tuple[float, float, np.ndarray]] = []
+    for interval, (start, stop) in enumerate(zip(breaks, breaks[1:])):
+        start = float(start)
+        stop = float(stop)
+        if (
+            stop <= start
+            or start < domain_start - 1e-12
+            or stop > domain_stop + 1e-12
+        ):
+            continue
+        width = stop - start
+        power = np.empty((degree + 1, 2), dtype=np.float64)
+        for exponent in range(degree + 1):
+            row = degree - exponent
+            power[exponent] = [
+                piece.c[row, interval] * width**exponent
+                for piece in pieces
+            ]
+        spans.append(
+            (
+                start,
+                stop,
+                _power_to_bernstein_controls(power),
+            )
+        )
+    if not spans:
+        raise ValueError("fitted spline contains no non-empty spans")
+
+    start_delta = np.asarray(first_point, dtype=np.float64) - spans[0][2][0]
+    stop_delta = np.asarray(last_point, dtype=np.float64) - spans[-1][2][-1]
+    corrected = []
+    for start, stop, controls in spans:
+        start_fraction = (start - domain_start) / domain_length
+        stop_fraction = (stop - domain_start) / domain_length
+        correction_start = (
+            (1.0 - start_fraction) * start_delta
+            + start_fraction * stop_delta
+        )
+        correction_stop = (
+            (1.0 - stop_fraction) * start_delta
+            + stop_fraction * stop_delta
+        )
+        fractions = np.linspace(0.0, 1.0, degree + 1)[:, None]
+        correction_controls = (
+            (1.0 - fractions) * correction_start
+            + fractions * correction_stop
+        )
+        corrected.append(controls + correction_controls)
+    corrected[0][0] = first_point
+    corrected[-1][-1] = last_point
+    return corrected
+
+
+def _split_bezier_batch(
+    controls: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split a batch of Bézier spans at parameter 0.5."""
+
+    working = np.asarray(controls, dtype=np.float64)
+    left = [working[:, 0]]
+    right = [working[:, -1]]
+    while working.shape[1] > 1:
+        working = 0.5 * (working[:, :-1] + working[:, 1:])
+        left.append(working[:, 0])
+        right.append(working[:, -1])
+    return (
+        np.stack(left, axis=1),
+        np.stack(right[::-1], axis=1),
+    )
+
+
+def _adaptive_sample_spline(
+    spline,
+    *,
+    first_point: Iterable[float],
+    last_point: Iterable[float],
+    closed: bool,
     max_chord_error: float,
     max_segment_arc_length: float,
-) -> tuple[np.ndarray, float, float]:
-    """Linearize one fitted curve under strict error and arc-length bounds."""
+) -> tuple[np.ndarray, float, float, int]:
+    """Directly linearize a fitted spline using certified Bézier bounds."""
 
-    points = _sanitize(dense_points)
     if not math.isfinite(max_chord_error) or max_chord_error <= 0:
         raise ValueError("max_chord_error must be finite and positive")
     if not math.isfinite(max_segment_arc_length) or max_segment_arc_length <= 0:
         raise ValueError("max_segment_arc_length must be finite and positive")
-    if len(points) <= 2:
-        return points.copy(), 0.0, 0.0
-
-    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-    minimum_output_points = min(4, len(points))
-    seed_indices = sorted(
-        {
-            int(round(value))
-            for value in np.linspace(
-                0,
-                len(points) - 1,
-                minimum_output_points,
-            )
-        }
+    first = np.asarray(first_point, dtype=np.float64)[:2]
+    last = np.asarray(last_point, dtype=np.float64)[:2]
+    if first.shape != (2,) or last.shape != (2,):
+        raise ValueError("spline endpoints must contain two coordinates")
+    spans = _spline_bezier_spans(
+        spline,
+        first_point=first,
+        last_point=last,
     )
-    keep = set(seed_indices)
-    stack = list(zip(seed_indices, seed_indices[1:]))
-    while stack:
-        first, last = stack.pop()
-        if last <= first + 1:
-            continue
-        distances = _point_to_chord_distances(points, first, last)
-        maximum = float(distances.max(initial=0.0))
-        arc_length = float(cumulative[last] - cumulative[first])
-        if maximum <= max_chord_error and arc_length <= max_segment_arc_length:
-            continue
-        if maximum > max_chord_error and len(distances):
-            split = first + 1 + int(np.argmax(distances))
+    active = np.stack(spans)
+    active_start = np.arange(len(active), dtype=np.float64)
+    active_stop = active_start + 1.0
+    accepted_controls: list[np.ndarray] = []
+    accepted_start: list[np.ndarray] = []
+    observed_error_bound = 0.0
+    observed_arc_bound = 0.0
+    evaluation_count = 0
+    for depth in range(33):
+        evaluation_count += len(active)
+        starts = active[:, 0]
+        stops = active[:, -1]
+        chords = stops - starts
+        squared = np.einsum("ij,ij->i", chords, chords)
+        interior = active[:, 1:-1]
+        if interior.shape[1]:
+            offsets = interior - starts[:, None, :]
+            fractions = np.divide(
+                np.einsum("nki,ni->nk", offsets, chords),
+                squared[:, None],
+                out=np.zeros((len(active), interior.shape[1])),
+                where=squared[:, None] > 1e-24,
+            )
+            fractions = np.clip(fractions, 0.0, 1.0)
+            projections = (
+                starts[:, None, :]
+                + fractions[:, :, None] * chords[:, None, :]
+            )
+            chord_error_bounds = np.linalg.norm(
+                interior - projections,
+                axis=2,
+            ).max(axis=1, initial=0.0)
+            degenerate = squared <= 1e-24
+            if np.any(degenerate):
+                chord_error_bounds[degenerate] = np.linalg.norm(
+                    offsets[degenerate],
+                    axis=2,
+                ).max(axis=1, initial=0.0)
         else:
-            halfway = 0.5 * (cumulative[first] + cumulative[last])
-            split = int(np.searchsorted(cumulative, halfway))
-            split = max(first + 1, min(split, last - 1))
-        keep.add(split)
-        stack.append((first, split))
-        stack.append((split, last))
+            chord_error_bounds = np.zeros(len(active), dtype=np.float64)
+        arc_length_bounds = np.linalg.norm(
+            np.diff(active, axis=1),
+            axis=2,
+        ).sum(axis=1)
+        accepted = (
+            (chord_error_bounds <= max_chord_error)
+            & (arc_length_bounds <= max_segment_arc_length)
+        )
+        if np.any(accepted):
+            accepted_controls.append(active[accepted])
+            accepted_start.append(active_start[accepted])
+            observed_error_bound = max(
+                observed_error_bound,
+                float(chord_error_bounds[accepted].max(initial=0.0)),
+            )
+            observed_arc_bound = max(
+                observed_arc_bound,
+                float(arc_length_bounds[accepted].max(initial=0.0)),
+            )
+        rejected = ~accepted
+        if not np.any(rejected):
+            break
+        if depth >= 32:
+            raise ValueError(
+                "adaptive spline subdivision exceeded its safety depth"
+            )
+        controls = active[rejected]
+        left, right = _split_bezier_batch(controls)
+        midpoint_parameter = 0.5 * (
+            active_start[rejected] + active_stop[rejected]
+        )
+        active = np.concatenate((left, right))
+        active_start = np.concatenate(
+            (active_start[rejected], midpoint_parameter)
+        )
+        active_stop = np.concatenate(
+            (midpoint_parameter, active_stop[rejected])
+        )
 
-    indices = sorted(keep)
-    observed_error = 0.0
-    observed_arc_length = 0.0
-    for first, last in zip(indices, indices[1:]):
-        observed_error = max(
-            observed_error,
-            float(
-                _point_to_chord_distances(points, first, last).max(initial=0.0)
-            ),
-        )
-        observed_arc_length = max(
-            observed_arc_length,
-            float(cumulative[last] - cumulative[first]),
-        )
-    return points[indices], observed_error, observed_arc_length
+    controls = np.concatenate(accepted_controls)
+    order = np.argsort(np.concatenate(accepted_start), kind="stable")
+    controls = controls[order]
+    points = np.concatenate(
+        (controls[0, :1], controls[:, -1]),
+        axis=0,
+    )
+    if closed:
+        points[-1] = points[0]
+        if len(points) < 4:
+            raise ValueError(
+                "adaptive spline produced too few points for a closed ring"
+            )
+    else:
+        points[0] = first
+        points[-1] = last
+    if not np.isfinite(points).all():
+        raise ValueError("adaptive spline produced non-finite coordinates")
+    return (
+        points,
+        observed_error_bound,
+        observed_arc_bound,
+        evaluation_count,
+    )
 
 
 def _unchanged(points: np.ndarray, closed: bool, reason: str) -> SmoothingResult:
@@ -223,6 +399,7 @@ def _unchanged(points: np.ndarray, closed: bool, reason: str) -> SmoothingResult
         closed=closed,
         max_chord_error=0.0,
         max_segment_arc_length=0.0,
+        curve_evaluation_count=len(points),
         reason=reason,
     )
 
@@ -234,10 +411,11 @@ def smooth_polyline(
     """Fit and resample one open or closed polyline.
 
     Units are the same as the input coordinates. For raster-derived pixel
-    coordinates, the defaults mean 1 px smoothing, a 0.5 px internal curve
-    sample, and final linearization bounded by 0.25 px chord error and 8 px
-    curve arc length. Deviation is reported but is not limited unless
-    max_deviation is set.
+    coordinates, the defaults mean 1 px smoothing and direct linearization
+    bounded by 0.25 px chord error and 8 px curve arc length. The 0.5 px
+    spacing remains an equivalent-count/reporting baseline and is not
+    materialized on the production path. Deviation is reported but is not
+    limited unless max_deviation is set.
     """
 
     config = config or SmoothingConfig()
@@ -255,12 +433,10 @@ def smooth_polyline(
     if total < float(config.min_length):
         return _unchanged(values, closed, "too_short")
 
-    sample_count = max(
+    dense_equivalent_count = max(
         int(config.spline_degree) + 1,
         int(math.ceil(total / float(config.curve_sampling_spacing))) + 1,
     )
-    samples = np.linspace(0.0, 1.0, sample_count)
-    reference = _resample(source_points, source_parameter, samples)
 
     # Sparse staircases can make a cubic spline behave like an unstable exact
     # interpolant. Fit against uniformly densified samples of the same source
@@ -296,33 +472,75 @@ def smooth_polyline(
             s=smoothing,
             per=closed,
         )
-        dense_candidate = np.column_stack(splev(samples, spline))
-        if closed:
-            dense_candidate[-1] = dense_candidate[0]
+        candidate, chord_error, arc_length, evaluation_count = (
+            _adaptive_sample_spline(
+                spline,
+                first_point=values[0],
+                last_point=values[0] if closed else values[-1],
+                closed=closed,
+                max_chord_error=float(config.max_chord_error),
+                max_segment_arc_length=float(
+                    config.max_segment_arc_length
+                ),
+            )
+        )
+        if config.max_deviation is None:
+            deviation_parameter = fit_parameter
+            deviation_source = fit_source
         else:
-            dense_candidate[0] = values[0]
-            dense_candidate[-1] = values[-1]
-        maximum, mean = _deviation(reference, dense_candidate)
-        candidate, chord_error, arc_length = adaptive_sample_curve(
-            dense_candidate,
-            max_chord_error=float(config.max_chord_error),
-            max_segment_arc_length=float(config.max_segment_arc_length),
+            deviation_parameter = np.linspace(
+                0.0,
+                1.0,
+                dense_equivalent_count,
+            )
+            deviation_source = _resample(
+                source_points,
+                source_parameter,
+                deviation_parameter,
+            )
+        fit_candidate = np.column_stack(
+            splev(deviation_parameter, spline)
+        )
+        fractions = deviation_parameter[:, None]
+        fit_candidate += (
+            (1.0 - fractions) * (values[0] - fit_candidate[0])
+            + fractions
+            * (
+                (values[0] if closed else values[-1])
+                - fit_candidate[-1]
+            )
+        )
+        maximum, mean = _deviation(
+            deviation_source,
+            fit_candidate,
         )
         return (
             candidate,
             maximum,
             mean,
-            len(dense_candidate),
+            dense_equivalent_count,
             chord_error,
             arc_length,
+            evaluation_count,
         )
-
-    if closed:
-        reference[-1] = reference[0]
 
     strengths = [1.0]
     if config.max_deviation is not None:
-        strengths.extend([0.75, 0.5, 0.35, 0.25, 0.18, 0.125, 0.09, 0.0625])
+        strengths.extend(
+            [
+                0.75,
+                0.5,
+                0.35,
+                0.25,
+                0.18,
+                0.125,
+                0.09,
+                0.0625,
+                0.04,
+                0.025,
+                0.0125,
+            ]
+        )
         strengths = [value for value in strengths if value >= float(config.min_strength)]
         if strengths[-1] > float(config.min_strength):
             strengths.append(float(config.min_strength))
@@ -336,6 +554,7 @@ def smooth_polyline(
                 dense_point_count,
                 chord_error,
                 arc_length,
+                evaluation_count,
             ) = fit_at(strength)
         except (TypeError, ValueError) as error:
             failure = f"spline_failed:{error}"
@@ -353,6 +572,7 @@ def smooth_polyline(
                 closed=closed,
                 max_chord_error=float(chord_error),
                 max_segment_arc_length=float(arc_length),
+                curve_evaluation_count=int(evaluation_count),
             )
     return _unchanged(values, closed, failure)
 
