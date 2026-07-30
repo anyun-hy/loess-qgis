@@ -106,6 +106,26 @@ esac
   echo "Plugin source not found: ${PLUGIN_SRC}" >&2
   exit 1
 }
+"${PYTHON_BIN}" -c '
+import sys
+from pathlib import Path
+
+source_root = Path(sys.argv[1]).expanduser().resolve()
+destination = Path(sys.argv[2]).expanduser().resolve()
+
+def contains(parent, child):
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+if contains(source_root, destination) or contains(destination, source_root):
+    raise SystemExit(
+        "Refusing plugin destination overlapping source repository: "
+        f"{destination} (source: {source_root})"
+    )
+' "${SOURCE_ROOT}" "${DEST_PLUGIN}"
 [[ -f "${PLUGIN_SRC}/metadata.txt" ]] || {
   echo "Missing plugin metadata" >&2
   exit 1

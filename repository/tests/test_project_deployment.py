@@ -150,6 +150,49 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
     assert import_check.stdout.strip() == "2 12 []"
 
 
+def test_plugin_installer_rejects_destinations_overlapping_source_tree(tmp_path):
+    fake_qgis = tmp_path / "qgis_process"
+    _fake_qgis(fake_qgis)
+    env = _environment(fake_qgis)
+    plugin_source = ROOT / "qgis_plugins" / "labeling_tool"
+    metadata_before = (plugin_source / "metadata.txt").read_bytes()
+
+    linked_plugin_root = tmp_path / "linked-plugins"
+    linked_plugin_root.mkdir()
+    (linked_plugin_root / "labeling_tool").symlink_to(
+        plugin_source,
+        target_is_directory=True,
+    )
+    unsafe_roots = (
+        ROOT / "qgis_plugins",
+        ROOT / "tests" / ".." / "qgis_plugins",
+        ROOT / ".unsafe-plugin-root",
+        linked_plugin_root,
+    )
+
+    for plugin_root in unsafe_roots:
+        result = _run(
+            [
+                str(ROOT / "bash" / "install_plugin.sh"),
+                "--platform",
+                "macos",
+                "--profile",
+                "overlap-audit",
+                "--plugin-dir",
+                str(plugin_root),
+                "--check-only",
+            ],
+            env=env,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "overlapping source repository" in result.stderr
+
+    assert (plugin_source / "metadata.txt").read_bytes() == metadata_before
+    assert not list((ROOT / "qgis_plugins").glob(".labeling_tool.*"))
+    assert not (ROOT / ".unsafe-plugin-root").exists()
+
+
 def test_project_update_preserves_user_data_and_restores_managed_code(tmp_path):
     fake_qgis = tmp_path / "qgis_process"
     _fake_qgis(fake_qgis)
