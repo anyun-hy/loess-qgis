@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 from shapely.affinity import affine_transform
+from shapely.errors import GEOSException
 from shapely.geometry import (
     GeometryCollection,
     LineString,
@@ -311,11 +312,21 @@ def _replace_geometry_dividers(geometry, replacements):
         rings[key] = _apply_ring_replacements(rings[key], located)
     rebuilt = []
     for polygon_index, polygon in enumerate(polygons):
+        exterior = rings[(polygon_index, 0)]
         interiors = [
             rings[(polygon_index, ring_index)]
             for ring_index in range(1, len(polygon.interiors) + 1)
         ]
-        rebuilt.append(Polygon(rings[(polygon_index, 0)], interiors))
+        if len(exterior) < 4 or any(len(ring) < 4 for ring in interiors):
+            raise CommonBoundarySmoothingError(
+                "divider replacement collapsed a polygon ring"
+            )
+        try:
+            rebuilt.append(Polygon(exterior, interiors))
+        except (GEOSException, TypeError, ValueError) as error:
+            raise CommonBoundarySmoothingError(
+                f"divider replacement could not rebuild polygon: {error}"
+            ) from error
     polygons = rebuilt
     return polygons[0] if isinstance(geometry, Polygon) else MultiPolygon(polygons)
 

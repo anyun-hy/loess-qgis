@@ -3,7 +3,12 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon,
 from shapely.ops import linemerge, split
 
 from boundary_fitting.unit_runtime import _fit_or_subdivide
-from common_boundary_smoother import _pair_validation_failure, smooth_common_boundaries
+from common_boundary_smoother import (
+    CommonBoundarySmoothingError,
+    _pair_validation_failure,
+    _replace_geometry_dividers,
+    smooth_common_boundaries,
+)
 from polyline_smoother import SmoothingConfig
 
 
@@ -232,6 +237,18 @@ def test_tiny_closed_divider_keeps_original_geometry_when_spline_collapses_it():
     assert all(item["geometry"].area > 0 for item in formal)
     assert formal[0]["geometry"].equals(records[0]["geometry"])
     assert formal[1]["geometry"].equals(records[1]["geometry"])
+
+
+def test_ring_collapse_is_reported_as_a_safe_replacement_failure():
+    polygon = Polygon([(0, 0), (1, 0), (0, 1), (0, 0)])
+    divider = LineString([(0, 0), (1, 0), (0, 1), (0, 0)])
+    collapsed = LineString([(0, 0), (0, 0)])
+
+    with np.testing.assert_raises_regex(
+        CommonBoundarySmoothingError,
+        "collapsed a polygon ring",
+    ):
+        _replace_geometry_dividers(polygon, [(divider, collapsed)])
 
 
 def test_pair_validation_rejects_geometry_that_collapses_in_output_crs():
