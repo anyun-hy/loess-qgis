@@ -1,6 +1,6 @@
 # 半自动矢量标注插件完整实施与验收方案（当前版）
 
-> 文件名保留 `plugin_plan_v3.md`。本文是插件唯一的设计、实施和验收依据。`docs/design_inference_env_ui.md`、`.omo/plans/` 和外部粘贴方案只作为设计输入，不得覆盖本文决策。
+> 文件名保留 `plugin_plan_v3.md`。本文是插件唯一的设计、实施和验收依据。`docs/design_inference_env_ui.md` 和外部历史方案只作为设计输入，不得覆盖本文决策。
 
 ## 1. 最终目标
 
@@ -1095,6 +1095,12 @@ SAM3 运行链均已删除，并由自动测试禁止恢复。本项目不维护
 必要的历史结论只在 `IMPLEMENTATION_STATUS.md` 中记录。用户显式“重做
 失败包”只允许进入 `manual_package_reset.py` 与
 `V5AsyncInferenceRunner` 的正式事务链。
+
+仓库不得跟踪 `.omo/`、`.opencode/` 等外部 Agent/工具状态，也不得把
+`output/`、`scratch/`、`__pycache__/`、`.DS_Store` 或固定 Run 审计结果
+当作源码提交。正式部署和测试需要的能力进入 `inference_scripts/`、
+`qgis_plugins/` 与 `tests/`；运行证据只在状态文档记录必要的路径、摘要
+和哈希，不把临时运行目录复制回源码仓库。
 
 ## 18. 实施顺序
 

@@ -28,6 +28,31 @@ def test_legacy_single_model_runtime_files_are_removed():
     assert not [str(path.relative_to(ROOT)) for path in obsolete if path.exists()]
 
 
+def test_repository_excludes_external_tool_and_runtime_artifact_roots():
+    obsolete_roots = (
+        ROOT / ".omo",
+        ROOT / ".opencode",
+        ROOT / "output",
+        ROOT / "scratch",
+        ROOT / "docs" / "DATA_INDEX.md",
+    )
+    assert not [
+        str(path.relative_to(ROOT))
+        for path in obsolete_roots
+        if path.exists()
+    ]
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    for pattern in (
+        "/.omo/",
+        "/.opencode/",
+        "/output/",
+        "/scratch/",
+        "__pycache__/",
+        ".DS_Store",
+    ):
+        assert pattern in ignore
+
+
 def test_legacy_v5_boundary_fitter_is_removed():
     obsolete = (
         ROOT / "inference_scripts" / "boundary_fitting" / "adaptive_fit.py",
