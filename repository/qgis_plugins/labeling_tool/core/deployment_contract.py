@@ -16,6 +16,7 @@ SHARED_RUNTIME_FILES = {
     "qgis_plugins/labeling_tool/core/ownership_neighbors.py":
         "runtime/labeling_tool/core/ownership_neighbors.py",
 }
+SUPPORTED_PLATFORMS = frozenset({"ubuntu", "macos"})
 
 
 def _sha256(path: Path) -> str:
@@ -73,6 +74,21 @@ def verify_project_runtime(
         plugin_manifest = _read_manifest(
             plugin_manifest_path, "qgis_plugin"
         )
+        project_platform = str(project_manifest.get("platform") or "")
+        plugin_platform = str(plugin_manifest.get("platform") or "")
+        if project_platform not in SUPPORTED_PLATFORMS:
+            raise ValueError(
+                f"项目部署平台无效: {project_platform or '<missing>'}"
+            )
+        if plugin_platform not in SUPPORTED_PLATFORMS:
+            raise ValueError(
+                f"插件部署平台无效: {plugin_platform or '<missing>'}"
+            )
+        if project_platform != plugin_platform:
+            raise ValueError(
+                "插件与项目部署平台不一致: "
+                f"plugin={plugin_platform}, project={project_platform}"
+            )
         project_runtime = _runtime_block(
             project_manifest, project_manifest_path
         )
@@ -121,6 +137,9 @@ def verify_project_runtime(
         "status": "ready",
         "value": str(project_runtime["sha256"]),
         "source": f"{plugin_manifest_path} / {project_manifest_path}",
-        "message": f"插件与项目共享模块一致，Git SHA={project_git}",
+        "message": (
+            f"插件与项目平台及共享模块一致，"
+            f"platform={project_platform}，Git SHA={project_git}"
+        ),
         "fix": "",
     }

@@ -119,6 +119,7 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
     )
     assert plugin_manifest["deployment_kind"] == "qgis_plugin"
     assert project_manifest["deployment_kind"] == "loess_project"
+    assert plugin_manifest["platform"] == project_manifest["platform"] == "macos"
 
     for name in SHARED_NAMES:
         source = ROOT / "qgis_plugins" / "labeling_tool" / "core" / name
@@ -148,6 +149,87 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
         env={**env, "PYTHONPATH": str(project_root / "runtime")},
     )
     assert import_check.stdout.strip() == "2 12 []"
+
+
+def test_runtime_contract_rejects_invalid_or_mismatched_platforms(tmp_path):
+    fake_qgis = tmp_path / "qgis_process"
+    _fake_qgis(fake_qgis)
+    env = _environment(fake_qgis)
+    plugin_root = tmp_path / "plugins"
+    installed_plugin = plugin_root / "labeling_tool"
+    project_root = tmp_path / "project"
+    plugin_manifest_path = installed_plugin / "deployment_manifest.json"
+    project_manifest_path = project_root / "project_manifest.json"
+
+    _run(
+        [
+            str(ROOT / "bash" / "install_plugin.sh"),
+            "--platform",
+            "macos",
+            "--profile",
+            "test-profile",
+            "--plugin-dir",
+            str(plugin_root),
+        ],
+        env=env,
+    )
+    _run(
+        [
+            str(ROOT / "bash" / "init_project.sh"),
+            "--platform",
+            "macos",
+            "--project-root",
+            str(project_root),
+        ],
+        env=env,
+    )
+
+    project_manifest = json.loads(
+        project_manifest_path.read_text(encoding="utf-8")
+    )
+    project_manifest["platform"] = "ubuntu"
+    project_manifest_path.write_text(
+        json.dumps(project_manifest),
+        encoding="utf-8",
+    )
+    check = verify_project_runtime(
+        project_root / "inference_scripts",
+        plugin_root=installed_plugin,
+    )
+    assert check["status"] == "error"
+    assert "插件与项目部署平台不一致" in check["message"]
+
+    project_manifest["platform"] = "windows"
+    project_manifest_path.write_text(
+        json.dumps(project_manifest),
+        encoding="utf-8",
+    )
+    check = verify_project_runtime(
+        project_root / "inference_scripts",
+        plugin_root=installed_plugin,
+    )
+    assert check["status"] == "error"
+    assert "项目部署平台无效" in check["message"]
+
+    project_manifest["platform"] = "macos"
+    project_manifest_path.write_text(
+        json.dumps(project_manifest),
+        encoding="utf-8",
+    )
+    plugin_manifest = json.loads(
+        plugin_manifest_path.read_text(encoding="utf-8")
+    )
+    plugin_manifest["platform"] = "windows"
+    plugin_manifest_path.write_text(
+        json.dumps(plugin_manifest),
+        encoding="utf-8",
+    )
+    check = verify_project_runtime(
+        project_root / "inference_scripts",
+        plugin_root=installed_plugin,
+    )
+    assert check["status"] == "error"
+    assert "插件部署平台无效" in check["message"]
 
 
 def test_plugin_installer_rejects_destinations_overlapping_source_tree(tmp_path):

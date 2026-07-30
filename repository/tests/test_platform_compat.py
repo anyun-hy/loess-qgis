@@ -103,11 +103,37 @@ def test_inference_environment_contract_has_two_minimal_platform_locks():
     assert "python=3.12" in ubuntu["dependencies"]
     assert "python=3.12.13" in macos["dependencies"]
     assert "pytorch=2.7.1" in macos["dependencies"]
+    required_sam3_packages = {
+        "sam3==0.1.4",
+        "timm==1.0.28",
+        "tqdm==4.67.3",
+        "ftfy==6.3.1",
+        "regex==2026.7.10",
+        "iopath==0.1.10",
+        "typing_extensions==4.15.0",
+        "huggingface-hub==1.23.0",
+        "einops==0.8.2",
+        "pycocotools==2.0.11",
+        "safetensors==0.8.0",
+        "psutil==7.2.2",
+    }
     for environment in (ubuntu, macos):
         assert not any(
             isinstance(item, str) and item.split("=", 1)[0] == "qgis"
             for item in environment["dependencies"]
         )
+        pip_packages = next(
+            item["pip"]
+            for item in environment["dependencies"]
+            if isinstance(item, dict) and "pip" in item
+        )
+        assert required_sam3_packages <= set(pip_packages)
+
+    initializer = (ROOT / "bash" / "init_project.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0" in initializer
+    assert "https://download.pytorch.org/whl/cu124" in initializer
 
 
 def test_environment_check_owns_and_terminates_its_process_group():
