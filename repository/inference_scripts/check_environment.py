@@ -36,6 +36,7 @@ from torchscript_runtime import load_torchscript_model
 
 FINGERPRINT_FILES = (
     "../project_manifest.json",
+    "../.loess-project-id",
     "../runtime/loess_launcher.sh",
 )
 

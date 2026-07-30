@@ -6,6 +6,7 @@ PLATFORM="${LOESS_PLATFORM:-auto}"
 PROFILE="${QGIS_PROFILE:-default}"
 PLUGIN_DIR_OVERRIDE="${QGIS_PLUGIN_DIR:-}"
 CHECK_ONLY=0
+ALLOW_DIRTY=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -24,6 +25,8 @@ Options:
   --profile NAME       QGIS profile name. Default: default
   --plugin-dir PATH    Override the QGIS plugin directory
   --check-only         Validate without changing the installed plugin
+  --allow-dirty        Allow a development deployment from modified source;
+                       the manifest records the actual source bundle SHA256
   -h, --help           Show this help
 EOF
 }
@@ -44,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --check-only)
       CHECK_ONLY=1
+      shift
+      ;;
+    --allow-dirty)
+      ALLOW_DIRTY=1
       shift
       ;;
     -h|--help)
@@ -170,32 +177,90 @@ if [[ "${qgis_version}" != *"${EXPECTED_QGIS}"* ]]; then
   exit 1
 fi
 
-GIT_SHA="${LOESS_GIT_SHA:-}"
-if [[ -z "${GIT_SHA}" ]] && git -C "${SOURCE_ROOT}" rev-parse HEAD >/dev/null 2>&1; then
-  GIT_SHA="$(git -C "${SOURCE_ROOT}" rev-parse HEAD)"
+source_args=(inspect --source-root "${SOURCE_ROOT}")
+if [[ "${ALLOW_DIRTY}" -eq 1 || "${LOESS_ALLOW_DIRTY:-0}" == "1" ]]; then
+  source_args+=(--allow-dirty)
 fi
-[[ "${GIT_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
-  echo "Cannot determine canonical Git SHA; set LOESS_GIT_SHA when installing an archive" >&2
-  exit 1
-}
+SOURCE_INFO="$("${PYTHON_BIN}" "${SCRIPT_DIR}/deployment_source.py" "${source_args[@]}")"
+GIT_SHA="$("${PYTHON_BIN}" -c '
+import json
+import sys
+print(json.loads(sys.argv[1])["git_sha"])
+' "${SOURCE_INFO}")"
 
 STAGE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/loess-plugin-install.XXXXXX")"
 STAGE_PLUGIN="${STAGE_PARENT}/${PLUGIN_NAME}"
+STAGED_DEST=""
+OLD_DEST=""
+NEW_INSTALLED=0
+DEPLOY_COMMITTED=0
+IN_CLEANUP=0
+
 cleanup() {
-  rm -rf -- "${STAGE_PARENT}"
+  local exit_code=$?
+  trap - EXIT INT TERM HUP
+  if [[ "${IN_CLEANUP}" -eq 1 ]]; then
+    exit "${exit_code}"
+  fi
+  IN_CLEANUP=1
+  if [[ "${DEPLOY_COMMITTED}" -eq 0 ]]; then
+    if [[ "${NEW_INSTALLED}" -eq 1 && -e "${DEST_PLUGIN}" ]]; then
+      rm -rf -- "${DEST_PLUGIN}"
+    fi
+    if [[ -n "${OLD_DEST}" && -e "${OLD_DEST}" ]]; then
+      if [[ -e "${DEST_PLUGIN}" ]]; then
+        rm -rf -- "${DEST_PLUGIN}"
+      fi
+      mv "${OLD_DEST}" "${DEST_PLUGIN}"
+    fi
+    if [[ -n "${STAGED_DEST}" && -e "${STAGED_DEST}" ]]; then
+      rm -rf -- "${STAGED_DEST}"
+    fi
+  elif [[ -n "${OLD_DEST}" && -e "${OLD_DEST}" ]]; then
+    rm -rf -- "${OLD_DEST}"
+  fi
+  if [[ -n "${STAGE_PARENT}" && -e "${STAGE_PARENT}" ]]; then
+    rm -rf -- "${STAGE_PARENT}"
+  fi
+  exit "${exit_code}"
+}
+on_signal() {
+  exit "$1"
+}
+fault_inject() {
+  local stage="$1"
+  [[ "${LOESS_TEST_SIGNAL_AT:-}" == "${stage}" ]] || return 0
+  case "${LOESS_TEST_SIGNAL:-TERM}" in
+    INT) kill -INT "$$" ;;
+    TERM) kill -TERM "$$" ;;
+    HUP) kill -HUP "$$" ;;
+    *)
+      echo "Invalid LOESS_TEST_SIGNAL: ${LOESS_TEST_SIGNAL}" >&2
+      return 2
+      ;;
+  esac
 }
 trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
 
 mkdir -p "${STAGE_PLUGIN}"
 rsync -rlpt --delete --omit-dir-times \
   --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' --exclude '._*' \
   "${PLUGIN_SRC}/" "${STAGE_PLUGIN}/"
+SOURCE_INFO_AFTER="$("${PYTHON_BIN}" "${SCRIPT_DIR}/deployment_source.py" "${source_args[@]}")"
+[[ "${SOURCE_INFO_AFTER}" == "${SOURCE_INFO}" ]] || {
+  echo "Deployable source changed while plugin staging was in progress" >&2
+  exit 1
+}
 PYTHONPYCACHEPREFIX="${STAGE_PARENT}/compile-cache" \
   "${PYTHON_BIN}" -m compileall -q "${STAGE_PLUGIN}"
 rm -rf -- "${STAGE_PARENT}/compile-cache"
 
 LOESS_STAGE_PLUGIN="${STAGE_PLUGIN}" \
 LOESS_GIT_SHA="${GIT_SHA}" \
+LOESS_SOURCE_INFO="${SOURCE_INFO}" \
 LOESS_PLATFORM="${PLATFORM}" \
 LOESS_PROFILE="${PROFILE}" \
 "${PYTHON_BIN}" -c '
@@ -225,6 +290,7 @@ payload = {
     "schema_version": 2,
     "deployment_kind": "qgis_plugin",
     "git_sha": os.environ["LOESS_GIT_SHA"],
+    "source": json.loads(os.environ["LOESS_SOURCE_INFO"]),
     "plugin_version": "0.4.0",
     "platform": os.environ["LOESS_PLATFORM"],
     "qgis_profile": os.environ["LOESS_PROFILE"],
@@ -245,6 +311,10 @@ echo "Validated ${PLUGIN_NAME} 0.4.0"
 echo "  platform: ${PLATFORM}"
 echo "  QGIS: ${qgis_version}"
 echo "  Git SHA: ${GIT_SHA}"
+echo "  source bundle: $(
+  "${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["source_bundle_sha256"])' \
+    "${SOURCE_INFO}"
+)"
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
   echo "Check-only complete; installed plugin was not changed."
@@ -256,18 +326,21 @@ STAGED_DEST="${QGIS_PLUGIN_ROOT}/.${PLUGIN_NAME}.new.$$"
 OLD_DEST="${QGIS_PLUGIN_ROOT}/.${PLUGIN_NAME}.old.$$"
 rm -rf -- "${STAGED_DEST}" "${OLD_DEST}"
 mv "${STAGE_PLUGIN}" "${STAGED_DEST}"
+fault_inject staged_destination
 
 if [[ -e "${DEST_PLUGIN}" ]]; then
   mv "${DEST_PLUGIN}" "${OLD_DEST}"
 fi
-if mv "${STAGED_DEST}" "${DEST_PLUGIN}"; then
-  rm -rf -- "${OLD_DEST}"
-else
-  [[ ! -e "${DEST_PLUGIN}" && -e "${OLD_DEST}" ]] && mv "${OLD_DEST}" "${DEST_PLUGIN}"
-  echo "Atomic plugin installation failed; previous installation was restored" >&2
-  exit 1
-fi
+fault_inject previous_installation_moved
+NEW_INSTALLED=1
+mv "${STAGED_DEST}" "${DEST_PLUGIN}"
+fault_inject new_installation_moved
 
 test -f "${DEST_PLUGIN}/metadata.txt"
 test -f "${DEST_PLUGIN}/deployment_manifest.json"
+fault_inject installation_verified
+DEPLOY_COMMITTED=1
+if [[ -e "${OLD_DEST}" ]]; then
+  rm -rf -- "${OLD_DEST}"
+fi
 echo "Installed QGIS plugin only: ${DEST_PLUGIN}"

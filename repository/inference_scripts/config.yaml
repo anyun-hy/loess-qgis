@@ -48,11 +48,13 @@ semantic_models:
 fusion_profiles:
   - profile_id: l2_fusion_v1
     file: ../weights/fusion_profile.json
+    sha256: "1e4a3086d016b26c074499a2035fea28ad0a4056e1cf3539fb04eb5e2f8c615d"
     enabled: true
 
 sam3:
   enabled: true
   checkpoint: ../weights/sam3.pt
+  sha256: "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
   version: sam3-v1
   device: auto
   buffer_px: 32

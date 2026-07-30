@@ -55,12 +55,13 @@ bash/install_plugin.sh
 bash/init_project.sh
 ```
 
-`install_plugin.sh` 只负责把 QGIS 插件安装到指定 platform/profile，支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。它不得询问或创建项目目录，不得部署推理脚本、创建权重/输入/输出目录，也不得创建或更新 Conda 推理环境。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；失败不得改变现有安装，也不得留下源码备份或 `.stage`。
+`install_plugin.sh` 只负责把 QGIS 插件安装到指定 platform/profile，支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。它不得询问或创建项目目录，不得部署推理脚本、创建权重/输入/输出目录，也不得创建或更新 Conda 推理环境。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；`INT/TERM/HUP`、校验失败或任一步移动失败都必须自动恢复安装前目录，不能留下源码备份、`.old`、`.new` 或 `.stage`。正式部署默认拒绝 deployable source 的已跟踪修改和未跟踪文件；只有显式 `--allow-dirty` 才允许开发部署，并必须在清单中同时标记 dirty 和实际源码包 SHA256。无 `.git` 发布包必须携带由干净工作树生成的 `source_manifest.json`，部署前重新计算并匹配整个可部署源码包摘要，不能只信外部传入的 Git SHA。
 
-`init_project.sh` 只负责用户选择的项目根目录，支持交互选择或 `--project-root`，以及 `--platform`、`--conda-exe`、`--conda-env`、`--create-env`、`--check-only` 和 `--check-assets`。它不得读取、安装或修改任何 QGIS profile。项目初始化后固定形成：
+`init_project.sh` 只负责用户选择的项目根目录，支持交互选择或 `--project-root`，以及 `--platform`、`--conda-exe`、`--conda-env`、`--create-env`、`--check-only`、`--check-assets`、`--rebind-project-root` 和开发态 `--allow-dirty`。它不得读取、安装或修改任何 QGIS profile。项目初始化后固定形成：
 
 ```text
 <project_root>/
+├── .loess-project-id
 ├── project_manifest.json
 ├── inference_scripts/
 ├── runtime/
@@ -83,11 +84,11 @@ bash/init_project.sh
     └── cache/
 ```
 
-权重文件、原始影像、范围矢量、GeoPackage、旧 Run 和缓存均不随仓库发布。初始化只创建说明和空目录；用户仍在 QGIS 中选择实际 raster/range 图层，插件中的推理脚本、输出工作区和 accepted 路径继续允许人工选择，不被项目清单锁死。`accepted_labels.gpkg` 不在初始化阶段创建，因为其 CRS 必须来自实际 Run 的 raster。
+权重文件、原始影像、范围矢量、GeoPackage、旧 Run 和缓存均不随仓库发布。初始化只创建说明和空目录；用户仍在 QGIS 中选择实际 raster/range 图层，插件中的推理脚本、输出工作区和 accepted 路径继续允许人工选择，不被项目清单锁死。`accepted_labels.gpkg` 不在初始化阶段创建，因为其 CRS 必须来自实际 Run 的 raster。三个语义模型、Fusion profile 和 SAM3 checkpoint 都必须在跟踪的 `config.yaml` 登记由训练/资产发布方提供的正式 SHA256；存在但没有可信 SHA、或实际 SHA 不一致都不得报告为可用。大文件校验必须流式读取。更换正式 Fusion/SAM3 资产时必须先由资产生产方给出新 SHA，再修改跟踪配置、评审提交并重新部署；禁止在运行机器上把“当前文件算出的哈希”直接登记为可信值。
 
-`qgis_plugins/labeling_tool/core/run_spec.py`、`run_state_db.py` 和 `ownership_neighbors.py` 是当前插件与推理进程共用的唯一维护源码。推理源码继续使用 `labeling_tool.core.*` 导入；项目初始化把这三个文件按原名部署到 `<project_root>/runtime/labeling_tool/core/`，Shell 通过 `PYTHONPATH` 使用该只读运行副本，不在部署时改写 Python 源码或 import。插件部署清单和项目清单必须记录相同 Git SHA、三个共享文件的逐文件 SHA256 和聚合 SHA256；两份清单还必须分别登记插件全部源码文件和项目全部 `inference_scripts/` 的逐文件 SHA256，环境检查按清单动态核对缺失、增加、内容改变和 Shell 执行权限，禁止另行维护手写“必要文件”列表。插件环境检查发现任一提交、清单或实际文件不一致时必须阻止启动并提示重新部署项目。两套 Python 进程可以各有同一提交的运行副本，但仓库内禁止出现第二份可独立修改的共享源码。
+`qgis_plugins/labeling_tool/core/run_spec.py`、`run_state_db.py` 和 `ownership_neighbors.py` 是当前插件与推理进程共用的唯一维护源码。推理源码继续使用 `labeling_tool.core.*` 导入；项目初始化把这三个文件按原名部署到 `<project_root>/runtime/labeling_tool/core/`，Shell 通过 `PYTHONPATH` 使用该只读运行副本，不在部署时改写 Python 源码或 import。插件部署清单和项目清单必须记录相同 Git SHA、相同实际源码包 SHA256、三个共享文件的逐文件 SHA256 和聚合 SHA256；两份清单还必须分别登记插件全部源码文件和项目全部 `inference_scripts/` 的逐文件 SHA256，环境检查按清单动态核对缺失、增加、内容改变和 Shell 执行权限，禁止另行维护手写“必要文件”列表。插件环境检查发现任一提交、源码包摘要、清单或实际文件不一致时必须阻止启动并提示重新部署项目。两套 Python 进程可以各有同一提交的运行副本，但仓库内禁止出现第二份可独立修改的共享源码。
 
-`init_project.sh` 更新时只原子替换其管理的 `inference_scripts/` 和 `runtime/`，保留 `weights/`、`input/`、`qgis/`、`output/` 及其中用户数据；目标已有同名受管目录但缺少合法 `project_manifest.json` 时必须拒绝覆盖。推理配置采用一份共享 Schema v2 和两个最小平台覆盖。初始化把平台、Conda 可执行文件和环境名写入带 SHA256 的 `runtime/loess_launcher.sh` 及项目清单；项目更新未显式传入新 `--conda-exe/--conda-env` 时必须保留已有值。所有推理 Shell 入口统一通过 `config.sh` 读取该配置，不能依赖 QGIS 启动进程偶然继承的 Conda 环境；只有显式的运行时 override 可以临时覆盖。
+`init_project.sh` 更新时只事务替换其管理的 `inference_scripts/`、`runtime/` 和项目清单，保留 `weights/`、`input/`、`qgis/`、`output/` 及其中用户数据；`INT/TERM/HUP` 或任一移动/验证失败都必须恢复更新前的三项受管内容。项目清单采用 schema 2，并与独立的 UUID 身份标记 `.loess-project-id` 一致；只有 `deployment_kind` 字段不能证明目录归本工具管理。schema 1 旧项目只有在项目根、受管路径、完整推理清单、launcher 和三个共享模块全部与旧清单一致时才自动迁移；受损旧项目不得自动认领。schema 2 项目允许在身份有效时修复受损/缺失的受管代码；项目移动后必须由用户显式传入 `--rebind-project-root`，保持同一 project ID。目标已有同名受管目录但缺少以上合法身份证据时必须拒绝覆盖。推理配置采用一份共享 Schema v2 和两个最小平台覆盖。初始化把平台、Conda 可执行文件和环境名写入带 SHA256 的 `runtime/loess_launcher.sh` 及项目清单；项目更新未显式传入新 `--conda-exe/--conda-env` 时必须保留已有值。所有推理 Shell 入口统一通过 `config.sh` 读取该配置，不能依赖 QGIS 启动进程偶然继承的 Conda 环境；只有显式的运行时 override 可以临时覆盖。
 
 ## 2. 原方案输入输出核对
 

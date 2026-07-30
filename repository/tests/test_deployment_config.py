@@ -100,6 +100,7 @@ def _config(model_sha):
         "fusion_profiles": [{
             "profile_id": "test_fusion",
             "file": "../weights/fusion_profile.json",
+            "sha256": "",
             "enabled": True,
         }],
         "sam3": {"enabled": False, "device": "cpu", "buffer_px": 32},
@@ -126,8 +127,13 @@ def _workspace(tmp_path, *, status="approved"):
     artifact.write_bytes(b"fixture-model")
     model_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     profile = _profile(model_sha, status=status)
-    (weights / "fusion_profile.json").write_text(json.dumps(profile), encoding="utf-8")
-    return scripts, _config(model_sha), profile
+    profile_path = weights / "fusion_profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    config = _config(model_sha)
+    config["fusion_profiles"][0]["sha256"] = hashlib.sha256(
+        profile_path.read_bytes()
+    ).hexdigest()
+    return scripts, config, profile
 
 
 def test_valid_schema_v2_registry_and_profile(tmp_path):
@@ -170,6 +176,75 @@ def test_registry_hash_mismatch_blocks_profile(tmp_path):
     )
     assert any(issue.code == "hash" for issue in issues)
     assert any("does not match model registry" in issue.message for issue in issues)
+
+
+def test_fusion_profile_requires_registered_file_hash(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    profile_path = tmp_path / "weights" / "fusion_profile.json"
+    profile_path.write_text(
+        profile_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    effective, issues = validate_deployment_config(
+        config,
+        scripts_dir=scripts,
+        verify_files=True,
+        verify_hashes=True,
+    )
+    assert any(
+        issue.path == "/fusion_profiles/0/sha256"
+        and issue.code == "hash"
+        for issue in issues
+    )
+    assert effective["fusion_profiles"][0]["trusted"] is False
+    assert effective["fusion_profiles"][0]["available"] is False
+
+
+def test_enabled_sam3_requires_registered_checkpoint_hash(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    checkpoint = tmp_path / "weights" / "sam3.pt"
+    checkpoint.write_bytes(b"approved-sam-checkpoint")
+    expected = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    config["sam3"] = {
+        "enabled": True,
+        "checkpoint": "../weights/sam3.pt",
+        "sha256": expected,
+        "version": "sam3-test",
+        "device": "cpu",
+        "buffer_px": 32,
+    }
+    checkpoint.write_bytes(b"changed-sam-checkpoint")
+    effective, issues = validate_deployment_config(
+        config,
+        scripts_dir=scripts,
+        verify_files=True,
+        verify_hashes=True,
+    )
+    assert any(
+        issue.path == "/sam3/sha256" and issue.code == "hash"
+        for issue in issues
+    )
+    assert effective["sam3"]["expected_sha256"] == expected
+    assert effective["sam3"]["trusted"] is False
+
+
+def test_enabled_sam3_cannot_omit_trusted_hash(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    checkpoint = tmp_path / "weights" / "sam3.pt"
+    checkpoint.write_bytes(b"sam-checkpoint")
+    config["sam3"] = {
+        "enabled": True,
+        "checkpoint": "../weights/sam3.pt",
+        "device": "cpu",
+        "buffer_px": 32,
+    }
+    _, issues = validate_deployment_config(
+        config,
+        scripts_dir=scripts,
+        verify_files=True,
+        verify_hashes=True,
+    )
+    assert any(issue.path == "/sam3/sha256" for issue in issues)
 
 
 def test_rejected_profile_is_valid_but_not_runnable(tmp_path):

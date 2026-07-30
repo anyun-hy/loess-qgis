@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Mapping
@@ -22,6 +23,7 @@ SHARED_RUNTIME_FILES = {
 SUPPORTED_PLATFORMS = frozenset({"ubuntu", "macos"})
 DEPLOYMENT_FINGERPRINT_FILES = (
     "../project_manifest.json",
+    "../.loess-project-id",
     "../runtime/loess_launcher.sh",
 )
 LAUNCHER_RELATIVE_PATH = "runtime/loess_launcher.sh"
@@ -61,6 +63,62 @@ def _runtime_block(manifest: Mapping[str, Any], path: Path) -> Mapping[str, Any]
     if not _SHA256_RE.fullmatch(digest):
         raise ValueError(f"{path} 的共享模块聚合 SHA256 无效")
     return value
+
+
+def _source_block(
+    manifest: Mapping[str, Any],
+    path: Path,
+) -> Mapping[str, Any]:
+    value = manifest.get("source")
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} 缺少 source 来源信息")
+    if value.get("schema_version") != 1:
+        raise ValueError(f"{path} 的 source schema 无效")
+    if value.get("kind") not in {"git_worktree", "release_archive"}:
+        raise ValueError(f"{path} 的 source.kind 无效")
+    if not isinstance(value.get("git_dirty"), bool):
+        raise ValueError(f"{path} 的 source.git_dirty 无效")
+    if not _GIT_SHA_RE.fullmatch(str(value.get("git_sha") or "")):
+        raise ValueError(f"{path} 的 source.git_sha 无效")
+    if not _SHA256_RE.fullmatch(
+        str(value.get("source_bundle_sha256") or "")
+    ):
+        raise ValueError(f"{path} 的源码包 SHA256 无效")
+    try:
+        file_count = int(value.get("source_file_count"))
+    except (TypeError, ValueError):
+        file_count = 0
+    if file_count < 1:
+        raise ValueError(f"{path} 的 source_file_count 无效")
+    if str(manifest.get("git_sha") or "") != str(value.get("git_sha") or ""):
+        raise ValueError(f"{path} 的 Git SHA 与 source.git_sha 不一致")
+    return value
+
+
+def _validate_project_identity(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    project_root: Path,
+) -> str:
+    if manifest.get("schema_version") != 2:
+        raise ValueError(f"{manifest_path} 必须使用项目清单 schema 2")
+    project_id = str(manifest.get("project_id") or "")
+    try:
+        parsed = uuid.UUID(project_id)
+    except ValueError as error:
+        raise ValueError(f"{manifest_path} 的 project_id 无效") from error
+    if str(parsed) != project_id:
+        raise ValueError(f"{manifest_path} 的 project_id 不是规范 UUID")
+    marker_path = project_root / ".loess-project-id"
+    marker = _read_manifest(marker_path, "loess_project_identity")
+    if (
+        marker.get("schema_version") != 1
+        or str(marker.get("project_id") or "") != project_id
+    ):
+        raise ValueError(f"{marker_path} 与项目清单身份不一致")
+    if manifest.get("managed_paths") != ["inference_scripts", "runtime"]:
+        raise ValueError(f"{manifest_path} 的 managed_paths 无效")
+    return project_id
 
 
 def _inventory_block(
@@ -223,6 +281,13 @@ def verify_project_runtime(
         plugin_manifest = _read_manifest(
             plugin_manifest_path, "qgis_plugin"
         )
+        _validate_project_identity(
+            project_manifest,
+            project_manifest_path,
+            project_root,
+        )
+        if plugin_manifest.get("schema_version") != 2:
+            raise ValueError(f"{plugin_manifest_path} 必须使用插件清单 schema 2")
         declared_project_root = Path(
             str(project_manifest.get("project_root") or "")
         ).expanduser()
@@ -274,6 +339,10 @@ def verify_project_runtime(
             project_manifest, project_manifest_path
         )
         plugin_runtime = _runtime_block(plugin_manifest, plugin_manifest_path)
+        project_source = _source_block(
+            project_manifest, project_manifest_path
+        )
+        plugin_source = _source_block(plugin_manifest, plugin_manifest_path)
 
         project_git = str(project_manifest.get("git_sha") or "")
         plugin_git = str(plugin_manifest.get("git_sha") or "")
@@ -286,6 +355,15 @@ def verify_project_runtime(
                 "插件与项目来自不同 Git 提交: "
                 f"plugin={plugin_git or '<missing>'}, "
                 f"project={project_git or '<missing>'}"
+            )
+        if (
+            project_source.get("source_bundle_sha256")
+            != plugin_source.get("source_bundle_sha256")
+        ):
+            raise ValueError(
+                "插件与项目的实际源码包 SHA256 不一致: "
+                f"plugin={plugin_source.get('source_bundle_sha256')}, "
+                f"project={project_source.get('source_bundle_sha256')}"
             )
         if project_runtime.get("sha256") != plugin_runtime.get("sha256"):
             raise ValueError("插件与项目的共享模块聚合 SHA256 不一致")

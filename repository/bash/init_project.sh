@@ -10,6 +10,8 @@ CONDA_ENV_EXPLICIT=0
 CREATE_ENV=0
 CHECK_ONLY=0
 CHECK_ASSETS=0
+ALLOW_DIRTY=0
+REBIND_PROJECT_ROOT=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -34,6 +36,11 @@ Options:
   --create-env         Create or update the platform inference environment
   --check-only         Validate the source and target without writing
   --check-assets       Fail unless required weight assets exist and hashes match
+  --rebind-project-root
+                       Explicitly accept a moved project whose identity marker
+                       still matches its manifest
+  --allow-dirty        Allow a development deployment from modified source;
+                       the manifest records the actual source bundle SHA256
   -h, --help           Show this help
 EOF
 }
@@ -68,6 +75,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --check-assets)
       CHECK_ASSETS=1
+      shift
+      ;;
+    --rebind-project-root)
+      REBIND_PROJECT_ROOT=1
+      shift
+      ;;
+    --allow-dirty)
+      ALLOW_DIRTY=1
       shift
       ;;
     -h|--help)
@@ -173,46 +188,37 @@ for shared_name in run_spec.py run_state_db.py ownership_neighbors.py; do
 done
 
 MANIFEST="${PROJECT_ROOT}/project_manifest.json"
-if [[ -e "${MANIFEST}" ]]; then
-  "${PYTHON_BIN}" -c '
+identity_args=(--project-root "${PROJECT_ROOT}")
+if [[ "${REBIND_PROJECT_ROOT}" -eq 1 ]]; then
+  identity_args+=(--allow-rebind)
+fi
+PROJECT_IDENTITY="$("${PYTHON_BIN}" "${SCRIPT_DIR}/project_identity.py" "${identity_args[@]}")"
+PROJECT_ID="$("${PYTHON_BIN}" -c '
 import json
 import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-except Exception as exc:
-    raise SystemExit(f"Invalid project manifest {path}: {exc}")
-if payload.get("deployment_kind") != "loess_project":
-    raise SystemExit(f"Refusing project with foreign manifest: {path}")
-' "${MANIFEST}"
-  if [[ "${CONDA_EXE_EXPLICIT}" -eq 0 ]]; then
-    CONDA_EXE="$("${PYTHON_BIN}" -c '
+print(json.loads(sys.argv[1])["project_id"])
+' "${PROJECT_IDENTITY}")"
+CREATE_IDENTITY="$("${PYTHON_BIN}" -c '
 import json
 import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(str((payload.get("launcher") or {}).get("conda_executable") or ""))
-' "${MANIFEST}")"
+print("1" if json.loads(sys.argv[1])["create_identity"] else "0")
+' "${PROJECT_IDENTITY}")"
+if [[ "${CONDA_EXE_EXPLICIT}" -eq 0 ]]; then
+  CONDA_EXE="$("${PYTHON_BIN}" -c '
+import json
+import sys
+print(json.loads(sys.argv[1])["conda_executable"])
+' "${PROJECT_IDENTITY}")"
+fi
+if [[ "${CONDA_ENV_EXPLICIT}" -eq 0 ]]; then
+  saved_environment="$("${PYTHON_BIN}" -c '
+import json
+import sys
+print(json.loads(sys.argv[1])["conda_environment"])
+' "${PROJECT_IDENTITY}")"
+  if [[ -n "${saved_environment}" ]]; then
+    ENV_NAME="${saved_environment}"
   fi
-  if [[ "${CONDA_ENV_EXPLICIT}" -eq 0 ]]; then
-    saved_environment="$("${PYTHON_BIN}" -c '
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(str((payload.get("launcher") or {}).get("conda_environment") or ""))
-' "${MANIFEST}")"
-    if [[ -n "${saved_environment}" ]]; then
-      ENV_NAME="${saved_environment}"
-    fi
-  fi
-elif [[ -e "${PROJECT_ROOT}/inference_scripts" || -e "${PROJECT_ROOT}/runtime" ]]; then
-  echo "Refusing to overwrite unmanaged inference_scripts/runtime without project_manifest.json" >&2
-  exit 1
 fi
 
 [[ "${ENV_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || {
@@ -231,19 +237,22 @@ print(Path(sys.argv[1]).expanduser().resolve())
   }
 fi
 
-GIT_SHA="${LOESS_GIT_SHA:-}"
-if [[ -z "${GIT_SHA}" ]] && git -C "${SOURCE_ROOT}" rev-parse HEAD >/dev/null 2>&1; then
-  GIT_SHA="$(git -C "${SOURCE_ROOT}" rev-parse HEAD)"
+source_args=(inspect --source-root "${SOURCE_ROOT}")
+if [[ "${ALLOW_DIRTY}" -eq 1 || "${LOESS_ALLOW_DIRTY:-0}" == "1" ]]; then
+  source_args+=(--allow-dirty)
 fi
-[[ "${GIT_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
-  echo "Cannot determine canonical Git SHA; set LOESS_GIT_SHA when initializing from an archive" >&2
-  exit 1
-}
+SOURCE_INFO="$("${PYTHON_BIN}" "${SCRIPT_DIR}/deployment_source.py" "${source_args[@]}")"
+GIT_SHA="$("${PYTHON_BIN}" -c '
+import json
+import sys
+print(json.loads(sys.argv[1])["git_sha"])
+' "${SOURCE_INFO}")"
 
 check_assets() {
   "${PYTHON_BIN}" -c '
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -257,10 +266,15 @@ for asset in manifest.get("required_assets", []):
         missing.append(asset["path"])
         continue
     expected = str(asset.get("sha256") or "")
-    if expected:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != expected:
-            mismatched.append(asset["path"])
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        mismatched.append(asset["path"] + " (missing trusted SHA256)")
+        continue
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        mismatched.append(asset["path"])
 if missing or mismatched:
     if missing:
         print("Missing required assets: " + ", ".join(missing), file=sys.stderr)
@@ -285,8 +299,14 @@ expected_git = sys.argv[4]
 expected_platform = sys.argv[5]
 expected_conda_exe = sys.argv[6]
 expected_conda_env = sys.argv[7]
+expected_source = json.loads(sys.argv[8])
+expected_project_id = sys.argv[9]
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
+if manifest.get("schema_version") != 2:
+    raise SystemExit("Project manifest must use schema 2")
+if manifest.get("project_id") != expected_project_id:
+    raise SystemExit("Project identity differs from the validated identity marker")
 if manifest.get("git_sha") != expected_git:
     raise SystemExit(
         "Project Git SHA differs from this source; rerun init_project.sh "
@@ -296,6 +316,10 @@ if Path(str(manifest.get("project_root") or "")).resolve() != root:
     raise SystemExit("Project was moved; rerun init_project.sh at its current path")
 if manifest.get("platform") != expected_platform:
     raise SystemExit("Project platform differs; rerun init_project.sh")
+if manifest.get("source") != expected_source:
+    raise SystemExit(
+        "Project source bundle differs from this source; rerun init_project.sh"
+    )
 
 launcher = manifest.get("launcher") or {}
 launcher_path = root / "runtime" / "loess_launcher.sh"
@@ -346,7 +370,7 @@ if actual_inference != expected_inference:
     )
 print("Existing project manifest and managed files are valid.")
 ' "${MANIFEST}" "${PROJECT_ROOT}" "${SOURCE_ROOT}" "${GIT_SHA}" \
-    "${PLATFORM}" "${CONDA_EXE}" "${ENV_NAME}"
+    "${PLATFORM}" "${CONDA_EXE}" "${ENV_NAME}" "${SOURCE_INFO}" "${PROJECT_ID}"
 }
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
@@ -400,14 +424,71 @@ mkdir -p "${PROJECT_ROOT}"
 STAGE_ROOT="$(mktemp -d "${PROJECT_ROOT}/.loess-project-init.XXXXXX")"
 OLD_INFERENCE="${PROJECT_ROOT}/.inference_scripts.old.$$"
 OLD_RUNTIME="${PROJECT_ROOT}/.runtime.old.$$"
+OLD_MANIFEST="${PROJECT_ROOT}/.project_manifest.json.old.$$"
 DEPLOY_COMMITTED=0
+NEW_INFERENCE=0
+NEW_RUNTIME=0
+NEW_MANIFEST=0
+NEW_IDENTITY=0
+IN_CLEANUP=0
 cleanup() {
-  rm -rf -- "${STAGE_ROOT}"
-  if [[ "${DEPLOY_COMMITTED}" -eq 1 ]]; then
-    rm -rf -- "${OLD_INFERENCE}" "${OLD_RUNTIME}"
+  local exit_code=$?
+  trap - EXIT INT TERM HUP
+  if [[ "${IN_CLEANUP}" -eq 1 ]]; then
+    exit "${exit_code}"
   fi
+  IN_CLEANUP=1
+  if [[ "${DEPLOY_COMMITTED}" -eq 0 ]]; then
+    if [[ "${NEW_INFERENCE}" -eq 1 && -e "${PROJECT_ROOT}/inference_scripts" ]]; then
+      rm -rf -- "${PROJECT_ROOT}/inference_scripts"
+    fi
+    if [[ "${NEW_RUNTIME}" -eq 1 && -e "${PROJECT_ROOT}/runtime" ]]; then
+      rm -rf -- "${PROJECT_ROOT}/runtime"
+    fi
+    if [[ "${NEW_MANIFEST}" -eq 1 && -e "${MANIFEST}" ]]; then
+      rm -f -- "${MANIFEST}"
+    fi
+    if [[ "${NEW_IDENTITY}" -eq 1 && -e "${PROJECT_ROOT}/.loess-project-id" ]]; then
+      rm -f -- "${PROJECT_ROOT}/.loess-project-id"
+    fi
+    if [[ -e "${OLD_INFERENCE}" ]]; then
+      mv "${OLD_INFERENCE}" "${PROJECT_ROOT}/inference_scripts"
+    fi
+    if [[ -e "${OLD_RUNTIME}" ]]; then
+      mv "${OLD_RUNTIME}" "${PROJECT_ROOT}/runtime"
+    fi
+    if [[ -e "${OLD_MANIFEST}" ]]; then
+      mv "${OLD_MANIFEST}" "${MANIFEST}"
+    fi
+  else
+    rm -rf -- "${OLD_INFERENCE}" "${OLD_RUNTIME}"
+    rm -f -- "${OLD_MANIFEST}"
+  fi
+  if [[ -e "${STAGE_ROOT}" ]]; then
+    rm -rf -- "${STAGE_ROOT}"
+  fi
+  exit "${exit_code}"
+}
+on_signal() {
+  exit "$1"
+}
+fault_inject() {
+  local stage="$1"
+  [[ "${LOESS_TEST_SIGNAL_AT:-}" == "${stage}" ]] || return 0
+  case "${LOESS_TEST_SIGNAL:-TERM}" in
+    INT) kill -INT "$$" ;;
+    TERM) kill -TERM "$$" ;;
+    HUP) kill -HUP "$$" ;;
+    *)
+      echo "Invalid LOESS_TEST_SIGNAL: ${LOESS_TEST_SIGNAL}" >&2
+      return 2
+      ;;
+  esac
 }
 trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
 
 mkdir -p "${STAGE_ROOT}/inference_scripts"
 rsync -rlpt --delete --omit-dir-times \
@@ -424,14 +505,23 @@ for shared_name in run_spec.py run_state_db.py ownership_neighbors.py; do
     "${STAGE_ROOT}/runtime/labeling_tool/core/${shared_name}"
 done
 
+SOURCE_INFO_AFTER="$("${PYTHON_BIN}" "${SCRIPT_DIR}/deployment_source.py" "${source_args[@]}")"
+[[ "${SOURCE_INFO_AFTER}" == "${SOURCE_INFO}" ]] || {
+  echo "Deployable source changed while project staging was in progress" >&2
+  exit 1
+}
+
 PYTHONPYCACHEPREFIX="${STAGE_ROOT}/compile-cache" "${PYTHON_BIN}" -m compileall -q \
   "${STAGE_ROOT}/inference_scripts" "${STAGE_ROOT}/runtime"
 rm -rf -- "${STAGE_ROOT}/compile-cache"
 
 LOESS_STAGE_ROOT="${STAGE_ROOT}" \
 LOESS_GIT_SHA="${GIT_SHA}" \
+LOESS_SOURCE_INFO="${SOURCE_INFO}" \
 LOESS_PLATFORM="${PLATFORM}" \
 LOESS_PROJECT_ROOT="${PROJECT_ROOT}" \
+LOESS_PROJECT_ID="${PROJECT_ID}" \
+LOESS_CREATE_IDENTITY="${CREATE_IDENTITY}" \
 LOESS_CONDA_EXE="${CONDA_EXE}" \
 LOESS_CONDA_ENV="${ENV_NAME}" \
 "${PYTHON_BIN}" -c '
@@ -480,17 +570,36 @@ for path in sorted(p for p in (stage / "inference_scripts").rglob("*") if p.is_f
 assets = []
 section = ""
 pending_artifact = None
+pending_fusion = None
+sam_asset = None
 for raw_line in config.splitlines():
     line = raw_line.strip()
     if line == "semantic_models:":
+        if pending_fusion:
+            assets.append(pending_fusion)
+            pending_fusion = None
         section = "models"
         continue
     if line == "fusion_profiles:":
+        if pending_fusion:
+            assets.append(pending_fusion)
+            pending_fusion = None
         section = "fusion"
         continue
     if line == "sam3:":
+        if pending_fusion:
+            assets.append(pending_fusion)
+            pending_fusion = None
         section = "sam3"
         continue
+    if line and not raw_line.startswith((" ", "\t")):
+        if pending_fusion:
+            assets.append(pending_fusion)
+            pending_fusion = None
+        if sam_asset:
+            assets.append(sam_asset)
+            sam_asset = None
+        section = ""
     if section == "models" and line.startswith("artifact:"):
         pending_artifact = line.split(":", 1)[1].strip().strip("\"'\''")
     elif section == "models" and pending_artifact and line.startswith("sha256:"):
@@ -502,24 +611,42 @@ for raw_line in config.splitlines():
         })
         pending_artifact = None
     elif section == "fusion" and line.startswith("file:"):
+        if pending_fusion:
+            assets.append(pending_fusion)
         value = line.split(":", 1)[1].strip().strip("\"'\''")
-        assets.append({
+        pending_fusion = {
             "kind": "fusion_profile",
             "path": "weights/" + Path(value).name,
             "sha256": "",
-        })
+        }
+    elif section == "fusion" and pending_fusion and line.startswith("sha256:"):
+        pending_fusion["sha256"] = line.split(":", 1)[1].strip().strip("\"'\''")
     elif section == "sam3" and line.startswith("checkpoint:"):
         value = line.split(":", 1)[1].strip().strip("\"'\''")
-        assets.append({
+        sam_asset = {
             "kind": "sam3_checkpoint",
             "path": "weights/" + Path(value).name,
             "sha256": "",
-        })
+        }
+    elif section == "sam3" and sam_asset and line.startswith("sha256:"):
+        sam_asset["sha256"] = line.split(":", 1)[1].strip().strip("\"'\''")
+
+if pending_fusion:
+    assets.append(pending_fusion)
+if sam_asset:
+    assets.append(sam_asset)
+for asset in assets:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(asset.get("sha256") or "")):
+        raise SystemExit(
+            f"Missing trusted SHA256 for required asset {asset.get('\''path'\'')}"
+        )
 
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "deployment_kind": "loess_project",
+    "project_id": os.environ["LOESS_PROJECT_ID"],
     "git_sha": os.environ["LOESS_GIT_SHA"],
+    "source": json.loads(os.environ["LOESS_SOURCE_INFO"]),
     "platform": os.environ["LOESS_PLATFORM"],
     "project_root": os.environ["LOESS_PROJECT_ROOT"],
     "managed_paths": ["inference_scripts", "runtime"],
@@ -550,35 +677,58 @@ payload = {
     json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
+if os.environ["LOESS_CREATE_IDENTITY"] == "1":
+    identity = {
+        "schema_version": 1,
+        "deployment_kind": "loess_project_identity",
+        "project_id": os.environ["LOESS_PROJECT_ID"],
+    }
+    (stage / ".loess-project-id").write_text(
+        json.dumps(identity, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 '
 
 rm -rf -- "${OLD_INFERENCE}" "${OLD_RUNTIME}"
+rm -f -- "${OLD_MANIFEST}"
 if [[ -e "${PROJECT_ROOT}/inference_scripts" ]]; then
   mv "${PROJECT_ROOT}/inference_scripts" "${OLD_INFERENCE}"
 fi
+fault_inject previous_inference_moved
 if [[ -e "${PROJECT_ROOT}/runtime" ]]; then
   mv "${PROJECT_ROOT}/runtime" "${OLD_RUNTIME}"
 fi
+fault_inject previous_runtime_moved
+if [[ -e "${MANIFEST}" ]]; then
+  mv "${MANIFEST}" "${OLD_MANIFEST}"
+fi
+fault_inject previous_manifest_moved
 
-rollback() {
-  rm -rf -- "${PROJECT_ROOT}/inference_scripts" "${PROJECT_ROOT}/runtime"
-  [[ -e "${OLD_INFERENCE}" ]] && mv "${OLD_INFERENCE}" "${PROJECT_ROOT}/inference_scripts"
-  [[ -e "${OLD_RUNTIME}" ]] && mv "${OLD_RUNTIME}" "${PROJECT_ROOT}/runtime"
-}
+NEW_INFERENCE=1
+mv "${STAGE_ROOT}/inference_scripts" "${PROJECT_ROOT}/inference_scripts"
+fault_inject new_inference_moved
+NEW_RUNTIME=1
+mv "${STAGE_ROOT}/runtime" "${PROJECT_ROOT}/runtime"
+fault_inject new_runtime_moved
+NEW_MANIFEST=1
+mv "${STAGE_ROOT}/project_manifest.json" "${MANIFEST}"
+fault_inject new_manifest_moved
+if [[ "${CREATE_IDENTITY}" -eq 1 ]]; then
+  NEW_IDENTITY=1
+  mv "${STAGE_ROOT}/.loess-project-id" "${PROJECT_ROOT}/.loess-project-id"
+fi
+fault_inject identity_installed
 
-if ! mv "${STAGE_ROOT}/inference_scripts" "${PROJECT_ROOT}/inference_scripts"; then
-  rollback
-  exit 1
-fi
-if ! mv "${STAGE_ROOT}/runtime" "${PROJECT_ROOT}/runtime"; then
-  rollback
-  exit 1
-fi
-if ! mv "${STAGE_ROOT}/project_manifest.json" "${PROJECT_ROOT}/project_manifest.json"; then
-  rollback
-  exit 1
-fi
+test -f "${PROJECT_ROOT}/inference_scripts/config.yaml"
+test -f "${PROJECT_ROOT}/runtime/loess_launcher.sh"
+test -f "${MANIFEST}"
+test -f "${PROJECT_ROOT}/.loess-project-id"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/project_identity.py" \
+  --project-root "${PROJECT_ROOT}" >/dev/null
+fault_inject installation_verified
 DEPLOY_COMMITTED=1
+rm -rf -- "${OLD_INFERENCE}" "${OLD_RUNTIME}"
+rm -f -- "${OLD_MANIFEST}"
 
 mkdir -p \
   "${PROJECT_ROOT}/weights" \
@@ -604,6 +754,11 @@ fi
 echo "Initialized Loess project only: ${PROJECT_ROOT}"
 echo "  platform: ${PLATFORM}"
 echo "  Git SHA: ${GIT_SHA}"
+echo "  project ID: ${PROJECT_ID}"
+echo "  source bundle: $(
+  "${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["source_bundle_sha256"])' \
+    "${SOURCE_INFO}"
+)"
 echo "  inference scripts: ${PROJECT_ROOT}/inference_scripts"
 echo "  shared runtime: ${PROJECT_ROOT}/runtime/labeling_tool/core"
 echo "  weights are not included; see weights/README_WEIGHTS.md"

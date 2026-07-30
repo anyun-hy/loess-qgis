@@ -468,11 +468,27 @@ def validate_deployment_config(
             continue
         profile_ids.add(configured_id)
         profile_path = resolve_path(entry.get("file"), base_dir)
+        expected_profile_sha = entry.get("sha256")
+        if not _valid_sha(expected_profile_sha):
+            issues.append(ValidationIssue(
+                f"/fusion_profiles/{index}/sha256",
+                "must be a lowercase SHA256",
+            ))
+        actual_profile_sha = (
+            sha256_file(profile_path) if profile_path.is_file() else ""
+        )
+        profile_hash_valid = (
+            _valid_sha(expected_profile_sha)
+            and actual_profile_sha == expected_profile_sha
+        )
         normalized_profile: dict[str, Any] = {
             "profile_id": configured_id,
             "file": str(entry.get("file") or ""),
             "file_path": str(profile_path),
             "enabled": bool(entry.get("enabled", True)),
+            "sha256": str(expected_profile_sha or ""),
+            "file_sha256": actual_profile_sha,
+            "trusted": profile_hash_valid,
             "available": False,
             "profile": None,
         }
@@ -480,6 +496,17 @@ def validate_deployment_config(
             issues.append(ValidationIssue(f"/fusion_profiles/{index}/file", "is required"))
         elif verify_files and not profile_path.is_file():
             issues.append(ValidationIssue(f"/fusion_profiles/{index}/file", f"file does not exist: {profile_path}", "missing"))
+        elif (
+            verify_files
+            and verify_hashes
+            and _valid_sha(expected_profile_sha)
+            and not profile_hash_valid
+        ):
+            issues.append(ValidationIssue(
+                f"/fusion_profiles/{index}/sha256",
+                f"SHA256 mismatch: {actual_profile_sha}",
+                "hash",
+            ))
         elif profile_path.is_file():
             try:
                 profile = load_json(profile_path)
@@ -494,7 +521,11 @@ def validate_deployment_config(
                         "does not match profile file",
                     ))
                 normalized_profile.update({
-                    "available": not profile_issues and profile.get("status") == "approved",
+                    "available": (
+                        profile_hash_valid
+                        and not profile_issues
+                        and profile.get("status") == "approved"
+                    ),
                     "status": profile.get("status", "invalid"),
                     "strategy": profile.get("strategy", ""),
                     "required_model_ids": [item.get("model_id") for item in profile.get("models", []) if isinstance(item, Mapping)],
@@ -524,6 +555,12 @@ def validate_deployment_config(
     sam = _mapping(config.get("sam3", {}), "/sam3", issues)
     sam_enabled = bool(sam.get("enabled", False))
     sam_checkpoint = resolve_path(sam.get("checkpoint"), base_dir)
+    expected_sam_sha = sam.get("sha256")
+    if sam_enabled and not _valid_sha(expected_sam_sha):
+        issues.append(ValidationIssue(
+            "/sam3/sha256",
+            "must be a lowercase SHA256 when SAM3 is enabled",
+        ))
     try:
         buffer_px = int(sam.get("buffer_px", 32))
     except (TypeError, ValueError):
@@ -535,10 +572,30 @@ def validate_deployment_config(
         issues.append(ValidationIssue("/sam3/device", "must be auto, cpu, mps, cuda, or cuda:N"))
     if sam_enabled and verify_files and not sam_checkpoint.is_file():
         issues.append(ValidationIssue("/sam3/checkpoint", f"file does not exist: {sam_checkpoint}", "missing"))
+    actual_sam_sha = (
+        sha256_file(sam_checkpoint) if sam_checkpoint.is_file() else ""
+    )
+    if (
+        sam_enabled
+        and verify_files
+        and verify_hashes
+        and _valid_sha(expected_sam_sha)
+        and actual_sam_sha != expected_sam_sha
+    ):
+        issues.append(ValidationIssue(
+            "/sam3/sha256",
+            f"SHA256 mismatch: {actual_sam_sha}",
+            "hash",
+        ))
     effective["sam3"] = {
         "enabled": sam_enabled,
         "checkpoint": str(sam_checkpoint),
-        "checkpoint_sha256": sha256_file(sam_checkpoint) if sam_checkpoint.is_file() else "",
+        "expected_sha256": str(expected_sam_sha or ""),
+        "checkpoint_sha256": actual_sam_sha,
+        "trusted": (
+            _valid_sha(expected_sam_sha)
+            and actual_sam_sha == expected_sam_sha
+        ),
         "version": str(sam.get("version") or ""),
         "requested_device": sam_device,
         "buffer_px": buffer_px,
