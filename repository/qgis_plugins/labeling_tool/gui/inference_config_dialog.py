@@ -207,9 +207,11 @@ class InferenceConfigDialog(QDialog):
         )
         boundary = self._registry.boundary_fitting
         self.boundary_label.setText(
-            "公共分界线单次 Cubic B-Spline；两侧 Polygon 共用拟合线；"
+            "公共分界线单次 Cubic B-Spline；两侧 Polygon 共用稀疏拟合线；"
             f"平滑因子 {boundary.get('smoothing_factor')}；"
-            f"输出间距 {boundary.get('output_spacing_px')} px；"
+            f"曲线采样 {boundary.get('curve_sampling_spacing_px')} px；"
+            f"最大弦误差 {boundary.get('max_chord_error_px')} px；"
+            f"最大弧长 {boundary.get('max_segment_arc_length_px')} px；"
             "不限制最大偏移，不执行拓扑修复或 Gap/Overlap 检查"
         )
 

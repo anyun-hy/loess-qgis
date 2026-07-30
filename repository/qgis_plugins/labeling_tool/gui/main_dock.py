@@ -879,8 +879,8 @@ class LabelingDockWidget(QgsDockWidget):
         boundary = effective.get("boundary_fitting") or {}
         if not self._boundary_smoothing_enabled:
             boundary_text = "关闭，保留原始像元边界"
-        elif boundary.get("mode") == "divider_cubic_bspline_v1":
-            boundary_text = "公共分界线 Cubic B-Spline"
+        elif boundary.get("mode") == "divider_cubic_bspline_adaptive_v2":
+            boundary_text = "公共分界线 B-Spline + 误差受限稀疏"
         else:
             boundary_text = "未确认"
         plan_status = "已确认" if self._inference_plan_confirmed else "待确认"

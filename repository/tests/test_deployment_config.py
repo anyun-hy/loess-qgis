@@ -106,9 +106,11 @@ def _config(model_sha):
         "sam3": {"enabled": False, "device": "cpu", "buffer_px": 32},
         "boundary_fitting": {
             "enabled": True,
-            "mode": "divider_cubic_bspline_v1",
+            "mode": "divider_cubic_bspline_adaptive_v2",
             "smoothing_factor": 1.0,
-            "output_spacing_px": 0.5,
+            "curve_sampling_spacing_px": 0.5,
+            "max_chord_error_px": 0.25,
+            "max_segment_arc_length_px": 8.0,
             "diagnostic_level": "changed_and_failed",
         },
         "classes": {
@@ -151,7 +153,10 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
     assert effective["fusion_profiles"][0]["required_model_ids"] == ["model_a"]
     assert effective["classes"]["background_index"] == -1
     assert effective["scaling"]["partition_halo_px"] == "auto"
-    assert effective["boundary_fitting"]["mode"] == "divider_cubic_bspline_v1"
+    assert (
+        effective["boundary_fitting"]["mode"]
+        == "divider_cubic_bspline_adaptive_v2"
+    )
 
 
 def test_legacy_single_model_config_is_rejected(tmp_path):

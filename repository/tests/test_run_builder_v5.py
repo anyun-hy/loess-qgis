@@ -19,9 +19,11 @@ def _scaling():
 def _boundary():
     return {
         "enabled": True,
-        "mode": "divider_cubic_bspline_v1",
+        "mode": "divider_cubic_bspline_adaptive_v2",
         "smoothing_factor": 1.0,
-        "output_spacing_px": 0.5,
+        "curve_sampling_spacing_px": 0.5,
+        "max_chord_error_px": 0.25,
+        "max_segment_arc_length_px": 8.0,
         "diagnostic_level": "changed_and_failed",
     }
 

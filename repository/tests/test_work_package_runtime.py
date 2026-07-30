@@ -49,9 +49,11 @@ def _scaling():
 def _boundary():
     return {
         "enabled": True,
-        "mode": "divider_cubic_bspline_v1",
+        "mode": "divider_cubic_bspline_adaptive_v2",
         "smoothing_factor": 1.0,
-        "output_spacing_px": 0.5,
+        "curve_sampling_spacing_px": 0.5,
+        "max_chord_error_px": 0.25,
+        "max_segment_arc_length_px": 8.0,
         "diagnostic_level": "changed_and_failed",
     }
 
@@ -284,7 +286,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert completed[0]["failed_unit_count"] == 0
     assert assembled["unit_count"] == 1
     assert assembled["object_count"] == 1
-    assert assembled["fit_version"] == "divider_cubic_bspline_v1"
+    assert assembled["fit_version"] == "divider_cubic_bspline_adaptive_v2"
     assert assembled["chain_count"] >= 0
     assert assembled["shared_chain_count"] >= 0
     assert assembled["spline_count"] >= 0
@@ -640,7 +642,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
                     **base,
                     "fit_method": "unchanged",
                     "fit_status": "unchanged",
-                    "fit_version": "divider_cubic_bspline_v1",
+                    "fit_version": "divider_cubic_bspline_adaptive_v2",
                     "vertex_count_before": 5,
                     "vertex_count_after": 5,
                     "max_shift_px": 0.0,
@@ -656,10 +658,14 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             [
                 {
                     "chain_id": "fixture_edge",
-                    "method": "cubic_bspline",
+                    "method": "cubic_bspline_adaptive",
                     "status": "changed",
                     "fitted_points": [[0.0, 0.0], [1.0, 1.0]],
                     "max_displacement_px": 0.25,
+                    "point_count_dense": 17,
+                    "point_count_after": 2,
+                    "max_chord_error_px": 0.125,
+                    "max_segment_arc_length_px": 1.5,
                 }
             ]
             if unit["unit_id"] == plan["spatial_units"][0]["unit_id"]
@@ -667,7 +673,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
         )
         unit_report = {
             "status": "passed",
-            "fit_version": "divider_cubic_bspline_v1",
+            "fit_version": "divider_cubic_bspline_adaptive_v2",
             "chain_count": 0,
             "shared_chain_count": 0,
             "spline_count": 0,
@@ -723,6 +729,14 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     assert report["validation"]["passed"] is True
     assert report["validation"]["scope"] == "all_output_polygons"
     assert report["validation"]["invalid_count"] == 0
+    assert report["curve_sampling_spacing_px"] == 0.5
+    assert report["max_chord_error_limit_px"] == 0.25
+    assert report["max_segment_arc_length_limit_px"] == 8.0
+    assert report["dense_curve_point_count"] == 17
+    assert report["sparse_curve_point_count"] == 2
+    assert report["max_chord_error_px"] == 0.125
+    assert report["max_segment_arc_length_px"] == 1.5
+    assert report["adaptive_point_reduction"] == pytest.approx(15 / 17)
     with fiona.open(run_dir / "models/a/semantic_polygons.gpkg") as source:
         features = list(source)
     with fiona.open(run_dir / "models/a/fitted_edges.gpkg") as source:
@@ -839,7 +853,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
                     **base,
                     "fit_method": "unchanged",
                     "fit_status": "unchanged",
-                    "fit_version": "divider_cubic_bspline_v1",
+                    "fit_version": "divider_cubic_bspline_adaptive_v2",
                     "vertex_count_before": 5,
                     "vertex_count_after": 5,
                     "max_shift_px": 0.0,
@@ -853,7 +867,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
         )
         unit_report = {
             "status": "passed",
-            "fit_version": "divider_cubic_bspline_v1",
+            "fit_version": "divider_cubic_bspline_adaptive_v2",
             "chain_count": 0,
             "shared_chain_count": 0,
             "spline_count": 0,

@@ -91,10 +91,14 @@ def create_v5_run(
     boundary_value = dict(boundary_fitting)
     if not isinstance(boundary_value.get("enabled"), bool):
         raise RunBuilderV5Error("boundary_fitting.enabled must be true or false")
-    boundary_value.setdefault("mode", "divider_cubic_bspline_v1")
-    if str(boundary_value.get("mode") or "") != "divider_cubic_bspline_v1":
+    boundary_value.setdefault("mode", "divider_cubic_bspline_adaptive_v2")
+    if (
+        str(boundary_value.get("mode") or "")
+        != "divider_cubic_bspline_adaptive_v2"
+    ):
         raise RunBuilderV5Error(
-            "boundary_fitting.mode must equal divider_cubic_bspline_v1"
+            "boundary_fitting.mode must equal "
+            "divider_cubic_bspline_adaptive_v2"
         )
     range_value = dict(range_selection or {})
     range_mode = str(range_value.get("mode") or "extent")

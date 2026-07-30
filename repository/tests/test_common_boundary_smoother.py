@@ -55,10 +55,23 @@ def test_common_divider_is_fitted_once_and_reused_by_both_polygons():
     raw_shared, records = _adjacent_staircase_polygons()
     formal, report = smooth_common_boundaries(
         records,
-        SmoothingConfig(smoothing_factor=1.0, output_spacing=0.5, max_deviation=None),
+        SmoothingConfig(
+            smoothing_factor=1.0,
+            curve_sampling_spacing=0.5,
+            max_deviation=None,
+        ),
     )
-    assert report["fit_version"] == "divider_cubic_bspline_v1"
+    assert report["fit_version"] == "divider_cubic_bspline_adaptive_v2"
     assert report["spline_count"] == 1
+    assert report["curve_sampling_spacing_px"] == 0.5
+    assert report["max_chord_error_limit_px"] == 0.25
+    assert report["max_segment_arc_length_limit_px"] == 8.0
+    assert report["max_chord_error_px"] <= 0.25 + 1e-12
+    assert report["max_segment_arc_length_px"] <= 8.0 + 1e-12
+    assert (
+        report["dense_curve_point_count"]
+        > report["sparse_curve_point_count"]
+    )
     assert report["candidate_validation"]["scope"] == "per_common_divider"
     assert report["validation"] == {
         "passed": True,
@@ -89,6 +102,10 @@ def test_common_divider_is_fitted_once_and_reused_by_both_polygons():
         np.asarray(report["diagnostics"][0]["fitted_points"]),
         coordinates[::-1],
     )
+    diagnostic = report["diagnostics"][0]
+    assert diagnostic["point_count_dense"] > diagnostic["point_count_after"]
+    assert diagnostic["max_chord_error_px"] <= 0.25 + 1e-12
+    assert diagnostic["max_segment_arc_length_px"] <= 8.0 + 1e-12
 
 
 def test_two_dividers_can_replace_different_sections_of_one_ring():
@@ -111,7 +128,7 @@ def test_two_dividers_can_replace_different_sections_of_one_ring():
         records,
         SmoothingConfig(
             smoothing_factor=1.0,
-            output_spacing=0.5,
+            curve_sampling_spacing=0.5,
             max_deviation=None,
             min_point_count=4,
         ),
@@ -163,7 +180,11 @@ def test_closed_island_divider_is_fitted_once_for_outer_hole_and_inner_polygon()
     ]
     formal, report = smooth_common_boundaries(
         records,
-        SmoothingConfig(smoothing_factor=1.0, output_spacing=0.5, max_deviation=None),
+        SmoothingConfig(
+            smoothing_factor=1.0,
+            curve_sampling_spacing=0.5,
+            max_deviation=None,
+        ),
     )
 
     assert report["spline_count"] == 1
@@ -197,16 +218,16 @@ def test_tiny_closed_divider_keeps_original_geometry_when_spline_collapses_it():
         records,
         SmoothingConfig(
             smoothing_factor=1.0,
-            output_spacing=0.5,
+            curve_sampling_spacing=0.5,
             max_deviation=None,
             min_point_count=4,
         ),
     )
 
     assert report["spline_count"] == 0
-    assert report["skipped_invalid_count"] == 1
+    assert report["skipped_invalid_count"] == 0
     assert report["unchanged_count"] == 1
-    assert report["diagnostics"][0]["status"] == "skipped_validation_failed"
+    assert report["diagnostics"] == []
     assert all(item["geometry"].is_valid for item in formal)
     assert all(item["geometry"].area > 0 for item in formal)
     assert formal[0]["geometry"].equals(records[0]["geometry"])
@@ -259,7 +280,7 @@ def test_partition_unit_runtime_uses_common_divider_mode():
         [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71],
         smoothing_config=SmoothingConfig(
             smoothing_factor=1.0,
-            output_spacing=0.5,
+            curve_sampling_spacing=0.5,
             max_deviation=None,
             min_point_count=4,
         ),
@@ -269,6 +290,6 @@ def test_partition_unit_runtime_uses_common_divider_mode():
     )
 
     assert len(raw) == len(formal) == 2
-    assert report["fit_version"] == "divider_cubic_bspline_v1"
+    assert report["fit_version"] == "divider_cubic_bspline_adaptive_v2"
     assert report["spline_count"] == 1
     assert all(record["fit_status"] == "changed" for record in formal)

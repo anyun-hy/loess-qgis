@@ -554,13 +554,14 @@ def _assemble_stream_impl(
     stream = streams[0]
     boundary = spec.get("boundary_fitting") or {}
     fit_mode = str(boundary.get("mode") or "")
-    if fit_mode != "divider_cubic_bspline_v1":
+    if fit_mode != "divider_cubic_bspline_adaptive_v2":
         raise StreamAssemblyError(
-            "only divider_cubic_bspline_v1 is supported by the current runtime"
+            "only divider_cubic_bspline_adaptive_v2 is supported "
+            "by the current runtime"
         )
     smoothing_enabled = bool(boundary.get("enabled", True))
     fit_version = (
-        "divider_cubic_bspline_v1"
+        "divider_cubic_bspline_adaptive_v2"
         if smoothing_enabled else "raw_polygonize_v1"
     )
     reused = _reuse_ready_assembly(spec, stream, database)
@@ -649,6 +650,10 @@ def _assemble_stream_impl(
             "method": "str:24",
             "status": "str:32",
             "max_shift": "float",
+            "dense_vtx": "int",
+            "sparse_vtx": "int",
+            "chord_err": "float",
+            "arc_len": "float",
         },
     }
     edge_artifacts, summary_validation = _validated_summary_inputs(
@@ -909,6 +914,15 @@ def _assemble_stream_impl(
         "object_count": object_count,
         "object_link_count": link_count,
         "fit_version": fit_version,
+        "curve_sampling_spacing_px": float(
+            boundary.get("curve_sampling_spacing_px", 0.5)
+        ),
+        "max_chord_error_limit_px": float(
+            boundary.get("max_chord_error_px", 0.25)
+        ),
+        "max_segment_arc_length_limit_px": float(
+            boundary.get("max_segment_arc_length_px", 8.0)
+        ),
         "chain_count": int(summary_aggregate["chain_count"]),
         "shared_chain_count": int(summary_aggregate["shared_chain_count"]),
         "spline_count": int(summary_aggregate["spline_count"]),
@@ -926,6 +940,13 @@ def _assemble_stream_impl(
         "topology_checks_performed": False,
     }
 
+    edge_metrics = {
+        "dense_curve_point_count": 0,
+        "sparse_curve_point_count": 0,
+        "max_chord_error_px": 0.0,
+        "max_segment_arc_length_px": 0.0,
+    }
+
     def write_edges(destination):
         def records():
             for artifact in edge_artifacts:
@@ -934,9 +955,24 @@ def _assemble_stream_impl(
                     layer="fitted_edges",
                 ) as source:
                     for feature in source:
+                        properties = dict(feature["properties"])
+                        edge_metrics["dense_curve_point_count"] += int(
+                            properties.get("dense_vtx") or 0
+                        )
+                        edge_metrics["sparse_curve_point_count"] += int(
+                            properties.get("sparse_vtx") or 0
+                        )
+                        edge_metrics["max_chord_error_px"] = max(
+                            edge_metrics["max_chord_error_px"],
+                            float(properties.get("chord_err") or 0.0),
+                        )
+                        edge_metrics["max_segment_arc_length_px"] = max(
+                            edge_metrics["max_segment_arc_length_px"],
+                            float(properties.get("arc_len") or 0.0),
+                        )
                         yield {
                             "geometry": feature["geometry"],
-                            "properties": dict(feature["properties"]),
+                            "properties": properties,
                         }
 
         destination.writerecords(records())
@@ -983,6 +1019,32 @@ def _assemble_stream_impl(
                 spec["raster"]["crs"],
                 write_edges,
             )
+            aggregate.update(edge_metrics)
+            dense_points = int(aggregate["dense_curve_point_count"])
+            sparse_points = int(aggregate["sparse_curve_point_count"])
+            aggregate["adaptive_point_reduction"] = (
+                1.0 - sparse_points / dense_points
+                if dense_points
+                else 0.0
+            )
+            chord_limit = float(aggregate["max_chord_error_limit_px"])
+            arc_limit = float(
+                aggregate["max_segment_arc_length_limit_px"]
+            )
+            tolerance = 1e-9
+            if aggregate["max_chord_error_px"] > chord_limit + tolerance:
+                raise StreamAssemblyError(
+                    "adaptive curve chord error exceeds configured limit: "
+                    f"{aggregate['max_chord_error_px']} > {chord_limit}"
+                )
+            if (
+                aggregate["max_segment_arc_length_px"]
+                > arc_limit + tolerance
+            ):
+                raise StreamAssemblyError(
+                    "adaptive curve arc length exceeds configured limit: "
+                    f"{aggregate['max_segment_arc_length_px']} > {arc_limit}"
+                )
             print(
                 json.dumps(
                     {

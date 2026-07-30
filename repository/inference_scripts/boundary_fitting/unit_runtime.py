@@ -218,7 +218,7 @@ def _write_gpkg(
     if include_fit:
         properties.update(
             {
-                "fit_method": "str:32",
+                "fit_method": "str:64",
                 "fit_status": "str:32",
                 "fit_version": "str:40",
                 "vtx_before": "int",
@@ -282,7 +282,12 @@ def _diagnostic_feature_records(
     transform: Affine,
 ):
     for edge in report.get("diagnostics") or []:
-        if edge.get("method") not in {"line", "spline", "cubic_bspline"} and not str(
+        if edge.get("method") not in {
+            "line",
+            "spline",
+            "cubic_bspline",
+            "cubic_bspline_adaptive",
+        } and not str(
             edge.get("status") or ""
         ).startswith("failed"):
             continue
@@ -299,6 +304,12 @@ def _diagnostic_feature_records(
                 "method": str(edge.get("method") or "unchanged"),
                 "status": str(edge.get("status") or ""),
                 "max_shift": float(edge.get("max_displacement_px") or 0.0),
+                "dense_vtx": int(edge.get("point_count_dense") or 0),
+                "sparse_vtx": int(edge.get("point_count_after") or 0),
+                "chord_err": float(edge.get("max_chord_error_px") or 0.0),
+                "arc_len": float(
+                    edge.get("max_segment_arc_length_px") or 0.0
+                ),
             },
         }
 
@@ -338,6 +349,10 @@ def _write_diagnostic_gpkg(
             "method": "str:24",
             "status": "str:32",
             "max_shift": "float",
+            "dense_vtx": "int",
+            "sparse_vtx": "int",
+            "chord_err": "float",
+            "arc_len": "float",
         },
     }
     try:
@@ -368,7 +383,13 @@ def _write_diagnostic_gpkg(
 def _smoothing_config(value: Mapping[str, Any]) -> SmoothingConfig:
     return SmoothingConfig(
         smoothing_factor=float(value.get("smoothing_factor", 1.0)),
-        output_spacing=float(value.get("output_spacing_px", 0.5)),
+        curve_sampling_spacing=float(
+            value.get("curve_sampling_spacing_px", 0.5)
+        ),
+        max_chord_error=float(value.get("max_chord_error_px", 0.25)),
+        max_segment_arc_length=float(
+            value.get("max_segment_arc_length_px", 8.0)
+        ),
         max_deviation=None,
         min_point_count=4,
     )
@@ -418,6 +439,10 @@ def _without_smoothing(raw_records: list[Mapping[str, Any]]):
         "skipped_invalid_count": 0,
         "max_displacement_px": 0.0,
         "mean_displacement_px": 0.0,
+        "dense_curve_point_count": 0,
+        "sparse_curve_point_count": 0,
+        "max_chord_error_px": 0.0,
+        "max_segment_arc_length_px": 0.0,
         "candidate_validation": {
             "passed": True,
             "scope": "not_applicable",
@@ -458,7 +483,7 @@ def _fit_or_subdivide(
             "status": "passed",
             "smoothing_enabled": bool(smoothing_enabled),
             "fit_version": (
-                "divider_cubic_bspline_v1"
+                "divider_cubic_bspline_adaptive_v2"
                 if smoothing_enabled else "raw_polygonize_v1"
             ),
             "chain_count": 0,
@@ -468,6 +493,10 @@ def _fit_or_subdivide(
             "skipped_invalid_count": 0,
             "max_displacement_px": 0.0,
             "mean_displacement_px": 0.0,
+            "dense_curve_point_count": 0,
+            "sparse_curve_point_count": 0,
+            "max_chord_error_px": 0.0,
+            "max_segment_arc_length_px": 0.0,
             "candidate_validation": {
                 "passed": True,
                 "scope": (
@@ -562,7 +591,7 @@ def _fit_or_subdivide(
         "status": "passed",
         "smoothing_enabled": bool(smoothing_enabled),
         "fit_version": (
-            "divider_cubic_bspline_v1"
+            "divider_cubic_bspline_adaptive_v2"
             if smoothing_enabled else "raw_polygonize_v1"
         ),
         "chain_count": sum(int(item.get("chain_count", 0)) for item in child_reports),
@@ -583,6 +612,28 @@ def _fit_or_subdivide(
         "mean_displacement_px": (
             sum(float(item.get("mean_displacement_px", 0.0)) for item in child_reports)
             / max(len(child_reports), 1)
+        ),
+        "dense_curve_point_count": sum(
+            int(item.get("dense_curve_point_count", 0))
+            for item in child_reports
+        ),
+        "sparse_curve_point_count": sum(
+            int(item.get("sparse_curve_point_count", 0))
+            for item in child_reports
+        ),
+        "max_chord_error_px": max(
+            (
+                float(item.get("max_chord_error_px", 0.0))
+                for item in child_reports
+            ),
+            default=0.0,
+        ),
+        "max_segment_arc_length_px": max(
+            (
+                float(item.get("max_segment_arc_length_px", 0.0))
+                for item in child_reports
+            ),
+            default=0.0,
         ),
         "validation": {
             "passed": True,
@@ -639,9 +690,13 @@ def run_unit_fit(
     database.set_stream_unit_status(run_id, stream_id, unit_id, "running")
     try:
         boundary = spec.get("boundary_fitting") or {}
-        if str(boundary.get("mode") or "") != "divider_cubic_bspline_v1":
+        if (
+            str(boundary.get("mode") or "")
+            != "divider_cubic_bspline_adaptive_v2"
+        ):
             raise UnitRuntimeError(
-                "only divider_cubic_bspline_v1 is supported by the current runtime"
+                "only divider_cubic_bspline_adaptive_v2 is supported "
+                "by the current runtime"
             )
         smoothing_enabled = bool(boundary.get("enabled", True))
         emit("polygonize_started", run_id=run_id, stream_id=stream_id, unit_id=unit_id)

@@ -244,7 +244,7 @@ def _state(tmp_path):
             unit_id,
             {
                 "status": "passed",
-                "fit_version": "divider_cubic_bspline_v1",
+                "fit_version": "divider_cubic_bspline_adaptive_v2",
                 "diagnostics": [],
             },
         )

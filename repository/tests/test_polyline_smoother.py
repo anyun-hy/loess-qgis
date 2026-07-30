@@ -6,7 +6,12 @@ import fiona
 import numpy as np
 from shapely.geometry import LineString, MultiLineString, mapping, shape
 
-from polyline_smoother import SmoothingConfig, smooth_polyline, smooth_vector_file
+from polyline_smoother import (
+    SmoothingConfig,
+    adaptive_sample_curve,
+    smooth_polyline,
+    smooth_vector_file,
+)
 
 
 def _staircase(length=80):
@@ -32,7 +37,42 @@ def test_cubic_bspline_visibly_reduces_staircase_direction_changes():
     assert result.strength == 1.0
     assert np.array_equal(result.points[0], points[0])
     assert np.array_equal(result.points[-1], points[-1])
+    assert result.dense_point_count > result.output_point_count
+    assert result.max_chord_error <= 0.25 + 1e-12
+    assert result.max_segment_arc_length <= 8.0 + 1e-12
     assert _direction_change_energy(result.points) < _direction_change_energy(points) * 0.15
+
+
+def test_adaptive_curve_sampling_enforces_error_and_arc_bounds():
+    x = np.linspace(0.0, 1000.0, 20_001)
+    dense = np.column_stack((x, 4.0 * np.sin(x / 35.0)))
+    sparse, chord_error, arc_length = adaptive_sample_curve(
+        dense,
+        max_chord_error=0.25,
+        max_segment_arc_length=8.0,
+    )
+
+    assert np.array_equal(sparse[0], dense[0])
+    assert np.array_equal(sparse[-1], dense[-1])
+    assert chord_error <= 0.25 + 1e-12
+    assert arc_length <= 8.0 + 1e-12
+    assert len(sparse) < len(dense) * 0.02
+
+
+def test_adaptive_closed_curve_remains_closed_with_structural_points():
+    angles = np.linspace(0.0, 2.0 * math.pi, 4001)
+    dense = np.column_stack((20.0 * np.cos(angles), 20.0 * np.sin(angles)))
+    dense[-1] = dense[0]
+    sparse, chord_error, arc_length = adaptive_sample_curve(
+        dense,
+        max_chord_error=0.25,
+        max_segment_arc_length=8.0,
+    )
+
+    assert len(sparse) >= 4
+    assert np.array_equal(sparse[0], sparse[-1])
+    assert chord_error <= 0.25 + 1e-12
+    assert arc_length <= 8.0 + 1e-12
 
 
 def test_sparse_four_point_staircase_does_not_overshoot():
@@ -41,7 +81,7 @@ def test_sparse_four_point_staircase_does_not_overshoot():
     )
     result = smooth_polyline(
         points,
-        SmoothingConfig(min_point_count=4, output_spacing=0.5),
+        SmoothingConfig(min_point_count=4, curve_sampling_spacing=0.5),
     )
     assert result.status == "smoothed"
     assert result.max_deviation < 1.0
@@ -76,7 +116,10 @@ def test_large_polyline_runs_in_linear_practical_time():
     x = np.linspace(0, 20_000, 20_001)
     points = np.column_stack((x, np.sin(x / 20) + (np.arange(len(x)) % 2) * 0.3))
     started = time.monotonic()
-    result = smooth_polyline(points, SmoothingConfig(output_spacing=1.0))
+    result = smooth_polyline(
+        points,
+        SmoothingConfig(curve_sampling_spacing=1.0),
+    )
     assert result.status == "smoothed"
     assert time.monotonic() - started < 5.0
 
@@ -93,7 +136,7 @@ def test_vector_file_cli_core_preserves_attributes_and_crs(tmp_path: Path):
             }
         )
     report = smooth_vector_file(source, output)
-    assert report["algorithm"] == "cubic_bspline_v1"
+    assert report["algorithm"] == "divider_cubic_bspline_adaptive_v2"
     assert report["smoothed_count"] == 1
     with fiona.open(output, layer="smoothed_lines") as result:
         feature = next(iter(result))

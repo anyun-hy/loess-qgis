@@ -11,7 +11,7 @@
 3. 每个实际执行的模型都保存独立的 mask、confidence、mosaic 和矢量面结果，并在地图中形成独立图层。
 4. 选择 `approved` 的 `fusion_profile.json` 时，按配置要求执行模型融合，保存独立的融合结果层。
 5. 所有规模统一采用空间分区、Halo、Core 和有界工作包；正式目标支持 1 到 500,000 个 `512 x 512` Tile，不把全部 Tile、概率、状态或矢量线网一次性放入内存、单个 JSON 或单个全图几何操作。
-6. 每个模型流和 Fusion 流先在分区概率 mosaic 上生成 raw coverage，再提取相邻 Polygon 的公共分界线；每条分界只执行一次 Cubic B-Spline 并由两侧共同复用，禁止构建旧共享边图、执行 RDP/直线/圆弧自适应拟合或整幅百万级亚像元线网。
+6. 每个模型流和 Fusion 流先在分区概率 mosaic 上生成 raw coverage，再提取相邻 Polygon 的公共分界线；每条分界只执行一次 Cubic B-Spline，再对同一拟合曲线执行误差受限的自适应稀疏，并由两侧共同复用最终坐标。禁止构建旧共享边图、对 raw 边界执行 RDP/直线/圆弧分类拟合或构建整幅百万级亚像元线网。
 7. 分区 Core、相邻 Seam corridor 和四分区 Junction patch 使用互斥空间所有权组装，保证跨分区没有缝隙、重叠和重复拟合；跨单元同类连通部件通过磁盘连接图分配统一 `object_id`，保留可流式写入的 `part_id`，禁止最后再执行一次整幅 dissolve。
 8. 用户选择一个边界拟合和跨分区验收均通过、`ready` 且 `approved` 的 Fusion 结果作为不可变基准，插件按 14 个类别拆分出 14 个可独立显示、编辑和确认的类别工作层。
 9. 用户在类别工作层中点击一个已有 Fusion 地物，SAM3 只对该位置生成临时候选边界；用户比较后决定保留 Fusion、采用 SAM3，或以任一几何为基础继续人工修边。
@@ -118,7 +118,7 @@ bash/init_project.sh
 4. 类别 mask 不做数值平均；融合发生在 14 通道分数层。
 5. Tile 只用于模型输入；概率拼接、raw polygonize 和边界拟合都以带 Halo 的空间分区为单位，禁止在单个 `512 x 512` Tile 内独立矢量化后拼接。
 6. 禁止分别平滑相邻 Polygon 的完整边界。两个区域之间的公共分界 `Polyline` 只提取、拟合和重采样一次；两侧 Polygon 必须复用同一组拟合坐标，方向可以相反。
-7. 当前正式拟合只使用 Cubic B-Spline 消除像元台阶；每条拟合边只做左右面有效、正面积和总面积守恒的通过/回退判断，不叠加 RDP、直线/圆弧分类、单面面积约束、Gap/Overlap 检测或 Topology Repair。
+7. 当前正式拟合只使用 Cubic B-Spline 消除像元台阶，并以最大弦误差 `0.25 px`、最大曲线弧长 `8 px` 稀疏表达同一拟合曲线；这一步不是对 raw 边界做 RDP，也不改变 B-Spline 形状契约。每条拟合边只做左右面有效、正面积和总面积守恒的通过/回退判断，不叠加直线/圆弧分类、单面面积约束、Gap/Overlap 检测或 Topology Repair。
 8. 公共分界线在 raster 像素坐标空间拟合，再用完整 affine transform 转回地图 CRS；禁止把像素参数直接当成 EPSG:4490 的度。
 9. 分类修整只允许从一个边界规则化验收通过、`ready` 且 `approved` 的 Fusion 结果初始化；正式 Fusion 保持不可变，模型结果只用于对照。
 10. 14 个类别工作层是分类修整阶段唯一的可见编辑载体；SAM3 不创建独立类别结果层，也不改变类别、object_id 或 part_id。
@@ -149,7 +149,7 @@ bash/init_project.sh
   ├── SQLite/WAL 任务库 + 有界工作包 + 背压
   ├── 单 MPS/CUDA 语义 worker，按工作包顺序执行所需模型
   ├── 分区 probability mosaic + raw polygonize
-  ├── 相邻 Polygon 公共分界线提取 + 单次 Cubic B-Spline + 均匀重采样
+  ├── 相邻 Polygon 公共分界线提取 + 单次 Cubic B-Spline + 误差受限自适应稀疏
   ├── Seam corridor + Junction patch 跨分区组装
   └── VRT/GeoPackage 结果、分页监控、停止/恢复/失败重试
 
@@ -211,9 +211,11 @@ sam3:
 
 boundary_fitting:
   enabled: true
-  mode: divider_cubic_bspline_v1
+  mode: divider_cubic_bspline_adaptive_v2
   smoothing_factor: 1.0
-  output_spacing_px: 0.5
+  curve_sampling_spacing_px: 0.5
+  max_chord_error_px: 0.25
+  max_segment_arc_length_px: 8.0
   diagnostic_level: changed_and_failed
 
 classes:
@@ -246,7 +248,7 @@ classes:
 - SAM3 设备独立检查；不稳定或不支持的 MPS 不强行使用，正式运行使用 CUDA 或 CPU。
 - `scaling` 参数必须满足：配置的分区 Core 至少 `2 x 2` Tile、Halo 不小于 `max(tile_overlap,seam_band_px)`、缓存预算和剩余磁盘为正、CPU worker 不超过可用核心与内存预算、开放 frontier 和重试数为正。
 - 启动前按 Tile 数、结果流数、像元覆盖和工作包预算估算峰值临时空间与永久空间；估算空间超过可用磁盘时阻止启动，禁止边运行边碰运气。
-- `boundary_fitting.enabled` 必须为 true，当前只接受 `mode=divider_cubic_bspline_v1`。`smoothing_factor` 和 `output_spacing_px` 必须为正数；不接受旧 Shared Edge/RDP 参数控制正式行为。
+- `boundary_fitting.enabled` 必须为 true，当前只接受 `mode=divider_cubic_bspline_adaptive_v2`。`smoothing_factor`、`curve_sampling_spacing_px`、`max_chord_error_px` 和 `max_segment_arc_length_px` 必须为正数；不接受旧 Shared Edge/RDP 参数控制正式行为。
 - `diagnostic_level` 正式默认 `changed_and_failed`，保存实际发生拟合的公共分界线和偏移报告；`all` 只能在存储预检通过后使用。
 - 推理环境必须提供 Shapely 的 Polygon 邻居查询能力和 SciPy `splprep/splev`；不要求独立拓扑修复 API。
 
@@ -307,7 +309,7 @@ linear_1x1
 | partition_grid | scaling | 默认每个 Core 为 `8 x 8` Tile |
 | partition_halo | scaling | `auto=max(overlap,seam_band_px)`，默认 192 px |
 | work_package_budget | scaling | 以临时 score cache 预算限制同时在途 Tile 数 |
-| boundary_fitting | 固定运行契约 | 公共分界 Polyline 提取一次、Cubic B-Spline 拟合一次、均匀重采样并同时重建两侧 Polygon；有效、正面积且总面积守恒才提交，否则共同回退原边 |
+| boundary_fitting | 固定运行契约 | 公共分界 Polyline 提取一次、Cubic B-Spline 拟合一次，以 `0.5 px` 内部曲线样本执行 `0.25 px` 最大弦误差和 `8 px` 最大弧长的自适应稀疏，再同时重建两侧 Polygon；有效、正面积且总面积守恒才提交，否则共同回退原边 |
 | output_root | 主面板 | 所有 run 的工作区，启动前验证可用空间 |
 | accepted_gpkg | 主面板 | 长期保存的已确认标签库 |
 | selected_model_ids | 配置弹窗 | 所有实际执行的模型 |
@@ -406,8 +408,9 @@ Tile 14-class probabilities
   -> A.boundary 与 B.boundary 的公共分界 Polyline
   -> 按弦长参数化
   -> 公共线只执行一次 Cubic B-Spline 拟合
-  -> 0.5 px 均匀重采样
-  -> 同一组拟合坐标写回 A 与 B（其中一侧可反向）
+  -> 以 0.5 px 间距生成内部拟合曲线样本
+  -> 在同一拟合曲线上按最大弦误差 0.25 px、最大弧长 8 px 自适应保留坐标
+  -> 同一组稀疏拟合坐标写回 A 与 B（其中一侧可反向）
   -> 重建 Polygon A / B
   -> 检查两侧均有效、面积均大于 0、两侧总面积基本守恒
   -> 通过则提交；失败则两侧共同保留原公共分界
@@ -433,9 +436,11 @@ inference_scripts/boundary_fitting/unit_runtime.py
 默认配置固定为：
 
 ```text
-mode = divider_cubic_bspline_v1
+mode = divider_cubic_bspline_adaptive_v2
 smoothing_factor = 1.0
-output_spacing_px = 0.5
+curve_sampling_spacing_px = 0.5
+max_chord_error_px = 0.25
+max_segment_arc_length_px = 8.0
 spline_degree = 3
 max_deviation = null
 ```
@@ -444,7 +449,9 @@ max_deviation = null
 
 公共分界至少 4 个点即可拟合。为避免 4–7 点稀疏折线退化成不稳定的精确三次插值，拟合前先沿原折线按 `1 px` 均匀加密样本，再执行 Cubic B-Spline；这一步不改变原折线，只改变拟合输入的采样密度。长度不足 `3 px` 或少于 4 点的微小分界保持原样。
 
-当前 E5S 明确不实现：RDP、直线/圆弧自适应分类、独立 Shared Edge 图、Topology Repair、Gap/Overlap/Coverage 检测、单面面积约束、自交修复和 Polygon valid 修复。只执行上述拟合结果的简单通过/回退判断；`Seam/Junction` 只属于大规模分区调度，不参与本节曲线算法。
+最终坐标稀疏只允许在线性化同一条 B-Spline 曲线时执行：每段必须同时满足相对内部密集曲线样本的最大弦误差和沿曲线最大弧长约束；开放线端点严格保留，闭合线保持闭合，并至少保留构成合法线环所需的结构点。禁止先稀疏 raw 像元边界再拟合，也禁止左右 Polygon 分别稀疏。
+
+当前 E5S 明确不实现：raw 边界 RDP、直线/圆弧自适应分类、独立 Shared Edge 图、Topology Repair、Gap/Overlap/Coverage 检测、单面面积约束、自交修复和 Polygon valid 修复。只执行上述拟合结果的简单通过/回退判断；`Seam/Junction` 只属于大规模分区调度，不参与本节曲线算法。
 
 E5S 自动验收必须覆盖：两面共享同一开放拟合线、一个环依次处理多条分界、闭合岛状分界复用同一拟合环、无效/零面积/总面积不守恒时两侧共同回退、最终 formal 无无效或非正面积 Polygon、台阶方向显著下降，以及真实 Core 分区可完成处理。真实验收由用户在 QGIS 中对 raw/formal 图层叠加目视判断；任一代表区域仍明显呈台阶或形变不可接受，就调整 B-Spline 参数或停止该路线，不用拓扑系统补救视觉效果。
 
@@ -579,8 +586,8 @@ QGIS 显示名：
 | model_version | TEXT | 模型版本或融合 profile 版本 |
 | source | TEXT | `semantic_model` 或 `semantic_fusion` |
 | fit_changed | INT | 最终对象是否包含已采用拟合边 |
-| fit_methods | TEXT | `cubic_bspline_shared_divider` 或 `unchanged` |
-| fit_version | TEXT | 当前固定 `divider_cubic_bspline_v1` |
+| fit_methods | TEXT | `cubic_bspline_adaptive_shared_divider` 或 `unchanged` |
+| fit_version | TEXT | 当前固定 `divider_cubic_bspline_adaptive_v2` |
 | fit_status | TEXT | 当前面是否为 `changed` 或 `unchanged` |
 | origin_unit_ids | TEXT | 来源 Core/Seam/Junction 单元 ID 列表摘要 |
 | vertex_count_before | INT | raw 对应边界坐标点数统计 |
@@ -832,7 +839,7 @@ QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在�
 - 显示 profile 策略、模型数量、基线 mIoU、融合 mIoU、approval、路径和 SHA 状态。
 - rejected profile 显示为不可运行。
 - SAM3 只显示为后处理能力，不作为语义启动必选项。
-- 显示只读摘要“边界拟合：公共分界线单次 Cubic B-Spline；两侧 Polygon 共用拟合线”；仅显示平滑因子、输出间距和诊断级别，不展示旧 RDP、面积、Gap/Overlap 或拓扑参数。
+- 显示只读摘要“边界拟合：公共分界线单次 Cubic B-Spline + 误差受限稀疏；两侧 Polygon 共用最终坐标”；显示平滑因子、内部曲线采样间距、最大弦误差、最大弧长和诊断级别，不展示旧 RDP、面积、Gap/Overlap 或拓扑参数。
 - “应用”后将有效方案摘要同步回主面板。
 
 ### 15.3 推理监控弹窗
@@ -1135,7 +1142,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 6. 实现逐模型独立分区结果和 Fusion 增量 accumulator。每个模型完成一个 Package 后先提交自身 Partition 资产并更新 accumulator，再按引用计数释放缓存；禁止等待全 run 三模型概率同时齐备。
 7. 实现 Partition `Core+Halo` probability cosine mosaic、Core mask/confidence 分块 GeoTIFF 和 VRT；在小范围 fixture 上与整幅参考逐像素对比。
 8. 对每个 Partition 生成永久 raw coverage；超过 segment/feature/时间门槛时递归细分，所有几何子进程都有心跳、超时和单元级重试。
-9. 实现 `相邻 Polygon -> 公共分界 Polyline -> 单次 Cubic B-Spline -> Resample -> 同时重建两侧 Polygon -> 简单通过/回退检查`；禁止整环分别平滑，不接入旧 Shared Edge、RDP、拓扑修复或 Gap/Overlap 检查。
+9. 实现 `相邻 Polygon -> 公共分界 Polyline -> 单次 Cubic B-Spline -> 误差/弧长受限稀疏 -> 同时重建两侧 Polygon -> 简单通过/回退检查`；禁止整环分别平滑，不接入旧 Shared Edge、raw 边界 RDP、拓扑修复或 Gap/Overlap 检查。
 10. 实现 Seam corridor 和 Junction patch 独立任务；用互斥所有权裁切后流式追加最终 GPKG，通过磁盘连接图统一跨单元 `object_id`，不执行整幅 dissolve。
 11. 生成每流 aggregate report、VRT、formal GPKG、诊断边和 Artifact 哈希；只有所有空间单元通过才把结果流标记为 `ready`。
 12. 重构监控为数据库聚合和分页查询，默认显示 Partition/Seam/Junction；Tile 每页最多 500 条。所有阶段必须发出可计算进度和心跳，结束、失败、停止后进度条退出忙碌状态。
@@ -1147,15 +1154,16 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 
 #### P0：输出矢量碎片化与存储失控
 
-状态：**已确认，尚未修复；作为下一项优先工作。**
+状态：**已确认，曲线密采样膨胀已选定修复；小连通域、诊断与重复资产仍待处理。**
 
 Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 Polygon。
 当前实现存在以下相互放大的问题：
 
 - `argmax` mask 直接 polygonize，进入矢量阶段前没有按类别和物理面积执行
   小连通域清理；机器噪声会变成大量独立 Polygon。
-- 公共分界默认按 `output_spacing_px=0.5` 重采样，在大规模碎片上显著放大
-  顶点数和 GPKG 体积。
+- 公共分界固定 `0.5 px` 密集重采样已经由
+  `divider_cubic_bspline_adaptive_v2` 直接替换；正式输出只保留满足
+  `0.25 px` 最大弦误差和 `8 px` 最大弧长的坐标。
 - 单元报告可保存完整 `raw_points/fitted_points` 坐标，报告 JSON 与诊断
   GPKG 重复承载同一类明细。
 - Stream ready 后，单元 raw/formal/report/fitted-edge 仍长期保留，与流级
@@ -1168,10 +1176,12 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
 1. 在 raster polygonize 前增加按类别的最小制图单元/小连通域清理，阈值以
    平方米表达，再按实际 affine 像元面积换算。道路、河流等线状类别必须按
    宽度、长度和连通性单独保护；禁止用全图矢量 dissolve 作为补救。
-2. 使用同一小范围、四条结果流做候选 A/B。最小面积先比较
-   `25/50/100/200 m²`，输出间距先比较 `0.5/1/2 px`；最终值只能根据类别
-   面积、邻接、窄长地物保留、拓扑、面数、顶点数和字节数共同确定。人工
-   QSDK 只作为结构与尺度参考，因覆盖范围不同，不能直接充当阈值。
+2. 使用同一小范围、四条结果流继续做小连通域候选 A/B。最小面积先比较
+   `25/50/100/200 m²`；曲线坐标固定使用已经通过真实 A/B 的
+   `0.25 px / 8 px` 保守档，不再混入第二组固定间距输出。最终面积值只能
+   根据类别面积、邻接、窄长地物保留、拓扑、面数、顶点数和字节数共同
+   确定。人工 QSDK 只作为结构与尺度参考，因覆盖范围不同，不能直接充当
+   阈值。
 3. 单元报告默认只保留 SQLite 标量摘要、计数和哈希。完整坐标诊断只能作为
    有界抽样或显式启用的压缩 debug 资产，不能随全部对象无限增长。
 4. 单元 raw/formal/report/fitted-edge 在 Stream 最终文件原子提交、完整性
@@ -1182,12 +1192,12 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
    密度、顶点数、单元报告字节、永久空间和峰值临时空间。超过门槛必须阻止
    启动或要求用户缩小范围，不能仅记录 warning 后继续。
 
-本问题与第 9、10、19、20 节当前“每流永久保留 raw/formal/report/诊断”
-以及第 8 节固定 `0.5 px` 的要求存在明确冲突。解决前不得静默删除现有
-正式资产或改变默认输出；A/B 完成后必须在本文中一次性确定流级 raw/fitted
-的最终保留策略和数值门槛，再修改代码。推荐评估的默认方向是：每流永久
-保留 formal 结果，raw/fitted 改为可选诊断或有界样本，但该选择尚未获最终
-验收证据。
+固定 `0.5 px` 正式输出的冲突已经由 2026-07-30 Tencent 真实
+Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其余冲突
+仍是第 9、10、19、20 节“每流永久保留 raw/formal/report/诊断”的策略；
+在流级保留策略和小连通域门槛取得独立证据前，不得静默删除现有正式资产。
+推荐评估方向仍是：每流永久保留 formal，raw/fitted 改为可选诊断或有界
+样本，但该选择尚未获最终验收证据。
 
 完成该问题至少需要证明：
 
@@ -1224,7 +1234,7 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
 - final/accepted 重叠双门测试同时验证 `topology_issues.accepted_overlap` 和写入器独立拒绝；即使跳过拓扑或勾选带问题入库，长期确认库哈希也不得变化。
 - 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 SQLite 连接。
 - raster affine 像素坐标往返测试，覆盖 EPSG:4490、负像元高、旋转/剪切 transform，禁止直接把 px 当地图单位。
-- Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致，输出间距稳定。
+- Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致；内部曲线按 `0.5 px` 采样，最终每段最大弦误差 `<=0.25 px`、最大弧长 `<=8 px`，并验证顶点数不随曲线长度按固定 `0.5 px` 线性膨胀。
 - 两个相邻面的台阶分界只产生一份拟合坐标；两侧重建后提取到的公共线与该坐标正向或反向完全一致。
 - 同一 Polygon 环同时连接两个邻面时，每条公共分界必须基于当前已提交几何依次尝试；前一条通过后，后一条仍能正确定位并独立通过或回退。
 - 岛状面闭合外环和包围面的孔环复用同一份 periodic B-Spline 坐标。
@@ -1256,7 +1266,7 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
 
 ### 公共分界线拟合真实验收
 
-从现有真实语义分割 Core 中选择至少三个包含明显台阶的相邻类别区域。A 为 raw Polygon，B 为 `divider_cubic_bspline_v1` formal Polygon；保存 raw/formal 叠加截图、公共线输入/输出坐标、点数、最大/平均偏移和耗时。
+从现有真实语义分割 Core 中选择至少三个包含明显台阶的相邻类别区域。A 为 raw Polygon，B 为 `divider_cubic_bspline_adaptive_v2` formal Polygon；保存 raw/formal 叠加截图、公共线输入/密集曲线/最终稀疏坐标点数、最大/平均偏移、实际最大弦误差、实际最大弧长和耗时。
 
 正式通过条件为：公共线只拟合一次，两侧 Polygon 提取出的分界与该拟合线坐标一致；默认拟合强度为 1，开放线端点位移为 0，闭合线保持闭合；实际偏移只供人工判断，不设置统一像素硬门槛。每条拟合线必须通过左右面有效、正面积和总面积守恒判断，否则共同回退原分界；最终 formal 不得包含 invalid、empty 或非正面积 Polygon。本验收不运行 topology、gap、overlap、coverage 或自交修复。人工必须目视确认台阶显著减少、整体轮廓基本一致；否则调整曲线参数或停止，不用复杂 GIS 系统补救。
 
@@ -1306,7 +1316,7 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
 - 每个执行模型和 Fusion 都有独立且永久保存的 Core mask/confidence 分块、VRT、raw polygons、formal polygons 和 boundary fitting report；临时概率只在全部依赖提交后按引用计数清理。
 - 每个模型流和 Fusion 流都完成 14 类概率空间 cosine 加权 Partition mosaic；Fusion 使用增量 accumulator，不能要求全 run 多模型概率同时常驻。
 - 每条 formal 流都对相邻 Polygon 的公共分界线执行一次 Cubic B-Spline，并把同一拟合坐标写回两侧；禁止两个 Polygon 整环分别平滑。
-- 曲线拟合报告记录实际偏移、点数、逐边回退数和耗时；除左右面有效、正面积和总面积守恒的简单提交门槛外，不执行 RDP、单面面积约束、Gap/Overlap/Coverage 或 Topology Repair；最终视觉效果由真实 QGIS raw/formal A/B 验收。
+- 曲线拟合报告记录实际偏移、密集/稀疏点数、实际最大弦误差、实际最大弧长、逐边回退数和耗时；除同一拟合曲线的误差受限线性化以及左右面有效、正面积和总面积守恒的简单提交门槛外，不执行 raw 边界 RDP、单面面积约束、Gap/Overlap/Coverage 或 Topology Repair；最终视觉效果由真实 QGIS raw/formal A/B 验收。
 - approved profile 能生成独立 fusion 结果，数学实现与 profile 契约一致。
 - approved Fusion 能无损初始化 14 个独立类别工作层，原始 Fusion 始终只读且哈希不变。
 - SAM3 只对用户点击的当前类别地物生成一个临时候选，不批量扫整类、不自动采用、不创建独立最终层；失败和取消不修改数据。

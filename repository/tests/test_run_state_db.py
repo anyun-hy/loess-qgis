@@ -98,7 +98,7 @@ def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path):
     )
     report = {
         "status": "passed",
-        "fit_version": "divider_cubic_bspline_v1",
+        "fit_version": "divider_cubic_bspline_adaptive_v2",
         "chain_count": 8,
         "shared_chain_count": 4,
         "spline_count": 3,

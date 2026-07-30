@@ -24,7 +24,9 @@ class PolylineSmoothingError(RuntimeError):
 @dataclass(frozen=True)
 class SmoothingConfig:
     smoothing_factor: float = 1.0
-    output_spacing: float = 0.5
+    curve_sampling_spacing: float = 0.5
+    max_chord_error: float = 0.25
+    max_segment_arc_length: float = 8.0
     max_deviation: float | None = None
     spline_degree: int = 3
     min_point_count: int = 4
@@ -34,7 +36,9 @@ class SmoothingConfig:
     def validate(self) -> None:
         for name in (
             "smoothing_factor",
-            "output_spacing",
+            "curve_sampling_spacing",
+            "max_chord_error",
+            "max_segment_arc_length",
             "min_length",
             "min_strength",
         ):
@@ -61,8 +65,11 @@ class SmoothingResult:
     max_deviation: float
     mean_deviation: float
     input_point_count: int
+    dense_point_count: int
     output_point_count: int
     closed: bool
+    max_chord_error: float
+    max_segment_arc_length: float
     reason: str = ""
 
 
@@ -117,6 +124,92 @@ def _deviation(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, flo
     return maximum, mean
 
 
+def _point_to_chord_distances(
+    points: np.ndarray,
+    first: int,
+    last: int,
+) -> np.ndarray:
+    values = points[first + 1 : last]
+    if not len(values):
+        return np.empty(0, dtype=np.float64)
+    start = points[first]
+    stop = points[last]
+    vector = stop - start
+    squared = float(np.dot(vector, vector))
+    if squared <= 1e-24:
+        return np.linalg.norm(values - start, axis=1)
+    factors = np.clip(((values - start) @ vector) / squared, 0.0, 1.0)
+    projections = start + factors[:, None] * vector
+    return np.linalg.norm(values - projections, axis=1)
+
+
+def adaptive_sample_curve(
+    dense_points: Iterable[Iterable[float]],
+    *,
+    max_chord_error: float,
+    max_segment_arc_length: float,
+) -> tuple[np.ndarray, float, float]:
+    """Linearize one fitted curve under strict error and arc-length bounds."""
+
+    points = _sanitize(dense_points)
+    if not math.isfinite(max_chord_error) or max_chord_error <= 0:
+        raise ValueError("max_chord_error must be finite and positive")
+    if not math.isfinite(max_segment_arc_length) or max_segment_arc_length <= 0:
+        raise ValueError("max_segment_arc_length must be finite and positive")
+    if len(points) <= 2:
+        return points.copy(), 0.0, 0.0
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    minimum_output_points = min(4, len(points))
+    seed_indices = sorted(
+        {
+            int(round(value))
+            for value in np.linspace(
+                0,
+                len(points) - 1,
+                minimum_output_points,
+            )
+        }
+    )
+    keep = set(seed_indices)
+    stack = list(zip(seed_indices, seed_indices[1:]))
+    while stack:
+        first, last = stack.pop()
+        if last <= first + 1:
+            continue
+        distances = _point_to_chord_distances(points, first, last)
+        maximum = float(distances.max(initial=0.0))
+        arc_length = float(cumulative[last] - cumulative[first])
+        if maximum <= max_chord_error and arc_length <= max_segment_arc_length:
+            continue
+        if maximum > max_chord_error and len(distances):
+            split = first + 1 + int(np.argmax(distances))
+        else:
+            halfway = 0.5 * (cumulative[first] + cumulative[last])
+            split = int(np.searchsorted(cumulative, halfway))
+            split = max(first + 1, min(split, last - 1))
+        keep.add(split)
+        stack.append((first, split))
+        stack.append((split, last))
+
+    indices = sorted(keep)
+    observed_error = 0.0
+    observed_arc_length = 0.0
+    for first, last in zip(indices, indices[1:]):
+        observed_error = max(
+            observed_error,
+            float(
+                _point_to_chord_distances(points, first, last).max(initial=0.0)
+            ),
+        )
+        observed_arc_length = max(
+            observed_arc_length,
+            float(cumulative[last] - cumulative[first]),
+        )
+    return points[indices], observed_error, observed_arc_length
+
+
 def _unchanged(points: np.ndarray, closed: bool, reason: str) -> SmoothingResult:
     return SmoothingResult(
         points=points.copy(),
@@ -125,8 +218,11 @@ def _unchanged(points: np.ndarray, closed: bool, reason: str) -> SmoothingResult
         max_deviation=0.0,
         mean_deviation=0.0,
         input_point_count=len(points),
+        dense_point_count=len(points),
         output_point_count=len(points),
         closed=closed,
+        max_chord_error=0.0,
+        max_segment_arc_length=0.0,
         reason=reason,
     )
 
@@ -138,8 +234,10 @@ def smooth_polyline(
     """Fit and resample one open or closed polyline.
 
     Units are the same as the input coordinates. For raster-derived pixel
-    coordinates, the defaults mean 1 px smoothing and 0.5 px output spacing.
-    Deviation is reported but is not limited unless max_deviation is set.
+    coordinates, the defaults mean 1 px smoothing, a 0.5 px internal curve
+    sample, and final linearization bounded by 0.25 px chord error and 8 px
+    curve arc length. Deviation is reported but is not limited unless
+    max_deviation is set.
     """
 
     config = config or SmoothingConfig()
@@ -159,7 +257,7 @@ def smooth_polyline(
 
     sample_count = max(
         int(config.spline_degree) + 1,
-        int(math.ceil(total / float(config.output_spacing))) + 1,
+        int(math.ceil(total / float(config.curve_sampling_spacing))) + 1,
     )
     samples = np.linspace(0.0, 1.0, sample_count)
     reference = _resample(source_points, source_parameter, samples)
@@ -167,7 +265,7 @@ def smooth_polyline(
     # Sparse staircases can make a cubic spline behave like an unstable exact
     # interpolant. Fit against uniformly densified samples of the same source
     # polyline so the curve remains a smoothing approximation.
-    fit_spacing = float(config.output_spacing) * 2.0
+    fit_spacing = float(config.curve_sampling_spacing) * 2.0
     fit_count = max(
         int(config.spline_degree) + 5,
         int(math.ceil(total / fit_spacing)) + 1,
@@ -198,14 +296,26 @@ def smooth_polyline(
             s=smoothing,
             per=closed,
         )
-        candidate = np.column_stack(splev(samples, spline))
+        dense_candidate = np.column_stack(splev(samples, spline))
         if closed:
-            candidate[-1] = candidate[0]
+            dense_candidate[-1] = dense_candidate[0]
         else:
-            candidate[0] = values[0]
-            candidate[-1] = values[-1]
-        maximum, mean = _deviation(reference, candidate)
-        return candidate, maximum, mean
+            dense_candidate[0] = values[0]
+            dense_candidate[-1] = values[-1]
+        maximum, mean = _deviation(reference, dense_candidate)
+        candidate, chord_error, arc_length = adaptive_sample_curve(
+            dense_candidate,
+            max_chord_error=float(config.max_chord_error),
+            max_segment_arc_length=float(config.max_segment_arc_length),
+        )
+        return (
+            candidate,
+            maximum,
+            mean,
+            len(dense_candidate),
+            chord_error,
+            arc_length,
+        )
 
     if closed:
         reference[-1] = reference[0]
@@ -219,7 +329,14 @@ def smooth_polyline(
     failure = "deviation_limit"
     for strength in strengths:
         try:
-            candidate, maximum, mean = fit_at(strength)
+            (
+                candidate,
+                maximum,
+                mean,
+                dense_point_count,
+                chord_error,
+                arc_length,
+            ) = fit_at(strength)
         except (TypeError, ValueError) as error:
             failure = f"spline_failed:{error}"
             continue
@@ -231,8 +348,11 @@ def smooth_polyline(
                 max_deviation=float(maximum),
                 mean_deviation=float(mean),
                 input_point_count=len(values),
+                dense_point_count=int(dense_point_count),
                 output_point_count=len(candidate),
                 closed=closed,
+                max_chord_error=float(chord_error),
+                max_segment_arc_length=float(arc_length),
             )
     return _unchanged(values, closed, failure)
 
@@ -321,7 +441,7 @@ def smooth_vector_file(
             target_path.unlink()
         raise
     return {
-        "algorithm": "cubic_bspline_v1",
+        "algorithm": "divider_cubic_bspline_adaptive_v2",
         "input": str(source_path),
         "output": str(target_path),
         "feature_count": feature_count,
@@ -341,7 +461,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-layer", default="smoothed_lines")
     parser.add_argument("--report")
     parser.add_argument("--smoothing-factor", type=float, default=1.0)
-    parser.add_argument("--output-spacing", type=float, default=0.5)
+    parser.add_argument("--curve-sampling-spacing", type=float, default=0.5)
+    parser.add_argument("--max-chord-error", type=float, default=0.25)
+    parser.add_argument("--max-segment-arc-length", type=float, default=8.0)
     parser.add_argument(
         "--max-deviation",
         type=float,
@@ -355,7 +477,9 @@ def main() -> int:
     args = _parser().parse_args()
     config = SmoothingConfig(
         smoothing_factor=args.smoothing_factor,
-        output_spacing=args.output_spacing,
+        curve_sampling_spacing=args.curve_sampling_spacing,
+        max_chord_error=args.max_chord_error,
+        max_segment_arc_length=args.max_segment_arc_length,
         max_deviation=args.max_deviation,
         spline_degree=args.spline_degree,
     )

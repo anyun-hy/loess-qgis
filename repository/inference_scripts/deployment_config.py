@@ -609,7 +609,9 @@ def validate_deployment_config(
     }
     numeric_defaults = {
         "smoothing_factor": 1.0,
-        "output_spacing_px": 0.5,
+        "curve_sampling_spacing_px": 0.5,
+        "max_chord_error_px": 0.25,
+        "max_segment_arc_length_px": 8.0,
     }
     for key, default in numeric_defaults.items():
         try:
@@ -623,9 +625,10 @@ def validate_deployment_config(
     for key, expected in required.items():
         if normalized_boundary[key] is not expected:
             issues.append(ValidationIssue(f"/boundary_fitting/{key}", f"must equal {str(expected).lower()}"))
-    if normalized_boundary["mode"] != "divider_cubic_bspline_v1":
+    if normalized_boundary["mode"] != "divider_cubic_bspline_adaptive_v2":
         issues.append(ValidationIssue(
-            "/boundary_fitting/mode", "must equal divider_cubic_bspline_v1"
+            "/boundary_fitting/mode",
+            "must equal divider_cubic_bspline_adaptive_v2",
         ))
     if normalized_boundary["diagnostic_level"] not in {"changed_and_failed", "all"}:
         issues.append(ValidationIssue(

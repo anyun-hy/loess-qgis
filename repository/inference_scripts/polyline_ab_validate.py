@@ -193,7 +193,9 @@ def run(report_path: Path, output_dir: Path, count: int = 3):
         "source_report": str(report_path.resolve()),
         "config": {
             "smoothing_factor": config.smoothing_factor,
-            "output_spacing": config.output_spacing,
+            "curve_sampling_spacing": config.curve_sampling_spacing,
+            "max_chord_error": config.max_chord_error,
+            "max_segment_arc_length": config.max_segment_arc_length,
             "max_deviation": config.max_deviation,
             "spline_degree": config.spline_degree,
         },

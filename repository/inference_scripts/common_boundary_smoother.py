@@ -381,12 +381,17 @@ def smooth_common_boundaries(
                             "chain_id": len(candidates),
                             "divider_id": f"{left_index}_{right_index}_{divider_index}",
                             "polygon_indices": [left_index, right_index],
-                            "method": "cubic_bspline",
+                            "method": "cubic_bspline_adaptive",
                             "status": "changed",
                             "max_displacement_px": result.max_deviation,
                             "mean_displacement_px": result.mean_deviation,
                             "point_count_before": result.input_point_count,
+                            "point_count_dense": result.dense_point_count,
                             "point_count_after": result.output_point_count,
+                            "max_chord_error_px": result.max_chord_error,
+                            "max_segment_arc_length_px": (
+                                result.max_segment_arc_length
+                            ),
                             "strength": result.strength,
                             "raw_points": [list(point) for point in divider.coords],
                             "fitted_points": result.points.tolist(),
@@ -469,9 +474,13 @@ def smooth_common_boundaries(
             {
                 **record,
                 "geometry": rebuilt,
-                "fit_method": "cubic_bspline_shared_divider" if feature_shifts else "unchanged",
+                "fit_method": (
+                    "cubic_bspline_adaptive_shared_divider"
+                    if feature_shifts
+                    else "unchanged"
+                ),
                 "fit_status": "changed" if feature_shifts else "unchanged",
-                "fit_version": "divider_cubic_bspline_v1",
+                "fit_version": "divider_cubic_bspline_adaptive_v2",
                 "vertex_count_before": before,
                 "vertex_count_after": after,
                 "max_shift_px": maximum,
@@ -494,7 +503,14 @@ def smooth_common_boundaries(
     )
     report = {
         "status": "passed",
-        "fit_version": "divider_cubic_bspline_v1",
+        "fit_version": "divider_cubic_bspline_adaptive_v2",
+        "curve_sampling_spacing_px": float(
+            config.curve_sampling_spacing
+        ),
+        "max_chord_error_limit_px": float(config.max_chord_error),
+        "max_segment_arc_length_limit_px": float(
+            config.max_segment_arc_length
+        ),
         "chain_count": len(candidates) + unchanged_count,
         "shared_chain_count": len(candidates) + unchanged_count,
         "spline_count": len(accepted),
@@ -502,6 +518,26 @@ def smooth_common_boundaries(
         "skipped_invalid_count": len(rejected),
         "max_displacement_px": maximum,
         "mean_displacement_px": mean,
+        "dense_curve_point_count": sum(
+            int(item["point_count_dense"]) for item in changed_diagnostics
+        ),
+        "sparse_curve_point_count": sum(
+            int(item["point_count_after"]) for item in changed_diagnostics
+        ),
+        "max_chord_error_px": max(
+            (
+                float(item["max_chord_error_px"])
+                for item in changed_diagnostics
+            ),
+            default=0.0,
+        ),
+        "max_segment_arc_length_px": max(
+            (
+                float(item["max_segment_arc_length_px"])
+                for item in changed_diagnostics
+            ),
+            default=0.0,
+        ),
         "candidate_validation": {
             "passed": True,
             "scope": "per_common_divider",
