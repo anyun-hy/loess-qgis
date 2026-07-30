@@ -57,13 +57,14 @@ bash/init_project.sh
 
 `install_plugin.sh` 只负责把 QGIS 插件安装到指定 platform/profile，支持 `--platform auto|ubuntu|macos`、`--profile`、`--plugin-dir` 和 `--check-only`。它不得询问或创建项目目录，不得部署推理脚本、创建权重/输入/输出目录，也不得创建或更新 Conda 推理环境。安装必须从当前 Git 提交构造临时 staging，完成语法、元数据和逐文件 SHA256 校验后原子替换目标插件；失败不得改变现有安装，也不得留下源码备份或 `.stage`。
 
-`init_project.sh` 只负责用户选择的项目根目录，支持交互选择或 `--project-root`，以及 `--platform`、`--conda-exe`、`--create-env`、`--check-only` 和 `--check-assets`。它不得读取、安装或修改任何 QGIS profile。项目初始化后固定形成：
+`init_project.sh` 只负责用户选择的项目根目录，支持交互选择或 `--project-root`，以及 `--platform`、`--conda-exe`、`--conda-env`、`--create-env`、`--check-only` 和 `--check-assets`。它不得读取、安装或修改任何 QGIS profile。项目初始化后固定形成：
 
 ```text
 <project_root>/
 ├── project_manifest.json
 ├── inference_scripts/
 ├── runtime/
+│   ├── loess_launcher.sh
 │   └── labeling_tool/
 │       └── core/
 │           ├── run_spec.py
@@ -84,9 +85,9 @@ bash/init_project.sh
 
 权重文件、原始影像、范围矢量、GeoPackage、旧 Run 和缓存均不随仓库发布。初始化只创建说明和空目录；用户仍在 QGIS 中选择实际 raster/range 图层，插件中的推理脚本、输出工作区和 accepted 路径继续允许人工选择，不被项目清单锁死。`accepted_labels.gpkg` 不在初始化阶段创建，因为其 CRS 必须来自实际 Run 的 raster。
 
-`qgis_plugins/labeling_tool/core/run_spec.py`、`run_state_db.py` 和 `ownership_neighbors.py` 是当前插件与推理进程共用的唯一维护源码。推理源码继续使用 `labeling_tool.core.*` 导入；项目初始化把这三个文件按原名部署到 `<project_root>/runtime/labeling_tool/core/`，Shell 通过 `PYTHONPATH` 使用该只读运行副本，不在部署时改写 Python 源码或 import。插件部署清单和项目清单必须记录相同 Git SHA、三个共享文件的逐文件 SHA256 和聚合 SHA256；插件环境检查发现任一提交、清单或实际文件不一致时必须阻止启动并提示重新部署项目。两套 Python 进程可以各有同一提交的运行副本，但仓库内禁止出现第二份可独立修改的共享源码。
+`qgis_plugins/labeling_tool/core/run_spec.py`、`run_state_db.py` 和 `ownership_neighbors.py` 是当前插件与推理进程共用的唯一维护源码。推理源码继续使用 `labeling_tool.core.*` 导入；项目初始化把这三个文件按原名部署到 `<project_root>/runtime/labeling_tool/core/`，Shell 通过 `PYTHONPATH` 使用该只读运行副本，不在部署时改写 Python 源码或 import。插件部署清单和项目清单必须记录相同 Git SHA、三个共享文件的逐文件 SHA256 和聚合 SHA256；两份清单还必须分别登记插件全部源码文件和项目全部 `inference_scripts/` 的逐文件 SHA256，环境检查按清单动态核对缺失、增加、内容改变和 Shell 执行权限，禁止另行维护手写“必要文件”列表。插件环境检查发现任一提交、清单或实际文件不一致时必须阻止启动并提示重新部署项目。两套 Python 进程可以各有同一提交的运行副本，但仓库内禁止出现第二份可独立修改的共享源码。
 
-`init_project.sh` 更新时只原子替换其管理的 `inference_scripts/` 和 `runtime/`，保留 `weights/`、`input/`、`qgis/`、`output/` 及其中用户数据；目标已有同名受管目录但缺少合法 `project_manifest.json` 时必须拒绝覆盖。推理配置采用一份共享 Schema v2 和两个最小平台覆盖，`config.sh` 默认 `CONDA_ENV=qgis`。
+`init_project.sh` 更新时只原子替换其管理的 `inference_scripts/` 和 `runtime/`，保留 `weights/`、`input/`、`qgis/`、`output/` 及其中用户数据；目标已有同名受管目录但缺少合法 `project_manifest.json` 时必须拒绝覆盖。推理配置采用一份共享 Schema v2 和两个最小平台覆盖。初始化把平台、Conda 可执行文件和环境名写入带 SHA256 的 `runtime/loess_launcher.sh` 及项目清单；项目更新未显式传入新 `--conda-exe/--conda-env` 时必须保留已有值。所有推理 Shell 入口统一通过 `config.sh` 读取该配置，不能依赖 QGIS 启动进程偶然继承的 Conda 环境；只有显式的运行时 override 可以临时覆盖。
 
 ## 2. 原方案输入输出核对
 
@@ -974,6 +975,7 @@ run_sam3_interactive.sh --session-root <run/refinement/sam3>
 
 失败与重试：
 
+- QGIS 执行 resume 或“重做失败包”前，必须先完成插件/项目完整部署清单、当前配置指纹、Schema v2 Run Spec 内容哈希、`run_id/output_root/run_dir/state_db` 路径身份以及状态库中 Run Spec SHA/路径绑定校验。上述校验全部通过后才允许把 `running` 改为 `interrupted`、清理文件、重置 attempt/lease 或修改 Run 状态；任一失败必须保持数据库和 Run 输出不变。
 - 运行中的自动重试保持最小范围：单空间单元失败只重试或细分该单元；Work Package 子进程的瞬时失败可以在同一 Package 内自动重试，不重新执行已经提交且哈希仍有效的其他 Package。
 - 用户显式点击“重做失败包”不是继续消耗旧 Job 的 attempt，也不是只把 `failed` 改回 `queued`。调度器必须先定位失败 Work Package；如果失败发生在 Core/Seam/Junction 单元，则按该单元的 Partition 依赖反查全部所属 Package。一次人工重做以这些 Package 为边界，把 Package Job 和全部受影响空间单元 Job 的 attempt、lease、progress 和 error 原子重置后重新排队。
 - 人工重做删除目标 Package 独占的 score/package 临时目录、Partition probability、core mask/confidence、受影响单元的 raw/formal/report/fitted-edge，以及已经失效的全流 VRT、总组装和 scale acceptance 输出；同时删除相应 Artifact、报告摘要和对象连通状态，再从仍然 ready 的未受影响 Partition 重建依赖引用。操作必须可重复执行，中途失败时 Run 保持 `resetting`，不得把部分清理后的状态当作可运行或 ready。

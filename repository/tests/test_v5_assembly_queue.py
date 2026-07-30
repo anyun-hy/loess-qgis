@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 class _Signal:
     def connect(self, _callback):
@@ -242,6 +244,32 @@ def test_manual_retry_selects_package_reset_instead_of_job_requeue(monkeypatch):
             },
         )
     ]
+
+
+def test_resume_contract_failure_precedes_database_mutation(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = module.V5AsyncInferenceRunner.__new__(
+        module.V5AsyncInferenceRunner
+    )
+    runner._running = False
+    runner.scripts_dir = "/project/inference_scripts"
+    events = []
+
+    def reject_recovery(*_args):
+        events.append("validate")
+        raise RuntimeError("deployment changed")
+
+    monkeypatch.setattr(module, "validate_recovery_run", reject_recovery)
+    monkeypatch.setattr(
+        module,
+        "RunStateDB",
+        lambda *_args: events.append("database-open"),
+    )
+
+    with pytest.raises(RuntimeError, match="deployment changed"):
+        runner.resume("/run/run_spec.json")
+
+    assert events == ["validate"]
 
 
 def test_unified_plugin_version_includes_startup_hardening():

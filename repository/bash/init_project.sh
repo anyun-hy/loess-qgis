@@ -5,6 +5,8 @@ PLATFORM="${LOESS_PLATFORM:-auto}"
 PROJECT_ROOT="${LOESS_PROJECT_ROOT:-}"
 CONDA_EXE="${CONDA_EXE:-}"
 ENV_NAME="${CONDA_ENV:-qgis}"
+CONDA_EXE_EXPLICIT=0
+CONDA_ENV_EXPLICIT=0
 CREATE_ENV=0
 CHECK_ONLY=0
 CHECK_ASSETS=0
@@ -28,6 +30,7 @@ Options:
                        ${RECOMMENDED_ROOT}
   --platform NAME      auto, ubuntu, or macos. Default: auto
   --conda-exe PATH     Override the Conda executable
+  --conda-env NAME     Override the Conda environment name. Default: qgis
   --create-env         Create or update the platform inference environment
   --check-only         Validate the source and target without writing
   --check-assets       Fail unless required weight assets exist and hashes match
@@ -47,6 +50,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --conda-exe)
       CONDA_EXE="${2:?Missing value for --conda-exe}"
+      CONDA_EXE_EXPLICIT=1
+      shift 2
+      ;;
+    --conda-env)
+      ENV_NAME="${2:?Missing value for --conda-env}"
+      CONDA_ENV_EXPLICIT=1
       shift 2
       ;;
     --create-env)
@@ -72,6 +81,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+[[ "${ENV_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "Invalid Conda environment name: ${ENV_NAME}" >&2
+  exit 2
+}
 
 if [[ -z "${PROJECT_ROOT}" ]]; then
   if [[ -t 0 ]]; then
@@ -173,9 +187,48 @@ except Exception as exc:
 if payload.get("deployment_kind") != "loess_project":
     raise SystemExit(f"Refusing project with foreign manifest: {path}")
 ' "${MANIFEST}"
+  if [[ "${CONDA_EXE_EXPLICIT}" -eq 0 ]]; then
+    CONDA_EXE="$("${PYTHON_BIN}" -c '
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(str((payload.get("launcher") or {}).get("conda_executable") or ""))
+' "${MANIFEST}")"
+  fi
+  if [[ "${CONDA_ENV_EXPLICIT}" -eq 0 ]]; then
+    saved_environment="$("${PYTHON_BIN}" -c '
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(str((payload.get("launcher") or {}).get("conda_environment") or ""))
+' "${MANIFEST}")"
+    if [[ -n "${saved_environment}" ]]; then
+      ENV_NAME="${saved_environment}"
+    fi
+  fi
 elif [[ -e "${PROJECT_ROOT}/inference_scripts" || -e "${PROJECT_ROOT}/runtime" ]]; then
   echo "Refusing to overwrite unmanaged inference_scripts/runtime without project_manifest.json" >&2
   exit 1
+fi
+
+[[ "${ENV_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "Invalid persisted Conda environment name: ${ENV_NAME}" >&2
+  exit 2
+}
+if [[ -n "${CONDA_EXE}" ]]; then
+  CONDA_EXE="$("${PYTHON_BIN}" -c '
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).expanduser().resolve())
+' "${CONDA_EXE}")"
+  [[ -x "${CONDA_EXE}" ]] || {
+    echo "Configured Conda executable is not executable: ${CONDA_EXE}" >&2
+    exit 1
+  }
 fi
 
 GIT_SHA="${LOESS_GIT_SHA:-}"
@@ -229,6 +282,9 @@ manifest_path = Path(sys.argv[1])
 root = Path(sys.argv[2])
 source_root = Path(sys.argv[3])
 expected_git = sys.argv[4]
+expected_platform = sys.argv[5]
+expected_conda_exe = sys.argv[6]
+expected_conda_env = sys.argv[7]
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
 if manifest.get("git_sha") != expected_git:
@@ -238,6 +294,22 @@ if manifest.get("git_sha") != expected_git:
     )
 if Path(str(manifest.get("project_root") or "")).resolve() != root:
     raise SystemExit("Project was moved; rerun init_project.sh at its current path")
+if manifest.get("platform") != expected_platform:
+    raise SystemExit("Project platform differs; rerun init_project.sh")
+
+launcher = manifest.get("launcher") or {}
+launcher_path = root / "runtime" / "loess_launcher.sh"
+if launcher.get("path") != "runtime/loess_launcher.sh":
+    raise SystemExit("Project launcher path is invalid")
+if launcher.get("conda_executable") != expected_conda_exe:
+    raise SystemExit("Project Conda executable differs; rerun init_project.sh")
+if launcher.get("conda_environment") != expected_conda_env:
+    raise SystemExit("Project Conda environment differs; rerun init_project.sh")
+if not launcher_path.is_file() or launcher_path.is_symlink():
+    raise SystemExit(f"Project launcher is missing or unsafe: {launcher_path}")
+launcher_digest = hashlib.sha256(launcher_path.read_bytes()).hexdigest()
+if launcher_digest != launcher.get("sha256"):
+    raise SystemExit("Project launcher SHA256 mismatch")
 
 shared = manifest.get("shared_runtime") or {}
 shared_files = shared.get("files") or {}
@@ -273,7 +345,8 @@ if actual_inference != expected_inference:
         "rerun init_project.sh"
     )
 print("Existing project manifest and managed files are valid.")
-' "${MANIFEST}" "${PROJECT_ROOT}" "${SOURCE_ROOT}" "${GIT_SHA}"
+' "${MANIFEST}" "${PROJECT_ROOT}" "${SOURCE_ROOT}" "${GIT_SHA}" \
+    "${PLATFORM}" "${CONDA_EXE}" "${ENV_NAME}"
 }
 
 if [[ "${CHECK_ONLY}" -eq 1 ]]; then
@@ -306,6 +379,11 @@ if [[ "${CREATE_ENV}" -eq 1 ]]; then
     echo "Conda executable not found" >&2
     exit 1
   }
+  CONDA_EXE="$("${PYTHON_BIN}" -c '
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).expanduser().resolve())
+' "${CONDA_EXE}")"
   if "${CONDA_EXE}" run -n "${ENV_NAME}" python -V >/dev/null 2>&1; then
     "${CONDA_EXE}" env update -n "${ENV_NAME}" -f "${ENV_FILE}"
   else
@@ -354,15 +432,31 @@ LOESS_STAGE_ROOT="${STAGE_ROOT}" \
 LOESS_GIT_SHA="${GIT_SHA}" \
 LOESS_PLATFORM="${PLATFORM}" \
 LOESS_PROJECT_ROOT="${PROJECT_ROOT}" \
+LOESS_CONDA_EXE="${CONDA_EXE}" \
+LOESS_CONDA_ENV="${ENV_NAME}" \
 "${PYTHON_BIN}" -c '
 import hashlib
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 
 stage = Path(os.environ["LOESS_STAGE_ROOT"])
 config = (stage / "inference_scripts" / "config.yaml").read_text(encoding="utf-8")
+launcher_path = stage / "runtime" / "loess_launcher.sh"
+launcher_path.write_text(
+    "# Generated by bash/init_project.sh; do not edit.\n"
+    + "LOESS_CONFIGURED_PLATFORM="
+    + shlex.quote(os.environ["LOESS_PLATFORM"])
+    + "\nLOESS_CONFIGURED_CONDA_EXE="
+    + shlex.quote(os.environ["LOESS_CONDA_EXE"])
+    + "\nLOESS_CONFIGURED_CONDA_ENV="
+    + shlex.quote(os.environ["LOESS_CONDA_ENV"])
+    + "\n",
+    encoding="utf-8",
+)
+launcher_sha256 = hashlib.sha256(launcher_path.read_bytes()).hexdigest()
 
 shared = {}
 aggregate = hashlib.sha256()
@@ -442,6 +536,12 @@ payload = {
         "import_root": "labeling_tool.core",
         "sha256": aggregate.hexdigest(),
         "files": shared,
+    },
+    "launcher": {
+        "path": "runtime/loess_launcher.sh",
+        "sha256": launcher_sha256,
+        "conda_executable": os.environ["LOESS_CONDA_EXE"],
+        "conda_environment": os.environ["LOESS_CONDA_ENV"],
     },
     "inference_files": inference_files,
     "required_assets": assets,

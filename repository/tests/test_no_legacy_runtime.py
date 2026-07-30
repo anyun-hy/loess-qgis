@@ -76,30 +76,26 @@ def test_plugin_core_exports_only_the_async_runtime():
     assert "semantic_weight" not in plugin_source
 
 
-def test_runtime_fingerprints_only_current_pipeline_files():
-    source = (ROOT / "inference_scripts" / "check_environment.py").read_text(
+def test_runtime_fingerprint_uses_deployment_inventory_not_a_file_list():
+    checker = (ROOT / "inference_scripts" / "check_environment.py").read_text(
         encoding="utf-8"
     )
-    for name in (
-        "semantic_batch.py", "torchscript_runtime.py", "work_package_runtime.py",
-        "incremental_fusion.py", "partition_mosaic.py", "assemble_stream.py",
-        "polyline_smoother.py", "common_boundary_smoother.py",
-        "sam3_interactive_worker.py", "run_work_package.sh", "run_unit_fit.sh",
-        "run_finalize_partition_rasters.sh", "run_assemble_stream.sh",
-        "scale_acceptance.py", "runtime_metrics.py", "run_scale_acceptance.sh",
-        "rasterio_compat.py",
-        "run_sam3_interactive_worker.sh",
-    ):
-        assert f'"{name}"' in source
-    for name in (
-        "predict_semantic.py", "run_semantic.sh", "semantic_model.py",
-        "run_sam3.sh", "sam3_class_batch.py", "run_sam3_class.sh",
-        "run_semantic_batch.sh", "run_mosaic.sh", "run_polygonize.sh",
-        "run_subpixel_vectorize.sh",
-        "boundary_fitting/edge_graph.py", "boundary_fitting/adaptive_fit.py",
-        "boundary_fitting/map_precision.py", "boundary_fitting/unit_fitter.py",
-    ):
-        assert f'"{name}"' not in source
+    contract = (
+        ROOT
+        / "qgis_plugins"
+        / "labeling_tool"
+        / "core"
+        / "deployment_contract.py"
+    ).read_text(encoding="utf-8")
+    fingerprint_block = checker.split("FINGERPRINT_FILES =", 1)[1].split(
+        "def add_check", 1
+    )[0]
+
+    assert '"../project_manifest.json"' in fingerprint_block
+    assert '"../runtime/loess_launcher.sh"' in fingerprint_block
+    assert '"work_package_runtime.py"' not in fingerprint_block
+    assert '_inventory_block(\n            project_manifest, "inference_files"' in contract
+    assert "_validate_inventory(" in contract
 
 
 def test_unit_fit_wrapper_uses_the_inference_scripts_directory():

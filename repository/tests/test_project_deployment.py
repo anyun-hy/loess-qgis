@@ -7,7 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from labeling_tool.core.deployment_contract import verify_project_runtime
+from check_environment import _fingerprint as environment_fingerprint
+from labeling_tool.core.deployment_contract import (
+    deployment_fingerprint,
+    verify_project_runtime,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +104,7 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
     )
     for relative in expected_directories:
         assert (project_root / relative).is_dir()
+    assert (project_root / "runtime" / "loess_launcher.sh").is_file()
     assert not (project_root / "accepted_labels.gpkg").exists()
     assert not list(project_root.rglob("__pycache__"))
     assert not list(project_root.rglob("*.pyc"))
@@ -133,6 +138,9 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
         plugin_root=installed_plugin,
     )
     assert check["status"] == "ready"
+    assert deployment_fingerprint(
+        project_root / "inference_scripts"
+    ) == environment_fingerprint(project_root / "inference_scripts")
 
     import_check = _run(
         [
@@ -328,6 +336,116 @@ def test_project_update_preserves_user_data_and_restores_managed_code(tmp_path):
     assert not list(project_root.glob(".loess-project-init.*"))
 
 
+def test_project_persists_custom_conda_launcher_across_updates(tmp_path):
+    fake_qgis = tmp_path / "qgis_process"
+    _fake_qgis(fake_qgis)
+    fake_conda = tmp_path / "custom conda" / "bin" / "conda"
+    fake_conda.parent.mkdir(parents=True)
+    fake_conda.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_conda.chmod(fake_conda.stat().st_mode | stat.S_IXUSR)
+    env = _environment(fake_qgis)
+    env.pop("CONDA_EXE", None)
+    env.pop("CONDA_ENV", None)
+    env.pop("LOESS_PLATFORM", None)
+    project_root = tmp_path / "project"
+    command = [
+        str(ROOT / "bash" / "init_project.sh"),
+        "--platform",
+        "macos",
+        "--project-root",
+        str(project_root),
+    ]
+
+    _run(
+        [
+            *command,
+            "--conda-exe",
+            str(fake_conda),
+            "--conda-env",
+            "loess-custom",
+        ],
+        env=env,
+    )
+    manifest_path = project_root / "project_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["launcher"]["conda_executable"] == str(fake_conda.resolve())
+    assert manifest["launcher"]["conda_environment"] == "loess-custom"
+    polluted_env = {
+        **env,
+        "CONDA_EXE": "/opt/anaconda3/bin/conda",
+        "CONDA_ENV": "base",
+        "LOESS_PLATFORM": "ubuntu",
+    }
+
+    launcher_check = _run(
+        [
+            "/bin/bash",
+            "-c",
+            (
+                'source "$1"; '
+                'printf "%s\\n%s\\n%s\\n" '
+                '"$CONDA_EXE" "$CONDA_ENV" "$LOESS_PLATFORM"'
+            ),
+            "bash",
+            str(project_root / "inference_scripts" / "config.sh"),
+        ],
+        env=polluted_env,
+    )
+    assert launcher_check.stdout.splitlines() == [
+        str(fake_conda.resolve()),
+        "loess-custom",
+        "macos",
+    ]
+
+    _run(command, env=polluted_env)
+    updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated["launcher"]["conda_executable"] == str(fake_conda.resolve())
+    assert updated["launcher"]["conda_environment"] == "loess-custom"
+    _run([*command, "--check-only"], env=polluted_env)
+
+    override_check = _run(
+        [
+            "/bin/bash",
+            "-c",
+            (
+                'source "$1"; '
+                'printf "%s\\n%s\\n%s\\n" '
+                '"$CONDA_EXE" "$CONDA_ENV" "$LOESS_PLATFORM"'
+            ),
+            "bash",
+            str(project_root / "inference_scripts" / "config.sh"),
+        ],
+        env={
+            **polluted_env,
+            "LOESS_CONDA_EXE_OVERRIDE": str(fake_conda),
+            "LOESS_CONDA_ENV_OVERRIDE": "temporary-test",
+            "LOESS_PLATFORM_OVERRIDE": "ubuntu",
+        },
+    )
+    assert override_check.stdout.splitlines() == [
+        str(fake_conda),
+        "temporary-test",
+        "ubuntu",
+    ]
+
+    fake_conda.unlink()
+    missing_pinned_conda = _run(
+        [
+            "/bin/bash",
+            "-c",
+            'source "$1"',
+            "bash",
+            str(project_root / "inference_scripts" / "config.sh"),
+        ],
+        env=polluted_env,
+        check=False,
+    )
+    assert missing_pinned_conda.returncode == 2
+    assert "Configured Conda executable is not executable" in (
+        missing_pinned_conda.stderr
+    )
+
+
 def test_project_check_only_is_non_mutating_and_assets_are_explicit(tmp_path):
     fake_qgis = tmp_path / "qgis_process"
     _fake_qgis(fake_qgis)
@@ -417,3 +535,31 @@ def test_runtime_contract_rejects_changed_project_copy(tmp_path):
     )
     assert check["status"] == "error"
     assert "项目共享模块已改变" in check["message"]
+
+    _run(
+        [
+            str(ROOT / "bash" / "init_project.sh"),
+            "--platform",
+            "macos",
+            "--project-root",
+            str(project_root),
+        ],
+        env=env,
+    )
+    project_manifest = json.loads(
+        (project_root / "project_manifest.json").read_text(encoding="utf-8")
+    )
+    for required in (
+        "tile_materializer.py",
+        "mosaic_builder.py",
+        "boundary_fitting/__init__.py",
+    ):
+        assert required in project_manifest["inference_files"]
+    (project_root / "inference_scripts" / "tile_materializer.py").unlink()
+    check = verify_project_runtime(
+        project_root / "inference_scripts",
+        plugin_root=plugin_root / "labeling_tool",
+    )
+    assert check["status"] == "error"
+    assert "项目 inference_scripts文件清单不一致" in check["message"]
+    assert "tile_materializer.py" in check["message"]

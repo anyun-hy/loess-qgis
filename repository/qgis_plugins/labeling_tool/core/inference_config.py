@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import signal
@@ -14,90 +13,12 @@ from qgis.PyQt.QtCore import (
 )
 from qgis.core import Qgis
 
-from .deployment_contract import verify_project_runtime
+from .deployment_contract import deployment_fingerprint, verify_project_runtime
 from .process_compat import configure_process, process_is_running
 
 
-PIPELINE_FILES = (
-    "run_work_package.sh",
-    "run_finalize_partition_rasters.sh",
-    "run_unit_fit.sh",
-    "run_assemble_stream.sh",
-    "run_scale_acceptance.sh",
-    "run_sam3_interactive_worker.sh",
-)
-REQUIRED_FILES = PIPELINE_FILES + (
-    "config.sh",
-    "config.yaml",
-    "deployment_config.py",
-    "semantic_batch.py",
-    "torchscript_runtime.py",
-    "work_package_runtime.py",
-    "partition_mosaic.py",
-    "incremental_fusion.py",
-    "finalize_partition_rasters.py",
-    "assemble_stream.py",
-    "scale_acceptance.py",
-    "runtime_metrics.py",
-    "rasterio_compat.py",
-    "difference_runtime.py",
-    "accepted_score.py",
-    "boundary_fitting/__init__.py",
-    "boundary_fitting/unit_runtime.py",
-    "polyline_smoother.py",
-    "common_boundary_smoother.py",
-    "run_polyline_smooth.sh",
-    "sam3_interactive_worker.py",
-    "check_environment.py",
-    "environment-ubuntu-cu124.yml",
-    "environment-macos-qgis4.yml",
-    "run_env_check.sh",
-)
-FINGERPRINT_FILES = (
-    "../project_manifest.json",
-    "../runtime/labeling_tool/core/run_spec.py",
-    "../runtime/labeling_tool/core/run_state_db.py",
-    "../runtime/labeling_tool/core/ownership_neighbors.py",
-    "config.sh",
-    "config.yaml",
-    "_device.py",
-    "deployment_config.py",
-    "check_environment.py",
-    "environment-ubuntu-cu124.yml",
-    "environment-macos-qgis4.yml",
-    "semantic_batch.py",
-    "torchscript_runtime.py",
-    "work_package_runtime.py",
-    "partition_mosaic.py",
-    "incremental_fusion.py",
-    "finalize_partition_rasters.py",
-    "assemble_stream.py",
-    "scale_acceptance.py",
-    "runtime_metrics.py",
-    "rasterio_compat.py",
-    "difference_runtime.py",
-    "accepted_score.py",
-    "boundary_fitting/__init__.py",
-    "boundary_fitting/unit_runtime.py",
-    "polyline_smoother.py",
-    "common_boundary_smoother.py",
-    "sam3_interactive_worker.py",
-    "sam3_refine.py",
-    "run_polyline_smooth.sh",
-) + PIPELINE_FILES
-
-
 def config_fingerprint(scripts_dir):
-    digest = hashlib.sha256()
-    for name in FINGERPRINT_FILES:
-        path = os.path.join(scripts_dir, name)
-        digest.update(name.encode("utf-8"))
-        if os.path.isfile(path):
-            with open(path, "rb") as handle:
-                digest.update(handle.read())
-        else:
-            digest.update(b"<missing>")
-    return "sha256:" + digest.hexdigest()
+    return deployment_fingerprint(scripts_dir)
 
 
 def _report(status, checks, fingerprint="", effective=None, stderr=""):
@@ -132,27 +53,7 @@ def static_check(scripts_dir):
             "fix": "重新选择 inference_scripts 目录",
         }])
 
-    checks = []
-    for name in REQUIRED_FILES:
-        file_path = os.path.join(path, name)
-        exists = os.path.isfile(file_path)
-        executable = not name.endswith(".sh") or os.access(file_path, os.X_OK)
-        ok = exists and executable
-        message = "文件存在"
-        if not exists:
-            message = "文件缺失"
-        elif not executable:
-            message = "脚本没有执行权限"
-        checks.append({
-            "id": "file_" + name.replace(".", "_"),
-            "status": "ready" if ok else "error",
-            "value": name,
-            "source": path,
-            "message": message,
-            "fix": f"修复 {file_path}",
-        })
-
-    checks.append(verify_project_runtime(path))
+    checks = [verify_project_runtime(path)]
     status = "error" if any(item["status"] == "error" for item in checks) else "ready"
     return _report(status, checks, config_fingerprint(path))
 

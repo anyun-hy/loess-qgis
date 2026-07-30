@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 
@@ -17,6 +20,14 @@ SHARED_RUNTIME_FILES = {
         "runtime/labeling_tool/core/ownership_neighbors.py",
 }
 SUPPORTED_PLATFORMS = frozenset({"ubuntu", "macos"})
+DEPLOYMENT_FINGERPRINT_FILES = (
+    "../project_manifest.json",
+    "../runtime/loess_launcher.sh",
+)
+LAUNCHER_RELATIVE_PATH = "runtime/loess_launcher.sh"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CONDA_ENV_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _sha256(path: Path) -> str:
@@ -28,6 +39,8 @@ def _sha256(path: Path) -> str:
 
 
 def _read_manifest(path: Path, kind: str) -> Mapping[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"{path} 不能是符号链接")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -45,9 +58,145 @@ def _runtime_block(manifest: Mapping[str, Any], path: Path) -> Mapping[str, Any]
     digest = str(value.get("sha256") or "")
     if not isinstance(files, Mapping) or set(files) != set(SHARED_RUNTIME_FILES):
         raise ValueError(f"{path} 的共享模块清单不完整")
-    if len(digest) != 64:
+    if not _SHA256_RE.fullmatch(digest):
         raise ValueError(f"{path} 的共享模块聚合 SHA256 无效")
     return value
+
+
+def _inventory_block(
+    manifest: Mapping[str, Any],
+    key: str,
+    manifest_path: Path,
+) -> dict[str, str]:
+    value = manifest.get(key)
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"{manifest_path} 缺少完整的 {key}")
+    normalized: dict[str, str] = {}
+    for raw_name, raw_digest in value.items():
+        name = str(raw_name)
+        relative = PurePosixPath(name)
+        if (
+            not name
+            or relative.is_absolute()
+            or "\\" in name
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError(f"{manifest_path} 的 {key} 路径无效: {name!r}")
+        digest = str(raw_digest)
+        if not _SHA256_RE.fullmatch(digest):
+            raise ValueError(
+                f"{manifest_path} 的 {key} SHA256 无效: {name}"
+            )
+        normalized[name] = digest
+    return normalized
+
+
+def _ignored_inventory_path(relative: str, excluded: set[str]) -> bool:
+    parts = PurePosixPath(relative).parts
+    name = parts[-1] if parts else ""
+    return (
+        relative in excluded
+        or "__pycache__" in parts
+        or name == ".DS_Store"
+        or name.startswith("._")
+        or name.endswith(".pyc")
+    )
+
+
+def _validate_inventory(
+    root: Path,
+    expected: Mapping[str, str],
+    *,
+    label: str,
+    excluded: set[str] | None = None,
+) -> None:
+    ignored = set(excluded or ())
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError(f"{label}目录缺失或不安全: {root}")
+    actual: dict[str, Path] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if _ignored_inventory_path(relative, ignored):
+            continue
+        if path.is_symlink():
+            raise ValueError(f"{label}包含符号链接: {path}")
+        if path.is_file():
+            actual[relative] = path
+
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("缺失=" + ",".join(missing[:8]))
+        if extra:
+            details.append("未登记=" + ",".join(extra[:8]))
+        raise ValueError(f"{label}文件清单不一致: {'; '.join(details)}")
+
+    for relative, expected_digest in sorted(expected.items()):
+        path = actual[relative]
+        if _sha256(path) != expected_digest:
+            raise ValueError(f"{label}文件已改变: {path}")
+        if path.suffix == ".sh" and not os.access(path, os.X_OK):
+            raise ValueError(f"{label}Shell 入口不可执行: {path}")
+
+
+def _validate_launcher(
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    project_root: Path,
+) -> Mapping[str, Any]:
+    launcher = manifest.get("launcher")
+    if not isinstance(launcher, Mapping):
+        raise ValueError(f"{manifest_path} 缺少 launcher")
+    if str(launcher.get("path") or "") != LAUNCHER_RELATIVE_PATH:
+        raise ValueError(f"{manifest_path} 的 launcher.path 无效")
+    digest = str(launcher.get("sha256") or "")
+    if not _SHA256_RE.fullmatch(digest):
+        raise ValueError(f"{manifest_path} 的 launcher.sha256 无效")
+    environment = str(launcher.get("conda_environment") or "")
+    if not _CONDA_ENV_RE.fullmatch(environment):
+        raise ValueError(f"{manifest_path} 的 Conda 环境名无效")
+    executable = launcher.get("conda_executable")
+    if not isinstance(executable, str):
+        raise ValueError(f"{manifest_path} 的 Conda 可执行文件配置无效")
+    if executable:
+        executable_path = Path(executable).expanduser()
+        if (
+            not executable_path.is_absolute()
+            or not executable_path.is_file()
+            or executable_path.is_symlink()
+            or not os.access(executable_path, os.X_OK)
+        ):
+            raise ValueError(
+                f"{manifest_path} 的 Conda 可执行文件不可用: {executable}"
+            )
+
+    launcher_path = project_root / LAUNCHER_RELATIVE_PATH
+    if (
+        not launcher_path.is_file()
+        or launcher_path.is_symlink()
+        or _sha256(launcher_path) != digest
+    ):
+        raise ValueError(f"项目启动配置缺失或已改变: {launcher_path}")
+    return launcher
+
+
+def deployment_fingerprint(scripts_dir: str | Path) -> str:
+    """Fingerprint the immutable project deployment and persisted launcher."""
+
+    scripts = Path(scripts_dir).expanduser().resolve()
+    digest = hashlib.sha256()
+    for relative in DEPLOYMENT_FINGERPRINT_FILES:
+        path = scripts / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_file() and not path.is_symlink():
+            digest.update(_sha256(path).encode("ascii"))
+        else:
+            digest.update(b"<missing>")
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
 
 
 def verify_project_runtime(
@@ -74,6 +223,16 @@ def verify_project_runtime(
         plugin_manifest = _read_manifest(
             plugin_manifest_path, "qgis_plugin"
         )
+        declared_project_root = Path(
+            str(project_manifest.get("project_root") or "")
+        ).expanduser()
+        if (
+            not declared_project_root.is_absolute()
+            or declared_project_root.resolve() != project_root
+        ):
+            raise ValueError(
+                f"{project_manifest_path} 的 project_root 与实际目录不一致"
+            )
         project_platform = str(project_manifest.get("platform") or "")
         plugin_platform = str(plugin_manifest.get("platform") or "")
         if project_platform not in SUPPORTED_PLATFORMS:
@@ -89,6 +248,28 @@ def verify_project_runtime(
                 "插件与项目部署平台不一致: "
                 f"plugin={plugin_platform}, project={project_platform}"
             )
+        project_inference = _inventory_block(
+            project_manifest, "inference_files", project_manifest_path
+        )
+        plugin_files = _inventory_block(
+            plugin_manifest, "files", plugin_manifest_path
+        )
+        _validate_inventory(
+            scripts,
+            project_inference,
+            label="项目 inference_scripts",
+        )
+        _validate_inventory(
+            plugin,
+            plugin_files,
+            label="插件",
+            excluded={"deployment_manifest.json"},
+        )
+        _validate_launcher(
+            project_manifest,
+            project_manifest_path,
+            project_root,
+        )
         project_runtime = _runtime_block(
             project_manifest, project_manifest_path
         )
@@ -96,6 +277,10 @@ def verify_project_runtime(
 
         project_git = str(project_manifest.get("git_sha") or "")
         plugin_git = str(plugin_manifest.get("git_sha") or "")
+        if not _GIT_SHA_RE.fullmatch(project_git):
+            raise ValueError(f"项目 Git SHA 无效: {project_git or '<missing>'}")
+        if not _GIT_SHA_RE.fullmatch(plugin_git):
+            raise ValueError(f"插件 Git SHA 无效: {plugin_git or '<missing>'}")
         if project_git != plugin_git:
             raise ValueError(
                 "插件与项目来自不同 Git 提交: "
@@ -138,7 +323,7 @@ def verify_project_runtime(
         "value": str(project_runtime["sha256"]),
         "source": f"{plugin_manifest_path} / {project_manifest_path}",
         "message": (
-            f"插件与项目平台及共享模块一致，"
+            f"插件与项目完整文件清单、启动配置及共享模块一致，"
             f"platform={project_platform}，Git SHA={project_git}"
         ),
         "fix": "",

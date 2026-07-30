@@ -15,6 +15,7 @@ from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyq
 
 from .manual_package_reset import reset_failed_work_packages
 from .process_compat import configure_process, process_is_running
+from .recovery_contract import validate_recovery_run
 from .result_catalog import artifact_sha256
 from .run_index import record_run_state
 from .run_spec import atomic_write_json, sha256_file
@@ -83,12 +84,23 @@ class V5AsyncInferenceRunner(QObject):
         del accepted_layer
         if self._running:
             raise RuntimeError("an inference pipeline is already running")
-        self._spec_path = str(Path(run_spec_path).resolve())
-        with open(self._spec_path, "r", encoding="utf-8") as handle:
-            self._spec = json.load(handle)
-        if self._spec.get("schema_version") != 2:
-            raise RuntimeError("V5 runner requires run_spec schema 2")
-        self._database = RunStateDB(self._spec["state_db"])
+        if reset_failed_packages and not resume:
+            raise RuntimeError("failed Package reset requires resume validation")
+        if resume:
+            spec, database, spec_path = validate_recovery_run(
+                run_spec_path,
+                self.scripts_dir,
+            )
+            self._spec = spec
+            self._database = database
+            self._spec_path = str(spec_path)
+        else:
+            self._spec_path = str(Path(run_spec_path).resolve())
+            with open(self._spec_path, "r", encoding="utf-8") as handle:
+                self._spec = json.load(handle)
+            if self._spec.get("schema_version") != 2:
+                raise RuntimeError("V5 runner requires run_spec schema 2")
+            self._database = RunStateDB(self._spec["state_db"])
         if resume:
             self._database.interrupt_run_jobs(self._spec["run_id"])
         self._manual_package_reset = {}

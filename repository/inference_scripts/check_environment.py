@@ -36,41 +36,7 @@ from torchscript_runtime import load_torchscript_model
 
 FINGERPRINT_FILES = (
     "../project_manifest.json",
-    "../runtime/labeling_tool/core/run_spec.py",
-    "../runtime/labeling_tool/core/run_state_db.py",
-    "../runtime/labeling_tool/core/ownership_neighbors.py",
-    "config.sh",
-    "config.yaml",
-    "_device.py",
-    "deployment_config.py",
-    "check_environment.py",
-    "environment-ubuntu-cu124.yml",
-    "environment-macos-qgis4.yml",
-    "semantic_batch.py",
-    "torchscript_runtime.py",
-    "work_package_runtime.py",
-    "partition_mosaic.py",
-    "incremental_fusion.py",
-    "finalize_partition_rasters.py",
-    "assemble_stream.py",
-    "scale_acceptance.py",
-    "runtime_metrics.py",
-    "rasterio_compat.py",
-    "difference_runtime.py",
-    "accepted_score.py",
-    "boundary_fitting/__init__.py",
-    "boundary_fitting/unit_runtime.py",
-    "polyline_smoother.py",
-    "common_boundary_smoother.py",
-    "sam3_interactive_worker.py",
-    "sam3_refine.py",
-    "run_polyline_smooth.sh",
-    "run_work_package.sh",
-    "run_finalize_partition_rasters.sh",
-    "run_unit_fit.sh",
-    "run_assemble_stream.sh",
-    "run_scale_acceptance.sh",
-    "run_sam3_interactive_worker.sh",
+    "../runtime/loess_launcher.sh",
 )
 
 
@@ -249,11 +215,16 @@ def _fingerprint(scripts_dir):
     for name in FINGERPRINT_FILES:
         path = scripts_dir / name
         digest.update(name.encode("utf-8"))
-        if path.is_file():
+        digest.update(b"\0")
+        if path.is_file() and not path.is_symlink():
+            file_digest = hashlib.sha256()
             with path.open("rb") as handle:
-                digest.update(handle.read())
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    file_digest.update(chunk)
+            digest.update(file_digest.hexdigest().encode("ascii"))
         else:
             digest.update(b"<missing>")
+        digest.update(b"\n")
     return "sha256:" + digest.hexdigest()
 
 

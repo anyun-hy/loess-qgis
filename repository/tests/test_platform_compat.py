@@ -84,6 +84,8 @@ def test_inference_environment_contract_has_two_minimal_platform_locks():
         encoding="utf-8"
     )
     assert 'CONDA_ENV="${CONDA_ENV:-qgis}"' in config_sh
+    assert 'CONDA_ENV="${LOESS_CONDA_ENV_OVERRIDE:-${LOESS_CONFIGURED_CONDA_ENV}}"' in config_sh
+    assert 'CONDA_EXE="${LOESS_CONDA_EXE_OVERRIDE:-${LOESS_CONFIGURED_CONDA_EXE}}"' in config_sh
     assert 'LOESS_PLATFORM="${LOESS_PLATFORM:-auto}"' in config_sh
     assert 'LOESS_ENV_LOCK="environment-ubuntu-cu124.yml"' in config_sh
     assert 'LOESS_ENV_LOCK="environment-macos-qgis4.yml"' in config_sh
@@ -152,25 +154,32 @@ def test_environment_check_owns_and_terminates_its_process_group():
     assert "os.killpg(pid, signal.SIGKILL)" in manager
 
 
-def test_plugin_and_checker_fingerprint_both_environment_lock_files():
+def test_plugin_and_checker_fingerprint_the_manifest_and_persisted_launcher():
     plugin_source = (
-        PLUGIN_ROOT / "core" / "inference_config.py"
+        PLUGIN_ROOT / "core" / "deployment_contract.py"
     ).read_text(encoding="utf-8")
     plugin_fingerprint_block = plugin_source.split(
-        "FINGERPRINT_FILES =", 1
-    )[1].split("def config_fingerprint", 1)[0]
+        "DEPLOYMENT_FINGERPRINT_FILES =", 1
+    )[1].split("LAUNCHER_RELATIVE_PATH", 1)[0]
     checker_source = (
         ROOT / "inference_scripts" / "check_environment.py"
     ).read_text(encoding="utf-8")
     checker_fingerprint_block = checker_source.split(
         "FINGERPRINT_FILES =", 1
     )[1].split("def add_check", 1)[0]
-    for lock in (
-        '"environment-ubuntu-cu124.yml"',
-        '"environment-macos-qgis4.yml"',
+    for contract_file in (
+        '"../project_manifest.json"',
+        '"../runtime/loess_launcher.sh"',
     ):
-        assert lock in plugin_fingerprint_block
-        assert lock in checker_fingerprint_block
+        assert contract_file in plugin_fingerprint_block
+        assert contract_file in checker_fingerprint_block
+    for obsolete_manual_entry in (
+        '"tile_materializer.py"',
+        '"mosaic_builder.py"',
+        '"work_package_runtime.py"',
+    ):
+        assert obsolete_manual_entry not in plugin_fingerprint_block
+        assert obsolete_manual_entry not in checker_fingerprint_block
 
 
 def test_processing_extent_preview_tracks_tile_controls():
