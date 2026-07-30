@@ -12,8 +12,18 @@ def test_legacy_single_model_runtime_files_are_removed():
         ROOT / "inference_scripts" / "run_sam3.sh",
         ROOT / "inference_scripts" / "sam3_class_batch.py",
         ROOT / "inference_scripts" / "run_sam3_class.sh",
+        ROOT / "inference_scripts" / "run_semantic_batch.sh",
+        ROOT / "inference_scripts" / "run_fusion.sh",
+        ROOT / "inference_scripts" / "run_mosaic.sh",
+        ROOT / "inference_scripts" / "run_polygonize.sh",
+        ROOT / "inference_scripts" / "run_subpixel_vectorize.sh",
+        ROOT / "inference_scripts" / "subpixel_vectorizer.py",
         ROOT / "qgis_plugins" / "labeling_tool" / "core" / "inference_runner.py",
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "async_runner.py",
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "pipeline_plan.py",
         ROOT / "qgis_plugins" / "labeling_tool" / "core" / "sam3_job_runner.py",
+        ROOT / "tests" / "test_pipeline_plan.py",
+        ROOT / "tests" / "test_subpixel_vectorizer.py",
     )
     assert not [str(path.relative_to(ROOT)) for path in obsolete if path.exists()]
 

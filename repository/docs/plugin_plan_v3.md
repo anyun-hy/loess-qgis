@@ -1050,10 +1050,9 @@ inference_scripts/config.yaml
 inference_scripts/check_environment.py
 inference_scripts/mosaic_builder.py
 inference_scripts/polygonize_mosaic.py
-inference_scripts/run_polygonize.sh
 qgis_plugins/labeling_tool/core/inference_config.py
-qgis_plugins/labeling_tool/core/async_runner.py
-qgis_plugins/labeling_tool/core/pipeline_plan.py
+qgis_plugins/labeling_tool/core/v5_async_runner.py
+qgis_plugins/labeling_tool/core/manual_package_reset.py
 qgis_plugins/labeling_tool/core/run_spec.py
 qgis_plugins/labeling_tool/core/result_catalog.py
 qgis_plugins/labeling_tool/core/layer_manager.py
@@ -1073,11 +1072,29 @@ inference_scripts/semantic_model.py
 inference_scripts/run_sam3.sh
 inference_scripts/sam3_class_batch.py
 inference_scripts/run_sam3_class.sh
+inference_scripts/run_semantic_batch.sh
+inference_scripts/run_fusion.sh
+inference_scripts/run_mosaic.sh
+inference_scripts/run_polygonize.sh
+inference_scripts/run_subpixel_vectorize.sh
+inference_scripts/subpixel_vectorizer.py
 qgis_plugins/labeling_tool/core/inference_runner.py
+qgis_plugins/labeling_tool/core/async_runner.py
+qgis_plugins/labeling_tool/core/pipeline_plan.py
 qgis_plugins/labeling_tool/core/sam3_job_runner.py
+tests/test_pipeline_plan.py
+tests/test_subpixel_vectorizer.py
 ```
 
-旧单模型/state_dict 运行链已经删除，并由自动测试禁止恢复；旧 `sam3_class_batch/run_sam3_class/sam3_job_runner` 必须在交互式 worker 通过验收后删除。本项目不维护 Schema v1、整类批量 SAM3 或新旧 SAM3 双轨兼容。
+上述旧单模型、整幅 JSON result-catalog 调度、整幅 subpixel 和批量
+SAM3 运行链均已删除，并由自动测试禁止恢复。本项目不维护 Schema v1、
+旧整幅调度、整类批量 SAM3 或新旧双轨兼容。
+
+固定 Run ID 的临时恢复 Python/Shell、`.stage`、源码备份和恢复日志不得
+作为仓库运行入口长期保留；可复用能力必须进入当前正式模块和 `tests/`，
+必要的历史结论只在 `IMPLEMENTATION_STATUS.md` 中记录。用户显式“重做
+失败包”只允许进入 `manual_package_reset.py` 与
+`V5AsyncInferenceRunner` 的正式事务链。
 
 ## 18. 实施顺序
 
