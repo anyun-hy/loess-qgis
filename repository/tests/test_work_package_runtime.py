@@ -243,6 +243,21 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         lease_token=leased["lease_token"],
     )
     assert unit_report["status"] == "passed"
+    persisted_unit_report = database.artifact_for_stream_unit(
+        spec["run_id"],
+        "fusion:fixture_fusion",
+        leased["unit_id"],
+        "unit_boundary_report",
+    )
+    with open(persisted_unit_report["path"], encoding="utf-8") as handle:
+        persisted_payload = json.load(handle)
+    assert "diagnostics" not in persisted_payload
+    assert persisted_payload["diagnostic_storage"] == {
+        "mode": "none",
+        "fitted_edge_count": 0,
+        "raw_points_persisted": False,
+        "fitted_points_in_json": False,
+    }
     assert database.stream_unit_counts(spec["run_id"], "fusion:fixture_fusion") == {
         "ready": 1
     }

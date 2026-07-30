@@ -805,7 +805,22 @@ def run_unit_fit(
         report["fitted_edge_count"] = fitted_edge_count
         from semantic_batch import _atomic_json
 
-        _atomic_json(report_path, report)
+        persisted_report = {
+            key: value
+            for key, value in report.items()
+            if key != "diagnostics"
+        }
+        persisted_report["diagnostic_storage"] = {
+            "mode": (
+                "fitted_edges_gpkg"
+                if fitted_edge_count
+                else "none"
+            ),
+            "fitted_edge_count": int(fitted_edge_count),
+            "raw_points_persisted": False,
+            "fitted_points_in_json": False,
+        }
+        _atomic_json(report_path, persisted_report)
         emit("rebuild_finished", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
         artifacts = [
             ("unit_raw", raw_path),
