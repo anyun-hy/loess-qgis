@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import json
 import os
@@ -11,7 +12,7 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import fiona
 from fiona.crs import CRS
@@ -84,10 +85,14 @@ def _atomic_gpkg(path: Path, layer: str, schema, crs, writer) -> None:
         raise
 
 
-def _readonly_sqlite(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    connection.execute("PRAGMA query_only=ON")
-    return connection
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        yield connection
+    finally:
+        connection.close()
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:

@@ -303,6 +303,37 @@ def test_resume_gpkg_requires_matching_schema_crs_identity_and_count(tmp_path):
         )
 
 
+def test_readonly_sqlite_context_closes_its_file_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "state.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE evidence(value INTEGER)")
+
+    real_connect = assemble_stream.sqlite3.connect
+    opened = []
+
+    def tracking_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        assemble_stream.sqlite3,
+        "connect",
+        tracking_connect,
+    )
+    with assemble_stream._readonly_sqlite(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM evidence"
+        ).fetchone()[0] == 0
+
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[0].execute("SELECT 1")
+
+
 def test_resume_failure_event_is_actionable(monkeypatch, capsys):
     def fail(*_args, **_kwargs):
         raise assemble_stream.StreamAssemblyError(
