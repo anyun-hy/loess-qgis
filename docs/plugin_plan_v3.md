@@ -21,7 +21,7 @@ SAM3 不是语义推理的必选步骤，也不参与类别判断。它不是独
 
 ### 1.1 Ubuntu 单仓双平台目标与运行边界
 
-唯一开发主仓固定为 `/Users/example/Desktop/loess-data/ubuntu/`，实际源码位于 `repository/`。macOS 与 Ubuntu 必须从同一 Git 提交安装同一份插件、推理运行时和部署入口；禁止维护完整的 macOS/Linux 双份源码。统一插件版本为 `0.4.0`，元数据兼容范围固定为 `qgisMinimumVersion=3.44`、`qgisMaximumVersion=4.99`。
+唯一开发主仓和源码根固定为 `/Users/example/Desktop/loess-data/ubuntu/`。macOS 与 Ubuntu 必须从同一 Git 提交安装同一份插件、推理运行时和部署入口；禁止维护完整的 macOS/Linux 双份源码。统一插件版本为 `0.4.0`，元数据兼容范围固定为 `qgisMinimumVersion=3.44`、`qgisMaximumVersion=4.99`。
 
 正式桌面支持矩阵固定为：
 

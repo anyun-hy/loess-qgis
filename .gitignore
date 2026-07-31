@@ -1,8 +1,25 @@
+# macOS and editor metadata
 .DS_Store
+._*
+
+# Python and test caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .coverage
+htmlcov/
+
+# External agent/tool state
+/.omo/
+/.opencode/
+
+# Generated runtime and manual-test artifacts
+/input/
+/output/
+/qgis/
+/runtime/
+/scratch/
+/weights/
 *.tmp
 *.partial
