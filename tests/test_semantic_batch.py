@@ -6,7 +6,7 @@ import numpy as np
 import rasterio
 import torch
 
-from semantic_batch import run_batch
+from semantic_batch import _read_tile, _run_model, _run_model_batch, run_batch
 
 
 class _FixtureModel(torch.nn.Module):
@@ -96,6 +96,29 @@ def test_batch_loads_model_once_and_writes_every_tile_output(tmp_path):
             assert cached["probabilities"].shape == (14, 512, 512)
             assert cached["probabilities"].dtype == np.float16
     assert (run_dir / "tmp" / "streams" / "model_a" / "stream_manifest.json").is_file()
+
+
+def test_model_batch_executes_one_batched_tensor_without_changing_tile_results(tmp_path):
+    model_path = tmp_path / "model.torchscript.pt"
+    _write_model(model_path)
+    first_path = tmp_path / "first.tif"
+    second_path = tmp_path / "second.tif"
+    _write_tile(first_path, value=64)
+    _write_tile(second_path, value=192)
+    model = torch.jit.load(str(model_path), map_location="cpu").eval()
+    images = np.stack([_read_tile(first_path)[0], _read_tile(second_path)[0]])
+
+    masks, confidence, probabilities = _run_model_batch(model, images, "cpu")
+    first_single = _run_model(model, images[0], "cpu")
+    second_single = _run_model(model, images[1], "cpu")
+
+    assert masks.shape == (2, 512, 512)
+    assert confidence.shape == (2, 512, 512)
+    assert probabilities.shape == (2, 14, 512, 512)
+    assert np.array_equal(masks[0], first_single[0])
+    assert np.array_equal(masks[1], second_single[0])
+    assert np.array_equal(probabilities[0], first_single[2])
+    assert np.array_equal(probabilities[1], second_single[2])
 
 
 def test_resume_reuses_only_fully_validated_tile_outputs(tmp_path):

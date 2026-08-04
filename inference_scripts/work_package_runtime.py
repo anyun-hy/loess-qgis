@@ -36,7 +36,13 @@ from partition_mosaic import (
     write_partition_rasters,
 )
 from runtime_metrics import directory_size, peak_rss_bytes
-from semantic_batch import _atomic_json, _atomic_npz, _read_tile, _run_model
+from semantic_batch import (
+    _atomic_json,
+    _atomic_npz,
+    _read_tile,
+    _run_model,
+    _run_model_batch,
+)
 from tile_materializer import materialize_package_tiles
 from torchscript_runtime import load_torchscript_model
 
@@ -60,6 +66,32 @@ def _default_infer(model: Any, tile_path: Path, device: str) -> np.ndarray:
     image, _profile = _read_tile(tile_path)
     _mask, _confidence, probabilities = _run_model(model, image, device)
     return probabilities.astype(np.float32)
+
+
+def _default_infer_batch(
+    model: Any,
+    tile_paths: list[Path],
+    device: str,
+) -> np.ndarray:
+    images = np.stack([_read_tile(path)[0] for path in tile_paths], axis=0)
+    _masks, _confidence, probabilities = _run_model_batch(model, images, device)
+    return probabilities
+
+
+def _clear_accelerator_cache(device: str) -> None:
+    try:
+        import torch
+
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif (
+            str(device).startswith("mps")
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
 
 def _score_paths(root: Path, model_id: str, tile_id: str) -> tuple[Path, Path]:
@@ -174,6 +206,7 @@ def run_work_package(
     resume: bool = False,
     model_loader: Callable[[Mapping[str, Any], str], Any] = _default_loader,
     infer_tile: Callable[[Any, Path, str], np.ndarray] = _default_infer,
+    infer_batch: Callable[[Any, list[Path], str], np.ndarray] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     spec_path = Path(run_spec_path).resolve()
@@ -210,6 +243,16 @@ def run_work_package(
     effective_device = resolve_device(str(requested_device))
     if not validate_device(effective_device):
         raise WorkPackageRuntimeError(f"semantic device is unavailable: {effective_device}")
+    configured_batch_size = max(
+        1, int((spec.get("runtime") or {}).get("tile_batch_size", 1))
+    )
+    if infer_batch is None:
+        if infer_tile is _default_infer:
+            infer_batch = _default_infer_batch
+        else:
+            infer_batch = lambda model, paths, selected_device: np.stack(
+                [infer_tile(model, path, selected_device) for path in paths], axis=0
+            )
     if not database.set_work_package_status(
         run_id, package_id, "running", expected=("queued", "interrupted", "failed", "running")
     ):
@@ -304,9 +347,98 @@ def run_work_package(
             )
             if model is not None:
                 model_load_count += 1
-            score_records = []
+            score_records_by_tile: dict[str, dict[str, Any]] = {}
             reused = 0
             accepted_count = 0
+            pending_inference: list[dict[str, Any]] = []
+            model_effective_batch_size = configured_batch_size
+            model_batch_count = 0
+            model_peak_batch_size = 0
+            model_batch_reduction_count = 0
+
+            def record_score(item: Mapping[str, Any], *, cache_kind: str) -> None:
+                tile_value = item["tile"]
+                tile_value_id = str(tile_value["tile_id"])
+                score_records_by_tile[tile_value_id] = {
+                    "row": int(tile_value["row_no"]),
+                    "col": int(tile_value["col_no"]),
+                    "width": int(tile_value["width"]),
+                    "height": int(tile_value["height"]),
+                    "score_path": str(item["score_path"]),
+                    "metadata_path": str(item["metadata_path"]),
+                    "cache_kind": cache_kind,
+                }
+                emit(
+                    "package_tile_completed",
+                    run_id=run_id,
+                    package_id=package_id,
+                    stream_id=stream_id,
+                    tile_id=tile_value_id,
+                    current=int(item["tile_index"]),
+                    total=len(active_tiles),
+                )
+
+            def flush_pending_inference() -> None:
+                nonlocal model_effective_batch_size
+                nonlocal model_batch_count
+                nonlocal model_peak_batch_size
+                nonlocal model_batch_reduction_count
+                cursor = 0
+                while cursor < len(pending_inference):
+                    attempt_size = min(
+                        model_effective_batch_size,
+                        len(pending_inference) - cursor,
+                    )
+                    group = pending_inference[cursor : cursor + attempt_size]
+                    try:
+                        probabilities_batch = np.asarray(
+                            infer_batch(
+                                model,
+                                [item["tile_path"] for item in group],
+                                effective_device,
+                            )
+                        )
+                        expected_shape = (attempt_size, 14, 512, 512)
+                        if probabilities_batch.shape != expected_shape:
+                            raise WorkPackageRuntimeError(
+                                "Tile probability batch shape must be "
+                                f"{expected_shape}, got {probabilities_batch.shape}"
+                            )
+                    except Exception as error:
+                        if attempt_size <= 1:
+                            raise
+                        reduced_size = max(1, attempt_size // 2)
+                        model_effective_batch_size = min(
+                            model_effective_batch_size, reduced_size
+                        )
+                        model_batch_reduction_count += 1
+                        _clear_accelerator_cache(effective_device)
+                        emit(
+                            "package_tile_batch_reduced",
+                            run_id=run_id,
+                            package_id=package_id,
+                            stream_id=stream_id,
+                            attempted_batch_size=attempt_size,
+                            effective_batch_size=model_effective_batch_size,
+                            reason=str(error),
+                        )
+                        continue
+                    model_batch_count += 1
+                    model_peak_batch_size = max(
+                        model_peak_batch_size, attempt_size
+                    )
+                    for item, probabilities in zip(group, probabilities_batch):
+                        _atomic_npz(
+                            item["score_path"],
+                            probabilities=np.asarray(
+                                probabilities, dtype=np.float16
+                            ),
+                        )
+                        _atomic_json(item["metadata_path"], item["expected"])
+                        record_score(item, cache_kind="model")
+                    cursor += attempt_size
+                pending_inference.clear()
+
             for tile_index, tile in enumerate(active_tiles, start=1):
                 tile_id = str(tile["tile_id"])
                 tile_path = Path(tile["raster_path"]).resolve()
@@ -335,15 +467,27 @@ def run_work_package(
                         "model_sha256": actual_sha,
                         "input_sha256": str(tile["sha256"]),
                     }
+                item = {
+                    "tile": tile,
+                    "tile_index": tile_index,
+                    "tile_path": tile_path,
+                    "score_path": score_path,
+                    "metadata_path": metadata_path,
+                    "expected": expected,
+                }
                 if resume and _score_is_current(score_path, metadata_path, expected):
+                    flush_pending_inference()
                     reused += 1
-                else:
+                    record_score(
+                        item,
+                        cache_kind="accepted" if is_accepted else "model",
+                    )
+                elif is_accepted:
+                    flush_pending_inference()
                     if not tile_path.is_file():
                         raise WorkPackageRuntimeError(f"Tile raster is missing: {tile_path}")
                     probabilities = np.asarray(
-                        accepted_probabilities(accepted_path, tile_path)
-                        if is_accepted
-                        else infer_tile(model, tile_path, effective_device),
+                        accepted_probabilities(accepted_path, tile_path),
                         dtype=np.float32,
                     )
                     if probabilities.shape != (14, 512, 512):
@@ -352,26 +496,19 @@ def run_work_package(
                         )
                     _atomic_npz(score_path, probabilities=probabilities.astype(np.float16))
                     _atomic_json(metadata_path, expected)
-                score_records.append(
-                    {
-                        "row": int(tile["row_no"]),
-                        "col": int(tile["col_no"]),
-                        "width": int(tile["width"]),
-                        "height": int(tile["height"]),
-                        "score_path": str(score_path),
-                        "metadata_path": str(metadata_path),
-                        "cache_kind": "accepted" if is_accepted else "model",
-                    }
-                )
-                emit(
-                    "package_tile_completed",
-                    run_id=run_id,
-                    package_id=package_id,
-                    stream_id=stream_id,
-                    tile_id=tile_id,
-                    current=tile_index,
-                    total=len(active_tiles),
-                )
+                    record_score(item, cache_kind="accepted")
+                else:
+                    if not tile_path.is_file():
+                        raise WorkPackageRuntimeError(f"Tile raster is missing: {tile_path}")
+                    pending_inference.append(item)
+                    if len(pending_inference) >= model_effective_batch_size:
+                        flush_pending_inference()
+
+            flush_pending_inference()
+            score_records = [
+                score_records_by_tile[str(tile["tile_id"])]
+                for tile in active_tiles
+            ]
 
             peak_cache_bytes = max(
                 peak_cache_bytes,
@@ -444,6 +581,11 @@ def run_work_package(
                     "accepted_count": accepted_count,
                     "excluded_count": len(excluded_tiles),
                     "reused_count": reused,
+                    "configured_tile_batch_size": configured_batch_size,
+                    "effective_tile_batch_size": model_effective_batch_size,
+                    "peak_tile_batch_size": model_peak_batch_size,
+                    "inference_batch_count": model_batch_count,
+                    "batch_reduction_count": model_batch_reduction_count,
                 }
             )
 
@@ -545,6 +687,7 @@ def run_work_package(
             "requested_device": str(requested_device),
             "effective_device": str(effective_device),
             "model_load_count": model_load_count,
+            "configured_tile_batch_size": configured_batch_size,
             "peak_cache_bytes": peak_cache_bytes,
             "peak_rss_bytes": peak_rss_bytes(),
             "cleaned_bytes": cleaned_bytes,

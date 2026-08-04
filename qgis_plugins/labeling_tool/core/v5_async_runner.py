@@ -22,6 +22,44 @@ from .run_spec import atomic_write_json, sha256_file
 from .run_state_db import RunStateDB
 
 
+def _resource_value(spec, key, default):
+    tuning = ((spec.get("resource_tuning") or {}).get("resolved") or {})
+    return max(1, int(tuning.get(key, default)))
+
+
+def cpu_worker_limit(spec, *, package_active):
+    scaling = spec.get("scaling") or {}
+    full = max(1, int(scaling.get("max_cpu_partition_workers", 2)))
+    if not package_active:
+        return full
+    return max(
+        1,
+        int(scaling.get("max_cpu_partition_workers_with_package", full)),
+    )
+
+
+def process_thread_environment_values(spec, context):
+    job = context.get("job") or {}
+    if job.get("job_type") == "work_package":
+        threads = _resource_value(spec, "package_process_threads", 2)
+    elif job.get("job_type") == "unit_fit":
+        threads = _resource_value(spec, "unit_process_threads", 1)
+    else:
+        threads = _resource_value(spec, "assembly_process_threads", 1)
+    value = str(threads)
+    return {
+        "OMP_NUM_THREADS": value,
+        "OMP_DYNAMIC": "FALSE",
+        "MKL_NUM_THREADS": value,
+        "MKL_DYNAMIC": "FALSE",
+        "OPENBLAS_NUM_THREADS": value,
+        "BLIS_NUM_THREADS": value,
+        "VECLIB_MAXIMUM_THREADS": value,
+        "NUMEXPR_NUM_THREADS": value,
+        "NUMEXPR_MAX_THREADS": value,
+    }
+
+
 class V5AsyncInferenceRunner(QObject):
     """Run one accelerator package and a bounded CPU geometry pool."""
 
@@ -131,6 +169,13 @@ class V5AsyncInferenceRunner(QObject):
         self._assembly_queue = []
         self._started_at = time.time()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
+        tuning = self._spec.get("resource_tuning") or {}
+        if tuning:
+            self.log_line.emit(
+                "system",
+                "[resource-tuning] "
+                + json.dumps(tuning, ensure_ascii=False, separators=(",", ":")),
+            )
         self._scheduler.start()
         self._watchdog.start()
         QTimer.singleShot(0, self._schedule)
@@ -204,10 +249,9 @@ class V5AsyncInferenceRunner(QObject):
             if job:
                 self._start_job(job)
                 started = True
+                package_active = True
 
-        cpu_limit = max(
-            1, int((self._spec.get("scaling") or {}).get("max_cpu_partition_workers", 2))
-        )
+        cpu_limit = cpu_worker_limit(self._spec, package_active=package_active)
         while unit_active < cpu_limit:
             job = self._database.lease_next_job(
                 self._spec["run_id"],
@@ -316,6 +360,10 @@ class V5AsyncInferenceRunner(QObject):
         process.setWorkingDirectory(self.scripts_dir)
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUNBUFFERED", "1")
+        for name, value in process_thread_environment_values(
+            self._spec, context
+        ).items():
+            environment.insert(name, value)
         process.setProcessEnvironment(environment)
         entry = {
             "token": token,

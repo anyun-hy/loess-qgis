@@ -4,7 +4,7 @@ runtime:
   device: auto
   model_artifacts_dir: ../weights
   keep_score_cache: false
-  tile_batch_size: 1
+  tile_batch_size: auto
 
 scaling:
   partition_tile_rows: 8
@@ -13,8 +13,9 @@ scaling:
   seam_band_px: 64
   score_cache_budget_gb: 8
   min_free_disk_gb: 50
-  tile_io_workers: 8
-  max_cpu_partition_workers: 6
+  tile_io_workers: auto
+  max_cpu_partition_workers: auto
+  assembly_validation_workers: auto
   max_open_frontier_units: 64
   max_partition_segments: 250000
   max_partition_features: 100000

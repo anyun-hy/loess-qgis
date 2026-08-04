@@ -134,24 +134,47 @@ def _read_tile(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
     return image, profile
 
 
-def _run_model(model, image: np.ndarray, device: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    tensor = torch.from_numpy(image.astype(np.float32, copy=False)).unsqueeze(0).to(device)
+def _run_model_batch(
+    model,
+    images: np.ndarray,
+    device: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    batch = np.asarray(images)
+    if batch.ndim != 4 or tuple(batch.shape[1:]) != (3, 512, 512):
+        raise BatchInferenceError(
+            "model batch input must be [B,3,512,512], got " + str(tuple(batch.shape))
+        )
+    if batch.shape[0] < 1:
+        raise BatchInferenceError("model batch input must contain at least one Tile")
+    tensor = torch.from_numpy(batch.astype(np.float32, copy=False)).to(device)
     tensor = tensor / 255.0
     tensor = (tensor - IMAGENET_MEAN.to(device)) / IMAGENET_STD.to(device)
     with torch.inference_mode():
         logits = model(tensor)
     if not torch.is_tensor(logits):
         raise BatchInferenceError(f"TorchScript output must be one tensor, got {type(logits).__name__}")
-    if tuple(logits.shape) != (1, 14, 512, 512):
-        raise BatchInferenceError(f"TorchScript output shape must be (1,14,512,512), got {tuple(logits.shape)}")
+    expected_shape = (int(batch.shape[0]), 14, 512, 512)
+    if tuple(logits.shape) != expected_shape:
+        raise BatchInferenceError(
+            f"TorchScript output shape must be {expected_shape}, got {tuple(logits.shape)}"
+        )
     logits = logits.float()
     probs = torch.softmax(logits, dim=1)
     confidence, mask = probs.max(dim=1)
     return (
-        mask[0].to(torch.uint8).cpu().numpy(),
-        confidence[0].cpu().numpy().astype(np.float32),
-        probs[0].cpu().numpy().astype(np.float16),
+        mask.to(torch.uint8).cpu().numpy(),
+        confidence.cpu().numpy().astype(np.float32),
+        probs.cpu().numpy().astype(np.float16),
     )
+
+
+def _run_model(model, image: np.ndarray, device: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    masks, confidence, probabilities = _run_model_batch(
+        model,
+        np.expand_dims(image, axis=0),
+        device,
+    )
+    return masks[0], confidence[0], probabilities[0]
 
 
 def _completed(paths: Mapping[str, Path], expected: Mapping[str, Any]) -> bool:

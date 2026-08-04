@@ -143,6 +143,53 @@ def test_active_assembly_process_blocks_second_stream(monkeypatch):
     ]
 
 
+def test_resource_budget_reduces_geometry_pool_only_while_package_is_active(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        }
+    }
+
+    assert module.cpu_worker_limit(spec, package_active=False) == 20
+    assert module.cpu_worker_limit(spec, package_active=True) == 16
+
+
+def test_child_process_thread_limits_prevent_nested_cpu_oversubscription(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "unit_process_threads": 1,
+                "assembly_process_threads": 1,
+            }
+        }
+    }
+    package_values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "work_package"}},
+    )
+    unit_values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "unit_fit"}},
+    )
+
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert package_values[name] == "4"
+        assert unit_values[name] == "1"
+    assert package_values["OMP_DYNAMIC"] == "FALSE"
+    assert package_values["MKL_DYNAMIC"] == "FALSE"
+
+
 def test_failed_stream_stops_queue_before_fusion_and_acceptance(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)

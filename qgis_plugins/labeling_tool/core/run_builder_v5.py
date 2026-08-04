@@ -59,6 +59,8 @@ def create_v5_run(
     models: Sequence[Mapping[str, Any]],
     effective_device: str,
     keep_score_cache: bool = False,
+    tile_batch_size: int = 1,
+    resource_tuning: Mapping[str, Any] | None = None,
     overlap: int,
     scaling: Mapping[str, Any],
     boundary_fitting: Mapping[str, Any],
@@ -175,7 +177,9 @@ def create_v5_run(
         "runtime": {
             "effective_device": str(effective_device),
             "keep_score_cache": bool(keep_score_cache),
+            "tile_batch_size": max(1, int(tile_batch_size)),
         },
+        "resource_tuning": dict(resource_tuning or {}),
         "scaling": scaling_value,
         "models": model_values,
         "fusion": fusion_value,
@@ -264,7 +268,9 @@ def create_v5_run(
         "runtime": {
             "effective_device": str(effective_device),
             "keep_score_cache": bool(keep_score_cache),
+            "tile_batch_size": max(1, int(tile_batch_size)),
         },
+        "resource_tuning": dict(resource_tuning or {}),
         "scaling": scaling_value,
         "boundary_fitting": boundary_value,
         "storage_preflight": dict(storage_report),

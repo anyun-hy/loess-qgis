@@ -401,6 +401,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
             },
         ],
         effective_device="cpu",
+        tile_batch_size=4,
         overlap=192,
         scaling=scaling,
         boundary_fitting=_boundary(),
@@ -418,9 +419,16 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         loaded.append(model_entry["model_id"])
         return model_entry["model_id"]
 
-    def infer(model_id, _tile_path, _device):
-        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
-        probabilities[0 if model_id == "a" else 1] = 1.0
+    batch_attempts = []
+
+    def infer_batch(model_id, tile_paths, _device):
+        batch_attempts.append(len(tile_paths))
+        if len(tile_paths) > 2:
+            raise RuntimeError("fixture batch capacity is two")
+        probabilities = np.zeros(
+            (len(tile_paths), 14, 512, 512), dtype=np.float32
+        )
+        probabilities[:, 0 if model_id == "a" else 1] = 1.0
         return probabilities
 
     database = RunStateDB(database_path)
@@ -451,7 +459,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         package_ids[0],
         device="cpu",
         model_loader=loader,
-        infer_tile=infer,
+        infer_batch=infer_batch,
     )
     tile_cache_dir = Path(spec["tile_cache_dir"])
     assert tile.is_file()
@@ -468,7 +476,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         package_ids[1],
         device="cpu",
         model_loader=loader,
-        infer_tile=infer,
+        infer_batch=infer_batch,
     )
     package_reports = [first_report, second_report]
     assert all(report["status"] == "ready" for report in package_reports)
@@ -478,6 +486,16 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert _sha(tile) == source_sha256
     assert not Path(spec["cache_root"]).exists()
     assert loaded == ["a", "b", "a", "b"]
+    assert 4 in batch_attempts
+    assert 2 in batch_attempts
+    assert all(
+        model["configured_tile_batch_size"] == 4
+        and model["effective_tile_batch_size"] == 2
+        and model["peak_tile_batch_size"] <= 2
+        and model["batch_reduction_count"] >= 1
+        for report in package_reports
+        for model in report["models"]
+    )
     assert database.work_package_counts(spec["run_id"]) == {"ready": 2}
     for package_id in package_ids:
         with sqlite3.connect(database_path) as connection:

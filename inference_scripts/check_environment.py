@@ -31,6 +31,7 @@ from deployment_config import (
     load_yaml,
     validate_deployment_config,
 )
+from hardware_tuning import collect_hardware_snapshot, resolve_hardware_tuning
 from torchscript_runtime import load_torchscript_model
 
 
@@ -712,7 +713,19 @@ def build_report(args):
     resolved_device = resolve_device(requested_device)
     device_ok = validate_device(resolved_device)
     runtime["effective_device"] = resolved_device
+    hardware = collect_hardware_snapshot(
+        device=resolved_device,
+        psutil_module=dependencies.get("psutil"),
+        torch_module=torch_module,
+    )
+    runtime, resolved_scaling, resource_tuning = resolve_hardware_tuning(
+        runtime,
+        effective.get("scaling") or {},
+        hardware,
+    )
     effective["runtime"] = runtime
+    effective["scaling"] = resolved_scaling
+    effective["resource_tuning"] = resource_tuning
     device_status = "ready" if device_ok else "error"
     device_message = ""
     if not device_ok:
@@ -728,6 +741,22 @@ def build_report(args):
         "config.yaml:runtime.device",
         device_message,
         "edit runtime.device or repair the PyTorch device environment",
+    )
+    resolved_resources = resource_tuning["resolved"]
+    add_check(
+        checks,
+        "resource_tuning",
+        "ready",
+        (
+            f"CPU {resolved_resources['max_cpu_partition_workers']}"
+            f"/{resolved_resources['max_cpu_partition_workers_with_package']}; "
+            f"Tile batch {resolved_resources['tile_batch_size']}; "
+            f"Tile I/O {resolved_resources['tile_io_workers']}; "
+            f"assembly {resolved_resources['assembly_validation_workers']}"
+        ),
+        "automatic hardware tuning",
+        "performance values were frozen from the current inference hardware",
+        "",
     )
 
     for index, model in enumerate(effective.get("semantic_models") or []):

@@ -172,7 +172,7 @@ runtime:
   device: auto
   model_artifacts_dir: ../weights
   keep_score_cache: false
-  tile_batch_size: 1
+  tile_batch_size: auto
 
 scaling:
   partition_tile_rows: 8
@@ -181,7 +181,9 @@ scaling:
   seam_band_px: 64
   score_cache_budget_gb: 16
   min_free_disk_gb: 50
-  max_cpu_partition_workers: 2
+  tile_io_workers: auto
+  max_cpu_partition_workers: auto
+  assembly_validation_workers: auto
   max_open_frontier_units: 64
   max_partition_segments: 250000
   max_partition_features: 100000
@@ -367,8 +369,10 @@ package_tile_limit = floor(
   → 提交正式资产并释放无依赖临时缓存
 ```
 
-- MPS/CUDA 正式只允许 1 个语义 worker，模型顺序执行，避免多模型争用统一内存；`tile_batch_size` 只控制单模型内部小批量。
-- CPU 允许默认 2 个 Partition 后处理 worker，与下一批语义推理流水重叠；必须使用有界队列和背压，CPU 队列满时暂停继续产生 score。
+- MPS/CUDA 正式只允许 1 个语义 worker，模型顺序执行，避免多模型争用统一内存；`tile_batch_size=auto` 在环境检查时按当前加速器显存/统一内存解析为小批量，Run 创建时冻结整数。生产推理必须真正按该值堆叠 Tile；模型拒绝批量或显存不足时按 1/2 递减并记录实际批量，不得启动第二个 GPU worker。
+- 当前正式硬件实测基线为 RTX 3090 24 GiB 取 16、M2 Max 32 GiB 统一内存取 8。RTX 3090 的三模型 batch 16 峰值预留显存约 4.6–9.0 GiB，batch 32 最高约 17.5 GiB 且额外吞吐不超过约 1.4%；M2 Max 三模型 batch 8 最高约 6.1 GiB，batch 16 虽可运行但最高约 9.0 GiB，会压缩 QGIS 与并行几何的统一内存余量。硬件阈值变化必须重新取得同口径正式模型证据。
+- `tile_io_workers`、`max_cpu_partition_workers` 和 `assembly_validation_workers` 默认使用 `auto`。环境检查按物理核心数、系统内存和加速器类型一次解析，Run Spec 同时记录硬件快照、解析公式版本和实际整数，恢复时沿用原值，不因机器当前负载重新猜测。
+- CPU 几何 worker 与下一批语义推理流水重叠。无 Work Package 时可使用受内存约束的物理核心上限；Work Package 运行时必须从几何池扣除该 Package 获得的 CPU 线程预算，使二者总预算不超过物理核心数。每个独立几何子进程的 OpenMP/MKL/OpenBLAS/Accelerate/NumExpr 线程固定为 1，禁止进程并发与库内线程形成乘法超订阅；必须继续使用有界队列和背压。
 - 每个几何 worker 是独立子进程。停止或超时只终止当前 Partition，不杀死 QGIS；父调度器根据 SQLite 状态决定重试、细分或失败。
 - 不能为 500,000 Tile 创建 500,000 个常驻 Qt 行、Python Future 或内存对象。
 - Fusion 使用磁盘分块增量 accumulator。`equal_probability_average`、`calibrated_global_weighted` 和 `calibrated_class_weighted` 按模型依次累加；`linear_1x1` 保存 profile 明确要求的最小中间通道。禁止为了 Fusion 同时保留整个 run 的全部模型概率。
@@ -1225,6 +1229,8 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - 500,000 Tile、对应 Partition/Seam/Junction 元数据压力测试；分页查询每页不超过 500，禁止把全部行实例化到 UI。
 - 任意行列数的 Partition/Halo/Core 规划测试；Core interior、Seam 和 Junction 的 union 等于 processing extent，pairwise intersection 面积为 0。
 - Work Package 预算、队列背压、低磁盘暂停、引用计数清理、单元失败重试和停止/resume 测试。
+- 自动硬件调优测试覆盖 12 核/32 GiB/MPS 与 20 核/约 100 GiB/24 GiB CUDA，验证 Run 冻结的批量、Tile I/O、几何并发、Work Package 同时运行时的 CPU 扣减和组装并发；固定人工整数仍必须原样保留。
+- 单模型 Tile 批处理测试验证实际 Torch 输入为 `B×3×512×512`、输出逐 Tile 原子提交且顺序稳定；批量不支持或内存不足时只在同一实现内递减到可用值并记录，不得保留逐 Tile 的第二套生产算法。子进程环境测试必须证明几何进程库内线程为 1，全部进程预算不超过已冻结物理核心数。
 - `output/cache/<run_id>/tile_cache/` 路径冻结、来源影像/用户 Tile 不可删除、跨 Package 共享 Tile 最后引用释放及 cache 符号链接拒绝测试。
 - 两个模拟模型、多 Work Package 的端到端测试；每个模型独立输出，Fusion 增量 accumulator 与一次性数学参考逐像素一致。
 - 峰值 Tile probability 数不超过计划预算；已提交且无依赖的缓存被清理，仍被 Fusion/Seam/retry 引用的缓存不会提前删除。

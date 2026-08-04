@@ -1573,6 +1573,10 @@ class LabelingDockWidget(QgsDockWidget):
                 keep_score_cache=bool(
                     (effective.get("runtime") or {}).get("keep_score_cache", False)
                 ),
+                tile_batch_size=int(
+                    (effective.get("runtime") or {}).get("tile_batch_size", 1)
+                ),
+                resource_tuning=effective.get("resource_tuning") or {},
                 overlap=ctx["overlap"],
                 scaling=scaling,
                 boundary_fitting={

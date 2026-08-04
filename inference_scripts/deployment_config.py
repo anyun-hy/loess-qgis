@@ -353,21 +353,28 @@ def validate_deployment_config(
     artifacts_dir = resolve_path(runtime.get("model_artifacts_dir"), base_dir)
     if not str(runtime.get("model_artifacts_dir", "")).strip():
         issues.append(ValidationIssue("/runtime/model_artifacts_dir", "is required"))
+    raw_batch_size = runtime.get("tile_batch_size", "auto")
+    if str(raw_batch_size).strip().lower() == "auto":
+        tile_batch_size: int | str = "auto"
+    else:
+        try:
+            tile_batch_size = int(raw_batch_size)
+        except (TypeError, ValueError):
+            tile_batch_size = 0
+        if tile_batch_size < 1:
+            issues.append(ValidationIssue("/runtime/tile_batch_size", "must be auto or at least 1"))
     effective["runtime"] = {
         "requested_device": device,
         "model_artifacts_dir": str(artifacts_dir),
         "keep_score_cache": bool(runtime.get("keep_score_cache", False)),
-        "tile_batch_size": int(runtime.get("tile_batch_size", 1) or 1),
+        "tile_batch_size": tile_batch_size,
     }
-    if effective["runtime"]["tile_batch_size"] < 1:
-        issues.append(ValidationIssue("/runtime/tile_batch_size", "must be at least 1"))
 
     scaling = _mapping(config.get("scaling"), "/scaling", issues)
     integer_defaults = {
         "partition_tile_rows": 8,
         "partition_tile_cols": 8,
         "seam_band_px": 64,
-        "max_cpu_partition_workers": 2,
         "max_open_frontier_units": 64,
         "max_partition_segments": 250000,
         "max_partition_features": 100000,
@@ -387,8 +394,26 @@ def validate_deployment_config(
             issues.append(ValidationIssue(f"/scaling/{key}", f"must be at least {minimum}"))
     if normalized_scaling["tile_page_size"] > 500:
         issues.append(ValidationIssue("/scaling/tile_page_size", "must not exceed 500"))
+    auto_integer_defaults = {
+        "tile_io_workers": "auto",
+        "max_cpu_partition_workers": "auto",
+        "assembly_validation_workers": "auto",
+    }
+    for key, default in auto_integer_defaults.items():
+        raw_value = scaling.get(key, default)
+        if str(raw_value).strip().lower() == "auto":
+            normalized_scaling[key] = "auto"
+            continue
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = 0
+        normalized_scaling[key] = value
+        if value < 1:
+            issues.append(ValidationIssue(f"/scaling/{key}", "must be auto or at least 1"))
     cpu_count = os.cpu_count() or 1
-    if normalized_scaling["max_cpu_partition_workers"] > cpu_count:
+    cpu_workers = normalized_scaling["max_cpu_partition_workers"]
+    if isinstance(cpu_workers, int) and cpu_workers > cpu_count:
         issues.append(ValidationIssue(
             "/scaling/max_cpu_partition_workers",
             f"must not exceed available CPU count {cpu_count}",
