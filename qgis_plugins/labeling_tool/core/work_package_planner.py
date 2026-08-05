@@ -26,6 +26,7 @@ def calculate_package_tile_limit(
     fusion_accumulator_bytes: int,
     mask_confidence_workspace_bytes: int,
     safety_margin_bytes: int,
+    fixed_temporary_overhead_bytes: int = 0,
     input_tile_bytes: int = 0,
     available_disk_bytes: int,
     min_free_disk_gb: float,
@@ -40,6 +41,9 @@ def calculate_package_tile_limit(
     }
     if any(value < 0 for value in components.values()):
         raise WorkPackagePlanError("per-Tile measured byte values cannot be negative")
+    fixed_overhead = int(fixed_temporary_overhead_bytes)
+    if fixed_overhead < 0:
+        raise WorkPackagePlanError("fixed temporary overhead cannot be negative")
     per_tile = sum(components.values())
     if per_tile <= 0:
         raise WorkPackagePlanError("measured working bytes per Tile must be positive")
@@ -47,12 +51,20 @@ def calculate_package_tile_limit(
     reserve = int(float(min_free_disk_gb) * GIB)
     if cache_budget <= 0 or reserve < 0:
         raise WorkPackagePlanError("cache budget must be positive and disk reserve non-negative")
-    usable_disk = int(available_disk_bytes) - reserve - int(permanent_estimated_bytes)
-    cache_limit = cache_budget // per_tile
+    usable_disk = (
+        int(available_disk_bytes)
+        - reserve
+        - int(permanent_estimated_bytes)
+        - fixed_overhead
+    )
+    usable_cache = cache_budget - fixed_overhead
+    cache_limit = max(0, usable_cache // per_tile)
     disk_limit = max(0, usable_disk // per_tile)
     effective = min(cache_limit, disk_limit)
     if effective < 1:
-        minimum_required = reserve + int(permanent_estimated_bytes) + per_tile
+        minimum_required = (
+            reserve + int(permanent_estimated_bytes) + fixed_overhead + per_tile
+        )
         shortfall = max(0, minimum_required - int(available_disk_bytes))
         raise WorkPackagePlanError(
             "磁盘空间预检失败："
@@ -67,6 +79,7 @@ def calculate_package_tile_limit(
         **components,
         "working_bytes_per_tile": per_tile,
         "cache_budget_bytes": cache_budget,
+        "fixed_temporary_overhead_bytes": fixed_overhead,
         "available_disk_bytes": int(available_disk_bytes),
         "min_free_disk_bytes": reserve,
         "permanent_estimated_bytes": int(permanent_estimated_bytes),
@@ -219,6 +232,7 @@ def storage_preflight(
     fusion_accumulator_bytes: int,
     mask_confidence_workspace_bytes: int,
     safety_margin_bytes: int,
+    fixed_temporary_overhead_bytes: int = 0,
     available_disk_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Use measured sample bytes to gate a run before any inference starts."""
@@ -245,13 +259,17 @@ def storage_preflight(
         fusion_accumulator_bytes=fusion_accumulator_bytes,
         mask_confidence_workspace_bytes=mask_confidence_workspace_bytes,
         safety_margin_bytes=safety_margin_bytes,
+        fixed_temporary_overhead_bytes=fixed_temporary_overhead_bytes,
         input_tile_bytes=input_per_tile,
         available_disk_bytes=available,
         min_free_disk_gb=min_free_disk_gb,
         permanent_estimated_bytes=permanent,
     )
     budget["package_tile_limit"] = min(count, budget["package_tile_limit"])
-    peak_temp = budget["package_tile_limit"] * budget["working_bytes_per_tile"]
+    peak_temp = (
+        budget["package_tile_limit"] * budget["working_bytes_per_tile"]
+        + budget["fixed_temporary_overhead_bytes"]
+    )
     peak_input = budget["package_tile_limit"] * input_per_tile
     required = budget["min_free_disk_bytes"] + permanent + peak_temp
     return {

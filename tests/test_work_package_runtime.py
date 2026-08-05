@@ -7,6 +7,7 @@ import fiona
 import numpy as np
 import pytest
 import rasterio
+import work_package_runtime
 from affine import Affine
 from rasterio.transform import from_origin
 from shapely.geometry import box, shape
@@ -79,6 +80,7 @@ def test_unit_polygonize_does_not_emit_deprecated_memory_driver_warning(capfd):
 def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     tmp_path,
     capsys,
+    monkeypatch,
 ):
     tile = tmp_path / "tile_0_0.tif"
     with rasterio.open(
@@ -189,10 +191,43 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         ).fetchone()[0] == "failed"
 
     model_a.write_bytes(b"model-a")
+    original_build_partition_arrays = work_package_runtime.build_partition_arrays
+    injected_partition_failures = 0
+
+    def fail_first_partition(*args, **kwargs):
+        nonlocal injected_partition_failures
+        if injected_partition_failures == 0:
+            injected_partition_failures += 1
+            raise RuntimeError("partition fault injection")
+        return original_build_partition_arrays(*args, **kwargs)
+
+    monkeypatch.setattr(
+        work_package_runtime, "build_partition_arrays", fail_first_partition
+    )
+    with pytest.raises(RuntimeError, match="partition fault injection"):
+        run_work_package(
+            spec_path,
+            package_id,
+            device="cpu",
+            model_loader=loader,
+            infer_tile=infer,
+        )
+    checkpoint_root = (
+        spec_path.parent
+        / "tmp"
+        / "work_packages"
+        / package_id
+        / "score_batches"
+        / "a"
+    )
+    assert list(checkpoint_root.glob("batch_*.npy"))
+    assert list(checkpoint_root.glob("batch_*.json"))
+
     result = run_work_package(
         spec_path,
         package_id,
         device="cpu",
+        resume=True,
         model_loader=loader,
         infer_tile=infer,
     )
@@ -213,9 +248,10 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         assert np.all(source.read(1) == 0)
     assert not list((run_dir / "tmp/work_packages" / package_id / "scores").rglob("*.npz"))
     assert not list((run_dir / "tmp/work_packages" / package_id / "scores").rglob("*.json"))
+    assert not (run_dir / "tmp/work_packages" / package_id / "score_batches").exists()
     assert not (run_dir / "tmp/work_packages" / package_id / "fusion").exists()
     assert result["cleaned_bytes"] > 0
-    assert result["model_load_count"] == 2
+    assert result["model_load_count"] == 1
     assert result["requested_device"] == "cpu"
     assert result["effective_device"] == "cpu"
     assert result["peak_cache_bytes"] > 0
@@ -223,6 +259,9 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert result["tile_cache_retained_count"] == 0
     assert result["peak_rss_bytes"] > 0
     assert result["elapsed_sec"] > 0
+    assert result["models"][0]["checkpoint_reused_count"] == 1
+    assert result["models"][0]["checkpoint_written_count"] == 0
+    assert result["models"][1]["checkpoint_written_count"] == 1
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
@@ -421,12 +460,13 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
 
     batch_attempts = []
 
-    def infer_batch(model_id, tile_paths, _device):
-        batch_attempts.append(len(tile_paths))
-        if len(tile_paths) > 2:
+    def infer_images(model_id, images, _device):
+        assert images.shape[1:] == (3, 512, 512)
+        batch_attempts.append(len(images))
+        if len(images) > 2:
             raise RuntimeError("fixture batch capacity is two")
         probabilities = np.zeros(
-            (len(tile_paths), 14, 512, 512), dtype=np.float32
+            (len(images), 14, 512, 512), dtype=np.float32
         )
         probabilities[:, 0 if model_id == "a" else 1] = 1.0
         return probabilities
@@ -459,7 +499,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         package_ids[0],
         device="cpu",
         model_loader=loader,
-        infer_batch=infer_batch,
+        infer_images=infer_images,
     )
     tile_cache_dir = Path(spec["tile_cache_dir"])
     assert tile.is_file()
@@ -476,7 +516,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         package_ids[1],
         device="cpu",
         model_loader=loader,
-        infer_batch=infer_batch,
+        infer_images=infer_images,
     )
     package_reports = [first_report, second_report]
     assert all(report["status"] == "ready" for report in package_reports)
@@ -493,6 +533,11 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         and model["effective_tile_batch_size"] == 2
         and model["peak_tile_batch_size"] <= 2
         and model["batch_reduction_count"] >= 1
+        and model["input_queue_capacity"] == 2
+        and model["input_queue_peak_batches"] <= 2
+        and model["result_queue_capacity"] == 1
+        and model["result_queue_peak_batches"] <= 1
+        and model["checkpoint_written_count"] >= 1
         for report in package_reports
         for model in report["models"]
     )

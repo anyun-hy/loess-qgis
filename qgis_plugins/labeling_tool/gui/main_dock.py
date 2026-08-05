@@ -1504,6 +1504,14 @@ class LabelingDockWidget(QgsDockWidget):
                 fusion_accumulator_bytes=pixel_count * 15 * 4 if fusion else 0,
                 mask_confidence_workspace_bytes=pixel_count * (14 * 4 + 5),
                 safety_margin_bytes=sample_tile_bytes,
+                # During atomic replacement, the committed checkpoint and the
+                # next full Batch temporary NPY may coexist briefly.
+                fixed_temporary_overhead_bytes=(
+                    pixel_count
+                    * 14
+                    * 2
+                    * max(1, int(scaling["tile_batch_size"]))
+                ),
             )
             stride = 512 - int(ctx["overlap"])
             accepted_tile_ids = {

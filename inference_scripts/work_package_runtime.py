@@ -8,6 +8,8 @@ import os
 import shutil
 import sys
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -36,6 +38,13 @@ from partition_mosaic import (
     write_partition_rasters,
 )
 from runtime_metrics import directory_size, peak_rss_bytes
+from score_batch_cache import (
+    ScoreBatchDiskReserveError,
+    discard_checkpoint,
+    load_checkpoint,
+    remove_owned_temporary_files,
+    write_checkpoint,
+)
 from semantic_batch import (
     _atomic_json,
     _atomic_npz,
@@ -70,10 +79,9 @@ def _default_infer(model: Any, tile_path: Path, device: str) -> np.ndarray:
 
 def _default_infer_batch(
     model: Any,
-    tile_paths: list[Path],
+    images: np.ndarray,
     device: str,
 ) -> np.ndarray:
-    images = np.stack([_read_tile(path)[0] for path in tile_paths], axis=0)
     _masks, _confidence, probabilities = _run_model_batch(model, images, device)
     return probabilities
 
@@ -94,8 +102,8 @@ def _clear_accelerator_cache(device: str) -> None:
         pass
 
 
-def _score_paths(root: Path, model_id: str, tile_id: str) -> tuple[Path, Path]:
-    score_root = root / "scores" / model_id
+def _accepted_score_paths(root: Path, tile_id: str) -> tuple[Path, Path]:
+    score_root = root / "accepted_scores"
     return score_root / f"tile_{tile_id}.npz", score_root / f"tile_{tile_id}.json"
 
 
@@ -156,6 +164,29 @@ def _prune_empty_tile_cache(tile_cache_dir: Path) -> None:
             break
 
 
+def _record_intersects_partition(
+    record: Mapping[str, Any],
+    partition: Mapping[str, Any],
+    *,
+    overlap: int,
+) -> bool:
+    width = int(record["width"])
+    height = int(record["height"])
+    stride_x = width - int(overlap)
+    stride_y = height - int(overlap)
+    tile_x0 = int(record["col"]) * stride_x
+    tile_y0 = int(record["row"]) * stride_y
+    tile_x1 = tile_x0 + width
+    tile_y1 = tile_y0 + height
+    halo = partition["halo_window"]
+    return not (
+        tile_x1 <= int(halo["x0"])
+        or tile_y1 <= int(halo["y0"])
+        or tile_x0 >= int(halo["x1"])
+        or tile_y0 >= int(halo["y1"])
+    )
+
+
 def _commit_artifact(
     database: RunStateDB,
     run_id: str,
@@ -207,6 +238,7 @@ def run_work_package(
     model_loader: Callable[[Mapping[str, Any], str], Any] = _default_loader,
     infer_tile: Callable[[Any, Path, str], np.ndarray] = _default_infer,
     infer_batch: Callable[[Any, list[Path], str], np.ndarray] | None = None,
+    infer_images: Callable[[Any, np.ndarray, str], np.ndarray] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     spec_path = Path(run_spec_path).resolve()
@@ -246,13 +278,7 @@ def run_work_package(
     configured_batch_size = max(
         1, int((spec.get("runtime") or {}).get("tile_batch_size", 1))
     )
-    if infer_batch is None:
-        if infer_tile is _default_infer:
-            infer_batch = _default_infer_batch
-        else:
-            infer_batch = lambda model, paths, selected_device: np.stack(
-                [infer_tile(model, path, selected_device) for path in paths], axis=0
-            )
+    production_batch_inference = infer_images or _default_infer_batch
     if not database.set_work_package_status(
         run_id, package_id, "running", expected=("queued", "interrupted", "failed", "running")
     ):
@@ -283,6 +309,7 @@ def run_work_package(
     peak_cache_bytes = 0
     tile_cache_released_count = 0
     tile_cache_retained_count = len(active_tiles)
+    partition_pools: list[ThreadPoolExecutor] = []
     try:
         io_workers = int((spec.get("scaling") or {}).get("tile_io_workers", 8))
 
@@ -341,33 +368,34 @@ def run_work_package(
                 for tile in active_tiles
                 if str(tile.get("status")) != "accepted"
             ]
-            model = (
-                model_loader(model_entry, effective_device)
-                if inferable_tiles else None
-            )
-            if model is not None:
-                model_load_count += 1
+            model = None
             score_records_by_tile: dict[str, dict[str, Any]] = {}
             reused = 0
             accepted_count = 0
-            pending_inference: list[dict[str, Any]] = []
             model_effective_batch_size = configured_batch_size
             model_batch_count = 0
             model_peak_batch_size = 0
             model_batch_reduction_count = 0
+            checkpoint_written_count = 0
+            checkpoint_reused_count = 0
+            checkpoint_written_bytes = 0
+            input_queue_capacity = 2
+            input_queue_peak_batches = 0
+            result_queue_capacity = 1
+            result_queue_peak_batches = 0
+            input_wait_sec = 0.0
+            inference_sec = 0.0
+            checkpoint_write_sec = 0.0
+            checkpoint_wait_sec = 0.0
+            partition_sec = 0.0
+            score_batch_root = package_root / "score_batches" / model_id
+            cleaned_bytes += remove_owned_temporary_files(score_batch_root)
 
-            def record_score(item: Mapping[str, Any], *, cache_kind: str) -> None:
-                tile_value = item["tile"]
-                tile_value_id = str(tile_value["tile_id"])
-                score_records_by_tile[tile_value_id] = {
-                    "row": int(tile_value["row_no"]),
-                    "col": int(tile_value["col_no"]),
-                    "width": int(tile_value["width"]),
-                    "height": int(tile_value["height"]),
-                    "score_path": str(item["score_path"]),
-                    "metadata_path": str(item["metadata_path"]),
-                    "cache_kind": cache_kind,
-                }
+            def record_score(
+                item: Mapping[str, Any], record: Mapping[str, Any]
+            ) -> None:
+                tile_value_id = str(item["tile"]["tile_id"])
+                score_records_by_tile[tile_value_id] = dict(record)
                 emit(
                     "package_tile_completed",
                     run_id=run_id,
@@ -378,153 +406,148 @@ def run_work_package(
                     total=len(active_tiles),
                 )
 
-            def flush_pending_inference() -> None:
-                nonlocal model_effective_batch_size
-                nonlocal model_batch_count
-                nonlocal model_peak_batch_size
-                nonlocal model_batch_reduction_count
-                cursor = 0
-                while cursor < len(pending_inference):
-                    attempt_size = min(
-                        model_effective_batch_size,
-                        len(pending_inference) - cursor,
-                    )
-                    group = pending_inference[cursor : cursor + attempt_size]
-                    try:
-                        probabilities_batch = np.asarray(
-                            infer_batch(
-                                model,
-                                [item["tile_path"] for item in group],
-                                effective_device,
-                            )
-                        )
-                        expected_shape = (attempt_size, 14, 512, 512)
-                        if probabilities_batch.shape != expected_shape:
-                            raise WorkPackageRuntimeError(
-                                "Tile probability batch shape must be "
-                                f"{expected_shape}, got {probabilities_batch.shape}"
-                            )
-                    except Exception as error:
-                        if attempt_size <= 1:
-                            raise
-                        reduced_size = max(1, attempt_size // 2)
-                        model_effective_batch_size = min(
-                            model_effective_batch_size, reduced_size
-                        )
-                        model_batch_reduction_count += 1
-                        _clear_accelerator_cache(effective_device)
-                        emit(
-                            "package_tile_batch_reduced",
-                            run_id=run_id,
-                            package_id=package_id,
-                            stream_id=stream_id,
-                            attempted_batch_size=attempt_size,
-                            effective_batch_size=model_effective_batch_size,
-                            reason=str(error),
-                        )
-                        continue
-                    model_batch_count += 1
-                    model_peak_batch_size = max(
-                        model_peak_batch_size, attempt_size
-                    )
-                    for item, probabilities in zip(group, probabilities_batch):
-                        _atomic_npz(
-                            item["score_path"],
-                            probabilities=np.asarray(
-                                probabilities, dtype=np.float16
-                            ),
-                        )
-                        _atomic_json(item["metadata_path"], item["expected"])
-                        record_score(item, cache_kind="model")
-                    cursor += attempt_size
-                pending_inference.clear()
-
+            all_items: list[dict[str, Any]] = []
             for tile_index, tile in enumerate(active_tiles, start=1):
-                tile_id = str(tile["tile_id"])
                 tile_path = Path(tile["raster_path"]).resolve()
-                is_accepted = str(tile.get("status")) == "accepted"
-                if is_accepted:
-                    score_path = package_root / "accepted_scores" / f"tile_{tile_id}.npz"
-                    metadata_path = package_root / "accepted_scores" / f"tile_{tile_id}.json"
-                    expected = {
-                        "schema_version": 1,
-                        "run_id": run_id,
-                        "package_id": package_id,
-                        "tile_id": tile_id,
-                        "source": "accepted_labels",
-                        "accepted_gpkg_sha256": str(spec["accepted_gpkg_sha256"]),
-                        "input_sha256": str(tile["sha256"]),
+                if not tile_path.is_file():
+                    raise WorkPackageRuntimeError(f"Tile raster is missing: {tile_path}")
+                all_items.append(
+                    {
+                        "tile": tile,
+                        "tile_index": tile_index,
+                        "tile_path": tile_path,
                     }
-                    accepted_count += 1
-                else:
-                    score_path, metadata_path = _score_paths(package_root, model_id, tile_id)
-                    expected = {
-                        "schema_version": 1,
-                        "run_id": run_id,
-                        "package_id": package_id,
-                        "tile_id": tile_id,
-                        "model_id": model_id,
-                        "model_sha256": actual_sha,
-                        "input_sha256": str(tile["sha256"]),
-                    }
-                item = {
-                    "tile": tile,
-                    "tile_index": tile_index,
-                    "tile_path": tile_path,
-                    "score_path": score_path,
-                    "metadata_path": metadata_path,
-                    "expected": expected,
+                )
+            accepted_items = [
+                item
+                for item in all_items
+                if str(item["tile"].get("status")) == "accepted"
+            ]
+            inferable_items = [
+                item
+                for item in all_items
+                if str(item["tile"].get("status")) != "accepted"
+            ]
+            for item in accepted_items:
+                tile = item["tile"]
+                tile_id = str(tile["tile_id"])
+                score_path, metadata_path = _accepted_score_paths(
+                    package_root, tile_id
+                )
+                expected = {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "package_id": package_id,
+                    "tile_id": tile_id,
+                    "source": "accepted_labels",
+                    "accepted_gpkg_sha256": str(spec["accepted_gpkg_sha256"]),
+                    "input_sha256": str(tile["sha256"]),
                 }
                 if resume and _score_is_current(score_path, metadata_path, expected):
-                    flush_pending_inference()
                     reused += 1
-                    record_score(
-                        item,
-                        cache_kind="accepted" if is_accepted else "model",
-                    )
-                elif is_accepted:
-                    flush_pending_inference()
-                    if not tile_path.is_file():
-                        raise WorkPackageRuntimeError(f"Tile raster is missing: {tile_path}")
+                else:
                     probabilities = np.asarray(
-                        accepted_probabilities(accepted_path, tile_path),
+                        accepted_probabilities(accepted_path, item["tile_path"]),
                         dtype=np.float32,
                     )
                     if probabilities.shape != (14, 512, 512):
                         raise WorkPackageRuntimeError(
-                            f"Tile probability shape must be [14,512,512], got {probabilities.shape}"
+                            "Tile probability shape must be [14,512,512], got "
+                            f"{probabilities.shape}"
                         )
-                    _atomic_npz(score_path, probabilities=probabilities.astype(np.float16))
+                    _atomic_npz(
+                        score_path, probabilities=probabilities.astype(np.float16)
+                    )
                     _atomic_json(metadata_path, expected)
-                    record_score(item, cache_kind="accepted")
-                else:
-                    if not tile_path.is_file():
-                        raise WorkPackageRuntimeError(f"Tile raster is missing: {tile_path}")
-                    pending_inference.append(item)
-                    if len(pending_inference) >= model_effective_batch_size:
-                        flush_pending_inference()
+                accepted_count += 1
+                record_score(
+                    item,
+                    {
+                        "tile_id": tile_id,
+                        "row": int(tile["row_no"]),
+                        "col": int(tile["col_no"]),
+                        "width": int(tile["width"]),
+                        "height": int(tile["height"]),
+                        "score_path": str(score_path),
+                        "metadata_path": str(metadata_path),
+                        "cache_kind": "accepted",
+                    },
+                )
 
-            flush_pending_inference()
-            score_records = [
-                score_records_by_tile[str(tile["tile_id"])]
-                for tile in active_tiles
+            groups = [
+                (sequence, inferable_items[offset : offset + configured_batch_size])
+                for sequence, offset in enumerate(
+                    range(0, len(inferable_items), configured_batch_size)
+                )
             ]
+            missing_groups: list[tuple[int, list[dict[str, Any]]]] = []
+            for sequence, group in groups:
+                records = (
+                    load_checkpoint(
+                        score_batch_root,
+                        run_id=run_id,
+                        package_id=package_id,
+                        model_id=model_id,
+                        model_sha256=actual_sha,
+                        sequence=sequence,
+                        items=group,
+                    )
+                    if resume
+                    else None
+                )
+                if records is None:
+                    cleaned_bytes += discard_checkpoint(score_batch_root, sequence)
+                    missing_groups.append((sequence, group))
+                    continue
+                checkpoint_reused_count += 1
+                reused += len(group)
+                for item, record in zip(group, records):
+                    record_score(item, record)
 
-            peak_cache_bytes = max(
-                peak_cache_bytes,
-                directory_size(package_root) + directory_size(tile_cache_dir),
-            )
+            if missing_groups:
+                model = model_loader(model_entry, effective_device)
+                model_load_count += 1
 
+            partition_requirements: list[tuple[dict[str, Any], list[str]]] = []
             for partition in partitions:
-                partition_id = partition["partition_id"]
+                required_ids = []
+                for item in all_items:
+                    tile = item["tile"]
+                    if _record_intersects_partition(
+                        {
+                            "row": tile["row_no"],
+                            "col": tile["col_no"],
+                            "width": tile["width"],
+                            "height": tile["height"],
+                        },
+                        partition,
+                        overlap=overlap,
+                    ):
+                        required_ids.append(str(tile["tile_id"]))
+                partition_requirements.append((partition, required_ids))
+
+            def build_partition(
+                partition: Mapping[str, Any], records: list[dict[str, Any]]
+            ) -> tuple[dict[str, np.ndarray], float]:
+                partition_started = time.monotonic()
                 arrays = build_partition_arrays(
-                    score_records,
+                    records,
                     partition,
                     overlap=overlap,
                     allow_uncovered=True,
                 )
+                return arrays, time.monotonic() - partition_started
+
+            def commit_partition(
+                partition: Mapping[str, Any], arrays: Mapping[str, np.ndarray]
+            ) -> None:
+                partition_id = str(partition["partition_id"])
                 probability_path = (
-                    run_dir / "tmp" / "probability_parts" / model_id / f"{partition_id}.tif"
+                    run_dir
+                    / "tmp"
+                    / "probability_parts"
+                    / model_id
+                    / f"{partition_id}.tif"
                 )
                 raster_root = run_dir / "models" / model_id / "raster_parts"
                 paths = write_partition_rasters(
@@ -534,7 +557,8 @@ def run_work_package(
                     crs=crs,
                     output_probability=probability_path,
                     output_mask=raster_root / f"{partition_id}_mask.tif",
-                    output_confidence=raster_root / f"{partition_id}_confidence.tif",
+                    output_confidence=raster_root
+                    / f"{partition_id}_confidence.tif",
                 )
                 for kind, key in (
                     ("partition_probability", "probability"),
@@ -565,14 +589,265 @@ def run_work_package(
                     fusion_accumulators[partition_id].add_model(
                         model_id, arrays["halo_probabilities"]
                     )
+
+            partition_cursor = 0
+            partition_future: Future[tuple[dict[str, np.ndarray], float]] | None = None
+            partition_future_entry: tuple[dict[str, Any], list[str]] | None = None
+            partition_queue_peak = 0
+            partition_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="loess-partition"
+            )
+            partition_pools.append(partition_pool)
+
+            def drain_partition(*, wait: bool) -> None:
+                nonlocal partition_future
+                nonlocal partition_future_entry
+                nonlocal partition_sec
+                if (
+                    partition_future is None
+                    or partition_future_entry is None
+                    or (not wait and not partition_future.done())
+                ):
+                    return
+                arrays, build_elapsed = partition_future.result()
+                partition, _required_ids = partition_future_entry
+                commit_started = time.monotonic()
+                commit_partition(partition, arrays)
+                partition_sec += float(build_elapsed) + (
+                    time.monotonic() - commit_started
+                )
+                partition_future = None
+                partition_future_entry = None
+
+            def schedule_ready_partition() -> None:
+                nonlocal partition_cursor
+                nonlocal partition_future
+                nonlocal partition_future_entry
+                nonlocal partition_queue_peak
+                drain_partition(wait=False)
+                if partition_future is not None or partition_cursor >= len(
+                    partition_requirements
+                ):
+                    return
+                entry = partition_requirements[partition_cursor]
+                partition, required_ids = entry
+                if not all(tile_id in score_records_by_tile for tile_id in required_ids):
+                    return
+                records = [score_records_by_tile[tile_id] for tile_id in required_ids]
+                partition_future = partition_pool.submit(
+                    build_partition, partition, records
+                )
+                partition_future_entry = entry
+                partition_queue_peak = 1
+                partition_cursor += 1
+
+            schedule_ready_partition()
+
+            min_free_bytes = int(
+                float((spec.get("scaling") or {}).get("min_free_disk_gb", 0.0))
+                * 1024**3
+            )
+
+            def write_batch(
+                sequence: int,
+                group: list[dict[str, Any]],
+                probabilities: np.ndarray,
+            ) -> tuple[list[dict[str, Any]], dict[str, Any], float]:
+                write_started = time.monotonic()
+                records, manifest = write_checkpoint(
+                    score_batch_root,
+                    run_id=run_id,
+                    package_id=package_id,
+                    model_id=model_id,
+                    model_sha256=actual_sha,
+                    sequence=sequence,
+                    items=group,
+                    probabilities=probabilities,
+                    min_free_bytes=min_free_bytes,
+                )
+                return records, manifest, time.monotonic() - write_started
+
+            writer_future: Future[
+                tuple[list[dict[str, Any]], dict[str, Any], float]
+            ] | None = None
+            writer_group: list[dict[str, Any]] | None = None
+
+            def drain_writer() -> None:
+                nonlocal writer_future
+                nonlocal writer_group
+                nonlocal checkpoint_written_count
+                nonlocal checkpoint_written_bytes
+                nonlocal checkpoint_write_sec
+                nonlocal checkpoint_wait_sec
+                nonlocal peak_cache_bytes
+                if writer_future is None or writer_group is None:
+                    return
+                wait_started = time.monotonic()
+                records, manifest, write_elapsed = writer_future.result()
+                checkpoint_wait_sec += time.monotonic() - wait_started
+                checkpoint_write_sec += float(write_elapsed)
+                checkpoint_written_count += 1
+                checkpoint_written_bytes += int(manifest["byte_count"])
+                for item, record in zip(writer_group, records):
+                    record_score(item, record)
+                peak_cache_bytes = max(
+                    peak_cache_bytes,
+                    directory_size(package_root) + directory_size(tile_cache_dir),
+                )
+                writer_future = None
+                writer_group = None
+                schedule_ready_partition()
+
+            with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="loess-score-writer"
+            ) as writer_pool:
+                with ThreadPoolExecutor(
+                    max_workers=max(1, io_workers),
+                    thread_name_prefix="loess-tile-read",
+                ) as read_pool:
+                    queued_reads: deque[
+                        tuple[int, list[dict[str, Any]], list[Future[Any]]]
+                    ] = deque()
+                    group_cursor = 0
+
+                    def fill_input_queue() -> None:
+                        nonlocal group_cursor
+                        nonlocal input_queue_peak_batches
+                        while (
+                            len(queued_reads) < input_queue_capacity
+                            and group_cursor < len(missing_groups)
+                        ):
+                            sequence, group = missing_groups[group_cursor]
+                            futures = [
+                                read_pool.submit(_read_tile, item["tile_path"])
+                                for item in group
+                            ]
+                            queued_reads.append((sequence, group, futures))
+                            group_cursor += 1
+                            input_queue_peak_batches = max(
+                                input_queue_peak_batches, len(queued_reads)
+                            )
+
+                    fill_input_queue()
+                    while queued_reads:
+                        sequence, group, read_futures = queued_reads.popleft()
+                        fill_input_queue()
+                        read_started = time.monotonic()
+                        images = np.stack(
+                            [future.result()[0] for future in read_futures], axis=0
+                        )
+                        input_wait_sec += time.monotonic() - read_started
+                        group_outputs: list[np.ndarray] = []
+                        cursor = 0
+                        while cursor < len(group):
+                            attempt_size = min(
+                                model_effective_batch_size, len(group) - cursor
+                            )
+                            subgroup = group[cursor : cursor + attempt_size]
+                            inference_started = time.monotonic()
+                            try:
+                                if infer_images is not None:
+                                    output = infer_images(
+                                        model,
+                                        images[cursor : cursor + attempt_size],
+                                        effective_device,
+                                    )
+                                elif infer_batch is not None:
+                                    output = infer_batch(
+                                        model,
+                                        [item["tile_path"] for item in subgroup],
+                                        effective_device,
+                                    )
+                                elif infer_tile is not _default_infer:
+                                    output = np.stack(
+                                        [
+                                            infer_tile(
+                                                model,
+                                                item["tile_path"],
+                                                effective_device,
+                                            )
+                                            for item in subgroup
+                                        ],
+                                        axis=0,
+                                    )
+                                else:
+                                    output = production_batch_inference(
+                                        model,
+                                        images[cursor : cursor + attempt_size],
+                                        effective_device,
+                                    )
+                                probabilities_batch = np.asarray(output)
+                                expected_shape = (attempt_size, 14, 512, 512)
+                                if probabilities_batch.shape != expected_shape:
+                                    raise WorkPackageRuntimeError(
+                                        "Tile probability batch shape must be "
+                                        f"{expected_shape}, got {probabilities_batch.shape}"
+                                    )
+                            except Exception as error:
+                                inference_sec += time.monotonic() - inference_started
+                                if attempt_size <= 1:
+                                    raise
+                                model_effective_batch_size = min(
+                                    model_effective_batch_size,
+                                    max(1, attempt_size // 2),
+                                )
+                                model_batch_reduction_count += 1
+                                _clear_accelerator_cache(effective_device)
+                                emit(
+                                    "package_tile_batch_reduced",
+                                    run_id=run_id,
+                                    package_id=package_id,
+                                    stream_id=stream_id,
+                                    attempted_batch_size=attempt_size,
+                                    effective_batch_size=model_effective_batch_size,
+                                    reason=str(error),
+                                )
+                                continue
+                            inference_sec += time.monotonic() - inference_started
+                            model_batch_count += 1
+                            model_peak_batch_size = max(
+                                model_peak_batch_size, attempt_size
+                            )
+                            group_outputs.append(
+                                np.asarray(probabilities_batch, dtype=np.float16)
+                            )
+                            cursor += attempt_size
+                        probabilities = np.concatenate(group_outputs, axis=0)
+                        drain_writer()
+                        writer_group = group
+                        writer_future = writer_pool.submit(
+                            write_batch, sequence, group, probabilities
+                        )
+                        result_queue_peak_batches = 1
+                    drain_writer()
+            while partition_cursor < len(partition_requirements):
+                schedule_ready_partition()
+                if partition_future is None:
+                    partition, required_ids = partition_requirements[
+                        partition_cursor
+                    ]
+                    missing_ids = [
+                        tile_id
+                        for tile_id in required_ids
+                        if tile_id not in score_records_by_tile
+                    ]
+                    raise WorkPackageRuntimeError(
+                        f"Partition {partition['partition_id']} lacks scores: "
+                        f"{missing_ids[:5]}"
+                    )
+                drain_partition(wait=True)
+            drain_partition(wait=True)
+            partition_pool.shutdown(wait=True, cancel_futures=True)
+            partition_pools.remove(partition_pool)
+            peak_cache_bytes = max(
+                peak_cache_bytes,
+                directory_size(package_root) + directory_size(tile_cache_dir),
+            )
             if not bool((spec.get("runtime") or {}).get("keep_score_cache", False)):
-                for record in score_records:
-                    if record["cache_kind"] == "model":
-                        cleaned_bytes += _unlink_with_count(Path(record["score_path"]))
-                        cleaned_bytes += _unlink_with_count(Path(record["metadata_path"]))
-                score_root = package_root / "scores" / model_id
-                if score_root.is_dir() and not any(score_root.iterdir()):
-                    score_root.rmdir()
+                cleaned_bytes += _remove_tree_with_count(score_batch_root)
+                batch_parent = package_root / "score_batches"
+                if batch_parent.is_dir() and not any(batch_parent.iterdir()):
+                    batch_parent.rmdir()
             model_summaries.append(
                 {
                     "model_id": model_id,
@@ -586,6 +861,20 @@ def run_work_package(
                     "peak_tile_batch_size": model_peak_batch_size,
                     "inference_batch_count": model_batch_count,
                     "batch_reduction_count": model_batch_reduction_count,
+                    "checkpoint_written_count": checkpoint_written_count,
+                    "checkpoint_reused_count": checkpoint_reused_count,
+                    "checkpoint_written_bytes": checkpoint_written_bytes,
+                    "input_queue_capacity": input_queue_capacity,
+                    "input_queue_peak_batches": input_queue_peak_batches,
+                    "result_queue_capacity": result_queue_capacity,
+                    "result_queue_peak_batches": result_queue_peak_batches,
+                    "partition_queue_capacity": 1,
+                    "partition_queue_peak": partition_queue_peak,
+                    "input_wait_sec": round(input_wait_sec, 6),
+                    "inference_sec": round(inference_sec, 6),
+                    "checkpoint_write_sec": round(checkpoint_write_sec, 6),
+                    "checkpoint_wait_sec": round(checkpoint_wait_sec, 6),
+                    "partition_sec": round(partition_sec, 6),
                 }
             )
 
@@ -699,7 +988,25 @@ def run_work_package(
         _atomic_json(package_root / "package_report.json", result)
         emit("work_package_finished", **result)
         return result
+    except ScoreBatchDiskReserveError as error:
+        for pool in partition_pools:
+            pool.shutdown(wait=True, cancel_futures=True)
+        partition_pools.clear()
+        database.set_work_package_status(
+            run_id, package_id, "interrupted", expected="running"
+        )
+        database.append_event(
+            run_id,
+            "work_package_paused_low_disk",
+            level="warning",
+            message=str(error),
+            payload={"package_id": package_id},
+        )
+        raise
     except Exception as error:
+        for pool in partition_pools:
+            pool.shutdown(wait=True, cancel_futures=True)
+        partition_pools.clear()
         database.set_work_package_status(run_id, package_id, "failed", expected="running")
         database.append_event(
             run_id,

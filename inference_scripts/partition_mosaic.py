@@ -25,9 +25,32 @@ def _window_tuple(value: Mapping[str, Any]) -> tuple[int, int, int, int]:
     return tuple(int(value[key]) for key in ("x0", "y0", "x1", "y1"))
 
 
-def _load_probabilities(record: Mapping[str, Any]) -> np.ndarray:
+def _load_probabilities(
+    record: Mapping[str, Any],
+    batch_cache: dict[Path, np.ndarray] | None = None,
+) -> np.ndarray:
     if "probabilities" in record:
         probabilities = np.asarray(record["probabilities"], dtype=np.float32)
+    elif "score_batch_path" in record:
+        path = Path(str(record["score_batch_path"])).resolve()
+        cache = batch_cache if batch_cache is not None else {}
+        batch = cache.get(path)
+        if batch is None:
+            batch = np.load(path, mmap_mode="r", allow_pickle=False)
+            if batch.ndim != 4 or batch.shape[1] != CLASS_COUNT:
+                mmap = getattr(batch, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                raise PartitionMosaicError(
+                    f"probability batch shape must be [B,14,H,W], got {batch.shape}"
+                )
+            cache[path] = batch
+        index = int(record["score_batch_index"])
+        if index < 0 or index >= batch.shape[0]:
+            raise PartitionMosaicError(
+                f"probability batch index {index} is outside {batch.shape[0]} records"
+            )
+        probabilities = np.asarray(batch[index], dtype=np.float32)
     else:
         path = Path(str(record["score_path"])).resolve()
         with np.load(path, allow_pickle=False) as cached:
@@ -59,56 +82,63 @@ def blend_probability_tiles(
     weight_sum = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
     used = 0
     weight_cache: dict[tuple[int, int, int], np.ndarray] = {}
-    for record in records:
-        if "probabilities" in record:
-            shape = np.asarray(record["probabilities"]).shape
-            if len(shape) != 3:
+    batch_cache: dict[Path, np.ndarray] = {}
+    try:
+        for record in records:
+            if "probabilities" in record:
+                shape = np.asarray(record["probabilities"]).shape
+                if len(shape) != 3:
+                    raise PartitionMosaicError(
+                        f"probability shape must be [14,H,W], got {shape}"
+                    )
+                height, width = int(shape[1]), int(shape[2])
+            else:
+                height = int(record.get("height", 512))
+                width = int(record.get("width", 512))
+            stride_x = width - int(overlap)
+            stride_y = height - int(overlap)
+            if stride_x < 1 or stride_y < 1:
+                raise PartitionMosaicError("overlap must be smaller than Tile dimensions")
+            tile_x0 = int(record["col"]) * stride_x
+            tile_y0 = int(record["row"]) * stride_y
+            tile_x1 = tile_x0 + width
+            tile_y1 = tile_y0 + height
+            ix0 = max(x0, tile_x0)
+            iy0 = max(y0, tile_y0)
+            ix1 = min(x1, tile_x1)
+            iy1 = min(y1, tile_y1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            probabilities = _load_probabilities(record, batch_cache)
+            if probabilities.shape[1:] != (height, width):
                 raise PartitionMosaicError(
-                    f"probability shape must be [14,H,W], got {shape}"
+                    "probability dimensions do not match the declared Tile size"
                 )
-            height, width = int(shape[1]), int(shape[2])
-        else:
-            height = int(record.get("height", 512))
-            width = int(record.get("width", 512))
-        stride_x = width - int(overlap)
-        stride_y = height - int(overlap)
-        if stride_x < 1 or stride_y < 1:
-            raise PartitionMosaicError("overlap must be smaller than Tile dimensions")
-        tile_x0 = int(record["col"]) * stride_x
-        tile_y0 = int(record["row"]) * stride_y
-        tile_x1 = tile_x0 + width
-        tile_y1 = tile_y0 + height
-        ix0 = max(x0, tile_x0)
-        iy0 = max(y0, tile_y0)
-        ix1 = min(x1, tile_x1)
-        iy1 = min(y1, tile_y1)
-        if ix1 <= ix0 or iy1 <= iy0:
-            continue
-        probabilities = _load_probabilities(record)
-        if probabilities.shape[1:] != (height, width):
-            raise PartitionMosaicError(
-                "probability dimensions do not match the declared Tile size"
+            weights = weight_cache.get((height, width, int(overlap)))
+            if weights is None:
+                weights = _tile_weights(height, width, int(overlap))
+                weight_cache[(height, width, int(overlap))] = weights
+            source_x0 = ix0 - tile_x0
+            source_y0 = iy0 - tile_y0
+            source_x1 = ix1 - tile_x0
+            source_y1 = iy1 - tile_y0
+            target_x0 = ix0 - x0
+            target_y0 = iy0 - y0
+            target_x1 = ix1 - x0
+            target_y1 = iy1 - y0
+            source = np.s_[source_y0:source_y1, source_x0:source_x1]
+            target = np.s_[target_y0:target_y1, target_x0:target_x1]
+            local_weights = weights[source]
+            probability_sum[:, target[0], target[1]] += (
+                probabilities[:, source[0], source[1]] * local_weights[None, :, :]
             )
-        weights = weight_cache.get((height, width, int(overlap)))
-        if weights is None:
-            weights = _tile_weights(height, width, int(overlap))
-            weight_cache[(height, width, int(overlap))] = weights
-        source_x0 = ix0 - tile_x0
-        source_y0 = iy0 - tile_y0
-        source_x1 = ix1 - tile_x0
-        source_y1 = iy1 - tile_y0
-        target_x0 = ix0 - x0
-        target_y0 = iy0 - y0
-        target_x1 = ix1 - x0
-        target_y1 = iy1 - y0
-        source = np.s_[source_y0:source_y1, source_x0:source_x1]
-        target = np.s_[target_y0:target_y1, target_x0:target_x1]
-        local_weights = weights[source]
-        probability_sum[:, target[0], target[1]] += (
-            probabilities[:, source[0], source[1]] * local_weights[None, :, :]
-        )
-        weight_sum[target] += local_weights
-        used += 1
+            weight_sum[target] += local_weights
+            used += 1
+    finally:
+        for batch in batch_cache.values():
+            mmap = getattr(batch, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
     if (used == 0 or np.any(weight_sum <= 0)) and not allow_uncovered:
         uncovered = int(np.count_nonzero(weight_sum <= 0))
         raise PartitionMosaicError(

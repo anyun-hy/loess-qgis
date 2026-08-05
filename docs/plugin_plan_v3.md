@@ -370,13 +370,16 @@ package_tile_limit = floor(
 ```
 
 - MPS/CUDA 正式只允许 1 个语义 worker，模型顺序执行，避免多模型争用统一内存；`tile_batch_size=auto` 在环境检查时按当前加速器显存/统一内存解析为小批量，Run 创建时冻结整数。生产推理必须真正按该值堆叠 Tile；模型拒绝批量或显存不足时按 1/2 递减并记录实际批量，不得启动第二个 GPU worker。
+- 单模型 Package 内的生产流水线固定为：容量 2 的有界输入预取队列读取并按 Tile 顺序组装 `B×3×512×512`，单一 MPS/CUDA worker 执行批推理，容量 1 的结果队列提交 Batch 检查点，单一 Partition 消费者按数据库中的确定顺序执行 Core+Halo mosaic。输入、写盘和纯数组 mosaic 可以与下一批推理重叠；Artifact 写入、SQLite 状态变更和 Fusion accumulator 提交仍由 Package 主线程顺序执行，禁止从后台线程并发修改正式状态。
+- 模型概率临时缓存不再逐 Tile 写压缩 NPZ。每个配置批次写一份连续 `float16 NPY` 和一份 JSON 清单；提交顺序固定为数据临时文件 `fsync -> atomic rename -> SHA256 -> manifest fsync -> atomic rename`。清单冻结 Run、Package、模型及模型哈希、批次序号、Tile 顺序、输入哈希、数组 shape/dtype/byte count 和数据 SHA256。只有数据与清单全部一致的 Batch 才能恢复复用；损坏、缺清单或身份不一致的 Batch 只能在本 Package 的受管理目录内删除并重算。
+- 批量因显存不足按 1/2 降档时，只改变同一批次内部的 GPU forward 子批大小；成功输出仍按原配置批次和原 Tile 顺序合并成一个检查点，避免恢复契约随临时显存状态变化。每次写 Batch 前重新检查 `min_free_disk_gb` 并额外预留本次原子写入字节；不足时完成已有原子提交后把 Package 置为 `interrupted/paused_low_disk`，不得开始新的概率写入。
 - 当前正式硬件实测基线为 RTX 3090 24 GiB 取 16、M2 Max 32 GiB 统一内存取 8。RTX 3090 的三模型 batch 16 峰值预留显存约 4.6–9.0 GiB，batch 32 最高约 17.5 GiB 且额外吞吐不超过约 1.4%；M2 Max 三模型 batch 8 最高约 6.1 GiB，batch 16 虽可运行但最高约 9.0 GiB，会压缩 QGIS 与并行几何的统一内存余量。硬件阈值变化必须重新取得同口径正式模型证据。
 - `tile_io_workers`、`max_cpu_partition_workers` 和 `assembly_validation_workers` 默认使用 `auto`。环境检查按物理核心数、系统内存和加速器类型一次解析，Run Spec 同时记录硬件快照、解析公式版本和实际整数，恢复时沿用原值，不因机器当前负载重新猜测。
 - CPU 几何 worker 与下一批语义推理流水重叠。无 Work Package 时可使用受内存约束的物理核心上限；Work Package 运行时必须从几何池扣除该 Package 获得的 CPU 线程预算，使二者总预算不超过物理核心数。每个独立几何子进程的 OpenMP/MKL/OpenBLAS/Accelerate/NumExpr 线程固定为 1，禁止进程并发与库内线程形成乘法超订阅；必须继续使用有界队列和背压。
 - 每个几何 worker 是独立子进程。停止或超时只终止当前 Partition，不杀死 QGIS；父调度器根据 SQLite 状态决定重试、细分或失败。
 - 不能为 500,000 Tile 创建 500,000 个常驻 Qt 行、Python Future 或内存对象。
 - Fusion 使用磁盘分块增量 accumulator。`equal_probability_average`、`calibrated_global_weighted` 和 `calibrated_class_weighted` 按模型依次累加；`linear_1x1` 保存 profile 明确要求的最小中间通道。禁止为了 Fusion 同时保留整个 run 的全部模型概率。
-- 单模型 probability 只有在其 Partition raster、raw/formal、Fusion accumulator、Seam/Junction 引用均提交后才删除。崩溃恢复按 Artifact 引用计数复用已完成缓存，不从头重跑整个工作包。
+- 单模型 Batch probability 只有在本模型当前 Package 的全部 Partition raster 与 Fusion accumulator 提交后才删除；跨 Package 长期保留只使用已提交的 Partition Artifact 和引用计数，不保留整个 Run 的逐 Tile 概率。崩溃恢复先复用通过身份、shape、字节数和 SHA256 验证的完整 Batch，再重算未提交或损坏 Batch，不从头重跑整个工作包。
 - Work Package 只有在自身模型流、Fusion 和正式 Partition 资产全部提交后，才可释放本包引用。仍被未完成邻包 Halo、重试或恢复引用的 Tile 缓存继续保留；最后一个依赖释放时同时删除 Tile 与其 metadata。失败、停止或未提交状态保留缓存用于安全恢复。
 - Tile 清理只能删除经路径归属校验、直接位于本 Run `tile_cache` 下的文件；来源影像、用户 Tile、其他 Run cache 和 `runs/<run_id>/` 永久结果均不得成为清理目标。
 
@@ -1143,7 +1146,7 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 2. 创建 `run_state.sqlite` schema、版本迁移和索引，导入小型 `run_spec.json`，把 Tile、Partition、Work Package、Stream、Seam、Junction、Artifact、Dependency、Retry、Event 全部改为数据库记录。
 3. 实现确定性空间规划器，生成 Tile -> Partition -> Core interior/Seam/Junction 所有权；把计划、像素窗口、affine、依赖和预估字节写入数据库。
 4. 实现存储预检和低磁盘保护。启动前用真实单 Tile 缓存字节数估计峰值，运行中低于 `min_free_disk_gb` 时完成当前原子写入后进入 `paused_low_disk`，不得继续产生新概率。
-5. 重构 semantic 调度为有界 Work Package：单个 MPS/CUDA worker 顺序加载模型，每个模型在一个 Package 内只加载一次；CPU 后处理通过有界队列与推理重叠。
+5. 重构 semantic 调度为有界 Work Package：单个 MPS/CUDA worker 顺序加载模型，每个模型在一个 Package 内只加载一次；容量 2 的输入队列、容量 1 的 Batch 检查点写入队列和单一确定性 Partition 消费者与推理形成背压流水线，后台只做输入、检查点和纯数组计算，Artifact/SQLite/Fusion 提交保持主线程顺序。
 6. 实现逐模型独立分区结果和 Fusion 增量 accumulator。每个模型完成一个 Package 后先提交自身 Partition 资产并更新 accumulator，再按引用计数释放缓存；禁止等待全 run 三模型概率同时齐备。
 7. 实现 Partition `Core+Halo` probability cosine mosaic、Core mask/confidence 分块 GeoTIFF 和 VRT；在小范围 fixture 上与整幅参考逐像素对比。
 8. 对每个 Partition 生成永久 raw coverage；超过 segment/feature/时间门槛时递归细分，所有几何子进程都有心跳、超时和单元级重试。
@@ -1230,7 +1233,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - 任意行列数的 Partition/Halo/Core 规划测试；Core interior、Seam 和 Junction 的 union 等于 processing extent，pairwise intersection 面积为 0。
 - Work Package 预算、队列背压、低磁盘暂停、引用计数清理、单元失败重试和停止/resume 测试。
 - 自动硬件调优测试覆盖 12 核/32 GiB/MPS 与 20 核/约 100 GiB/24 GiB CUDA，验证 Run 冻结的批量、Tile I/O、几何并发、Work Package 同时运行时的 CPU 扣减和组装并发；固定人工整数仍必须原样保留。
-- 单模型 Tile 批处理测试验证实际 Torch 输入为 `B×3×512×512`、输出逐 Tile 原子提交且顺序稳定；批量不支持或内存不足时只在同一实现内递减到可用值并记录，不得保留逐 Tile 的第二套生产算法。子进程环境测试必须证明几何进程库内线程为 1，全部进程预算不超过已冻结物理核心数。
+- 单模型 Tile 批处理测试验证实际 Torch 输入为 `B×3×512×512`，输入队列峰值不超过 2、结果队列峰值不超过 1；输出按原 Tile 顺序提交为带 SHA256 清单的原子 Batch 检查点，禁止生产逐 Tile 压缩概率文件。批量不支持或内存不足时只在同一实现内递减 GPU 子批并记录，最终检查点的配置批次身份和顺序保持不变，不得保留逐 Tile 的第二套生产算法。测试同时覆盖数据/清单中断、损坏哈希、低磁盘暂停、分区失败后复用、只清理受管理临时文件；子进程环境测试必须证明几何进程库内线程为 1，全部进程预算不超过已冻结物理核心数。
 - `output/cache/<run_id>/tile_cache/` 路径冻结、来源影像/用户 Tile 不可删除、跨 Package 共享 Tile 最后引用释放及 cache 符号链接拒绝测试。
 - 两个模拟模型、多 Work Package 的端到端测试；每个模型独立输出，Fusion 增量 accumulator 与一次性数学参考逐像素一致。
 - 峰值 Tile probability 数不超过计划预算；已提交且无依赖的缓存被清理，仍被 Fusion/Seam/retry 引用的缓存不会提前删除。
