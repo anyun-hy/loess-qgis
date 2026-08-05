@@ -1510,7 +1510,7 @@ class LabelingDockWidget(QgsDockWidget):
                     pixel_count
                     * 14
                     * 2
-                    * max(1, int(scaling["tile_batch_size"]))
+                    * max(1, int(registry.runtime["tile_batch_size"]))
                 ),
             )
             stride = 512 - int(ctx["overlap"])
