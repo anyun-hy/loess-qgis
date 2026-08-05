@@ -307,10 +307,11 @@ if manifest.get("schema_version") != 2:
     raise SystemExit("Project manifest must use schema 2")
 if manifest.get("project_id") != expected_project_id:
     raise SystemExit("Project identity differs from the validated identity marker")
-if manifest.get("git_sha") != expected_git:
+actual_git = manifest.get("git_sha")
+if actual_git != expected_git:
     raise SystemExit(
         "Project Git SHA differs from this source; rerun init_project.sh "
-        f"to update it ({manifest.get('git_sha')} != {expected_git})"
+        f"to update it ({actual_git} != {expected_git})"
     )
 if Path(str(manifest.get("project_root") or "")).resolve() != root:
     raise SystemExit("Project was moved; rerun init_project.sh at its current path")

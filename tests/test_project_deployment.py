@@ -871,6 +871,26 @@ def test_project_check_only_is_non_mutating_and_assets_are_explicit(tmp_path):
     assert asset_check.returncode == 3
     assert "Missing required assets" in asset_check.stderr
 
+    manifest_path = project_root / "project_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["git_sha"] = "0" * 40
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    stale_check = _run(
+        [
+            str(ROOT / "bash" / "init_project.sh"),
+            "--platform",
+            "macos",
+            "--project-root",
+            str(project_root),
+            "--check-only",
+        ],
+        env=env,
+        check=False,
+    )
+    assert stale_check.returncode != 0
+    assert "Project Git SHA differs from this source" in stale_check.stderr
+    assert "Traceback" not in stale_check.stderr
+
 
 def test_runtime_contract_rejects_changed_project_copy(tmp_path):
     fake_qgis = tmp_path / "qgis_process"
