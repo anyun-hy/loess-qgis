@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import datetime as dt
+import fcntl
 import json
 import os
 import sqlite3
@@ -31,6 +32,7 @@ from labeling_tool.core.run_spec import sha256_file
 from deployment_config import load_json
 from difference_runtime import apply_accepted_difference
 from semantic_batch import _atomic_json
+from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
 
 
@@ -40,6 +42,252 @@ class StreamAssemblyError(RuntimeError):
 
 ASSEMBLY_VALIDATION_MAX_IN_FLIGHT = 32
 OBJECT_ID_BATCH_SIZE = 512
+GPKG_ATOMIC_OVERHEAD_BYTES = 4 * 1024**2
+JSON_ATOMIC_OVERHEAD_BYTES = 64 * 1024
+UNIT_INTERMEDIATE_KINDS = (
+    "unit_raw",
+    "unit_formal",
+    "unit_boundary_report",
+    "unit_fitted_edges",
+)
+UNIT_INTERMEDIATE_SUFFIXES = {
+    "unit_raw": "_raw.gpkg",
+    "unit_formal": "_formal.gpkg",
+    "unit_boundary_report": "_report.json",
+    "unit_fitted_edges": "_fitted_edges.gpkg",
+}
+
+
+def _remaining_permanent_reserve_bytes(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+) -> int:
+    return exact_remaining_permanent_bytes(spec, database)
+
+
+def _run_storage_guard(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    *,
+    disk_usage=None,
+) -> StorageGuard:
+    storage = dict(spec.get("storage_preflight") or {})
+    min_free_bytes = int(
+        storage.get("effective_min_free_disk_bytes")
+        or float((spec.get("scaling") or {}).get("min_free_disk_gb", 0.0))
+        * 1024**3
+    )
+    remaining = _remaining_permanent_reserve_bytes(spec, database)
+    options = {
+        "min_free_bytes": max(0, min_free_bytes),
+        "remaining_permanent_bytes": lambda: remaining,
+    }
+    if disk_usage is not None:
+        options["disk_usage"] = disk_usage
+    return StorageGuard(Path(spec["run_dir"]), **options)
+
+
+def _cleanup_stream_unit_artifacts(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    stream_id: str,
+) -> dict[str, Any]:
+    """Delete verified unit intermediates only after assembled outputs are ready."""
+
+    run_id = str(spec["run_id"])
+    run_dir = Path(spec["run_dir"]).resolve()
+    unit_root = (
+        run_dir / "tmp" / "unit_outputs" / str(stream_id).replace(":", "_")
+    )
+    if unit_root.is_symlink():
+        raise StreamAssemblyError(
+            f"refusing to clean symlinked unit output directory: {unit_root}"
+        )
+    candidates = [
+        dict(artifact)
+        for artifact in database.artifacts_for_stream(
+            run_id, str(stream_id), status="ready"
+        )
+        if str(artifact.get("kind") or "") in UNIT_INTERMEDIATE_KINDS
+        and int(artifact.get("ref_count") or 0) == 0
+    ]
+
+    # Validate every target before deleting the first file.  This prevents a
+    # forged/stale DB path from turning a cleanup pass into a partial deletion.
+    validated: list[tuple[dict[str, Any], Path]] = []
+    for artifact in candidates:
+        kind = str(artifact["kind"])
+        unit_id = str(artifact["unit_id"])
+        path = Path(str(artifact["path"]))
+        expected = unit_root / f"{unit_id}{UNIT_INTERMEDIATE_SUFFIXES[kind]}"
+        if path.is_symlink() or path.resolve() != expected.resolve():
+            raise StreamAssemblyError(
+                "unit intermediate cleanup path is outside the owned Stream "
+                f"directory: {path}"
+            )
+        if not path.is_file():
+            raise StreamAssemblyError(
+                f"unit intermediate is missing before verified cleanup: {path}"
+            )
+        if (
+            path.stat().st_size != int(artifact["byte_count"])
+            or sha256_file(path) != str(artifact["sha256"])
+        ):
+            raise StreamAssemblyError(
+                f"unit intermediate changed before verified cleanup: {path}"
+            )
+        validated.append((artifact, path))
+
+    kind_counts: dict[str, int] = {}
+    cleaned_bytes = 0
+    for artifact, path in validated:
+        artifact_id = int(artifact["artifact_id"])
+        claimed = database.claim_artifact_cleanup(artifact_id)
+        if claimed is None:
+            raise StreamAssemblyError(
+                f"unit intermediate cleanup claim changed: {path}"
+            )
+        try:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_size != int(claimed["byte_count"])
+                or sha256_file(path) != str(claimed["sha256"])
+            ):
+                raise StreamAssemblyError(
+                    f"unit intermediate changed after cleanup claim: {path}"
+                )
+            path.unlink()
+            if not database.finish_artifact_cleanup(artifact_id, success=True):
+                raise StreamAssemblyError(
+                    f"unit intermediate cleanup state changed: {path}"
+                )
+        except Exception:
+            database.finish_artifact_cleanup(artifact_id, success=False)
+            raise
+        kind = str(artifact["kind"])
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        cleaned_bytes += int(artifact["byte_count"])
+    try:
+        unit_root.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+    report = {
+        "status": "passed",
+        "stream_id": str(stream_id),
+        "artifact_count": len(validated),
+        "cleaned_bytes": cleaned_bytes,
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "path_policy": "run_tmp_unit_outputs_exact_file",
+        "integrity_policy": "db_claim_size_sha256",
+    }
+    database.append_event(
+        run_id,
+        "stream_unit_artifacts_cleaned",
+        message=str(stream_id),
+        payload=report,
+    )
+    return report
+
+
+@contextmanager
+def _reserved_vector_write(
+    storage_guard: StorageGuard | None,
+    lock_path: Path | None,
+    operation: str,
+    write_bytes: int,
+):
+    if storage_guard is None:
+        yield
+        return
+    shared_lock = lock_path or (
+        storage_guard.root / "tmp" / ".vector-storage-reserve.lock"
+    )
+    shared_lock.parent.mkdir(parents=True, exist_ok=True)
+    with shared_lock.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        reserved_write = 0
+        try:
+            reservation = storage_guard.check(
+                operation,
+                write_bytes=max(0, int(write_bytes)),
+                managed_growth_bytes=0,
+                reserve_managed_growth=True,
+            )
+            reserved_write = int(reservation["reserved_write_bytes"])
+            yield
+        finally:
+            if reserved_write:
+                storage_guard.adjust(0, settled_write_bytes=reserved_write)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _estimate_source_gpkg_bytes(
+    paths: Iterator[str | Path] | list[str | Path] | tuple[str | Path, ...],
+    *,
+    multiplier: int = 2,
+) -> int:
+    source_bytes = sum(Path(path).stat().st_size for path in paths)
+    return max(
+        GPKG_ATOMIC_OVERHEAD_BYTES,
+        max(1, int(multiplier)) * source_bytes + GPKG_ATOMIC_OVERHEAD_BYTES,
+    )
+
+
+def _estimate_json_bytes(payload: Mapping[str, Any]) -> int:
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    return len(encoded) + JSON_ATOMIC_OVERHEAD_BYTES
+
+
+def _write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    storage_guard: StorageGuard | None = None,
+    storage_lock_path: Path | None = None,
+    operation: str = "stream_report",
+) -> None:
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        _estimate_json_bytes(payload),
+    ):
+        _atomic_json(path, payload)
+
+
+def _accepted_layer_has_geometry(
+    accepted_path: str | Path,
+    *,
+    accepted_layer: str = "accepted_labels",
+) -> bool:
+    path = Path(accepted_path).resolve()
+    if not path.is_file() or accepted_layer not in fiona.listlayers(path):
+        return False
+    with fiona.open(path, layer=accepted_layer) as source:
+        return any(feature.get("geometry") for feature in source)
+
+
+def _guarded_accepted_difference(
+    source_path: Path,
+    accepted_path: str | Path,
+    output_path: Path,
+    *,
+    storage_guard: StorageGuard | None,
+    storage_lock_path: Path | None,
+    operation: str,
+) -> dict[str, Any]:
+    if not _accepted_layer_has_geometry(accepted_path):
+        return apply_accepted_difference(source_path, accepted_path, output_path)
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        _estimate_source_gpkg_bytes((source_path,), multiplier=2),
+    ):
+        return apply_accepted_difference(source_path, accepted_path, output_path)
 
 
 def _stream_root(spec: Mapping[str, Any], stream: Mapping[str, Any]) -> Path:
@@ -62,27 +310,45 @@ def _read_features(path: str | Path) -> list[dict[str, Any]]:
     return result
 
 
-def _atomic_gpkg(path: Path, layer: str, schema, crs, writer) -> None:
+def _atomic_gpkg(
+    path: Path,
+    layer: str,
+    schema,
+    crs,
+    writer,
+    *,
+    storage_guard: StorageGuard | None = None,
+    storage_lock_path: Path | None = None,
+    estimated_write_bytes: int = GPKG_ATOMIC_OVERHEAD_BYTES,
+    operation: str = "stream_gpkg",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
-    temporary.unlink(missing_ok=True)
-    try:
-        with fiona.open(
-            temporary,
-            "w",
-            driver="GPKG",
-            layer=layer,
-            schema=schema,
-            crs=CRS.from_user_input(crs),
-        ) as destination:
-            writer(destination)
-        with sqlite3.connect(temporary) as connection:
-            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise StreamAssemblyError(f"GeoPackage integrity check failed: {temporary}")
-        os.replace(temporary, path)
-    except Exception:
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        estimated_write_bytes,
+    ):
         temporary.unlink(missing_ok=True)
-        raise
+        try:
+            with fiona.open(
+                temporary,
+                "w",
+                driver="GPKG",
+                layer=layer,
+                schema=schema,
+                crs=CRS.from_user_input(crs),
+            ) as destination:
+                writer(destination)
+            with sqlite3.connect(temporary) as connection:
+                if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise StreamAssemblyError(
+                        f"GeoPackage integrity check failed: {temporary}"
+                    )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -451,7 +717,8 @@ def _reuse_ready_assembly(
     rows = {
         str(row["stream_id"]): row for row in database.stream_rows(run_id)
     }
-    if str((rows.get(stream_id) or {}).get("status") or "") != "ready":
+    stream_status = str((rows.get(stream_id) or {}).get("status") or "")
+    if stream_status not in {"ready", "failed"}:
         return None
     root = _stream_root(spec, stream)
     paths = {
@@ -499,6 +766,7 @@ def _reuse_ready_assembly(
     report.setdefault("report_summary_source", "sqlite")
     report.setdefault("report_json_parse_count", 0)
     report["object_link_count"] = database.object_link_count(run_id, stream_id)
+    report["recovered_stream_status"] = stream_status
     print(
         json.dumps(
             {"event": "stream_assembly_reused", **report},
@@ -571,6 +839,10 @@ def _assemble_stream_impl(
     )
     reused = _reuse_ready_assembly(spec, stream, database)
     if reused is not None:
+        database.set_stream_status(run_id, stream_id, "ready", error="")
+        reused["unit_artifact_cleanup"] = _cleanup_stream_unit_artifacts(
+            spec, database, stream_id
+        )
         return reused
     database.set_stream_status(
         run_id,
@@ -599,6 +871,8 @@ def _assemble_stream_impl(
 
     transform = spec["raster"]["transform"]
     root = _stream_root(spec, stream)
+    storage_guard = _run_storage_guard(spec, database)
+    storage_lock_path = Path(spec["run_dir"]) / "tmp" / ".vector-storage-reserve.lock"
     raw_path = root / "semantic_polygons_raw.gpkg"
     formal_path = root / "semantic_polygons.gpkg"
     report_path = root / "boundary_fitting_report.json"
@@ -790,6 +1064,12 @@ def _assemble_stream_impl(
             raw_schema,
             spec["raster"]["crs"],
             write_raw,
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            estimated_write_bytes=_estimate_source_gpkg_bytes(
+                tuple(raw_by_unit.values())
+            ),
+            operation=f"stream_raw:{stream_id}",
         )
 
         def write_formal(destination):
@@ -890,6 +1170,12 @@ def _assemble_stream_impl(
             formal_schema,
             spec["raster"]["crs"],
             write_formal,
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            estimated_write_bytes=_estimate_source_gpkg_bytes(
+                tuple(formal_by_unit.values())
+            ),
+            operation=f"stream_formal:{stream_id}",
         )
 
     aggregate = {
@@ -1023,6 +1309,12 @@ def _assemble_stream_impl(
                 edge_schema,
                 spec["raster"]["crs"],
                 write_edges,
+                storage_guard=storage_guard,
+                storage_lock_path=storage_lock_path,
+                estimated_write_bytes=_estimate_source_gpkg_bytes(
+                    tuple(str(item["path"]) for item in edge_artifacts)
+                ),
+                operation=f"stream_fitted_edges_stage:{stream_id}",
             )
             aggregate.update(edge_metrics)
             dense_points = int(aggregate["dense_curve_point_count"])
@@ -1107,17 +1399,26 @@ def _assemble_stream_impl(
                     raise StreamAssemblyError(
                         "accepted_labels changed after run creation"
                     )
-            difference = apply_accepted_difference(
+            difference = _guarded_accepted_difference(
                 formal_path,
                 accepted_value,
                 staged_candidate_path,
+                storage_guard=storage_guard,
+                storage_lock_path=storage_lock_path,
+                operation=f"stream_candidate_stage:{stream_id}",
             )
             candidate_written = staged_candidate_path.is_file()
             if candidate_written and difference.get("output"):
                 difference = dict(difference)
                 difference["output"] = str(candidate_path)
             aggregate["difference"] = difference
-            _atomic_json(staged_report_path, aggregate)
+            _write_json(
+                staged_report_path,
+                aggregate,
+                storage_guard=storage_guard,
+                storage_lock_path=storage_lock_path,
+                operation=f"stream_report_stage:{stream_id}",
+            )
             if resume_from_reports:
                 _assert_fingerprint_unchanged(raw_path, resume_inputs["raw"])
                 _assert_fingerprint_unchanged(formal_path, resume_inputs["formal"])
@@ -1159,6 +1460,9 @@ def _assemble_stream_impl(
         stream_id,
         "ready",
         error="",
+    )
+    aggregate["unit_artifact_cleanup"] = _cleanup_stream_unit_artifacts(
+        spec, database, stream_id
     )
     print(json.dumps({"event": "stream_assembled", **aggregate}, separators=(",", ":")))
     return aggregate

@@ -40,7 +40,10 @@ def cpu_worker_limit(spec, *, package_active):
 
 def process_thread_environment_values(spec, context):
     job = context.get("job") or {}
-    if job.get("job_type") == "work_package":
+    if (
+        context.get("kind") == "accelerator_worker"
+        or job.get("job_type") == "work_package"
+    ):
         threads = _resource_value(spec, "package_process_threads", 2)
     elif job.get("job_type") == "unit_fit":
         threads = _resource_value(spec, "unit_process_threads", 1)
@@ -61,7 +64,7 @@ def process_thread_environment_values(spec, context):
 
 
 class V5AsyncInferenceRunner(QObject):
-    """Run one accelerator package and a bounded CPU geometry pool."""
+    """Run one persistent accelerator worker and a bounded CPU geometry pool."""
 
     log_line = pyqtSignal(str, str)
     step_started = pyqtSignal(str)
@@ -95,6 +98,9 @@ class V5AsyncInferenceRunner(QObject):
         self._stopped = False
         self._phase = "idle"
         self._worker_id = f"qgis-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._accelerator_worker_id = self._worker_id + "-accelerator"
+        self._accelerator_done = False
+        self._accelerator_crash_count = 0
         self._processes = {}
         self._assembly_queue = []
         self._started_at = 0.0
@@ -140,6 +146,9 @@ class V5AsyncInferenceRunner(QObject):
                 raise RuntimeError("V5 runner requires run_spec schema 2")
             self._database = RunStateDB(self._spec["state_db"])
         if resume:
+            recovered_package_jobs = self._database.recover_ready_work_package_jobs(
+                self._spec["run_id"]
+            )
             self._database.interrupt_run_jobs(self._spec["run_id"])
         self._manual_package_reset = {}
         if reset_failed_packages:
@@ -166,9 +175,18 @@ class V5AsyncInferenceRunner(QObject):
         self._stopped = False
         self._phase = "jobs"
         self._processes.clear()
+        self._accelerator_worker_id = self._worker_id + "-accelerator"
+        self._accelerator_done = False
+        self._accelerator_crash_count = 0
         self._assembly_queue = []
         self._started_at = time.time()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
+        if resume and recovered_package_jobs:
+            self.log_line.emit(
+                "system",
+                "[recovery] finalized ready Work Package jobs: "
+                + str(recovered_package_jobs),
+            )
         tuning = self._spec.get("resource_tuning") or {}
         if tuning:
             self.log_line.emit(
@@ -201,7 +219,14 @@ class V5AsyncInferenceRunner(QObject):
         for entry in entries:
             self._terminate_entry(entry, graceful=True)
         for entry in entries:
-            job = entry["context"].get("job")
+            context = entry["context"]
+            if context.get("kind") == "accelerator_worker":
+                self._database.interrupt_work_package_worker(
+                    self._spec["run_id"],
+                    context["worker_id"],
+                )
+                continue
+            job = context.get("job")
             if job:
                 self._database.interrupt_job(job["job_id"], job["lease_token"])
         self._processes.clear()
@@ -227,31 +252,37 @@ class V5AsyncInferenceRunner(QObject):
             self._emit_progress("磁盘空间低于保留阈值，已暂停派发新任务")
             return
 
+        accelerator_active = any(
+            entry["context"].get("kind") == "accelerator_worker"
+            for entry in self._processes.values()
+        )
         active_jobs = [
             entry["context"].get("job") for entry in self._processes.values()
             if entry["context"].get("kind") == "job"
         ]
-        package_active = any(job and job["job_type"] == "work_package" for job in active_jobs)
         unit_active = sum(1 for job in active_jobs if job and job["job_type"] == "unit_fit")
         started = False
 
-        if not package_active:
-            job = self._database.lease_next_work_package(
-                self._spec["run_id"],
-                self._worker_id + "-accelerator",
-                max_open_frontier_units=int(
-                    (self._spec.get("scaling") or {}).get(
-                        "max_open_frontier_units", 64
-                    )
-                ),
-                lease_seconds=1800,
-            )
-            if job:
-                self._start_job(job)
+        package_counts = self._database.job_counts(
+            self._spec["run_id"],
+            job_type="work_package",
+        )
+        package_pending = any(
+            package_counts.get(status, 0)
+            for status in ("queued", "interrupted", "running")
+        )
+        if not self._accelerator_done and not accelerator_active:
+            if package_pending:
+                self._start_accelerator_worker()
                 started = True
-                package_active = True
+                accelerator_active = True
+            else:
+                self._accelerator_done = True
 
-        cpu_limit = cpu_worker_limit(self._spec, package_active=package_active)
+        cpu_limit = cpu_worker_limit(
+            self._spec,
+            package_active=accelerator_active,
+        )
         while unit_active < cpu_limit:
             job = self._database.lease_next_job(
                 self._spec["run_id"],
@@ -290,31 +321,47 @@ class V5AsyncInferenceRunner(QObject):
             )
 
     def _start_job(self, job):
-        if job["job_type"] == "work_package":
-            self._start_process(
-                f"work_package:{job['package_id']}",
-                "run_work_package.sh",
-                [
-                    "--run-spec", self._spec_path,
-                    "--package-id", job["package_id"],
-                    "--device", self._spec["runtime"]["effective_device"],
-                    "--resume",
-                ],
-                {"kind": "job", "job": job},
+        if job["job_type"] != "unit_fit":
+            raise RuntimeError(
+                "QGIS may only launch unit_fit jobs directly; "
+                "Work Packages belong to the persistent accelerator worker"
             )
-        else:
-            self._start_process(
-                f"unit_fit:{job['stream_id']}:{job['unit_id']}",
-                "run_unit_fit.sh",
-                [
-                    "--run-spec", self._spec_path,
-                    "--stream-id", job["stream_id"],
-                    "--unit-id", job["unit_id"],
-                    "--job-id", str(job["job_id"]),
-                    "--lease-token", job["lease_token"],
-                ],
-                {"kind": "job", "job": job},
-            )
+        self._start_process(
+            f"unit_fit:{job['stream_id']}:{job['unit_id']}",
+            "run_unit_fit.sh",
+            [
+                "--run-spec", self._spec_path,
+                "--stream-id", job["stream_id"],
+                "--unit-id", job["unit_id"],
+                "--job-id", str(job["job_id"]),
+                "--lease-token", job["lease_token"],
+            ],
+            {"kind": "job", "job": job},
+        )
+
+    def _start_accelerator_worker(self):
+        self._start_process(
+            "accelerator_worker",
+            "run_work_package.sh",
+            [
+                "--run-spec", self._spec_path,
+                "--worker-id", self._accelerator_worker_id,
+                "--device", self._spec["runtime"]["effective_device"],
+                "--max-open-frontier-units",
+                str(
+                    int(
+                        (self._spec.get("scaling") or {}).get(
+                            "max_open_frontier_units", 64
+                        )
+                    )
+                ),
+                "--resume",
+            ],
+            {
+                "kind": "accelerator_worker",
+                "worker_id": self._accelerator_worker_id,
+            },
+        )
 
     def _start_assembly(self):
         active_assemblies = [
@@ -380,9 +427,27 @@ class V5AsyncInferenceRunner(QObject):
         process.finished.connect(
             lambda code, status, t=token: self._process_finished(t, code, status)
         )
+        process.errorOccurred.connect(
+            lambda error, t=token: self._process_error(t, error)
+        )
         self.step_started.emit(label)
         self.log_line.emit("system", "[cmd] " + shlex.join(["/bin/bash", path, *arguments]))
         process.start()
+
+    def _process_error(self, token, _process_error):
+        entry = self._processes.get(token)
+        if not entry or not self._running:
+            return
+        process = entry["process"]
+        entry["forced_error"] = (
+            entry["forced_error"]
+            or f"{entry['context']['label']} process error: {process.errorString()}"
+        )
+        if not process_is_running(process):
+            QTimer.singleShot(
+                0,
+                lambda t=token: self._process_finished(t, -1, None),
+            )
 
     def _read(self, token, level):
         entry = self._processes.get(token)
@@ -417,6 +482,10 @@ class V5AsyncInferenceRunner(QObject):
             return
         if not isinstance(event, dict) or not event.get("event"):
             return
+        if event["event"] == "work_package_finished":
+            # A completed Package proves the persistent worker reached useful
+            # work; only consecutive process crashes count toward the guard.
+            self._accelerator_crash_count = 0
         self.stream_progress.emit(event)
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)
@@ -446,6 +515,73 @@ class V5AsyncInferenceRunner(QObject):
         label = context["label"]
         success = int(exit_code) == 0 and not entry["forced_error"]
         error = entry["forced_error"] or ("" if success else f"{label} failed (rc={int(exit_code)})")
+
+        if context.get("kind") == "accelerator_worker":
+            worker_id = context["worker_id"]
+            if not success:
+                self._database.interrupt_work_package_worker(
+                    self._spec["run_id"],
+                    worker_id,
+                )
+            package_counts = self._database.job_counts(
+                self._spec["run_id"],
+                job_type="work_package",
+            )
+            package_pending = any(
+                package_counts.get(status, 0)
+                for status in ("queued", "interrupted", "running")
+            )
+            if success and package_pending:
+                success = False
+                error = (
+                    "accelerator_worker exited while Work Packages remain: "
+                    + str(package_counts)
+                )
+                self._database.interrupt_work_package_worker(
+                    self._spec["run_id"],
+                    worker_id,
+                )
+                package_counts = self._database.job_counts(
+                    self._spec["run_id"],
+                    job_type="work_package",
+                )
+                package_pending = any(
+                    package_counts.get(status, 0)
+                    for status in ("queued", "interrupted", "running")
+                )
+            self.step_finished.emit(
+                label,
+                int(exit_code),
+                {
+                    "success": success,
+                    "error": error,
+                    "stream_id": "",
+                },
+            )
+            if success:
+                self._accelerator_done = True
+                self._accelerator_crash_count = 0
+            elif package_pending:
+                self._accelerator_crash_count += 1
+                if self._accelerator_crash_count >= 3:
+                    self._finish(
+                        False,
+                        "persistent accelerator worker crashed repeatedly: "
+                        + error,
+                    )
+                    return
+                self.log_line.emit(
+                    "system",
+                    "[accelerator-restart] "
+                    f"attempt={self._accelerator_crash_count} error={error}",
+                )
+            else:
+                # No Package can be retried.  Let the normal job graph check
+                # report exhausted failures instead of respawning the worker.
+                self._accelerator_done = True
+            self._emit_progress(label)
+            QTimer.singleShot(0, self._schedule)
+            return
 
         if context.get("kind") == "job":
             job = context["job"]
@@ -557,17 +693,26 @@ class V5AsyncInferenceRunner(QObject):
         except (ProcessLookupError, OSError):
             process.kill()
         process.waitForFinished(2500 if graceful else 1000)
+        if graceful and process_is_running(process):
+            try:
+                if pid > 0 and entry.get("owns_process_group"):
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except (ProcessLookupError, OSError):
+                process.kill()
+            process.waitForFinished(1000)
 
     def _disk_below_reserve(self):
+        storage = self._spec.get("storage_preflight") or {}
         reserve = int(
-            float((self._spec.get("scaling") or {}).get("min_free_disk_gb", 0))
+            storage.get("effective_min_free_disk_bytes")
+            or float((self._spec.get("scaling") or {}).get("min_free_disk_gb", 0))
             * 1024**3
         )
         return shutil.disk_usage(self._spec["output_root"]).free <= reserve
 
     def _cleanup_released_artifacts(self):
-        if bool((self._spec.get("runtime") or {}).get("keep_score_cache", False)):
-            return
         candidates = self._database.cleanup_candidates(
             self._spec["run_id"],
             limit=1000,
@@ -703,6 +848,24 @@ class V5AsyncInferenceRunner(QObject):
         self._scheduler.stop()
         self._watchdog.stop()
         self._running = False
+        if not success and self._processes:
+            entries = list(self._processes.values())
+            for entry in entries:
+                self._terminate_entry(entry, graceful=False)
+            for entry in entries:
+                context = entry["context"]
+                if context.get("kind") == "accelerator_worker":
+                    self._database.interrupt_work_package_worker(
+                        self._spec["run_id"],
+                        context["worker_id"],
+                    )
+                    continue
+                job = context.get("job")
+                if job:
+                    self._database.interrupt_job(
+                        job["job_id"], job["lease_token"]
+                    )
+            self._processes.clear()
         ready_streams = (
             [self._result_stream(stream) for stream in self._spec.get("streams", [])]
             if success else []

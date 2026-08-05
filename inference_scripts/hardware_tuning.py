@@ -8,7 +8,10 @@ from typing import Any, Mapping
 
 
 GIB = 1024**3
-TUNING_SCHEMA_VERSION = 1
+TUNING_SCHEMA_VERSION = 2
+BATCH_PROBE_SCHEMA_VERSION = 1
+CUDA_BATCH_PROBE_CEILING = 128
+MPS_BATCH_PROBE_CEILING = 64
 
 
 def collect_hardware_snapshot(
@@ -97,6 +100,100 @@ def _automatic_tile_batch_size(hardware: Mapping[str, Any]) -> int:
         if system_memory >= 24 * GIB:
             return 4
     return 1
+
+
+def batch_probe_safety_reserve_bytes(hardware: Mapping[str, Any]) -> int:
+    """Return accelerator headroom that a successful probe must leave free."""
+
+    kind = str(hardware.get("accelerator_kind") or "cpu")
+    total = int(hardware.get("accelerator_memory_total_bytes") or 0)
+    if kind == "cuda":
+        return max(2 * GIB, int(total * 0.10)) if total > 0 else 2 * GIB
+    if kind == "mps":
+        return max(4 * GIB, int(total * 0.20)) if total > 0 else 4 * GIB
+    return 0
+
+
+def model_batch_probe_candidates(
+    hardware: Mapping[str, Any],
+) -> list[int]:
+    """Build one bounded exponential probe sequence for the active device.
+
+    CPU remains deliberately conservative.  Accelerator probes are isolated by
+    ``check_environment.py`` and stop at the first failed or low-headroom
+    candidate, so this ceiling is only an upper bound rather than a promised
+    allocation.
+    """
+
+    kind = str(hardware.get("accelerator_kind") or "cpu")
+    if kind not in {"cuda", "mps"}:
+        return [1]
+    ceiling = (
+        CUDA_BATCH_PROBE_CEILING
+        if kind == "cuda"
+        else MPS_BATCH_PROBE_CEILING
+    )
+    values: list[int] = []
+    value = 1
+    while value <= ceiling:
+        values.append(value)
+        value *= 2
+    return values
+
+
+def freeze_model_batch_probe_results(
+    runtime: Mapping[str, Any],
+    resource_tuning: Mapping[str, Any],
+    probe_results: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Freeze per-model probes plus a conservative scalar compatibility value.
+
+    The Package runtime consumes ``tile_batch_size_by_model``.  The minimum
+    verified value remains in ``runtime.tile_batch_size`` for older reporting,
+    fallback models, and callers that only understand the scalar field.
+    """
+
+    runtime_value = dict(runtime)
+    tuning_value = dict(resource_tuning)
+    resolved = dict(tuning_value.get("resolved") or {})
+    automatic_fields = {
+        str(value) for value in tuning_value.get("automatic_fields") or []
+    }
+    normalized_results: dict[str, dict[str, Any]] = {}
+    batch_by_model: dict[str, int] = {}
+    for raw_model_id, raw_result in sorted(probe_results.items()):
+        model_id = str(raw_model_id)
+        result = dict(raw_result)
+        normalized_results[model_id] = result
+        if not bool(result.get("ok")):
+            continue
+        try:
+            batch_size = int(result.get("safe_batch_size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if batch_size >= 1:
+            batch_by_model[model_id] = batch_size
+
+    resolved["tile_batch_size_by_model"] = batch_by_model
+    if "tile_batch_size" in automatic_fields and batch_by_model:
+        scalar_batch_size = min(batch_by_model.values())
+        runtime_value["tile_batch_size"] = scalar_batch_size
+        resolved["tile_batch_size"] = scalar_batch_size
+
+    tuning_value["resolved"] = resolved
+    tuning_value["model_batch_probe"] = {
+        "schema_version": BATCH_PROBE_SCHEMA_VERSION,
+        "method": "isolated_resident_model_set_exponential_dummy_forward",
+        "status": (
+            "completed"
+            if batch_by_model
+            else "not_applicable"
+            if "tile_batch_size" not in automatic_fields
+            else "incomplete"
+        ),
+        "results": normalized_results,
+    }
+    return runtime_value, tuning_value
 
 
 def resolve_hardware_tuning(

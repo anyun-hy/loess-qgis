@@ -31,7 +31,13 @@ from deployment_config import (
     load_yaml,
     validate_deployment_config,
 )
-from hardware_tuning import collect_hardware_snapshot, resolve_hardware_tuning
+from hardware_tuning import (
+    batch_probe_safety_reserve_bytes,
+    collect_hardware_snapshot,
+    freeze_model_batch_probe_results,
+    model_batch_probe_candidates,
+    resolve_hardware_tuning,
+)
 from torchscript_runtime import load_torchscript_model
 
 
@@ -153,6 +159,571 @@ def verify_torchscript_contract_isolated(path, device, timeout=600):
         f"TorchScript contract worker failed on {device} "
         f"(exit={result.returncode}): {detail}"
     )
+
+
+def _clear_accelerator_cache(torch_module, device):
+    gc.collect()
+    if str(device).startswith("cuda") and torch_module.cuda.is_available():
+        torch_module.cuda.empty_cache()
+    elif (
+        str(device).startswith("mps")
+        and hasattr(torch_module, "backends")
+        and torch_module.backends.mps.is_available()
+    ):
+        torch_module.mps.empty_cache()
+
+
+def _accelerator_free_bytes(torch_module, device):
+    try:
+        if str(device).startswith("cuda") and torch_module.cuda.is_available():
+            index = int(str(device).split(":", 1)[1]) if ":" in str(device) else 0
+            return int(torch_module.cuda.mem_get_info(index)[0])
+        if str(device).startswith("mps"):
+            recommended = getattr(torch_module.mps, "recommended_max_memory", None)
+            allocated = getattr(torch_module.mps, "driver_allocated_memory", None)
+            if callable(recommended) and callable(allocated):
+                return max(0, int(recommended()) - int(allocated()))
+    except Exception:
+        return None
+    return None
+
+
+def _synchronize_accelerator(torch_module, device):
+    if str(device).startswith("cuda"):
+        synchronize = getattr(torch_module.cuda, "synchronize", None)
+        if callable(synchronize):
+            index = int(str(device).split(":", 1)[1]) if ":" in str(device) else 0
+            synchronize(index)
+    elif str(device).startswith("mps"):
+        synchronize = getattr(torch_module.mps, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+
+def _batch_probe_error_kind(torch_module, error):
+    cuda_oom = getattr(getattr(torch_module, "cuda", None), "OutOfMemoryError", ())
+    if isinstance(cuda_oom, type) and isinstance(error, cuda_oom):
+        return "out_of_memory"
+    text = f"{type(error).__name__}: {error}".lower()
+    if any(
+        marker in text
+        for marker in (
+            "out of memory",
+            "not enough memory",
+            "mps backend out of memory",
+            "cuda error: out of memory",
+        )
+    ):
+        return "out_of_memory"
+    return "runtime_error"
+
+
+def _probe_loaded_torchscript_batches(
+    torch_module,
+    model,
+    runtime_info,
+    device,
+    candidates,
+    *,
+    reserve_bytes=0,
+    progress=None,
+    model_id=None,
+):
+    """Probe one already-resident model without releasing its model object."""
+
+    normalized_candidates = sorted({int(value) for value in candidates if int(value) >= 1})
+    if not normalized_candidates or normalized_candidates[0] != 1:
+        raise ValueError("Batch probe candidates must start at 1")
+    sample = None
+    output = None
+    records = []
+    successful = []
+    safe_candidates = []
+    stop_reason = "ceiling_reached"
+    first_failed_batch = None
+
+    def publish(payload):
+        if progress is not None:
+            value = dict(payload)
+            if model_id is not None:
+                value["model_id"] = str(model_id)
+            progress(value)
+
+    try:
+        for batch_size in normalized_candidates:
+            publish({"event": "batch_probe_started", "batch_size": batch_size})
+            try:
+                sample = torch_module.zeros(
+                    batch_size,
+                    3,
+                    512,
+                    512,
+                    dtype=torch_module.float32,
+                    device=device,
+                )
+                with torch_module.inference_mode():
+                    output = model(sample)
+                _synchronize_accelerator(torch_module, device)
+                if not torch_module.is_tensor(output):
+                    raise TypeError(
+                        "TorchScript output must be one tensor, got "
+                        f"{type(output).__name__}"
+                    )
+                expected_shape = (batch_size, 14, 512, 512)
+                if tuple(output.shape) != expected_shape:
+                    raise ValueError(
+                        f"TorchScript output shape is {tuple(output.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                if output.dtype != torch_module.float32:
+                    raise TypeError(
+                        f"TorchScript output dtype is {output.dtype}, expected float32"
+                    )
+                free_bytes = _accelerator_free_bytes(torch_module, device)
+                successful.append(batch_size)
+                enough_headroom = (
+                    free_bytes is None
+                    or batch_size == 1
+                    or free_bytes >= int(reserve_bytes)
+                )
+                if enough_headroom:
+                    safe_candidates.append(batch_size)
+                    status = "passed"
+                else:
+                    status = "insufficient_headroom"
+                    stop_reason = "safety_reserve"
+                record = {
+                    "batch_size": batch_size,
+                    "status": status,
+                    "accelerator_free_bytes": free_bytes,
+                }
+                records.append(record)
+                publish({"event": "batch_probe_result", **record})
+                if not enough_headroom:
+                    break
+            except Exception as error:
+                first_failed_batch = batch_size
+                stop_reason = _batch_probe_error_kind(torch_module, error)
+                record = {
+                    "batch_size": batch_size,
+                    "status": "failed",
+                    "error_kind": stop_reason,
+                    "error": str(error),
+                }
+                records.append(record)
+                publish({"event": "batch_probe_result", **record})
+                break
+            finally:
+                output = None
+                sample = None
+                _clear_accelerator_cache(torch_module, device)
+    finally:
+        output = None
+        sample = None
+        _clear_accelerator_cache(torch_module, device)
+
+    last_verified_batch_size = max(
+        safe_candidates or ([1] if successful else []), default=0
+    )
+    fatal_runtime_error = stop_reason == "runtime_error"
+    safe_batch_size = 0 if fatal_runtime_error else last_verified_batch_size
+    ok = safe_batch_size >= 1 and not fatal_runtime_error
+    return {
+        "ok": ok,
+        "safe_batch_size": safe_batch_size,
+        "last_verified_batch_size": last_verified_batch_size,
+        "max_successful_batch": max(successful, default=0),
+        "first_failed_batch": first_failed_batch,
+        "stop_reason": stop_reason,
+        "reserve_bytes": int(reserve_bytes),
+        "runtime_info": runtime_info,
+        "probes": records,
+        "message": (
+            f"TorchScript Batch probe selected {safe_batch_size} on {device}; "
+            f"stop={stop_reason}; reserve={int(reserve_bytes)} bytes"
+            if ok
+            else (
+                "TorchScript Batch probe encountered a non-capacity runtime "
+                f"error at Batch {first_failed_batch} on {device}; no Batch "
+                "value may be frozen"
+                if fatal_runtime_error
+                else f"TorchScript Batch probe failed at Batch 1 on {device}"
+            )
+        ),
+    }
+
+
+def probe_torchscript_batches(
+    torch_module,
+    path,
+    device,
+    candidates,
+    *,
+    reserve_bytes=0,
+    progress=None,
+):
+    """Load one model once and probe ascending dummy-forward Batch sizes."""
+
+    model = None
+    runtime_info = {}
+    try:
+        model, runtime_info = load_torchscript_model(path, device)
+        return _probe_loaded_torchscript_batches(
+            torch_module,
+            model,
+            runtime_info,
+            device,
+            candidates,
+            reserve_bytes=reserve_bytes,
+            progress=progress,
+        )
+    except Exception as error:
+        stop_reason = _batch_probe_error_kind(torch_module, error)
+        return {
+            "ok": False,
+            "safe_batch_size": 0,
+            "last_verified_batch_size": 0,
+            "max_successful_batch": 0,
+            "first_failed_batch": 1,
+            "stop_reason": stop_reason,
+            "reserve_bytes": int(reserve_bytes),
+            "runtime_info": runtime_info,
+            "probes": [],
+            "message": f"TorchScript Batch probe failed during model load: {error}",
+        }
+    finally:
+        model = None
+        _clear_accelerator_cache(torch_module, device)
+
+
+def probe_torchscript_model_set_batches(
+    torch_module,
+    model_entries,
+    device,
+    candidates,
+    *,
+    reserve_bytes=0,
+    progress=None,
+):
+    """Load the complete model set, retain it, then probe each model in turn."""
+
+    entries = [
+        {
+            "model_id": str(entry["model_id"]),
+            "path": str(Path(entry["path"]).resolve()),
+        }
+        for entry in model_entries
+    ]
+    model_ids = [entry["model_id"] for entry in entries]
+    if not entries or len(model_ids) != len(set(model_ids)):
+        raise ValueError("Batch probe model set must contain unique model IDs")
+
+    loaded_models = {}
+    runtime_info_by_model = {}
+    results = {}
+
+    def publish(payload):
+        if progress is not None:
+            progress(dict(payload))
+
+    try:
+        for entry in entries:
+            model_id = entry["model_id"]
+            publish({"event": "model_set_load_started", "model_id": model_id})
+            try:
+                model, runtime_info = load_torchscript_model(entry["path"], device)
+            except Exception as error:
+                resident_ids = list(loaded_models)
+                message = (
+                    f"complete model-set load failed at {model_id}: {error}; "
+                    "no Batch value may be frozen"
+                )
+                for item in entries:
+                    item_id = item["model_id"]
+                    results[item_id] = {
+                        "ok": False,
+                        "safe_batch_size": 0,
+                        "last_verified_batch_size": 0,
+                        "max_successful_batch": 0,
+                        "first_failed_batch": 1,
+                        "stop_reason": "model_set_load_failed",
+                        "reserve_bytes": int(reserve_bytes),
+                        "runtime_info": runtime_info_by_model.get(item_id, {}),
+                        "probes": [],
+                        "expected_model_ids": list(model_ids),
+                        "resident_model_ids": resident_ids,
+                        "resident_model_count": len(resident_ids),
+                        "model_set_complete": False,
+                        "message": message,
+                    }
+                return {
+                    "ok": False,
+                    "expected_model_ids": list(model_ids),
+                    "resident_model_ids": resident_ids,
+                    "resident_model_count": len(resident_ids),
+                    "model_set_complete": False,
+                    "results": results,
+                    "message": message,
+                }
+            loaded_models[model_id] = model
+            runtime_info_by_model[model_id] = runtime_info
+            publish({"event": "model_set_load_completed", "model_id": model_id})
+
+        resident_model_ids = list(model_ids)
+        for entry in entries:
+            model_id = entry["model_id"]
+            result = _probe_loaded_torchscript_batches(
+                torch_module,
+                loaded_models[model_id],
+                runtime_info_by_model[model_id],
+                device,
+                candidates,
+                reserve_bytes=reserve_bytes,
+                progress=publish,
+                model_id=model_id,
+            )
+            result.update(
+                {
+                    "resident_model_ids": resident_model_ids,
+                    "resident_model_count": len(resident_model_ids),
+                    "model_set_complete": True,
+                }
+            )
+            results[model_id] = result
+
+        ok = all(bool(results[model_id].get("ok")) for model_id in model_ids)
+        return {
+            "ok": ok,
+            "expected_model_ids": resident_model_ids,
+            "resident_model_ids": resident_model_ids,
+            "resident_model_count": len(resident_model_ids),
+            "model_set_complete": True,
+            "results": results,
+            "message": (
+                f"probed {len(model_ids)} models while the complete set remained resident"
+            ),
+        }
+    finally:
+        loaded_models.clear()
+        runtime_info_by_model.clear()
+        _clear_accelerator_cache(torch_module, device)
+
+
+def verify_torchscript_batch_probe_isolated(
+    path,
+    device,
+    candidates,
+    *,
+    reserve_bytes=0,
+    timeout=1200,
+):
+    """Probe one model in one child process and retain progress after a crash."""
+
+    normalized_candidates = [int(value) for value in candidates]
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--batch-probe-worker",
+        "--model-path",
+        str(Path(path).resolve()),
+        "--device",
+        str(device),
+        "--batch-candidates",
+        ",".join(str(value) for value in normalized_candidates),
+        "--reserve-bytes",
+        str(max(0, int(reserve_bytes))),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout.decode() if isinstance(error.stdout, bytes) else (error.stdout or "")
+        stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else (error.stderr or "")
+        result = type(
+            "TimedOutProbe",
+            (),
+            {"returncode": -1, "stdout": stdout, "stderr": stderr or "timeout"},
+        )()
+
+    final_payload = None
+    progress_records = []
+    started_batches = []
+    for line in (result.stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("event") == "batch_probe_started":
+            started_batches.append(int(payload["batch_size"]))
+        elif payload.get("event") == "batch_probe_result":
+            progress_records.append(
+                {key: value for key, value in payload.items() if key != "event"}
+            )
+        elif payload.get("batch_probe") is True:
+            final_payload = {
+                key: value for key, value in payload.items() if key != "batch_probe"
+            }
+    if final_payload is not None:
+        return final_payload
+
+    safe_candidates = [
+        int(record["batch_size"])
+        for record in progress_records
+        if record.get("status") == "passed"
+    ]
+    successful_candidates = [
+        int(record["batch_size"])
+        for record in progress_records
+        if record.get("status") in {"passed", "insufficient_headroom"}
+    ]
+    safe_batch_size = max(safe_candidates or ([1] if successful_candidates else []), default=0)
+    failed_batch = next(
+        (
+            int(record["batch_size"])
+            for record in progress_records
+            if record.get("status") == "failed"
+        ),
+        None,
+    )
+    if failed_batch is None and started_batches:
+        completed_batches = {
+            int(record["batch_size"]) for record in progress_records
+        }
+        failed_batch = next(
+            (value for value in reversed(started_batches) if value not in completed_batches),
+            None,
+        )
+    detail = (result.stderr or "").strip() or "worker exited without a final result"
+    return {
+        "ok": safe_batch_size >= 1,
+        "safe_batch_size": safe_batch_size,
+        "max_successful_batch": max(successful_candidates, default=0),
+        "first_failed_batch": failed_batch,
+        "stop_reason": "worker_crash",
+        "reserve_bytes": int(reserve_bytes),
+        "runtime_info": {},
+        "probes": progress_records,
+        "message": (
+            f"Batch probe worker stopped at {failed_batch}; selected "
+            f"previous verified Batch {safe_batch_size}; {detail}"
+            if safe_batch_size >= 1
+            else f"Batch probe worker failed before Batch 1 completed; {detail}"
+        ),
+    }
+
+
+def verify_torchscript_model_set_batch_probe_isolated(
+    model_entries,
+    device,
+    candidates,
+    *,
+    reserve_bytes=0,
+    timeout=1200,
+):
+    """Probe one complete model set in one child and require a final contract."""
+
+    entries = [
+        {
+            "model_id": str(entry["model_id"]),
+            "path": str(Path(entry["path"]).resolve()),
+        }
+        for entry in model_entries
+    ]
+    expected_ids = [entry["model_id"] for entry in entries]
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--batch-probe-set-worker",
+        "--model-set-json",
+        json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+        "--device",
+        str(device),
+        "--batch-candidates",
+        ",".join(str(int(value)) for value in candidates),
+        "--reserve-bytes",
+        str(max(0, int(reserve_bytes))),
+    ]
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout.decode() if isinstance(error.stdout, bytes) else (error.stdout or "")
+        stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else (error.stderr or "")
+        process = type(
+            "TimedOutModelSetProbe",
+            (),
+            {"returncode": -1, "stdout": stdout, "stderr": stderr or "timeout"},
+        )()
+
+    final_payload = None
+    loaded_ids = []
+    for line in (process.stdout or "").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("event") == "model_set_load_completed":
+            loaded_ids.append(str(payload.get("model_id") or ""))
+        elif payload.get("batch_probe_set") is True:
+            final_payload = {
+                key: value
+                for key, value in payload.items()
+                if key != "batch_probe_set"
+            }
+
+    if final_payload is not None:
+        result_ids = list((final_payload.get("results") or {}).keys())
+        resident_ids = list(final_payload.get("resident_model_ids") or [])
+        if (
+            bool(final_payload.get("model_set_complete"))
+            and result_ids == expected_ids
+            and resident_ids == expected_ids
+        ):
+            return final_payload
+
+    detail = (process.stderr or "").strip() or "worker exited without a complete result"
+    message = (
+        "complete model-set Batch probe did not finish; no partial Batch value "
+        f"may be frozen (loaded={loaded_ids}, exit={process.returncode}): {detail}"
+    )
+    failed_results = {
+        model_id: {
+            "ok": False,
+            "safe_batch_size": 0,
+            "last_verified_batch_size": 0,
+            "max_successful_batch": 0,
+            "first_failed_batch": None,
+            "stop_reason": "worker_crash",
+            "reserve_bytes": int(reserve_bytes),
+            "runtime_info": {},
+            "probes": [],
+            "expected_model_ids": list(expected_ids),
+            "resident_model_ids": list(loaded_ids),
+            "resident_model_count": len(loaded_ids),
+            "model_set_complete": False,
+            "message": message,
+        }
+        for model_id in expected_ids
+    }
+    return {
+        "ok": False,
+        "expected_model_ids": list(expected_ids),
+        "resident_model_ids": list(loaded_ids),
+        "resident_model_count": len(loaded_ids),
+        "model_set_complete": False,
+        "results": failed_results,
+        "message": message,
+    }
 
 
 def verify_sam3_checkpoint(torch_module, path):
@@ -742,22 +1313,40 @@ def build_report(args):
         device_message,
         "edit runtime.device or repair the PyTorch device environment",
     )
-    resolved_resources = resource_tuning["resolved"]
-    add_check(
-        checks,
-        "resource_tuning",
-        "ready",
-        (
-            f"CPU {resolved_resources['max_cpu_partition_workers']}"
-            f"/{resolved_resources['max_cpu_partition_workers_with_package']}; "
-            f"Tile batch {resolved_resources['tile_batch_size']}; "
-            f"Tile I/O {resolved_resources['tile_io_workers']}; "
-            f"assembly {resolved_resources['assembly_validation_workers']}"
-        ),
-        "automatic hardware tuning",
-        "performance values were frozen from the current inference hardware",
-        "",
+
+    batch_auto = "tile_batch_size" in set(
+        resource_tuning.get("automatic_fields") or []
     )
+    probe_candidates = model_batch_probe_candidates(hardware)
+    probe_reserve_bytes = batch_probe_safety_reserve_bytes(hardware)
+    model_batch_probes = {}
+    if (
+        batch_auto
+        and torch_module is not None
+        and device_ok
+        and str(resolved_device).startswith(("mps", "cuda"))
+    ):
+        eligible_probe_entries = []
+        for index, model in enumerate(effective.get("semantic_models") or []):
+            model_id = str(model["model_id"])
+            prefix = f"/semantic_models/{index}"
+            if _has_issue(issues, prefix):
+                continue
+            if str(resolved_device).startswith("mps") and not _mps_runtime_requirement(
+                model_id, getattr(torch_module, "__version__", "0")
+            )[0]:
+                continue
+            eligible_probe_entries.append(
+                {"model_id": model_id, "path": model.get("artifact_path", "")}
+            )
+        if eligible_probe_entries:
+            model_set_probe = verify_torchscript_model_set_batch_probe_isolated(
+                eligible_probe_entries,
+                resolved_device,
+                probe_candidates,
+                reserve_bytes=probe_reserve_bytes,
+            )
+            model_batch_probes.update(model_set_probe.get("results") or {})
 
     for index, model in enumerate(effective.get("semantic_models") or []):
         model_id = model["model_id"]
@@ -781,10 +1370,35 @@ def build_report(args):
             )
             fix = "upgrade torch to >=2.7 with matching torchvision and torchaudio in the configured Conda environment"
         else:
-            if str(resolved_device).startswith(("mps", "cuda")):
+            if batch_auto and str(resolved_device).startswith(("mps", "cuda")):
+                probe_result = model_batch_probes.get(model_id) or {
+                    "ok": False,
+                    "safe_batch_size": 0,
+                    "stop_reason": "model_set_probe_missing",
+                    "model_set_complete": False,
+                    "message": (
+                        "model was not included in a complete resident model-set "
+                        "Batch probe"
+                    ),
+                }
+                ok = bool(probe_result.get("ok"))
+                message = str(probe_result.get("message") or "")
+            elif str(resolved_device).startswith(("mps", "cuda")):
                 ok, message = verify_torchscript_contract_isolated(path, resolved_device)
             else:
                 ok, message = verify_torchscript_contract(torch_module, path, resolved_device)
+                if ok and batch_auto:
+                    model_batch_probes[model_id] = {
+                        "ok": True,
+                        "safe_batch_size": 1,
+                        "max_successful_batch": 1,
+                        "first_failed_batch": None,
+                        "stop_reason": "cpu_conservative",
+                        "reserve_bytes": 0,
+                        "runtime_info": {},
+                        "probes": [{"batch_size": 1, "status": "passed"}],
+                        "message": "CPU uses conservative Batch 1",
+                    }
             status = "ready" if ok else "error"
             if not ok and str(resolved_device).startswith("mps"):
                 fix = (
@@ -802,6 +1416,44 @@ def build_report(args):
             message,
             fix,
         )
+
+    runtime, resource_tuning = freeze_model_batch_probe_results(
+        runtime,
+        resource_tuning,
+        model_batch_probes,
+    )
+    effective["runtime"] = runtime
+    effective["resource_tuning"] = resource_tuning
+    resolved_resources = resource_tuning["resolved"]
+    batch_by_model = resolved_resources.get("tile_batch_size_by_model") or {}
+    probe_required = batch_auto and device_ok and torch_module is not None
+    tuning_status = "ready" if (not probe_required or batch_by_model) else "error"
+    model_batches = ", ".join(
+        f"{model_id}={batch_size}"
+        for model_id, batch_size in sorted(batch_by_model.items())
+    )
+    add_check(
+        checks,
+        "resource_tuning",
+        tuning_status,
+        (
+            f"CPU {resolved_resources['max_cpu_partition_workers']}"
+            f"/{resolved_resources['max_cpu_partition_workers_with_package']}; "
+            f"Tile batch {resolved_resources['tile_batch_size']}"
+            + (f" ({model_batches})" if model_batches else "")
+            + f"; Tile I/O {resolved_resources['tile_io_workers']}; "
+            f"assembly {resolved_resources['assembly_validation_workers']}"
+        ),
+        "automatic hardware tuning and isolated resident model-set Batch probes",
+        (
+            "all runnable models were loaded together in one isolated process; "
+            "per-model Batch values were then probed once and frozen while the "
+            "complete model set remained resident"
+            if batch_by_model
+            else "no verified per-model Batch result is available"
+        ),
+        "repair the model/device contract and rerun the environment check",
+    )
 
     for index, profile_entry in enumerate(effective.get("fusion_profiles") or []):
         profile_id = profile_entry["profile_id"]
@@ -960,10 +1612,90 @@ def main():
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--report-json", default="")
     parser.add_argument("--contract-worker", action="store_true")
+    parser.add_argument("--batch-probe-worker", action="store_true")
+    parser.add_argument("--batch-probe-set-worker", action="store_true")
     parser.add_argument("--sam3-worker", action="store_true")
     parser.add_argument("--model-path")
+    parser.add_argument("--model-set-json", default="")
     parser.add_argument("--device")
+    parser.add_argument("--batch-candidates", default="")
+    parser.add_argument("--reserve-bytes", type=int, default=0)
     args = parser.parse_args()
+    if args.batch_probe_set_worker:
+        if not args.model_set_json or not args.device or not args.batch_candidates:
+            parser.error(
+                "--batch-probe-set-worker requires --model-set-json, --device "
+                "and --batch-candidates"
+            )
+        try:
+            model_entries = json.loads(args.model_set_json)
+            if not isinstance(model_entries, list):
+                raise ValueError("model set must be a JSON list")
+            candidates = [
+                int(value)
+                for value in args.batch_candidates.split(",")
+                if value.strip()
+            ]
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            parser.error(f"invalid model-set Batch probe arguments: {error}")
+        import torch
+
+        def publish_model_set_probe_event(payload):
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+        probe_result = probe_torchscript_model_set_batches(
+            torch,
+            model_entries,
+            args.device,
+            candidates,
+            reserve_bytes=max(0, int(args.reserve_bytes)),
+            progress=publish_model_set_probe_event,
+        )
+        sys.stdout.write(
+            json.dumps(
+                {"batch_probe_set": True, **probe_result},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        return 0 if probe_result["ok"] else 2
+    if args.batch_probe_worker:
+        if not args.model_path or not args.device or not args.batch_candidates:
+            parser.error(
+                "--batch-probe-worker requires --model-path, --device and "
+                "--batch-candidates"
+            )
+        try:
+            candidates = [
+                int(value)
+                for value in args.batch_candidates.split(",")
+                if value.strip()
+            ]
+        except ValueError:
+            parser.error("--batch-candidates must be comma-separated integers")
+        import torch
+
+        def publish_probe_event(payload):
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+        probe_result = probe_torchscript_batches(
+            torch,
+            args.model_path,
+            args.device,
+            candidates,
+            reserve_bytes=max(0, int(args.reserve_bytes)),
+            progress=publish_probe_event,
+        )
+        sys.stdout.write(
+            json.dumps(
+                {"batch_probe": True, **probe_result},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        return 0 if probe_result["ok"] else 2
     if args.contract_worker:
         if not args.model_path or not args.device:
             parser.error("--contract-worker requires --model-path and --device")

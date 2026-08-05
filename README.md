@@ -4,6 +4,10 @@
 与 macOS QGIS 4/Qt6/MPS。插件、推理运行时和部署脚本共同使用这一份源码，
 禁止建立完整的 macOS/Linux 双份实现。
 
+`/Users/example/Desktop/loess-data` 是合并前的历史/原始数据工作目录。除非用户
+在当前任务中明确点名并授权，不得搜索、读取、比较、复制或修改该目录，也不得
+用其中的历史脚本或状态记录覆盖本仓库的当前事实。
+
 正式源码直接位于仓库根目录：
 
 - `qgis_plugins/labeling_tool/`：QGIS 插件、界面和运行编排。

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import shutil
 import stat
+import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -13,6 +17,58 @@ from .run_state_db import RunStateDB
 
 class ManualPackageResetError(RuntimeError):
     pass
+
+
+class _PackageResetLock:
+    """Use the same stable inode as the accelerator Package writer."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+b")
+        try:
+            fcntl.flock(
+                self._handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as error:
+            self._handle.seek(0)
+            owner = self._handle.read().decode("utf-8", errors="replace").strip()
+            self._handle.close()
+            self._handle = None
+            detail = f"; owner={owner}" if owner else ""
+            raise ManualPackageResetError(
+                "manual Package reset is blocked by an active filesystem "
+                f"writer: {self.path}{detail}"
+            ) from error
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "action": "manual_package_reset",
+                    "acquired_at": time.time(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
 
 
 def _run_owned_path(run_dir: Path, raw_path: str | Path) -> Path:
@@ -233,28 +289,42 @@ def reset_failed_work_packages(
     deleted_bytes = 0
     deleted_directories = 0
     try:
-        for path in sorted(
-            _reset_file_paths(spec, plan, run_dir),
-            key=lambda item: (len(item.parts), str(item)),
-            reverse=True,
-        ):
-            count, byte_count = _remove_file(path)
-            deleted_files += count
-            deleted_bytes += byte_count
-        for package_id in plan["package_ids"]:
-            package_root = _run_owned_path(
-                run_dir,
-                run_dir / "tmp" / "work_packages" / str(package_id),
+        with ExitStack() as locks:
+            # Acquire every stable Package lock before deleting the first
+            # output.  A stale process may still hold the inode after its DB
+            # lease was recovered; in that case reset remains resumable and
+            # no filesystem content is touched.
+            for package_id in plan["package_ids"]:
+                lock_path = _run_owned_path(
+                    run_dir,
+                    run_dir
+                    / "tmp"
+                    / "package_locks"
+                    / f"{str(package_id)}.lock",
+                )
+                locks.enter_context(_PackageResetLock(lock_path))
+            for path in sorted(
+                _reset_file_paths(spec, plan, run_dir),
+                key=lambda item: (len(item.parts), str(item)),
+                reverse=True,
+            ):
+                count, byte_count = _remove_file(path)
+                deleted_files += count
+                deleted_bytes += byte_count
+            for package_id in plan["package_ids"]:
+                package_root = _run_owned_path(
+                    run_dir,
+                    run_dir / "tmp" / "work_packages" / str(package_id),
+                )
+                count, byte_count = _remove_directory(package_root)
+                deleted_files += count
+                deleted_bytes += byte_count
+                if count or byte_count:
+                    deleted_directories += 1
+            completed = state.complete_failed_package_reset(
+                run_id,
+                plan["package_ids"],
             )
-            count, byte_count = _remove_directory(package_root)
-            deleted_files += count
-            deleted_bytes += byte_count
-            if count or byte_count:
-                deleted_directories += 1
-        completed = state.complete_failed_package_reset(
-            run_id,
-            plan["package_ids"],
-        )
     except Exception as error:
         state.append_event(
             run_id,

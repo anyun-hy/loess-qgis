@@ -165,3 +165,50 @@ def test_checkpoint_honors_disk_reserve_and_only_cleans_owned_temporary_files(
             min_free_bytes=1,
         )
     assert permanent.read_bytes() == b"owned evidence"
+
+
+def test_checkpoint_reserves_remaining_outputs_and_enforces_frozen_high_water(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "score_batches" / "model-a"
+    probabilities = _probabilities()
+    estimated_write = probabilities.nbytes + score_batch_cache.CHECKPOINT_WRITE_OVERHEAD_BYTES
+    monkeypatch.setattr(
+        score_batch_cache.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=estimated_write + 99),
+    )
+    with pytest.raises(ScoreBatchDiskReserveError, match="insufficient disk"):
+        write_checkpoint(
+            root,
+            run_id="run-a",
+            package_id="package-a",
+            model_id="model-a",
+            model_sha256="model-sha",
+            sequence=0,
+            items=_items(),
+            probabilities=probabilities,
+            min_free_bytes=50,
+            additional_free_reserve_bytes=50,
+        )
+    assert not root.exists() or not any(root.iterdir())
+
+    monkeypatch.setattr(
+        score_batch_cache.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=10 * estimated_write),
+    )
+    with pytest.raises(ScoreBatchDiskReserveError, match="high-water"):
+        write_checkpoint(
+            root,
+            run_id="run-a",
+            package_id="package-a",
+            model_id="model-a",
+            model_sha256="model-sha",
+            sequence=0,
+            items=_items(),
+            probabilities=probabilities,
+            managed_cache_bytes=1,
+            managed_cache_budget_bytes=estimated_write,
+        )
+    assert not root.exists() or not any(root.iterdir())

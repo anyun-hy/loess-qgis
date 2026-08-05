@@ -11,7 +11,7 @@ scaling:
   partition_tile_cols: 8
   partition_halo_px: auto
   seam_band_px: 64
-  score_cache_budget_gb: 8
+  score_cache_budget_gb: auto
   min_free_disk_gb: 50
   tile_io_workers: auto
   max_cpu_partition_workers: auto

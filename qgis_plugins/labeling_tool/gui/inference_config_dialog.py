@@ -198,10 +198,16 @@ class InferenceConfigDialog(QDialog):
             self.sam_label.setText("SAM3 后处理: 未启用；不影响语义模型运行。")
         scaling = self._registry.scaling
         runtime = self._registry.runtime
+        cache_budget = scaling.get("score_cache_budget_gb")
+        cache_label = (
+            "auto（Run 启动时按磁盘解析）"
+            if str(cache_budget).lower() == "auto"
+            else f"{cache_budget} GiB"
+        )
         self.scaling_label.setText(
             f"Partition {scaling.get('partition_tile_rows')} × {scaling.get('partition_tile_cols')} Tile；"
             f"Halo {scaling.get('partition_halo_px')}；Seam {scaling.get('seam_band_px')} px；"
-            f"score cache {scaling.get('score_cache_budget_gb')} GiB；"
+            f"score cache {cache_label}；"
             f"磁盘保留 {scaling.get('min_free_disk_gb')} GiB；"
             f"CPU worker {scaling.get('max_cpu_partition_workers')}"
             f"（GPU 同时运行时 {scaling.get('max_cpu_partition_workers_with_package')}）；"

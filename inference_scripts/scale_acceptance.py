@@ -148,6 +148,7 @@ def _database_metrics(database_path: Path, run_id: str) -> dict[str, Any]:
         "artifact_counts": dict(Counter(str(row["status"]) for row in artifact_rows)),
         "ready_artifact_bytes": ready_bytes,
         "artifact_integrity_errors": integrity_errors,
+        "artifact_rows": artifact_rows,
     }
 
 
@@ -163,15 +164,25 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
     package_report_paths = run_dir.glob(
         "tmp/work_packages/*/package_report.json"
     )
-    unit_report_paths = run_dir.glob("tmp/unit_outputs/**/*_report.json")
     metrics = _database_metrics(database_path, run_id)
     cleanup = database.artifact_cleanup_summary(run_id)
     timing = _pipeline_timing(run_dir / "logs" / "pipeline.jsonl")
 
     model_load_counts: Counter[str] = Counter()
+    model_cache_hit_counts: Counter[str] = Counter()
     package_report_count = 0
-    unit_report_count = 0
-    all_boundary_units_passed = True
+    unit_summaries = [
+        summary
+        for stream in spec.get("streams") or []
+        for summary in database.unit_report_summaries(
+            run_id, str(stream["stream_id"])
+        )
+    ]
+    unit_report_count = len(unit_summaries)
+    all_boundary_units_passed = all(
+        str(summary.get("status") or "") == "passed"
+        for summary in unit_summaries
+    )
     inferred_tiles = 0
     package_cleaned_bytes = 0
     peak_cache_bytes = 0
@@ -186,21 +197,128 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         for model in report.get("models") or []:
             count = int(model.get("inferred_count", 0))
             inferred_tiles += count
-            if count > 0:
-                model_load_counts[str(model["model_id"])] += 1
-    for report in _iter_reports(unit_report_paths):
-        unit_report_count += 1
-        peak_rss_bytes = max(peak_rss_bytes, int(report.get("peak_rss_bytes", 0)))
-        if report.get("status") != "passed":
-            all_boundary_units_passed = False
-
+            model_id = str(model["model_id"])
+            model_load_counts[model_id] += int(
+                model.get("cold_load_count", 1 if count > 0 else 0)
+            )
+            model_cache_hit_counts[model_id] += int(
+                model.get("cache_hit_count", 0)
+            )
+    model_event_path = run_dir / "logs" / "accelerator_model_loads.jsonl"
+    journal_load_counts: Counter[str] = Counter()
+    journal_load_completed_counts: Counter[str] = Counter()
+    journal_cache_hit_counts: Counter[str] = Counter()
+    model_load_counts_by_session: dict[str, Counter[str]] = {}
+    if model_event_path.is_file():
+        with model_event_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                try:
+                    event = json.loads(line)
+                    if str(event.get("run_id")) != run_id:
+                        raise ValueError("run_id mismatch")
+                    model_id = str(event["model_id"])
+                    session_id = str(event["worker_session_id"])
+                    session_counts = model_load_counts_by_session.setdefault(
+                        session_id, Counter()
+                    )
+                    event_kind = str(event.get("event") or "")
+                    legacy_completed = False
+                    if not event_kind and "cold_loaded" in event:
+                        # Schema 1 compatibility for already-created Runs.
+                        event_kind = (
+                            "load_started"
+                            if bool(event["cold_loaded"])
+                            else "cache_hit"
+                        )
+                        legacy_completed = bool(event["cold_loaded"])
+                    if event_kind == "load_started":
+                        journal_load_counts[model_id] += 1
+                        session_counts[model_id] += 1
+                        if legacy_completed:
+                            journal_load_completed_counts[model_id] += 1
+                    elif event_kind == "load_completed":
+                        journal_load_completed_counts[model_id] += 1
+                    elif event_kind == "cache_hit":
+                        journal_cache_hit_counts[model_id] += 1
+                    else:
+                        raise ValueError(f"unknown event: {event_kind!r}")
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise ScaleAcceptanceError(
+                        "invalid accelerator model-load journal at line "
+                        f"{line_number}: {error}"
+                    ) from error
+    if journal_load_counts:
+        model_load_counts = journal_load_counts
+    if journal_cache_hit_counts:
+        model_cache_hit_counts = journal_cache_hit_counts
+    if not journal_load_counts and not journal_cache_hit_counts:
+        worker_reports = list(
+            _iter_reports(run_dir.glob("logs/accelerator_workers/*.json"))
+        )
+        if not worker_reports:
+            worker_report_path = run_dir / "logs" / "accelerator_worker_report.json"
+            if worker_report_path.is_file():
+                worker_reports = [load_json(worker_report_path)]
+        if worker_reports:
+            model_load_counts = Counter()
+            model_cache_hit_counts = Counter()
+            for worker_report in worker_reports:
+                model_load_counts.update(
+                    {
+                        str(key): int(value)
+                        for key, value in (
+                            worker_report.get("model_cold_load_counts") or {}
+                        ).items()
+                    }
+                )
+                model_cache_hit_counts.update(
+                    {
+                        str(key): int(value)
+                        for key, value in (
+                            worker_report.get("model_cache_hit_counts") or {}
+                        ).items()
+                    }
+                )
     expected_packages = int(metrics["counts"]["work_packages"])
     expected_units = int(metrics["counts"]["spatial_units"])
     expected_streams = len(spec.get("streams") or [])
     expected_unit_reports = expected_units * expected_streams
+    unit_artifact_rows = [
+        row
+        for row in metrics["artifact_rows"]
+        if str(row.get("kind") or "") in {
+            "unit_raw",
+            "unit_formal",
+            "unit_boundary_report",
+            "unit_fitted_edges",
+        }
+    ]
+    expected_unit_artifacts = (
+        expected_unit_reports * 3
+        + sum(
+            1
+            for summary in unit_summaries
+            if int(summary.get("fitted_edge_count") or 0) > 0
+        )
+    )
+    unit_artifact_status_counts = Counter(
+        str(row.get("status") or "") for row in unit_artifact_rows
+    )
+    storage = dict(spec.get("storage_preflight") or {})
+    storage_schema = int(storage.get("storage_tuning_schema_version") or 0)
+    frozen_cache_budget_bytes = int(
+        storage.get("working_cache_budget_bytes")
+        or storage.get("resolved_score_cache_budget_bytes")
+        or 0
+    )
+    cache_budget_gate_applicable = storage_schema >= 2
     hard_gates = {
         "all_package_reports_present": package_report_count == expected_packages,
         "all_unit_reports_present": unit_report_count == expected_unit_reports,
+        "all_unit_intermediates_cleaned": (
+            len(unit_artifact_rows) == expected_unit_artifacts
+            and unit_artifact_status_counts == {"cleaned": expected_unit_artifacts}
+        ),
         "all_work_packages_ready": metrics["package_counts"] == {
             "ready": expected_packages
         },
@@ -217,19 +335,31 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         ) and len(metrics["stream_unit_counts"]) == expected_streams,
         "no_artifact_integrity_errors": not metrics["artifact_integrity_errors"],
         "all_boundary_units_passed": all_boundary_units_passed,
+        "peak_cache_within_frozen_budget": (
+            not cache_budget_gate_applicable
+            or (
+                frozen_cache_budget_bytes > 0
+                and peak_cache_bytes <= frozen_cache_budget_bytes
+            )
+        ),
     }
     actual_run_bytes = directory_size(run_dir)
-    storage = dict(spec.get("storage_preflight") or {})
-    estimated_permanent = int(storage.get("estimated_permanent_bytes", 0))
+    actual_permanent_bytes = int(metrics["ready_artifact_bytes"])
+    estimated_permanent = int(
+        storage.get("estimated_permanent_output_bytes")
+        or storage.get("permanent_base_bytes")
+        or 0
+    )
     disk_deviation = (
-        abs(actual_run_bytes - estimated_permanent) / estimated_permanent
+        abs(actual_permanent_bytes - estimated_permanent) / estimated_permanent
         if estimated_permanent > 0
         else 0.0
     )
     warnings = []
     if estimated_permanent > 0 and disk_deviation > 0.20:
         warnings.append(
-            "actual run bytes differ from estimated permanent bytes by more than 20%"
+            "ready permanent Artifact bytes differ from the frozen permanent "
+            "output estimate by more than 20%"
         )
     hard_passed = all(hard_gates.values())
     status = "failed" if not hard_passed else "warning" if warnings else "passed"
@@ -248,10 +378,34 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "package_count": expected_packages,
         "stream_count": expected_streams,
         "stream_unit_counts": metrics["stream_unit_counts"],
+        "unit_report_summary_count": unit_report_count,
+        "unit_artifact_cleanup": {
+            "expected_artifact_count": expected_unit_artifacts,
+            "artifact_count": len(unit_artifact_rows),
+            "status_counts": dict(sorted(unit_artifact_status_counts.items())),
+        },
         "job_counts": metrics["job_counts"],
         "failed_count": int(metrics["job_counts"].get("failed", 0)),
         "retry_count": int(metrics["retry_count"]),
         "model_load_counts": dict(sorted(model_load_counts.items())),
+        "model_cache_hit_counts": dict(sorted(model_cache_hit_counts.items())),
+        "model_load_completed_counts": dict(
+            sorted(journal_load_completed_counts.items())
+        ),
+        "model_load_incomplete_counts": {
+            model_id: max(
+                0,
+                int(count) - int(journal_load_completed_counts.get(model_id, 0)),
+            )
+            for model_id, count in sorted(journal_load_counts.items())
+            if int(count) > int(journal_load_completed_counts.get(model_id, 0))
+        },
+        "model_load_counts_by_worker_session": {
+            session_id: dict(sorted(counts.items()))
+            for session_id, counts in sorted(
+                model_load_counts_by_session.items()
+            )
+        },
         "inferred_model_tile_count": inferred_tiles,
         "peak_cache_bytes": peak_cache_bytes,
         "peak_rss_bytes": peak_rss_bytes,
@@ -263,8 +417,15 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "storage": {
             "preflight": storage,
             "actual_run_bytes": actual_run_bytes,
+            "actual_permanent_artifact_bytes": actual_permanent_bytes,
+            "actual_nonartifact_and_temporary_bytes": max(
+                0, actual_run_bytes - actual_permanent_bytes
+            ),
             "ready_artifact_bytes": metrics["ready_artifact_bytes"],
             "permanent_estimate_deviation_ratio": disk_deviation,
+            "cache_budget_gate_applicable": cache_budget_gate_applicable,
+            "frozen_cache_budget_bytes": frozen_cache_budget_bytes,
+            "peak_cache_bytes": peak_cache_bytes,
         },
         "artifact_counts": metrics["artifact_counts"],
         "artifact_integrity_errors": metrics["artifact_integrity_errors"],

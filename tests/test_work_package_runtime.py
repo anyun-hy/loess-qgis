@@ -1,12 +1,15 @@
 import hashlib
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import fiona
 import numpy as np
 import pytest
 import rasterio
+import assemble_stream as assemble_stream_module
 import work_package_runtime
 from affine import Affine
 from rasterio.transform import from_origin
@@ -27,10 +30,18 @@ from assemble_stream import StreamAssemblyError, assemble_stream
 from finalize_partition_rasters import finalize_partition_rasters
 from scale_acceptance import build_scale_acceptance_report
 from work_package_runtime import (
+    BatchCapacityError,
+    PersistentModelProvider,
     WorkPackageRuntimeError,
+    LeaseLostError,
+    _PackageFileLock,
+    _LeaseHeartbeat,
     _commit_artifact,
+    _is_recoverable_batch_error,
+    run_persistent_worker,
     run_work_package,
 )
+from storage_guard import StorageReserveError
 
 
 def _sha(path):
@@ -59,6 +70,76 @@ def _boundary():
     }
 
 
+def _single_tile_two_model_run(tmp_path, *, run_id):
+    tile = tmp_path / f"{run_id}_source.tif"
+    with rasterio.open(
+        tile,
+        "w",
+        driver="GTiff",
+        width=512,
+        height=512,
+        count=3,
+        dtype="uint8",
+        crs="EPSG:4490",
+        transform=from_origin(0, 512, 1, 1),
+    ) as destination:
+        destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
+    models = []
+    for model_id in ("a", "b"):
+        artifact = tmp_path / f"{run_id}_{model_id}.pt"
+        artifact.write_bytes(f"model-{model_id}".encode())
+        models.append(
+            {
+                "model_id": model_id,
+                "artifact_path": str(artifact),
+                "sha256": _sha(artifact),
+                "version": "fixture",
+            }
+        )
+    profile = {
+        "profile_id": "fixture_fusion",
+        "status": "approved",
+        "approval": {"passed": True},
+        "strategy": "equal_probability_average",
+        "models": [{"model_id": "a"}, {"model_id": "b"}],
+        "weights": [[0.5, 0.5] for _ in range(14)],
+    }
+    return create_v5_run(
+        output_root=tmp_path / f"{run_id}_output",
+        raster={
+            "path": tile,
+            "crs": "EPSG:4490",
+            "transform": [1, 0, 0, 0, -1, 512],
+            "nodata": None,
+        },
+        requested_extent={"xmin": 0, "ymin": 0, "xmax": 512, "ymax": 512},
+        processing_extent={"xmin": 0, "ymin": 0, "xmax": 512, "ymax": 512},
+        tile_rows=1,
+        tile_cols=1,
+        tiles=[
+            {
+                "row": 0,
+                "col": 0,
+                "path": str(tile),
+                "sha256": _sha(tile),
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 512, "y1": 512},
+            }
+        ],
+        models=models,
+        effective_device="cpu",
+        overlap=192,
+        scaling=_scaling(),
+        boundary_fitting=_boundary(),
+        storage_report={
+            "package_tile_limit": 4,
+            "working_bytes_per_tile": 4096,
+            "status": "passed",
+        },
+        fusion={"profile_id": "fixture_fusion", "profile": profile},
+        run_id=run_id,
+    )
+
+
 def test_unit_polygonize_does_not_emit_deprecated_memory_driver_warning(capfd):
     probabilities = np.zeros((14, 2, 2), dtype=np.float32)
     probabilities[0, 0, 0] = 1.0
@@ -75,6 +156,519 @@ def test_unit_polygonize_does_not_emit_deprecated_memory_driver_warning(capfd):
     captured = capfd.readouterr()
     assert len(records) == 2
     assert "'Memory' driver is deprecated" not in captured.err
+
+
+def test_package_filesystem_lock_excludes_a_second_lease_owner(tmp_path):
+    lock_path = tmp_path / "tmp" / "package_locks" / "package_00000.lock"
+    first = _PackageFileLock(lock_path)
+    second = _PackageFileLock(lock_path)
+    first.acquire()
+    try:
+        with pytest.raises(WorkPackageRuntimeError, match="already held"):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
+
+
+def test_batch_downgrade_only_accepts_explicit_capacity_or_accelerator_oom():
+    assert _is_recoverable_batch_error(BatchCapacityError("capacity"), "cpu")
+    assert _is_recoverable_batch_error(RuntimeError("CUDA out of memory"), "cuda:0")
+    assert _is_recoverable_batch_error(RuntimeError("MPS out of memory"), "mps")
+    assert not _is_recoverable_batch_error(RuntimeError("bad Tile"), "cuda:0")
+    assert not _is_recoverable_batch_error(RuntimeError("out of memory"), "cpu")
+    assert not _is_recoverable_batch_error(
+        WorkPackageRuntimeError("Tile probability batch shape is wrong"),
+        "cuda:0",
+    )
+
+
+def test_late_second_model_failure_reuses_committed_first_model_outputs(tmp_path):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_190000_a1b2c3",
+    )
+    database = RunStateDB(database_path)
+    package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
+        "package_id"
+    ]
+    loaded = []
+    fail_b = {"value": True}
+
+    def loader(model_entry, _device):
+        loaded.append(model_entry["model_id"])
+        return model_entry["model_id"]
+
+    def infer(model_id, _tile_path, _device):
+        if model_id == "b" and fail_b["value"]:
+            raise RuntimeError("late model b fault")
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    with pytest.raises(RuntimeError, match="late model b fault"):
+        run_work_package(
+            spec_path,
+            package_id,
+            device="cpu",
+            model_loader=loader,
+            infer_tile=infer,
+        )
+    first_model_paths = [
+        spec_path.parent
+        / "models/a/raster_parts"
+        / f"partition_00000_00000_{suffix}.tif"
+        for suffix in ("mask", "confidence")
+    ] + [
+        spec_path.parent
+        / "tmp/probability_parts/a/partition_00000_00000.tif"
+    ]
+    before = {str(path): _sha(path) for path in first_model_paths}
+    assert not (
+        spec_path.parent
+        / "tmp/work_packages"
+        / package_id
+        / "score_batches/a"
+    ).exists()
+
+    fail_b["value"] = False
+    report = run_work_package(
+        spec_path,
+        package_id,
+        device="cpu",
+        resume=True,
+        model_loader=loader,
+        infer_tile=infer,
+    )
+
+    assert report["status"] == "ready"
+    assert loaded == ["a", "b", "b"]
+    assert report["models"][0]["reused_partition_output_count"] == 1
+    assert report["models"][0]["cold_load_count"] == 0
+    assert {str(path): _sha(path) for path in first_model_paths} == before
+
+
+def test_linear_work_package_passes_fusion_head_to_partition_finalize(tmp_path):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_190500_linear",
+    )
+    profile = spec["fusion"]["profile"]
+    profile["strategy"] = "linear_1x1"
+    profile["models"] = [
+        {"model_id": "a", "temperature": 1.0},
+        {"model_id": "b", "temperature": 1.0},
+    ]
+    profile["weights"] = [[0.5, 0.5] for _ in range(14)]
+    atomic_write_json(spec_path, spec)
+
+    calls = []
+
+    def fusion_head(features):
+        calls.append(tuple(features.shape))
+        output = np.zeros(
+            (1, 14, features.shape[-2], features.shape[-1]),
+            dtype=np.float32,
+        )
+        output[:, 3] = 1.0
+        return output
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    database = RunStateDB(database_path)
+    package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
+        "package_id"
+    ]
+    report = run_work_package(
+        spec_path,
+        package_id,
+        device="cpu",
+        model_loader=lambda entry, _device: entry["model_id"],
+        infer_tile=infer,
+        fusion_head=fusion_head,
+    )
+
+    assert report["status"] == "ready"
+    assert calls == [(1, 28, 512, 512)]
+    assert database.artifacts_for_stream(
+        spec["run_id"], "fusion:fixture_fusion", kind="partition_probability"
+    )
+
+
+def test_linear_fusion_head_loader_verifies_and_adapts_torchscript(tmp_path):
+    import torch
+
+    class FirstModelHead(torch.nn.Module):
+        def forward(self, features):
+            return features[:, :14]
+
+    head_path = tmp_path / "fixture_head.pt"
+    traced = torch.jit.trace(
+        FirstModelHead(), torch.zeros((1, 28, 2, 3), dtype=torch.float32)
+    )
+    traced.save(str(head_path))
+    profile_path = tmp_path / "fusion_profile.json"
+    profile = {
+        "profile_id": "linear_fixture",
+        "strategy": "linear_1x1",
+        "fusion_head": {
+            "artifact": head_path.name,
+            "sha256": _sha(head_path),
+        },
+    }
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    spec = {"fusion": {"profile_path": str(profile_path)}, "models": []}
+
+    loaded_head = work_package_runtime._load_linear_fusion_head(
+        spec, profile, "cpu"
+    )
+    output = loaded_head(np.zeros((1, 28, 2, 3), dtype=np.float32))
+
+    assert tuple(output.shape) == (1, 14, 2, 3)
+    assert output.device.type == "cpu"
+
+
+def test_preflight_failure_after_lease_is_atomically_requeued(
+    tmp_path, monkeypatch
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_194000_d4e5f6",
+    )
+    database = RunStateDB(database_path)
+    job = database.lease_next_work_package(
+        spec["run_id"],
+        "preflight-failure-worker",
+        max_open_frontier_units=64,
+        lease_seconds=120,
+    )
+    assert job is not None
+    monkeypatch.setattr(work_package_runtime, "validate_device", lambda _value: False)
+
+    with pytest.raises(WorkPackageRuntimeError, match="device is unavailable"):
+        run_work_package(
+            spec_path,
+            job["package_id"],
+            job_id=job["job_id"],
+            lease_token=job["lease_token"],
+            device="cpu",
+        )
+
+    assert database.get_job(job["job_id"])["status"] == "queued"
+    assert database.get_work_package(
+        spec["run_id"], job["package_id"]
+    )["status"] == "queued"
+
+
+def test_heartbeat_thread_surfaces_database_exception_as_lease_loss(
+    tmp_path, monkeypatch
+):
+    database = RunStateDB(tmp_path / "state.sqlite")
+    database.initialize()
+    monkeypatch.setattr(
+        RunStateDB,
+        "heartbeat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("db unavailable")),
+    )
+    heartbeat = _LeaseHeartbeat(
+        database.path,
+        run_id="run",
+        package_id="package",
+        job_id=1,
+        lease_token="token",
+        stop_event=threading.Event(),
+        interval_sec=0.01,
+        lease_seconds=30,
+    )
+    monkeypatch.setattr(heartbeat, "check", lambda: None)
+    heartbeat.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while not heartbeat.lost_event.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert heartbeat.lost_event.is_set()
+        # Restore the real check behavior while retaining the injected loss.
+        monkeypatch.undo()
+        with pytest.raises(LeaseLostError, match="db unavailable"):
+            heartbeat.check()
+    finally:
+        heartbeat.close()
+
+
+def test_heartbeat_keeps_lease_alive_after_stop_until_owner_closes(
+    tmp_path, monkeypatch
+):
+    database = RunStateDB(tmp_path / "state.sqlite")
+    database.initialize()
+    calls = []
+
+    def accepted_heartbeat(*_args, **_kwargs):
+        calls.append(time.monotonic())
+        return True
+
+    monkeypatch.setattr(RunStateDB, "heartbeat", accepted_heartbeat)
+    stopper = threading.Event()
+    heartbeat = _LeaseHeartbeat(
+        database.path,
+        run_id="run",
+        package_id="package",
+        job_id=1,
+        lease_token="token",
+        stop_event=stopper,
+        interval_sec=0.01,
+        lease_seconds=30,
+    )
+    monkeypatch.setattr(heartbeat, "check", lambda: None)
+    heartbeat.start()
+    stopper.set()
+    try:
+        deadline = time.monotonic() + 1.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(calls) >= 2
+    finally:
+        heartbeat.close()
+
+
+def test_lease_loss_fences_persistent_session_before_next_package(
+    tmp_path, monkeypatch
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_194000_fenced",
+    )
+    database = RunStateDB(database_path)
+    database.insert_work_packages(
+        spec["run_id"],
+        [{"package_id": "package_00001", "sequence_no": 1}],
+    )
+    database.insert_jobs(
+        spec["run_id"],
+        [{"job_type": "work_package", "package_id": "package_00001"}],
+    )
+    calls = []
+
+    def lose_lease(_spec_path, package_id, **_kwargs):
+        calls.append(package_id)
+        raise LeaseLostError("replacement worker owns the lease")
+
+    monkeypatch.setattr(work_package_runtime, "run_work_package", lose_lease)
+    report = run_persistent_worker(
+        spec_path,
+        "stale-worker",
+        device="cpu",
+        heartbeat_interval_sec=0.05,
+    )
+
+    assert calls == ["package_00000"]
+    assert report["session_fenced"] is True
+    assert report["package_attempt_count"] == 1
+    with sqlite3.connect(database_path) as connection:
+        states = dict(
+            connection.execute(
+                "SELECT package_id, status FROM jobs WHERE job_type='work_package'"
+            ).fetchall()
+        )
+    assert states == {"package_00000": "running", "package_00001": "queued"}
+
+
+@pytest.mark.parametrize(
+    "target_prefix",
+    (
+        "tile_cache:",
+        "partition_rasters:model:a:",
+        "partition_rasters:fusion:fixture_fusion:",
+    ),
+)
+def test_persistent_worker_waits_for_low_disk_without_consuming_attempt(
+    tmp_path, monkeypatch, target_prefix
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_191000_c4d5e6",
+    )
+    checks = {"fired": False}
+    original_check = work_package_runtime.StorageGuard.check
+
+    def fail_once(self, operation, **kwargs):
+        if not checks["fired"] and str(operation).startswith(target_prefix):
+            checks["fired"] = True
+            raise StorageReserveError(
+                operation,
+                free_bytes=100,
+                required_free_bytes=200,
+                write_bytes=int(kwargs.get("write_bytes") or 0),
+                managed_bytes=0,
+                managed_budget_bytes=0,
+            )
+        return original_check(self, operation, **kwargs)
+
+    monkeypatch.setattr(work_package_runtime.StorageGuard, "check", fail_once)
+    provider = PersistentModelProvider(
+        lambda model_entry, _device: model_entry["model_id"]
+    )
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    worker_report = run_persistent_worker(
+        spec_path,
+        "low-disk-worker",
+        device="cpu",
+        model_provider=provider,
+        infer_tile=infer,
+        heartbeat_interval_sec=0.01,
+        low_disk_poll_sec=0.01,
+    )
+
+    database = RunStateDB(database_path)
+    package = database.page_work_packages(spec["run_id"], limit=1)[0]
+    jobs = database.job_counts(spec["run_id"], job_type="work_package")
+    with sqlite3.connect(database_path) as connection:
+        attempt = connection.execute(
+            "SELECT attempt FROM jobs WHERE job_type='work_package'"
+        ).fetchone()[0]
+    assert worker_report["status"] == "ready"
+    assert checks["fired"] is True
+    assert worker_report["low_disk_pause_count"] == 1
+    assert package["status"] == "ready"
+    assert jobs == {"ready": 1}
+    assert attempt == 1
+
+
+def test_persistent_worker_fails_fixed_managed_budget_instead_of_waiting(
+    tmp_path, monkeypatch
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_193000_b1c2d3",
+    )
+    original_check = work_package_runtime.StorageGuard.check
+    fired = {"value": False}
+
+    def fail_fixed_budget(self, operation, **kwargs):
+        if not fired["value"] and str(operation).startswith("tile_cache:"):
+            fired["value"] = True
+            raise StorageReserveError(
+                operation,
+                free_bytes=10_000,
+                required_free_bytes=1_000,
+                write_bytes=int(kwargs.get("write_bytes") or 0),
+                managed_bytes=2_000,
+                managed_budget_bytes=1_000,
+            )
+        return original_check(self, operation, **kwargs)
+
+    monkeypatch.setattr(
+        work_package_runtime.StorageGuard, "check", fail_fixed_budget
+    )
+    report = run_persistent_worker(
+        spec_path,
+        "fixed-budget-worker",
+        device="cpu",
+        model_provider=PersistentModelProvider(
+            lambda model_entry, _device: model_entry["model_id"]
+        ),
+        low_disk_poll_sec=0.01,
+    )
+
+    database = RunStateDB(database_path)
+    assert fired["value"] is True
+    assert report["status"] == "failed"
+    assert report["low_disk_pause_count"] == 0
+    assert database.job_counts(spec["run_id"], job_type="work_package") == {
+        "failed": 1
+    }
+
+
+def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(
+    tmp_path,
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_193500_cache",
+    )
+    spec["runtime"]["keep_score_cache"] = True
+    atomic_write_json(spec_path, spec)
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    report = run_persistent_worker(
+        spec_path,
+        "delayed-cache-worker",
+        device="cpu",
+        model_provider=PersistentModelProvider(
+            lambda model_entry, _device: model_entry["model_id"]
+        ),
+        infer_tile=infer,
+        heartbeat_interval_sec=0.05,
+    )
+
+    assert report["status"] == "ready"
+    database = RunStateDB(database_path)
+    package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
+        "package_id"
+    ]
+    package_root = spec_path.parent / "tmp" / "work_packages" / package_id
+    package_report = json.loads(
+        (package_root / "package_report.json").read_text(encoding="utf-8")
+    )
+    assert package_report["score_cache_retention"] == "until_package_ready"
+    assert not (package_root / "score_batches").exists()
+    assert not (package_root / "accepted_scores").exists()
+    assert not (package_root / "fusion").exists()
+    assert not Path(spec["cache_root"]).exists()
+
+
+@pytest.mark.parametrize("residual_status", ("queued", "interrupted", "running"))
+def test_persistent_worker_never_reports_residual_jobs_as_ready(
+    tmp_path, residual_status
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_192000_e7f8a9",
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """UPDATE jobs SET status=?, attempt=max_attempts,
+               worker_id=CASE WHEN ?='running' THEN 'other-worker' ELSE '' END,
+               lease_token=CASE WHEN ?='running' THEN 'other-token' ELSE '' END,
+               lease_expires=CASE WHEN ?='running' THEN ? ELSE NULL END
+               WHERE job_type='work_package'""",
+            (
+                residual_status,
+                residual_status,
+                residual_status,
+                residual_status,
+                32503680000.0,
+            ),
+        )
+        connection.execute(
+            "UPDATE work_packages SET status=? WHERE run_id=?",
+            (residual_status, spec["run_id"]),
+        )
+
+    report = run_persistent_worker(
+        spec_path,
+        "nonterminal-worker",
+        device="cpu",
+        model_provider=PersistentModelProvider(
+            lambda model_entry, _device: model_entry["model_id"]
+        ),
+    )
+
+    assert report["status"] == "incomplete"
+    assert report["job_counts"] == {residual_status: 1}
+    assert report["package_attempt_count"] == 0
 
 
 def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
@@ -441,6 +1035,9 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         ],
         effective_device="cpu",
         tile_batch_size=4,
+        resource_tuning={
+            "resolved": {"tile_batch_size_by_model": {"a": 4, "b": 2}}
+        },
         overlap=192,
         scaling=scaling,
         boundary_fitting=_boundary(),
@@ -464,7 +1061,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         assert images.shape[1:] == (3, 512, 512)
         batch_attempts.append(len(images))
         if len(images) > 2:
-            raise RuntimeError("fixture batch capacity is two")
+            raise BatchCapacityError("fixture batch capacity is two")
         probabilities = np.zeros(
             (len(images), 14, 512, 512), dtype=np.float32
         )
@@ -494,30 +1091,40 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert shared_tile_ids
     assert first_only_tile_ids
 
-    first_report = run_work_package(
+    provider = PersistentModelProvider(loader)
+    worker_report = run_persistent_worker(
         spec_path,
-        package_ids[0],
+        "multi-package-accelerator",
         device="cpu",
-        model_loader=loader,
+        model_provider=provider,
         infer_images=infer_images,
+        heartbeat_interval_sec=0.05,
+        low_disk_poll_sec=0.05,
+    )
+    assert worker_report["status"] == "ready"
+    assert worker_report["package_ready_count"] == 2
+    first_report = json.loads(
+        (
+            spec_path.parent
+            / "tmp/work_packages"
+            / package_ids[0]
+            / "package_report.json"
+        ).read_text(encoding="utf-8")
+    )
+    second_report = json.loads(
+        (
+            spec_path.parent
+            / "tmp/work_packages"
+            / package_ids[1]
+            / "package_report.json"
+        ).read_text(encoding="utf-8")
     )
     tile_cache_dir = Path(spec["tile_cache_dir"])
     assert tile.is_file()
     assert _sha(tile) == source_sha256
-    for tile_id in shared_tile_ids:
-        row, col = tile_id.split("_")
-        assert (tile_cache_dir / f"tile_{row}_{col}.tif").is_file()
     for tile_id in first_only_tile_ids:
         row, col = tile_id.split("_")
         assert not (tile_cache_dir / f"tile_{row}_{col}.tif").exists()
-
-    second_report = run_work_package(
-        spec_path,
-        package_ids[1],
-        device="cpu",
-        model_loader=loader,
-        infer_images=infer_images,
-    )
     package_reports = [first_report, second_report]
     assert all(report["status"] == "ready" for report in package_reports)
     assert first_report["tile_cache_retained_count"] == len(shared_tile_ids)
@@ -525,14 +1132,33 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert tile.is_file()
     assert _sha(tile) == source_sha256
     assert not Path(spec["cache_root"]).exists()
-    assert loaded == ["a", "b", "a", "b"]
-    assert 4 in batch_attempts
+    assert loaded == ["a", "b"]
+    assert worker_report["model_cold_load_counts"] == {"a": 1, "b": 1}
+    assert worker_report["model_cache_hit_counts"] == {"a": 1, "b": 1}
+    journal_events = [
+        json.loads(line)
+        for line in (
+            spec_path.parent / "logs" / "accelerator_model_loads.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    for model_id in ("a", "b"):
+        events = [
+            item["event"]
+            for item in journal_events
+            if item["model_id"] == model_id
+        ]
+        assert events == ["load_started", "load_completed", "cache_hit"]
+    assert batch_attempts.count(4) == 1
     assert 2 in batch_attempts
+    assert worker_report["model_effective_batch_sizes"] == {
+        "a@cpu": 2,
+        "b@cpu": 2,
+    }
     assert all(
-        model["configured_tile_batch_size"] == 4
+        model["configured_tile_batch_size"]
+        == {"a": 4, "b": 2}[model["model_id"]]
         and model["effective_tile_batch_size"] == 2
         and model["peak_tile_batch_size"] <= 2
-        and model["batch_reduction_count"] >= 1
         and model["input_queue_capacity"] == 2
         and model["input_queue_peak_batches"] <= 2
         and model["result_queue_capacity"] == 1
@@ -541,20 +1167,15 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         for report in package_reports
         for model in report["models"]
     )
+    assert {
+        model["model_id"]: model["batch_reduction_count"]
+        for model in first_report["models"]
+    } == {"a": 1, "b": 0}
+    assert all(
+        model["batch_reduction_count"] == 0
+        for model in second_report["models"]
+    )
     assert database.work_package_counts(spec["run_id"]) == {"ready": 2}
-    for package_id in package_ids:
-        with sqlite3.connect(database_path) as connection:
-            package_job_id = connection.execute(
-                "SELECT job_id FROM jobs WHERE job_type='work_package' AND package_id=?",
-                (package_id,),
-            ).fetchone()[0]
-        leased = database.lease_job(
-            package_job_id, "multi-package-test", lease_seconds=120
-        )
-        assert leased is not None
-        assert database.finish_job(
-            leased["job_id"], leased["lease_token"], status="ready"
-        )
 
     finalized = finalize_partition_rasters(spec_path)
     assert finalized["status"] == "raster_ready"
@@ -588,6 +1209,15 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert all(report["unit_count"] == 3 for report in assembly_reports)
     assert all(report["validation"]["passed"] for report in assembly_reports)
     assert all(
+        report["unit_artifact_cleanup"]["status"] == "passed"
+        for report in assembly_reports
+    )
+    assert all(
+        report["unit_artifact_cleanup"]["artifact_count"] >= 9
+        for report in assembly_reports
+    )
+    assert not list((spec_path.parent / "tmp" / "unit_outputs").rglob("*_*.*"))
+    assert all(
         report["validation"]["scope"] == "all_output_polygons"
         for report in assembly_reports
     )
@@ -598,13 +1228,40 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert scale_report["status"] == "passed"
     assert scale_report["package_count"] == 2
     assert scale_report["spatial_unit_count"] == 3
-    assert scale_report["model_load_counts"] == {"a": 2, "b": 2}
+    assert scale_report["model_load_counts"] == {"a": 1, "b": 1}
+    assert scale_report["model_cache_hit_counts"] == {"a": 1, "b": 1}
+    assert scale_report["model_load_completed_counts"] == {"a": 1, "b": 1}
+    assert scale_report["model_load_incomplete_counts"] == {}
     assert scale_report["failed_count"] == 0
     assert scale_report["retry_count"] == 0
+    assert scale_report["hard_gates"]["all_unit_intermediates_cleaned"] is True
+    assert scale_report["unit_report_summary_count"] == 9
+    assert scale_report["unit_artifact_cleanup"]["status_counts"] == {
+        "cleaned": scale_report["unit_artifact_cleanup"]["expected_artifact_count"]
+    }
     assert scale_report["peak_cache_bytes"] > 0
     assert scale_report["peak_rss_bytes"] > 0
     assert scale_report["cleaned_bytes"] > 0
     assert not scale_report["artifact_integrity_errors"]
+
+    original_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    over_budget_spec = json.loads(json.dumps(original_spec))
+    over_budget_spec.setdefault("storage_preflight", {}).update(
+        {
+            "storage_tuning_schema_version": 2,
+            "working_cache_budget_bytes": scale_report["peak_cache_bytes"] - 1,
+        }
+    )
+    atomic_write_json(spec_path, over_budget_spec)
+    budget_rejected = build_scale_acceptance_report(spec_path)
+    assert budget_rejected["hard_gate_passed"] is False
+    assert budget_rejected["status"] == "failed"
+    assert (
+        budget_rejected["hard_gates"]["peak_cache_within_frozen_budget"]
+        is False
+    )
+    assert budget_rejected["storage"]["cache_budget_gate_applicable"] is True
+    atomic_write_json(spec_path, original_spec)
 
     for relative in (
         "models/a/semantic_polygons.gpkg",
@@ -834,7 +1491,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     assert reassembled["object_link_count"] == report["object_link_count"]
 
 
-def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
+def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
     run_id = "20260729_120000_queue64"
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -985,6 +1642,22 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
             "ready",
         )
 
+    # Defer only the post-ready cleanup for the first pass so this same fixture
+    # can also exercise the report-resume corruption boundary below.  Production
+    # assembly always runs the real cleanup immediately after the final outputs
+    # are committed and verified.
+    real_cleanup = assemble_stream_module._cleanup_stream_unit_artifacts
+    monkeypatch.setattr(
+        assemble_stream_module,
+        "_cleanup_stream_unit_artifacts",
+        lambda _spec, _database, stream_id: {
+            "status": "deferred_for_resume_test",
+            "stream_id": stream_id,
+            "artifact_count": 0,
+            "cleaned_bytes": 0,
+            "kind_counts": {},
+        },
+    )
     report = assemble_stream(spec_path, "model:a")
 
     assert report["status"] == "passed"
@@ -1017,6 +1690,11 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     }
     broken_unit_report = output_root / "core_00032_report.json"
     valid_unit_report = broken_unit_report.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        assemble_stream_module,
+        "_cleanup_stream_unit_artifacts",
+        real_cleanup,
+    )
     broken_unit_report.write_text("{broken-json", encoding="utf-8")
     database.set_stream_status(
         run_id,
@@ -1024,6 +1702,13 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
         "failed",
         error="injected report recovery failure",
     )
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """UPDATE artifacts SET status='failed'
+               WHERE run_id=? AND stream_id=? AND unit_id='assembled'
+               AND kind IN ('boundary_fitting_report', 'fitted_edges')""",
+            (run_id, "model:a"),
+        )
 
     with pytest.raises(
         StreamAssemblyError,
@@ -1043,13 +1728,6 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path):
     assert not list(stream_root.glob(".*.tmp.*"))
 
     broken_unit_report.write_text(valid_unit_report, encoding="utf-8")
-    with sqlite3.connect(state_path) as connection:
-        connection.execute(
-            """UPDATE artifacts SET status='failed'
-               WHERE run_id=? AND stream_id=? AND unit_id='assembled'
-               AND kind IN ('boundary_fitting_report', 'fitted_edges')""",
-            (run_id, "model:a"),
-        )
     resumed = assemble_stream(spec_path, "model:a", resume_from_reports=True)
 
     assert resumed["status"] == "passed"

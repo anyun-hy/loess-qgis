@@ -234,14 +234,19 @@ def test_main_dock_can_start_a_prepared_v5_run_without_hiding_ready_results():
     assert "self._recovery_run_spec or self._last_run_spec" in source
 
 
-def test_main_dock_reads_resolved_tile_batch_size_from_runtime():
+def test_main_dock_uses_frozen_per_model_batch_sizes_for_storage_preflight():
     source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(encoding="utf-8")
-    preflight_block = source.split("storage = storage_preflight(", 1)[1].split(
+    preparation_block = source.split("resolved_resources =", 1)[1].split(
         "stride = 512", 1
     )[0]
 
-    assert 'registry.runtime["tile_batch_size"]' in preflight_block
-    assert 'scaling["tile_batch_size"]' not in preflight_block
+    assert 'registry.runtime["tile_batch_size"]' in preparation_block
+    assert 'resolved_resources.get("tile_batch_size_by_model")' in preparation_block
+    assert "storage_batch_size = max(selected_batch_sizes" in preparation_block
+    assert "tile_batch_size=storage_batch_size" in preparation_block
+    assert 'scaling["tile_batch_size"]' not in preparation_block
+    assert '"resolved_score_cache_budget_gb"' in preparation_block
+    assert 'scaling["score_cache_budget_mode"]' in preparation_block
 
 
 def test_v5_runner_requires_scale_acceptance_before_ready():

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Usage: run_work_package.sh --run-spec <json> --package-id <id> [--device <device>] [--resume]
+# Production usage: run_work_package.sh --run-spec <json> --worker-id <id> \
+#   [--device <device>] [--max-open-frontier-units <count>] [--resume]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
