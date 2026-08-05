@@ -184,8 +184,261 @@ def test_job_lease_heartbeat_completion_and_recovery(tmp_path):
     assert database.interrupt_expired_jobs(now_epoch=time.time() + 2) == 1
     retried = database.lease_next_job(RUN_ID, "worker-c")
     assert retried["job_id"] == expired["job_id"]
-    assert retried["attempt"] == 2
+    # Interrupted work is resumable and does not consume a failure attempt.
+    assert retried["attempt"] == 1
     assert database.job_counts(RUN_ID) == {"ready": 1, "running": 1}
+
+
+def test_work_package_lease_and_crash_cleanup_are_atomic(tmp_path):
+    database = _database(tmp_path)
+    database.insert_work_packages(
+        RUN_ID,
+        [{"package_id": "package_00000", "sequence_no": 0}],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [{"job_type": "work_package", "package_id": "package_00000"}],
+    )
+
+    leased = database.lease_next_work_package(
+        RUN_ID,
+        "package-worker",
+        max_open_frontier_units=64,
+        lease_seconds=120,
+    )
+    assert leased is not None
+    assert database.get_work_package(RUN_ID, "package_00000")["status"] == "running"
+    assert database.get_job(leased["job_id"])["status"] == "running"
+
+    # Simulate a worker process dying after lease acquisition but before the
+    # Work Package runtime starts. Administrative cleanup must close both rows.
+    assert database.interrupt_work_package_worker(RUN_ID, "package-worker") == 1
+    assert database.get_work_package(RUN_ID, "package_00000")["status"] == "interrupted"
+    interrupted = database.get_job(leased["job_id"])
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["attempt"] == 0
+
+    resumed = database.lease_job(
+        leased["job_id"],
+        "replacement-worker",
+        lease_seconds=120,
+    )
+    assert resumed is not None
+    assert resumed["attempt"] == 1
+    assert database.get_work_package(RUN_ID, "package_00000")["status"] == "running"
+
+
+def test_expired_worker_token_cannot_finish_but_admin_can_interrupt(tmp_path):
+    database = _database(tmp_path)
+    database.insert_jobs(RUN_ID, [{"job_type": "tile_inference", "tile_id": "0_0"}])
+    leased = database.lease_next_job(RUN_ID, "worker", lease_seconds=120)
+    assert leased is not None
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+            (time.time() - 1, leased["job_id"]),
+        )
+
+    assert not database.finish_job(leased["job_id"], leased["lease_token"])
+    assert database.get_job(leased["job_id"])["status"] == "running"
+    assert database.interrupt_job(leased["job_id"], leased["lease_token"])
+    interrupted = database.get_job(leased["job_id"])
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["attempt"] == 0
+
+
+@pytest.mark.parametrize("lease_mode", ["next", "exact"])
+def test_unit_fit_waits_for_all_dependency_packages_to_be_ready(
+    tmp_path,
+    lease_mode,
+):
+    database = _database(tmp_path)
+    database.insert_work_packages(
+        RUN_ID,
+        [{"package_id": "package_00000", "sequence_no": 0}],
+    )
+    database.insert_partitions(
+        RUN_ID,
+        [
+            {
+                "partition_id": "partition_00000",
+                "row": 0,
+                "col": 0,
+                "core_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "halo_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "package_id": "package_00000",
+            }
+        ],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "core_00000",
+                "unit_type": "core",
+                "owner_key": "core_00000",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": ["partition_00000"],
+            }
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {"job_type": "work_package", "package_id": "package_00000"},
+            {
+                "job_type": "unit_fit",
+                "stream_id": "model:test",
+                "unit_id": "core_00000",
+            },
+        ],
+    )
+    with sqlite3.connect(database.path) as connection:
+        rows = dict(
+            connection.execute(
+                "SELECT job_type, job_id FROM jobs WHERE run_id=?",
+                (RUN_ID,),
+            ).fetchall()
+        )
+    package_job = database.lease_job(
+        rows["work_package"],
+        "package-worker",
+        lease_seconds=120,
+    )
+    assert package_job is not None
+    assert database.get_work_package(RUN_ID, "package_00000")["status"] == "running"
+
+    probability = database.register_artifact(
+        RUN_ID,
+        "partition_probability",
+        tmp_path / "partition_00000_probability.tif",
+        stream_id="model:test",
+        unit_id="partition_00000",
+    )
+    assert database.mark_artifact_ready(
+        probability,
+        byte_count=1,
+        sha256="f" * 64,
+    )
+    assert database.add_artifact_dependency(rows["unit_fit"], probability)
+
+    def lease_unit():
+        if lease_mode == "next":
+            return database.lease_next_job(
+                RUN_ID,
+                "unit-worker",
+                job_types=("unit_fit",),
+                lease_seconds=120,
+            )
+        return database.lease_job(
+            rows["unit_fit"],
+            "unit-worker",
+            lease_seconds=120,
+        )
+
+    # The Artifact exists and is linked, but it is not consumable until the
+    # producing Package and its leased control Job commit ready atomically.
+    assert lease_unit() is None
+    assert database.get_job(rows["unit_fit"])["attempt"] == 0
+    assert database.complete_work_package_job(
+        RUN_ID,
+        "package_00000",
+        package_job["job_id"],
+        package_job["lease_token"],
+    )
+    assert database.get_work_package(RUN_ID, "package_00000")["status"] == "ready"
+    leased_unit = lease_unit()
+    assert leased_unit is not None
+    assert leased_unit["job_id"] == rows["unit_fit"]
+    assert leased_unit["attempt"] == 1
+
+
+def test_resumed_package_reset_keeps_original_cross_package_scope(tmp_path):
+    database = _database(tmp_path)
+    assert database.set_run_status(RUN_ID, "failed", expected="preflight")
+    database.insert_work_packages(
+        RUN_ID,
+        [
+            {
+                "package_id": "package_00000",
+                "sequence_no": 0,
+                "status": "failed",
+            },
+            {
+                "package_id": "package_00001",
+                "sequence_no": 1,
+                "status": "ready",
+            },
+        ],
+    )
+    database.insert_partitions(
+        RUN_ID,
+        [
+            {
+                "partition_id": "partition_00000",
+                "row": 0,
+                "col": 0,
+                "core_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "halo_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "package_id": "package_00000",
+            },
+            {
+                "partition_id": "partition_00001",
+                "row": 0,
+                "col": 1,
+                "core_window": {"x0": 1, "y0": 0, "x1": 2, "y1": 1},
+                "halo_window": {"x0": 1, "y0": 0, "x1": 2, "y1": 1},
+                "package_id": "package_00001",
+            },
+        ],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "seam_00000_00001",
+                "unit_type": "seam",
+                "owner_key": "seam_00000_00001",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 2, "y1": 1},
+                "dependency_ids": ["partition_00000", "partition_00001"],
+            }
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "work_package",
+                "package_id": "package_00000",
+                "status": "failed",
+            },
+            {
+                "job_type": "work_package",
+                "package_id": "package_00001",
+                "status": "ready",
+            },
+            {
+                "job_type": "unit_fit",
+                "unit_id": "seam_00000_00001",
+                "status": "ready",
+            },
+        ],
+    )
+
+    first = database.begin_failed_package_reset(RUN_ID)
+    assert first["package_ids"] == ["package_00000"]
+    assert database.get_job(first["job_ids"][-1])["status"] == "resetting"
+
+    resumed = database.begin_failed_package_reset(RUN_ID)
+    assert resumed["package_ids"] == ["package_00000"]
+    assert database.get_work_package(RUN_ID, "package_00001")["status"] == "ready"
+    with sqlite3.connect(database.path) as connection:
+        neighbor_job_status = connection.execute(
+            """SELECT status FROM jobs WHERE run_id=?
+               AND job_type='work_package' AND package_id='package_00001'""",
+            (RUN_ID,),
+        ).fetchone()[0]
+    assert neighbor_job_status == "ready"
 
 
 def test_events_are_persistent_and_foreign_keys_are_enforced(tmp_path):
@@ -384,6 +637,18 @@ def test_spatial_plan_and_packages_are_persisted_with_foreign_keys(tmp_path):
     assert database.insert_spatial_units(RUN_ID, plan["spatial_units"]) == len(
         plan["spatial_units"]
     )
+
+    persisted_partitions = database.partitions_for_run(RUN_ID)
+    assert len(persisted_partitions) == plan["partition_count"]
+    assert [
+        (partition["row"], partition["col"])
+        for partition in persisted_partitions
+    ] == sorted(
+        (partition["row"], partition["col"])
+        for partition in persisted_partitions
+    )
+    assert persisted_partitions[0]["core_window"] == partitions[0]["core_window"]
+    assert persisted_partitions[0]["halo_window"] == partitions[0]["halo_window"]
 
     with sqlite3.connect(database.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM work_packages").fetchone()[0] == len(

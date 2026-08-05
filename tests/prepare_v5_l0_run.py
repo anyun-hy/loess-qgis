@@ -20,13 +20,19 @@ for import_root in (PLUGIN_ROOT, SCRIPTS_ROOT):
         sys.path.insert(0, str(import_root))
 
 from labeling_tool.core.run_builder_v5 import create_v5_run
+from labeling_tool.core.spatial_planner import plan_spatial_units
 from labeling_tool.core.run_spec import (
     atomic_write_json,
     reserve_run_directory,
     run_tile_cache_dir,
     sha256_file,
 )
-from labeling_tool.core.work_package_planner import storage_preflight
+from labeling_tool.core.work_package_planner import (
+    WorkPackagePlanError,
+    permanent_output_reserve,
+    resolve_frozen_tile_batch_size,
+    storage_preflight,
+)
 from check_environment import _fingerprint
 from deployment_config import load_and_validate_config
 
@@ -140,18 +146,52 @@ def prepare(source_run: Path, output_root: Path, *, device: str, run_id: str | N
         scaling["partition_halo_px"] = max(overlap, int(scaling["seam_band_px"]))
     pixel_count = 512 * 512
     sample_tile_bytes = first_source.stat().st_size
+    spatial_plan = plan_spatial_units(
+        tile_rows=rows,
+        tile_cols=cols,
+        tile_size=512,
+        overlap=overlap,
+        partition_tile_rows=int(scaling["partition_tile_rows"]),
+        partition_tile_cols=int(scaling["partition_tile_cols"]),
+        seam_band_px=int(scaling["seam_band_px"]),
+        halo_px=int(scaling["partition_halo_px"]),
+    )
+    permanent = permanent_output_reserve(
+        spatial_plan,
+        stream_count=len(models) + 1,
+    )
+    source_resolved = (
+        (source_spec.get("resource_tuning") or {}).get("resolved") or {}
+    )
+    try:
+        tile_batch_size = resolve_frozen_tile_batch_size(
+            (effective.get("runtime") or {}).get("tile_batch_size", "auto"),
+            source_resolved.get("tile_batch_size"),
+            (source_spec.get("runtime") or {}).get("tile_batch_size"),
+        )
+    except WorkPackagePlanError as error:
+        raise L0PreparationError(str(error)) from error
     storage = storage_preflight(
         output_root,
         tile_count=len(linked_tiles),
         stream_count=len(models) + 1,
-        permanent_bytes_per_tile_per_stream=pixel_count * 8,
+        permanent_raster_bytes=permanent["permanent_raster_bytes"],
+        vector_output_reserve_bytes=permanent["vector_output_reserve_bytes"],
+        permanent_core_pixel_count=permanent["core_pixel_count"],
         input_tile_bytes_per_tile=sample_tile_bytes,
-        score_cache_budget_gb=float(scaling["score_cache_budget_gb"]),
+        score_cache_budget_gb=scaling["score_cache_budget_gb"],
         min_free_disk_gb=float(scaling["min_free_disk_gb"]),
         current_model_probability_bytes=pixel_count * 14 * 2,
         fusion_accumulator_bytes=pixel_count * 15 * 4,
         mask_confidence_workspace_bytes=pixel_count * (14 * 4 + 5),
         safety_margin_bytes=sample_tile_bytes,
+        fixed_temporary_overhead_bytes=(
+            pixel_count
+            * 14
+            * 2
+            * tile_batch_size
+        ),
+        tile_batch_size=tile_batch_size,
     )
     processing = dict(source_spec["processing_extent"])
     spec, spec_path, database_path = create_v5_run(
@@ -179,6 +219,7 @@ def prepare(source_run: Path, output_root: Path, *, device: str, run_id: str | N
         models=models,
         effective_device=device,
         keep_score_cache=False,
+        tile_batch_size=tile_batch_size,
         overlap=overlap,
         scaling=scaling,
         boundary_fitting=effective["boundary_fitting"],

@@ -418,7 +418,21 @@ def validate_deployment_config(
             "/scaling/max_cpu_partition_workers",
             f"must not exceed available CPU count {cpu_count}",
         ))
-    for key, default in (("score_cache_budget_gb", 16.0), ("min_free_disk_gb", 50.0)):
+    raw_cache_budget = scaling.get("score_cache_budget_gb", "auto")
+    if str(raw_cache_budget).strip().lower() == "auto":
+        normalized_scaling["score_cache_budget_gb"] = "auto"
+    else:
+        try:
+            cache_budget = float(raw_cache_budget)
+        except (TypeError, ValueError):
+            cache_budget = float("nan")
+        normalized_scaling["score_cache_budget_gb"] = cache_budget
+        if not math.isfinite(cache_budget) or cache_budget <= 0:
+            issues.append(ValidationIssue(
+                "/scaling/score_cache_budget_gb",
+                "must be auto or finite and positive",
+            ))
+    for key, default in (("min_free_disk_gb", 50.0),):
         try:
             value = float(scaling.get(key, default))
         except (TypeError, ValueError):

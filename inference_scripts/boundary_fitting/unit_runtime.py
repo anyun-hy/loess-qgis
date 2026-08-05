@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 import tempfile
@@ -36,11 +38,130 @@ from polyline_smoother import SmoothingConfig
 from deployment_config import load_json
 from runtime_metrics import peak_rss_bytes
 from rasterio_compat import quiet_deprecated_memory_driver
+from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
 
 
 class UnitRuntimeError(RuntimeError):
     pass
+
+
+GPKG_ATOMIC_OVERHEAD_BYTES = 4 * 1024**2
+JSON_ATOMIC_OVERHEAD_BYTES = 64 * 1024
+
+
+def _remaining_permanent_reserve_bytes(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+) -> int:
+    return exact_remaining_permanent_bytes(spec, database)
+
+
+def _run_storage_guard(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    *,
+    disk_usage=None,
+) -> StorageGuard:
+    storage = dict(spec.get("storage_preflight") or {})
+    min_free_bytes = int(
+        storage.get("effective_min_free_disk_bytes")
+        or float((spec.get("scaling") or {}).get("min_free_disk_gb", 0.0))
+        * 1024**3
+    )
+    remaining = _remaining_permanent_reserve_bytes(spec, database)
+    options = {
+        "min_free_bytes": max(0, min_free_bytes),
+        "remaining_permanent_bytes": lambda: remaining,
+    }
+    if disk_usage is not None:
+        options["disk_usage"] = disk_usage
+    return StorageGuard(Path(spec["run_dir"]), **options)
+
+
+@contextmanager
+def _reserved_vector_write(
+    storage_guard: StorageGuard | None,
+    lock_path: Path | None,
+    operation: str,
+    write_bytes: int,
+):
+    """Reserve one atomic vector write across all unit-fit processes.
+
+    The lock is held only for the file transaction.  Geometry calculation stays
+    parallel, while two processes cannot both pass a stale free-space check.
+    """
+
+    if storage_guard is None:
+        yield
+        return
+    shared_lock = lock_path or (
+        storage_guard.root / "tmp" / ".vector-storage-reserve.lock"
+    )
+    shared_lock.parent.mkdir(parents=True, exist_ok=True)
+    with shared_lock.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        reserved_write = 0
+        try:
+            reservation = storage_guard.check(
+                operation,
+                write_bytes=max(0, int(write_bytes)),
+                managed_growth_bytes=0,
+                reserve_managed_growth=True,
+            )
+            reserved_write = int(reservation["reserved_write_bytes"])
+            yield
+        finally:
+            if reserved_write:
+                storage_guard.adjust(0, settled_write_bytes=reserved_write)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _estimate_record_gpkg_bytes(
+    records: list[Mapping[str, Any]],
+    *,
+    attribute_bytes: int,
+) -> int:
+    payload_bytes = 0
+    for record in records:
+        geometry = record.get("geometry")
+        payload_bytes += len(geometry.wkb) if geometry is not None else 0
+        payload_bytes += max(0, int(attribute_bytes))
+    return max(GPKG_ATOMIC_OVERHEAD_BYTES, payload_bytes * 2)
+
+
+def _estimate_diagnostic_gpkg_bytes(report: Mapping[str, Any]) -> int:
+    payload_bytes = sum(
+        len(edge.get("fitted_points") or []) * 16 + 512
+        for edge in report.get("diagnostics") or []
+    )
+    return max(GPKG_ATOMIC_OVERHEAD_BYTES, payload_bytes * 2)
+
+
+def _estimate_json_bytes(payload: Mapping[str, Any]) -> int:
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    return len(encoded) + JSON_ATOMIC_OVERHEAD_BYTES
+
+
+def _write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    storage_guard: StorageGuard | None = None,
+    storage_lock_path: Path | None = None,
+    operation: str = "unit_report",
+) -> None:
+    from semantic_batch import _atomic_json
+
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        _estimate_json_bytes(payload),
+    ):
+        _atomic_json(path, payload)
 
 
 def emit(event: str, **payload: Any) -> None:
@@ -205,10 +326,12 @@ def _write_gpkg(
     transform: Affine,
     crs: str,
     include_fit: bool,
+    storage_guard: StorageGuard | None = None,
+    storage_lock_path: Path | None = None,
+    operation: str = "unit_gpkg",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
-    temporary.unlink(missing_ok=True)
     properties = {
         "polygon_id": "str:96",
         "class_code": "int",
@@ -257,20 +380,30 @@ def _write_gpkg(
                 "properties": values,
             }
 
-    try:
-        with fiona.open(
-            temporary,
-            "w",
-            driver="GPKG",
-            layer="polygons",
-            schema=schema,
-            crs=CRS.from_user_input(crs),
-        ) as destination:
-            destination.writerecords(feature_records())
-        os.replace(temporary, path)
-    except Exception:
+    estimated_write_bytes = _estimate_record_gpkg_bytes(
+        records,
+        attribute_bytes=768 if include_fit else 384,
+    )
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        estimated_write_bytes,
+    ):
         temporary.unlink(missing_ok=True)
-        raise
+        try:
+            with fiona.open(
+                temporary,
+                "w",
+                driver="GPKG",
+                layer="polygons",
+                schema=schema,
+                crs=CRS.from_user_input(crs),
+            ) as destination:
+                destination.writerecords(feature_records())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _diagnostic_feature_records(
@@ -323,6 +456,9 @@ def _write_diagnostic_gpkg(
     unit_id: str,
     transform: Affine,
     crs: str,
+    storage_guard: StorageGuard | None = None,
+    storage_lock_path: Path | None = None,
+    operation: str = "unit_fitted_edges",
 ) -> int:
     edge_count = sum(
         1
@@ -338,7 +474,6 @@ def _write_diagnostic_gpkg(
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
-    temporary.unlink(missing_ok=True)
     schema = {
         "geometry": "LineString",
         "properties": {
@@ -355,29 +490,35 @@ def _write_diagnostic_gpkg(
             "arc_len": "float",
         },
     }
-    try:
-        with fiona.open(
-            temporary,
-            "w",
-            driver="GPKG",
-            layer="fitted_edges",
-            schema=schema,
-            crs=CRS.from_user_input(crs),
-        ) as destination:
-            destination.writerecords(
-                _diagnostic_feature_records(
-                    report,
-                    run_id=run_id,
-                    stream_id=stream_id,
-                    unit_id=unit_id,
-                    transform=transform,
-                )
-            )
-        os.replace(temporary, path)
-        return edge_count
-    except Exception:
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        _estimate_diagnostic_gpkg_bytes(report),
+    ):
         temporary.unlink(missing_ok=True)
-        raise
+        try:
+            with fiona.open(
+                temporary,
+                "w",
+                driver="GPKG",
+                layer="fitted_edges",
+                schema=schema,
+                crs=CRS.from_user_input(crs),
+            ) as destination:
+                destination.writerecords(
+                    _diagnostic_feature_records(
+                        report,
+                        run_id=run_id,
+                        stream_id=stream_id,
+                        unit_id=unit_id,
+                        transform=transform,
+                    )
+                )
+            os.replace(temporary, path)
+            return edge_count
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _smoothing_config(value: Mapping[str, Any]) -> SmoothingConfig:
@@ -766,12 +907,17 @@ def run_unit_fit(
         formal_path = output_root / f"{unit_id}_formal.gpkg"
         report_path = output_root / f"{unit_id}_report.json"
         fitted_edges_path = output_root / f"{unit_id}_fitted_edges.gpkg"
+        storage_guard = _run_storage_guard(spec, database)
+        storage_lock_path = run_dir / "tmp" / ".vector-storage-reserve.lock"
         _write_gpkg(
             raw_path,
             raw_records,
             transform=transform,
             crs=spec["raster"]["crs"],
             include_fit=False,
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            operation=f"unit_raw:{stream_id}:{unit_id}",
         )
         emit("rebuild_started", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
         _write_gpkg(
@@ -780,6 +926,9 @@ def run_unit_fit(
             transform=transform,
             crs=spec["raster"]["crs"],
             include_fit=True,
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            operation=f"unit_formal:{stream_id}:{unit_id}",
         )
         report.update(
             {
@@ -801,10 +950,11 @@ def run_unit_fit(
             unit_id=unit_id,
             transform=transform,
             crs=spec["raster"]["crs"],
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            operation=f"unit_fitted_edges:{stream_id}:{unit_id}",
         )
         report["fitted_edge_count"] = fitted_edge_count
-        from semantic_batch import _atomic_json
-
         persisted_report = {
             key: value
             for key, value in report.items()
@@ -820,7 +970,13 @@ def run_unit_fit(
             "raw_points_persisted": False,
             "fitted_points_in_json": False,
         }
-        _atomic_json(report_path, persisted_report)
+        _write_json(
+            report_path,
+            persisted_report,
+            storage_guard=storage_guard,
+            storage_lock_path=storage_lock_path,
+            operation=f"unit_report:{stream_id}:{unit_id}",
+        )
         emit("rebuild_finished", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
         artifacts = [
             ("unit_raw", raw_path),

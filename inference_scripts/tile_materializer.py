@@ -24,6 +24,9 @@ class TileMaterializationError(RuntimeError):
     pass
 
 
+TILE_MATERIALIZATION_METHOD_VERSION = "gtiff-rgb-512-v1"
+
+
 _THREAD_LOCAL = threading.local()
 
 
@@ -95,7 +98,14 @@ def _valid_existing(path: Path, expected_sha: str) -> str:
         return ""
 
 
-def _materialize_one(source_path: Path, output_dir: Path, tile: Mapping[str, Any]) -> dict[str, Any]:
+def _materialize_one(
+    source_path: Path,
+    output_dir: Path,
+    tile: Mapping[str, Any],
+    *,
+    before_write: Callable[[str, int], int | None] | None = None,
+    managed_delta: Callable[..., None] | None = None,
+) -> dict[str, Any]:
     tile_id = str(tile["tile_id"])
     row = int(tile.get("row_no", tile.get("row", 0)))
     col = int(tile.get("col_no", tile.get("col", 0)))
@@ -118,6 +128,10 @@ def _materialize_one(source_path: Path, output_dir: Path, tile: Mapping[str, Any
             "sha256": digest,
             "reused": True,
         }
+    previous_bytes = sum(
+        path.stat().st_size if path.is_file() else 0
+        for path in (output_path, metadata_path)
+    )
     source = _source(source_path)
     if source.count < 3:
         raise TileMaterializationError(f"source image must have at least 3 bands, got {source.count}")
@@ -140,6 +154,21 @@ def _materialize_one(source_path: Path, output_dir: Path, tile: Mapping[str, Any
     image = source.read((1, 2, 3), window=window, boundless=False)
     if image.shape != (3, 512, 512):
         raise TileMaterializationError(f"Tile {tile_id} read shape is {image.shape}, expected (3,512,512)")
+    if before_write is not None and managed_delta is None:
+        raise TileMaterializationError(
+            "managed write reservation requires a settlement callback"
+        )
+    reserved_growth = 0
+    if before_write is not None:
+        # The GeoTIFF is intentionally uncompressed.  Reserve the full input
+        # array plus a bounded metadata/driver allowance before creating its
+        # atomic temporary file.
+        reserved_growth = int(
+            before_write(
+                f"tile_cache:{tile_id}", int(image.nbytes) + 64 * 1024
+            )
+            or 0
+        )
     profile = source.profile.copy()
     profile.update(driver="GTiff", width=512, height=512, count=3, transform=source.window_transform(window), tiled=True, blockxsize=256, blockysize=256, compress=None, interleave="pixel", BIGTIFF="IF_SAFER")
     for key in ("photometric", "compress", "predictor"):
@@ -148,48 +177,75 @@ def _materialize_one(source_path: Path, output_dir: Path, tile: Mapping[str, Any
     temporary = output_path.with_name(
         f".{output_path.stem}.{os.getpid()}.{secrets.token_hex(4)}.tmp.tif"
     )
+    metadata_tmp: Path | None = None
     try:
         with rasterio.open(temporary, "w", **profile) as destination:
             destination.write(image)
         os.replace(temporary, output_path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    digest = _sha256(output_path)
-    if expected_sha and digest != expected_sha:
-        output_path.unlink()
-        raise TileMaterializationError(
-            f"Tile {tile_id} changed while being rematerialized"
+        digest = _sha256(output_path)
+        if expected_sha and digest != expected_sha:
+            output_path.unlink()
+            raise TileMaterializationError(
+                f"Tile {tile_id} changed while being rematerialized"
+            )
+        metadata = {"row": row, "col": col, "bounds": bounds, "crs": str(source.crs or ""), "geotransform": list(source.window_transform(window).to_gdal()), "width": 512, "height": 512, "tile_path": str(output_path), "sha256": digest}
+        metadata_tmp = metadata_path.with_name(
+            f".{metadata_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         )
-    metadata = {"row": row, "col": col, "bounds": bounds, "crs": str(source.crs or ""), "geotransform": list(source.window_transform(window).to_gdal()), "width": 512, "height": 512, "tile_path": str(output_path), "sha256": digest}
-    metadata_tmp = metadata_path.with_name(
-        f".{metadata_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-    )
-    try:
         metadata_tmp.write_text(
             json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
         os.replace(metadata_tmp, metadata_path)
+        return {
+            "tile_id": tile_id,
+            "row": row,
+            "col": col,
+            "tile_path": str(output_path),
+            "metadata_path": str(metadata_path),
+            "sha256": digest,
+            "reused": False,
+            "source_window": {
+                "x0": int(window.col_off),
+                "y0": int(window.row_off),
+                "x1": int(window.col_off + window.width),
+                "y1": int(window.row_off + window.height),
+            },
+            "source_bounds": bounds,
+            "uncompressed_bytes": int(image.nbytes),
+            "materialized_tile_bytes": int(output_path.stat().st_size),
+            "metadata_bytes": int(metadata_path.stat().st_size),
+            "materialized_cache_bytes": int(
+                output_path.stat().st_size + metadata_path.stat().st_size
+            ),
+            "materialization_method_version": (
+                TILE_MATERIALIZATION_METHOD_VERSION
+            ),
+        }
     finally:
-        try:
-            metadata_tmp.unlink()
-        except FileNotFoundError:
-            pass
-    return {
-        "tile_id": tile_id,
-        "row": row,
-        "col": col,
-        "tile_path": str(output_path),
-        "metadata_path": str(metadata_path),
-        "sha256": digest,
-        "reused": False,
-    }
+        temporary.unlink(missing_ok=True)
+        if metadata_tmp is not None:
+            metadata_tmp.unlink(missing_ok=True)
+        if managed_delta is not None and reserved_growth:
+            current_bytes = sum(
+                path.stat().st_size if path.is_file() else 0
+                for path in (output_path, metadata_path)
+            )
+            managed_delta(
+                current_bytes - previous_bytes - reserved_growth,
+                settled_write_bytes=reserved_growth,
+            )
 
 
-def materialize_package_tiles(spec: Mapping[str, Any], tiles: Sequence[Mapping[str, Any]], *, workers: int = 4, progress: Callable[[int, int, Mapping[str, Any]], None] | None = None) -> list[dict[str, Any]]:
+def materialize_package_tiles(
+    spec: Mapping[str, Any],
+    tiles: Sequence[Mapping[str, Any]],
+    *,
+    workers: int = 4,
+    progress: Callable[[int, int, Mapping[str, Any]], None] | None = None,
+    before_write: Callable[[str, int], int | None] | None = None,
+    managed_delta: Callable[..., None] | None = None,
+) -> list[dict[str, Any]]:
     source_path = Path(str((spec.get("raster") or {}).get("path") or "")).resolve()
     if not source_path.is_file():
         raise TileMaterializationError(f"source image is missing: {source_path}")
@@ -205,7 +261,19 @@ def materialize_package_tiles(spec: Mapping[str, Any], tiles: Sequence[Mapping[s
     worker_count = max(1, min(int(workers), total, 16))
     results = []
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        for current, result in enumerate(executor.map(lambda item: _materialize_one(source_path, output_dir, item), values), start=1):
+        for current, result in enumerate(
+            executor.map(
+                lambda item: _materialize_one(
+                    source_path,
+                    output_dir,
+                    item,
+                    before_write=before_write,
+                    managed_delta=managed_delta,
+                ),
+                values,
+            ),
+            start=1,
+        ):
             results.append(result)
             if progress is not None:
                 progress(current, total, result)

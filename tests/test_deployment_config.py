@@ -161,6 +161,32 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
     )
 
 
+def test_score_cache_budget_accepts_auto_and_rejects_invalid_values(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    config["scaling"]["score_cache_budget_gb"] = "auto"
+    effective, issues = validate_deployment_config(
+        config,
+        scripts_dir=scripts,
+        verify_files=True,
+        verify_hashes=True,
+    )
+    assert issues == []
+    assert effective["scaling"]["score_cache_budget_gb"] == "auto"
+
+    for invalid in (0, -1, "unlimited"):
+        config["scaling"]["score_cache_budget_gb"] = invalid
+        _effective, issues = validate_deployment_config(
+            config,
+            scripts_dir=scripts,
+            verify_files=True,
+            verify_hashes=True,
+        )
+        assert any(
+            issue.path == "/scaling/score_cache_budget_gb"
+            for issue in issues
+        )
+
+
 def test_auto_performance_fields_are_valid_schema_values(tmp_path):
     scripts, config, _ = _workspace(tmp_path)
     config["runtime"]["tile_batch_size"] = "auto"

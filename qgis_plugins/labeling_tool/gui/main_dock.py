@@ -121,11 +121,17 @@ from ..gui.inference_monitor import InferenceMonitorDialog
 from ..gui.inference_config_dialog import InferenceConfigDialog
 from ..gui.class_refinement_dialog import ClassRefinementDialog
 from ..core.v5_async_runner import V5AsyncInferenceRunner
+from ..core.tile_cache_probe_runner import TileCacheProbeRunner
 from ..core.model_registry import ModelRegistry
 from ..core.run_builder_v5 import create_v5_run
 from ..core.run_spec import reserve_run_directory, run_tile_cache_dir
 from ..core import run_index
-from ..core.work_package_planner import storage_preflight
+from ..core.work_package_planner import (
+    fusion_accumulator_bytes_per_tile,
+    permanent_output_reserve,
+    resolve_frozen_tile_batch_size,
+    storage_preflight,
+)
 from ..core.environment_report import compact_problem, format_check_details
 from ..core.result_catalog import valid_ready_stream_ids
 from ..core.run_state_db import RunStateDB
@@ -184,6 +190,7 @@ class LabelingDockWidget(QgsDockWidget):
         self._pipeline_state = "idle"
         self._pipeline_stage_total = 0
         self._tile_extractor = None
+        self._tile_cache_probe = None
         self._pending_run = None
         self._cleaning_up = False
         self.monitor_dialog = InferenceMonitorDialog(self)
@@ -1173,6 +1180,8 @@ class LabelingDockWidget(QgsDockWidget):
         self._refresh_processing_extent_preview()
 
     def _on_start(self):
+        if self._pipeline_running:
+            return
         report = self.config_manager.last_report
         scripts_dir = self.script_path_edit.text().strip()
         if not report or self.config_manager.is_stale(scripts_dir):
@@ -1452,6 +1461,67 @@ class LabelingDockWidget(QgsDockWidget):
         self._release_tile_extractor()
         if self._pipeline_state != "extracting" or not self._pending_run:
             return
+        try:
+            active_tiles = sorted(
+                self._current_tiles,
+                key=lambda item: (int(item["row"]), int(item["col"])),
+            )
+            if not active_tiles:
+                raise ValueError("当前选择范围内没有可用于存储预检的 active Tile")
+            sample = active_tiles[0]
+            row = int(sample["row"])
+            col = int(sample["col"])
+            request = {
+                "tile_id": f"{row}_{col}",
+                "row_no": row,
+                "col_no": col,
+                "bounds": self._extent_as_dict(sample["bounds"]),
+            }
+            ctx = self._pending_run
+            raster_path = ctx["raster"].source().split("|", 1)[0]
+            probe = TileCacheProbeRunner(
+                self.script_path_edit.text().strip(), parent=self
+            )
+            probe.succeeded.connect(self._on_tile_cache_probe_ready)
+            probe.failed.connect(self._on_tile_cache_probe_failed)
+            self._tile_cache_probe = probe
+            self._pipeline_state = "preflighting"
+            self._apply_stage_progress({
+                "key": "extraction",
+                "name": "存储预检",
+                "index": 1,
+                "stage_total": self._pipeline_stage_total,
+                "current": 0,
+                "total": 1,
+                "message": (
+                    f"正在用正式物化路径测量真实 Tile ({row},{col}) 缓存字节"
+                ),
+            })
+            probe.start(
+                raster_path=raster_path,
+                output_root=ctx["output_dir"],
+                tile=request,
+            )
+        except Exception as exc:
+            self._release_tile_cache_probe(cancel=True)
+            self._finish_before_inference("Tile 存储预检失败", str(exc))
+
+    def _on_tile_cache_probe_ready(self, measurement):
+        self._release_tile_cache_probe()
+        if self._pipeline_state != "preflighting" or not self._pending_run:
+            return
+        self._pending_run["tile_cache_sample"] = dict(measurement)
+        self._start_inference_after_tile_cache_probe()
+
+    def _on_tile_cache_probe_failed(self, message):
+        self._release_tile_cache_probe()
+        if self._pipeline_state != "preflighting" or not self._pending_run:
+            return
+        self._finish_before_inference("Tile 存储预检失败", str(message))
+
+    def _start_inference_after_tile_cache_probe(self):
+        if self._pipeline_state != "preflighting" or not self._pending_run:
+            return
         self._pipeline_state = "inferencing"
         ctx = self._pending_run
         effective = ctx["effective"]
@@ -1478,30 +1548,67 @@ class LabelingDockWidget(QgsDockWidget):
                     int(ctx["overlap"]), int(scaling.get("seam_band_px", 64))
                 )
             pixel_count = 512 * 512
-            raster_path = ctx["raster"].source().split("|", 1)[0]
-            raster_pixels = max(
-                1, int(ctx["raster"].width()) * int(ctx["raster"].height())
+            tile_cache_sample = dict(ctx.get("tile_cache_sample") or {})
+            sample_tile_bytes = int(
+                tile_cache_sample.get("materialized_cache_bytes") or 0
             )
-            source_bytes = os.path.getsize(raster_path)
-            sample_tile_bytes = max(
-                int(source_bytes * pixel_count / raster_pixels),
-                pixel_count * 3,
-            )
+            if sample_tile_bytes <= 0:
+                raise ValueError("真实 Tile 探针没有返回有效缓存字节数")
             stream_count = len(selected_models) + (1 if fusion else 0)
             grid_tiles = list(ctx.get("grid_tiles") or [])
+            tile_rows = max(int(tile["row"]) for tile in grid_tiles) + 1
+            tile_cols = max(int(tile["col"]) for tile in grid_tiles) + 1
+            spatial_plan = plan_spatial_units(
+                tile_rows=tile_rows,
+                tile_cols=tile_cols,
+                tile_size=512,
+                overlap=int(ctx["overlap"]),
+                partition_tile_rows=int(scaling["partition_tile_rows"]),
+                partition_tile_cols=int(scaling["partition_tile_cols"]),
+                seam_band_px=int(scaling["seam_band_px"]),
+                halo_px=int(scaling["partition_halo_px"]),
+            )
+            permanent = permanent_output_reserve(
+                spatial_plan,
+                stream_count=stream_count,
+            )
+            resolved_resources = (
+                (effective.get("resource_tuning") or {}).get("resolved") or {}
+            )
+            tile_batch_size = resolve_frozen_tile_batch_size(
+                registry.runtime["tile_batch_size"],
+                resolved_resources.get("tile_batch_size"),
+            )
+            selected_batch_sizes = [
+                max(
+                    1,
+                    int(
+                        (
+                            resolved_resources.get("tile_batch_size_by_model")
+                            or {}
+                        ).get(model["model_id"], tile_batch_size)
+                    ),
+                )
+                for model in selected_models
+            ]
+            storage_batch_size = max(selected_batch_sizes, default=tile_batch_size)
             storage = storage_preflight(
                 ctx["output_dir"],
                 tile_count=len(self._current_tiles),
                 stream_count=stream_count,
-                # Mask is highly compressible categorical int16; confidence is
-                # a DEFLATE-compressed float32. Four bytes/pixel is the bounded
-                # on-disk planning estimate for the permanent pair.
-                permanent_bytes_per_tile_per_stream=pixel_count * 4,
+                permanent_raster_bytes=permanent["permanent_raster_bytes"],
+                vector_output_reserve_bytes=permanent[
+                    "vector_output_reserve_bytes"
+                ],
+                permanent_core_pixel_count=permanent["core_pixel_count"],
                 input_tile_bytes_per_tile=sample_tile_bytes,
-                score_cache_budget_gb=float(scaling["score_cache_budget_gb"]),
+                score_cache_budget_gb=scaling["score_cache_budget_gb"],
                 min_free_disk_gb=float(scaling["min_free_disk_gb"]),
                 current_model_probability_bytes=pixel_count * 14 * 2,
-                fusion_accumulator_bytes=pixel_count * 15 * 4 if fusion else 0,
+                fusion_accumulator_bytes=fusion_accumulator_bytes_per_tile(
+                    (fusion or {}).get("profile"),
+                    pixel_count=pixel_count,
+                ),
                 mask_confidence_workspace_bytes=pixel_count * (14 * 4 + 5),
                 safety_margin_bytes=sample_tile_bytes,
                 # During atomic replacement, the committed checkpoint and the
@@ -1510,9 +1617,17 @@ class LabelingDockWidget(QgsDockWidget):
                     pixel_count
                     * 14
                     * 2
-                    * max(1, int(registry.runtime["tile_batch_size"]))
+                    * storage_batch_size
                 ),
+                tile_batch_size=storage_batch_size,
             )
+            storage["input_tile_sample"] = tile_cache_sample
+            scaling["score_cache_budget_mode"] = storage[
+                "score_cache_budget_mode"
+            ]
+            scaling["score_cache_budget_gb"] = storage[
+                "resolved_score_cache_budget_gb"
+            ]
             stride = 512 - int(ctx["overlap"])
             accepted_tile_ids = {
                 (int(tile["row"]), int(tile["col"]))
@@ -1573,17 +1688,15 @@ class LabelingDockWidget(QgsDockWidget):
                 },
                 requested_extent=self._extent_as_dict(ctx["extent"]),
                 processing_extent=self._extent_as_dict(processing_extent),
-                tile_rows=max(int(tile["row"]) for tile in grid_tiles) + 1,
-                tile_cols=max(int(tile["col"]) for tile in grid_tiles) + 1,
+                tile_rows=tile_rows,
+                tile_cols=tile_cols,
                 tiles=normalized_tiles,
                 models=selected_models,
                 effective_device=(effective.get("runtime") or {}).get("effective_device", "cpu"),
                 keep_score_cache=bool(
                     (effective.get("runtime") or {}).get("keep_score_cache", False)
                 ),
-                tile_batch_size=int(
-                    (effective.get("runtime") or {}).get("tile_batch_size", 1)
-                ),
+                tile_batch_size=tile_batch_size,
                 resource_tuning=effective.get("resource_tuning") or {},
                 overlap=ctx["overlap"],
                 scaling=scaling,
@@ -1717,6 +1830,7 @@ class LabelingDockWidget(QgsDockWidget):
 
     def _on_tile_extraction_stopped(self):
         self._release_tile_extractor()
+        self._release_tile_cache_probe(cancel=True)
         self._pipeline_running = False
         self._pipeline_state = "finished"
         self._pending_run = None
@@ -1732,7 +1846,16 @@ class LabelingDockWidget(QgsDockWidget):
         if extractor is not None:
             extractor.deleteLater()
 
+    def _release_tile_cache_probe(self, *, cancel=False):
+        probe = self._tile_cache_probe
+        self._tile_cache_probe = None
+        if probe is not None:
+            if cancel:
+                probe.cleanup()
+            probe.deleteLater()
+
     def _finish_before_inference(self, title, message):
+        self._release_tile_cache_probe(cancel=True)
         self._pipeline_running = False
         self._pipeline_state = "finished"
         self._pending_run = None
@@ -1751,7 +1874,9 @@ class LabelingDockWidget(QgsDockWidget):
         self.progress_bar.setFormat(text)
 
     def _on_stop(self):
-        if self._pipeline_state not in ("extracting", "inferencing"):
+        if self._pipeline_state not in (
+            "extracting", "preflighting", "inferencing"
+        ):
             if self.monitor_dialog is not None:
                 self.monitor_dialog.mark_finished("无任务运行")
             return
@@ -1761,6 +1886,10 @@ class LabelingDockWidget(QgsDockWidget):
         if self._pipeline_state == "extracting" and self._tile_extractor:
             self._pipeline_state = "stopping"
             self._tile_extractor.stop()
+        elif self._pipeline_state == "preflighting" and self._tile_cache_probe:
+            self._pipeline_state = "stopping"
+            self._release_tile_cache_probe(cancel=True)
+            self._on_tile_extraction_stopped()
         elif self._pipeline_state == "inferencing" and self.runner:
             self._pipeline_state = "stopping"
             self.runner.stop()
@@ -2693,6 +2822,9 @@ class LabelingDockWidget(QgsDockWidget):
         if self._tile_extractor is not None:
             self._tile_extractor.stop()
             self._tile_extractor = None
+        if self._tile_cache_probe is not None:
+            self._tile_cache_probe.cleanup()
+            self._tile_cache_probe = None
         if self.refinement_dialog is not None:
             self.refinement_dialog.cleanup()
 

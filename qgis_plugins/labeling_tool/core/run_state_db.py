@@ -549,6 +549,24 @@ class RunStateDB:
             result.append(item)
         return result
 
+    def partitions_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        """Return every Run Partition in deterministic row/column order."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM partitions WHERE run_id=?
+                   ORDER BY row_no, col_no""",
+                (str(run_id),),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["row"] = item.pop("row_no")
+            item["col"] = item.pop("col_no")
+            item["core_window"] = json.loads(item.pop("core_window_json"))
+            item["halo_window"] = json.loads(item.pop("halo_window_json"))
+            result.append(item)
+        return result
+
     def get_partition(self, run_id: str, partition_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1102,6 +1120,44 @@ class RunStateDB:
                 ).fetchone()
             )
 
+    def _lease_selected_job(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        worker_id: str,
+        token: str,
+        expires: float,
+        now: str,
+    ) -> dict[str, Any]:
+        """Lease one selected Job and its Work Package in one transaction."""
+        job_id = int(row["job_id"])
+        updated = connection.execute(
+            """UPDATE jobs SET status='running', attempt=attempt+1,
+               worker_id=?, lease_token=?, lease_expires=?, heartbeat_at=?,
+               updated_at=? WHERE job_id=?
+               AND status IN ('queued','interrupted') AND attempt < max_attempts""",
+            (str(worker_id), token, expires, now, now, job_id),
+        )
+        if updated.rowcount != 1:
+            raise RunStateError("Job state changed during lease acquisition")
+        if str(row["job_type"]) == "work_package":
+            package_updated = connection.execute(
+                """UPDATE work_packages SET status='running', updated_at=?
+                   WHERE run_id=? AND package_id=?
+                     AND status IN ('queued','interrupted')""",
+                (now, str(row["run_id"]), str(row["package_id"])),
+            )
+            if package_updated.rowcount != 1:
+                raise RunStateError(
+                    "Work Package state changed during lease acquisition"
+                )
+        leased = connection.execute(
+            "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if leased is None:
+            raise RunStateError("leased Job disappeared during lease acquisition")
+        return dict(leased)
+
     def lease_next_job(
         self,
         run_id: str,
@@ -1118,10 +1174,23 @@ class RunStateDB:
             "AND status IN ('queued','interrupted') AND attempt < max_attempts "
             "AND EXISTS (SELECT 1 FROM runs r WHERE r.run_id=jobs.run_id "
             "AND r.status IN ('preflight','planned','running','raster_ready')) "
+            "AND (job_type!='work_package' OR EXISTS ("
+            " SELECT 1 FROM work_packages wp WHERE wp.run_id=jobs.run_id"
+            " AND wp.package_id=jobs.package_id"
+            " AND wp.status IN ('queued','interrupted'))) "
             "AND (job_type!='unit_fit' OR "
-            "(SELECT COUNT(*) FROM artifact_dependencies ad WHERE ad.job_id=jobs.job_id)="
-            "(SELECT COUNT(*) FROM unit_dependencies ud "
-            " WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id))"
+            "((SELECT COUNT(*) FROM artifact_dependencies ad"
+            " WHERE ad.job_id=jobs.job_id)="
+            " (SELECT COUNT(*) FROM unit_dependencies ud"
+            " WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)"
+            " AND NOT EXISTS ("
+            "  SELECT 1 FROM unit_dependencies ud"
+            "  LEFT JOIN partitions p ON p.run_id=ud.run_id"
+            "   AND p.partition_id=ud.partition_id"
+            "  LEFT JOIN work_packages wp ON wp.run_id=p.run_id"
+            "   AND wp.package_id=p.package_id"
+            "  WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id"
+            "   AND COALESCE(wp.status,'')!='ready')))"
         )
         values: list[Any] = [str(run_id)]
         if job_types:
@@ -1132,18 +1201,8 @@ class RunStateDB:
             row = connection.execute(sql, values).fetchone()
             if row is None:
                 return None
-            updated = connection.execute(
-                """UPDATE jobs SET status='running', attempt=attempt+1,
-                   worker_id=?, lease_token=?, lease_expires=?, heartbeat_at=?,
-                   updated_at=? WHERE job_id=? AND status IN ('queued','interrupted')""",
-                (str(worker_id), token, expires, now, now, int(row["job_id"])),
-            )
-            if updated.rowcount != 1:
-                return None
-            return _row_dict(
-                connection.execute(
-                    "SELECT * FROM jobs WHERE job_id=?", (int(row["job_id"]),)
-                ).fetchone()
+            return self._lease_selected_job(
+                connection, row, worker_id, token, expires, now
             )
 
     def lease_next_work_package(
@@ -1174,14 +1233,17 @@ class RunStateDB:
                                 'preflight','planned','running','raster_ready'
                               )
                           )
+                          AND wp.status IN ('queued','interrupted')
                           AND j.package_id IN ({placeholders})
                         ORDER BY j.priority DESC, wp.sequence_no, j.job_id LIMIT 1""",
                     [str(run_id), *preferred],
                 ).fetchone()
             if row is not None:
-                return self.lease_job(
+                leased = self.lease_job(
                     int(row["job_id"]), worker_id, lease_seconds=lease_seconds
                 )
+                if leased is not None:
+                    return leased
         return self.lease_next_job(
             run_id,
             worker_id,
@@ -1209,27 +1271,34 @@ class RunStateDB:
                          'preflight','planned','running','raster_ready'
                        )
                    )
+                   AND (job_type!='work_package' OR EXISTS (
+                     SELECT 1 FROM work_packages wp
+                     WHERE wp.run_id=jobs.run_id
+                       AND wp.package_id=jobs.package_id
+                       AND wp.status IN ('queued','interrupted')
+                   ))
                    AND (job_type!='unit_fit' OR
-                     (SELECT COUNT(*) FROM artifact_dependencies ad
-                      WHERE ad.job_id=jobs.job_id)=
-                     (SELECT COUNT(*) FROM unit_dependencies ud
-                      WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id))""",
+                     ((SELECT COUNT(*) FROM artifact_dependencies ad
+                       WHERE ad.job_id=jobs.job_id)=
+                      (SELECT COUNT(*) FROM unit_dependencies ud
+                       WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM unit_dependencies ud
+                        LEFT JOIN partitions p
+                          ON p.run_id=ud.run_id
+                         AND p.partition_id=ud.partition_id
+                        LEFT JOIN work_packages wp
+                          ON wp.run_id=p.run_id AND wp.package_id=p.package_id
+                        WHERE ud.run_id=jobs.run_id
+                          AND ud.unit_id=jobs.unit_id
+                          AND COALESCE(wp.status,'')!='ready'
+                      )))""",
                 (int(job_id),),
             ).fetchone()
             if row is None:
                 return None
-            updated = connection.execute(
-                """UPDATE jobs SET status='running', attempt=attempt+1,
-                   worker_id=?, lease_token=?, lease_expires=?, heartbeat_at=?,
-                   updated_at=? WHERE job_id=? AND status IN ('queued','interrupted')""",
-                (str(worker_id), token, expires, now, now, int(job_id)),
-            )
-            if updated.rowcount != 1:
-                return None
-            return _row_dict(
-                connection.execute(
-                    "SELECT * FROM jobs WHERE job_id=?", (int(job_id),)
-                ).fetchone()
+            return self._lease_selected_job(
+                connection, row, worker_id, token, expires, now
             )
 
     def heartbeat(
@@ -1242,12 +1311,14 @@ class RunStateDB:
         lease_seconds: float = 60.0,
     ) -> bool:
         now = _now()
-        expires = time.time() + max(1.0, float(lease_seconds))
+        fence_time = time.time()
+        expires = fence_time + max(1.0, float(lease_seconds))
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET progress_current=?, progress_total=?,
                    heartbeat_at=?, lease_expires=?, updated_at=?
-                   WHERE job_id=? AND status='running' AND lease_token=?""",
+                   WHERE job_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
                 (
                     max(0, int(current)),
                     max(0, int(total)),
@@ -1256,6 +1327,7 @@ class RunStateDB:
                     now,
                     int(job_id),
                     str(lease_token),
+                    fence_time,
                 ),
             ).rowcount == 1
 
@@ -1270,19 +1342,344 @@ class RunStateDB:
         if status not in {"ready", "failed", "stopped"}:
             raise ValueError(f"invalid terminal job status: {status}")
         now = _now()
+        fence_time = time.time()
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET status=?, error=?, worker_id='',
                    lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE job_id=? AND status='running' AND lease_token=?""",
-                (str(status), str(error), now, now, int(job_id), str(lease_token)),
+                   WHERE job_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    str(status),
+                    str(error),
+                    now,
+                    now,
+                    int(job_id),
+                    str(lease_token),
+                    fence_time,
+                ),
             ).rowcount == 1
+
+    def work_package_job_holds_lease(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+    ) -> bool:
+        """Return whether the exact Package job currently owns this lease."""
+        token = str(lease_token)
+        if not token:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM jobs
+                   WHERE job_id=? AND run_id=? AND job_type='work_package'
+                     AND package_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    int(job_id),
+                    str(run_id),
+                    str(package_id),
+                    token,
+                    time.time(),
+                ),
+            ).fetchone()
+        return row is not None
+
+    def transition_work_package_job(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+        status: str,
+        error: str = "",
+    ) -> bool:
+        """Atomically transition a Package and its exact leased job.
+
+        Only the current, unexpired ``job_id``/``lease_token`` pair may change
+        either row. A stale worker, a job for another Package, or a lost lease
+        changes neither row. Both updates share one ``BEGIN IMMEDIATE``
+        transaction so the Package and control-plane Job cannot diverge.
+        """
+        target = str(status)
+        if target not in {"ready", "failed", "interrupted"}:
+            raise ValueError(
+                f"invalid Work Package/job transition status: {target}"
+            )
+        identifier = str(run_id)
+        package = str(package_id)
+        token = str(lease_token)
+        if not token:
+            return False
+        now = _now()
+        fence_time = time.time()
+        job_error = "" if target == "ready" else str(error)
+        with self.transaction() as connection:
+            matching = connection.execute(
+                """SELECT 1 FROM jobs
+                   WHERE job_id=? AND run_id=? AND job_type='work_package'
+                     AND package_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (int(job_id), identifier, package, token, fence_time),
+            ).fetchone()
+            package_running = connection.execute(
+                """SELECT 1 FROM work_packages
+                   WHERE run_id=? AND package_id=? AND status='running'""",
+                (identifier, package),
+            ).fetchone()
+            if matching is None or package_running is None:
+                return False
+            package_update = connection.execute(
+                """UPDATE work_packages SET status=?, updated_at=?
+                   WHERE run_id=? AND package_id=? AND status='running'""",
+                (target, now, identifier, package),
+            )
+            job_update = connection.execute(
+                """UPDATE jobs SET status=?, error=?, worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   , attempt=CASE WHEN ?='interrupted'
+                                  THEN MAX(0, attempt-1) ELSE attempt END
+                   WHERE job_id=? AND run_id=? AND job_type='work_package'
+                     AND package_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    target,
+                    job_error,
+                    now,
+                    now,
+                    target,
+                    int(job_id),
+                    identifier,
+                    package,
+                    token,
+                    fence_time,
+                ),
+            )
+            if package_update.rowcount != 1 or job_update.rowcount != 1:
+                raise RunStateError(
+                    "Work Package/job state changed during atomic transition"
+                )
+            return True
+
+    def complete_work_package_job(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+    ) -> bool:
+        """Atomically mark a Package and its exact leased job ready."""
+        return self.transition_work_package_job(
+            run_id, package_id, job_id, lease_token, status="ready"
+        )
+
+    def fail_work_package_job(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+        *,
+        error: str = "",
+    ) -> bool:
+        """Atomically fail a Package and its exact leased job."""
+        return self.transition_work_package_job(
+            run_id,
+            package_id,
+            job_id,
+            lease_token,
+            status="failed",
+            error=error,
+        )
+
+    def interrupt_work_package_job(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+        *,
+        error: str = "",
+    ) -> bool:
+        """Atomically interrupt a Package and its exact leased job."""
+        return self.transition_work_package_job(
+            run_id,
+            package_id,
+            job_id,
+            lease_token,
+            status="interrupted",
+            error=error,
+        )
+
+    def fail_or_requeue_work_package_job(
+        self,
+        run_id: str,
+        package_id: str,
+        job_id: int,
+        lease_token: str,
+        error: str = "",
+    ) -> str | None:
+        """Atomically fail or requeue the exact leased Package attempt.
+
+        Returns ``queued`` while another attempt remains, ``failed`` when the
+        attempt limit is exhausted, and ``None`` when the lease fence no longer
+        belongs to the caller. A stale worker therefore cannot alter the
+        Package currently owned by a newer lease.
+        """
+        identifier = str(run_id)
+        package = str(package_id)
+        token = str(lease_token)
+        if not token:
+            return None
+        now = _now()
+        fence_time = time.time()
+        with self.transaction() as connection:
+            leased = connection.execute(
+                """SELECT attempt, max_attempts FROM jobs
+                   WHERE job_id=? AND run_id=? AND job_type='work_package'
+                     AND package_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (int(job_id), identifier, package, token, fence_time),
+            ).fetchone()
+            package_running = connection.execute(
+                """SELECT 1 FROM work_packages
+                   WHERE run_id=? AND package_id=? AND status='running'""",
+                (identifier, package),
+            ).fetchone()
+            if leased is None or package_running is None:
+                return None
+            target = (
+                "queued"
+                if int(leased["attempt"]) < int(leased["max_attempts"])
+                else "failed"
+            )
+            package_update = connection.execute(
+                """UPDATE work_packages SET status=?, updated_at=?
+                   WHERE run_id=? AND package_id=? AND status='running'""",
+                (target, now, identifier, package),
+            )
+            job_update = connection.execute(
+                """UPDATE jobs SET status=?, error=?, worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   WHERE job_id=? AND run_id=? AND job_type='work_package'
+                     AND package_id=? AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    target,
+                    "" if target == "queued" else str(error),
+                    now,
+                    now,
+                    int(job_id),
+                    identifier,
+                    package,
+                    token,
+                    fence_time,
+                ),
+            )
+            if package_update.rowcount != 1 or job_update.rowcount != 1:
+                raise RunStateError(
+                    "Work Package/job state changed during atomic retry decision"
+                )
+            return target
+
+    def interrupt_work_package_worker(
+        self,
+        run_id: str,
+        worker_id: str,
+    ) -> int:
+        """Atomically interrupt every running Package owned by one worker.
+
+        Worker IDs are unique to a runner instance. Jobs already re-leased to
+        another worker do not match and their Package rows remain untouched.
+        """
+        identifier = str(run_id)
+        worker = str(worker_id)
+        if not worker:
+            return 0
+        now = _now()
+        with self.transaction() as connection:
+            leased = connection.execute(
+                """SELECT job_id, package_id, lease_token FROM jobs
+                   WHERE run_id=? AND job_type='work_package'
+                     AND status='running' AND worker_id=?
+                   ORDER BY job_id""",
+                (identifier, worker),
+            ).fetchall()
+            for row in leased:
+                package_update = connection.execute(
+                    """UPDATE work_packages SET status='interrupted', updated_at=?
+                       WHERE run_id=? AND package_id=? AND status='running'
+                         AND EXISTS (
+                           SELECT 1 FROM jobs
+                           WHERE job_id=? AND run_id=?
+                             AND job_type='work_package' AND package_id=?
+                             AND status='running' AND worker_id=?
+                             AND lease_token=?
+                         )""",
+                    (
+                        now,
+                        identifier,
+                        str(row["package_id"]),
+                        int(row["job_id"]),
+                        identifier,
+                        str(row["package_id"]),
+                        worker,
+                        str(row["lease_token"]),
+                    ),
+                )
+                job_update = connection.execute(
+                    """UPDATE jobs SET status='interrupted', worker_id='',
+                       lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                       , attempt=MAX(0, attempt-1)
+                       WHERE job_id=? AND run_id=? AND job_type='work_package'
+                         AND package_id=? AND status='running' AND worker_id=?
+                         AND lease_token=?""",
+                    (
+                        now,
+                        now,
+                        int(row["job_id"]),
+                        identifier,
+                        str(row["package_id"]),
+                        worker,
+                        str(row["lease_token"]),
+                    ),
+                )
+                if package_update.rowcount != 1 or job_update.rowcount != 1:
+                    raise RunStateError(
+                        "Work Package/job state changed during worker interruption"
+                    )
+            return len(leased)
+
+    def recover_ready_work_package_jobs(self, run_id: str) -> int:
+        """Heal the legacy crash window where Package was ready before its job.
+
+        Older workers committed the two rows separately.  A Package marked
+        ready was written only after all formal Package outputs had committed,
+        so its corresponding control-plane job can be finalized without
+        rerunning models.  New workers do not create this state.
+        """
+        now = _now()
+        with self.transaction() as connection:
+            return connection.execute(
+                """UPDATE jobs SET status='ready', error='', worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   WHERE run_id=? AND job_type='work_package' AND status!='ready'
+                     AND EXISTS (
+                       SELECT 1 FROM work_packages wp
+                       WHERE wp.run_id=jobs.run_id
+                         AND wp.package_id=jobs.package_id
+                         AND wp.status='ready'
+                     )""",
+                (now, now, str(run_id)),
+            ).rowcount
 
     def interrupt_job(self, job_id: int, lease_token: str) -> bool:
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='', lease_token='',
-                   lease_expires=NULL, updated_at=?
+                   lease_expires=NULL, updated_at=?, attempt=MAX(0, attempt-1)
                    WHERE job_id=? AND status='running' AND lease_token=?""",
                 (_now(), int(job_id), str(lease_token)),
             ).rowcount == 1
@@ -1300,9 +1697,23 @@ class RunStateDB:
         now_value = time.time() if now_epoch is None else float(now_epoch)
         now = _now()
         with self.transaction() as connection:
+            connection.execute(
+                """UPDATE work_packages SET status='interrupted', updated_at=?
+                   WHERE status='running' AND EXISTS (
+                     SELECT 1 FROM jobs
+                     WHERE jobs.run_id=work_packages.run_id
+                       AND jobs.package_id=work_packages.package_id
+                       AND jobs.job_type='work_package'
+                       AND jobs.status='running'
+                       AND jobs.lease_expires IS NOT NULL
+                       AND jobs.lease_expires < ?
+                   )""",
+                (now, now_value),
+            )
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?
+                   lease_token='', lease_expires=NULL, updated_at=?,
+                   attempt=MAX(0, attempt-1)
                    WHERE status='running' AND lease_expires IS NOT NULL
                    AND lease_expires < ?""",
                 (now, now_value),
@@ -1310,12 +1721,26 @@ class RunStateDB:
 
     def interrupt_run_jobs(self, run_id: str) -> int:
         """Recover only the selected run after a QGIS/process interruption."""
+        identifier = str(run_id)
+        now = _now()
         with self.transaction() as connection:
+            connection.execute(
+                """UPDATE work_packages SET status='interrupted', updated_at=?
+                   WHERE run_id=? AND status='running' AND EXISTS (
+                     SELECT 1 FROM jobs
+                     WHERE jobs.run_id=work_packages.run_id
+                       AND jobs.package_id=work_packages.package_id
+                       AND jobs.job_type='work_package'
+                       AND jobs.status='running'
+                   )""",
+                (now, identifier),
+            )
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?
+                   lease_token='', lease_expires=NULL, updated_at=?,
+                   attempt=MAX(0, attempt-1)
                    WHERE run_id=? AND status='running'""",
-                (_now(), str(run_id)),
+                (now, identifier),
             ).rowcount
 
     def begin_failed_package_reset(self, run_id: str) -> dict[str, Any]:
@@ -1355,32 +1780,52 @@ class RunStateDB:
             connection.execute(
                 "CREATE TEMP TABLE reset_packages(package_id TEXT PRIMARY KEY)"
             )
-            connection.execute(
-                """INSERT OR IGNORE INTO reset_packages(package_id)
-                   SELECT package_id FROM work_packages
-                   WHERE run_id=? AND status IN ('failed','resetting')""",
-                (identifier,),
-            )
-            connection.execute(
-                """INSERT OR IGNORE INTO reset_packages(package_id)
-                   SELECT package_id FROM jobs
-                   WHERE run_id=? AND job_type='work_package'
-                     AND status IN ('failed','resetting') AND package_id!=''""",
-                (identifier,),
-            )
-            connection.execute(
-                """INSERT OR IGNORE INTO reset_packages(package_id)
-                   SELECT DISTINCT p.package_id
-                   FROM jobs j
-                   JOIN unit_dependencies d
-                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   JOIN partitions p
-                     ON p.run_id=d.run_id AND p.partition_id=d.partition_id
-                   WHERE j.run_id=? AND j.job_type='unit_fit'
-                     AND j.status IN ('failed','resetting')
-                     AND p.package_id IS NOT NULL""",
-                (identifier,),
-            )
+            if run_status == "resetting":
+                # A resumed filesystem cleanup must retain the exact Package
+                # set frozen by the first call.  Its downstream unit_fit Jobs
+                # are also marked resetting, but using those units to discover
+                # Packages again would incorrectly absorb ready neighbours of
+                # a cross-Package Seam/Junction.
+                connection.execute(
+                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                       SELECT package_id FROM work_packages
+                       WHERE run_id=? AND status='resetting'""",
+                    (identifier,),
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                       SELECT package_id FROM jobs
+                       WHERE run_id=? AND job_type='work_package'
+                         AND status='resetting' AND package_id!=''""",
+                    (identifier,),
+                )
+            else:
+                connection.execute(
+                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                       SELECT package_id FROM work_packages
+                       WHERE run_id=? AND status='failed'""",
+                    (identifier,),
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                       SELECT package_id FROM jobs
+                       WHERE run_id=? AND job_type='work_package'
+                         AND status='failed' AND package_id!=''""",
+                    (identifier,),
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                       SELECT DISTINCT p.package_id
+                       FROM jobs j
+                       JOIN unit_dependencies d
+                         ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                       JOIN partitions p
+                         ON p.run_id=d.run_id AND p.partition_id=d.partition_id
+                       WHERE j.run_id=? AND j.job_type='unit_fit'
+                         AND j.status='failed'
+                         AND p.package_id IS NOT NULL""",
+                    (identifier,),
+                )
             package_ids = [
                 str(row["package_id"])
                 for row in connection.execute(
@@ -2367,12 +2812,21 @@ class RunStateDB:
             )
             return int(cursor.lastrowid)
 
-    def job_counts(self, run_id: str, *, stream_id: str = "") -> dict[str, int]:
+    def job_counts(
+        self,
+        run_id: str,
+        *,
+        stream_id: str = "",
+        job_type: str = "",
+    ) -> dict[str, int]:
         sql = "SELECT status, COUNT(*) AS n FROM jobs WHERE run_id=?"
         values: list[Any] = [str(run_id)]
         if stream_id:
             sql += " AND stream_id=?"
             values.append(str(stream_id))
+        if job_type:
+            sql += " AND job_type=?"
+            values.append(str(job_type))
         sql += " GROUP BY status"
         with self._connect() as connection:
             return {

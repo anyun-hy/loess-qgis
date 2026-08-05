@@ -14,6 +14,7 @@ import numpy as np
 
 
 CLASS_COUNT = 14
+CHECKPOINT_WRITE_OVERHEAD_BYTES = 1024 * 1024
 
 
 class ScoreBatchCacheError(RuntimeError):
@@ -21,7 +22,9 @@ class ScoreBatchCacheError(RuntimeError):
 
 
 class ScoreBatchDiskReserveError(ScoreBatchCacheError):
-    pass
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        self.transient = bool(transient)
+        super().__init__(str(message))
 
 
 def _sha256_file(path: Path) -> str:
@@ -206,6 +209,9 @@ def write_checkpoint(
     items: Sequence[Mapping[str, Any]],
     probabilities: np.ndarray,
     min_free_bytes: int = 0,
+    additional_free_reserve_bytes: int = 0,
+    managed_cache_bytes: int = 0,
+    managed_cache_budget_bytes: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink():
@@ -216,12 +222,29 @@ def write_checkpoint(
         raise ScoreBatchCacheError(
             f"checkpoint probability shape must be {expected_shape}, got {array.shape}"
         )
-    required_free = int(min_free_bytes) + int(array.nbytes)
+    estimated_write_bytes = int(array.nbytes) + CHECKPOINT_WRITE_OVERHEAD_BYTES
+    projected_managed_cache = int(managed_cache_bytes) + estimated_write_bytes
+    if (
+        managed_cache_budget_bytes is not None
+        and projected_managed_cache > int(managed_cache_budget_bytes)
+    ):
+        raise ScoreBatchDiskReserveError(
+            "probability checkpoint exceeds frozen score-cache high-water: "
+            f"projected={projected_managed_cache}, "
+            f"budget={int(managed_cache_budget_bytes)}",
+            transient=False,
+        )
+    required_free = (
+        int(min_free_bytes)
+        + int(additional_free_reserve_bytes)
+        + estimated_write_bytes
+    )
     actual_free = int(shutil.disk_usage(root).free)
     if actual_free < required_free:
         raise ScoreBatchDiskReserveError(
             "insufficient disk for probability checkpoint: "
-            f"free={actual_free}, required={required_free}"
+            f"free={actual_free}, required={required_free}",
+            transient=True,
         )
     data_path, manifest_path = _checkpoint_paths(root, sequence)
     descriptor, temporary = tempfile.mkstemp(

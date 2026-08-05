@@ -86,6 +86,16 @@ class FusionAccumulator:
         ):
             raise IncrementalFusionError("fusion accumulator state does not match profile")
 
+    def completed_model_ids(self) -> tuple[str, ...]:
+        state = self._state()
+        self._validate_state(state)
+        return tuple(str(value) for value in state["completed_model_ids"])
+
+    def is_finalized(self) -> bool:
+        state = self._state()
+        self._validate_state(state)
+        return bool(state.get("finalized"))
+
     def add_model(self, model_id: str, probabilities: np.ndarray) -> dict[str, Any]:
         state = self._state()
         self._validate_state(state)

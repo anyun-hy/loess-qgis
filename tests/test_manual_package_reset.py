@@ -4,8 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from labeling_tool.core.manual_package_reset import reset_failed_work_packages
+from labeling_tool.core.manual_package_reset import (
+    ManualPackageResetError,
+    reset_failed_work_packages,
+)
 from labeling_tool.core.run_state_db import RunStateDB, RunStateError
+from work_package_runtime import _PackageFileLock
 
 
 RUN_ID = "20260729_120000_retry"
@@ -413,6 +417,33 @@ def test_manual_retry_resets_failed_package_and_downstream_but_preserves_cache(
     assert seam_dependency_ids == {
         state["artifact_paths"][("partition_1", "partition_probability")][1]
     }
+
+
+def test_manual_reset_refuses_active_stable_package_lock_before_deleting(tmp_path):
+    state = _state(tmp_path)
+    lock = _PackageFileLock(
+        state["run_dir"] / "tmp" / "package_locks" / "package_00000.lock"
+    )
+    lock.acquire()
+    try:
+        with pytest.raises(ManualPackageResetError, match="active filesystem writer"):
+            reset_failed_work_packages(
+                state["spec"],
+                database=state["database"],
+            )
+        assert state["package_file"].is_file()
+        assert state["unit_temp"].is_file()
+        assert state["database"].get_run(RUN_ID)["status"] == "resetting"
+    finally:
+        lock.release()
+
+    resumed = reset_failed_work_packages(
+        state["spec"],
+        database=state["database"],
+    )
+    assert resumed["package_ids"] == ["package_00000"]
+    assert not state["package_file"].exists()
+    assert not state["unit_temp"].exists()
 
 
 def test_failed_unit_reset_maps_every_partition_back_to_its_package(tmp_path):
