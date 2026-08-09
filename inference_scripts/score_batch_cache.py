@@ -12,6 +12,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from storage_guard import StorageGuard
+
 
 CLASS_COUNT = 14
 CHECKPOINT_WRITE_OVERHEAD_BYTES = 1024 * 1024
@@ -212,6 +214,8 @@ def write_checkpoint(
     additional_free_reserve_bytes: int = 0,
     managed_cache_bytes: int = 0,
     managed_cache_budget_bytes: int | None = None,
+    storage_guard: StorageGuard | None = None,
+    storage_operation: str = "score_checkpoint",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink():
@@ -234,50 +238,90 @@ def write_checkpoint(
             f"budget={int(managed_cache_budget_bytes)}",
             transient=False,
         )
-    required_free = (
-        int(min_free_bytes)
-        + int(additional_free_reserve_bytes)
-        + estimated_write_bytes
-    )
-    actual_free = int(shutil.disk_usage(root).free)
-    if actual_free < required_free:
-        raise ScoreBatchDiskReserveError(
-            "insufficient disk for probability checkpoint: "
-            f"free={actual_free}, required={required_free}",
-            transient=True,
-        )
     data_path, manifest_path = _checkpoint_paths(root, sequence)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{data_path.name}.", suffix=".tmp", dir=root
+    previous_exists = {
+        data_path: data_path.is_file(),
+        manifest_path: manifest_path.is_file(),
+    }
+    previous_bytes = sum(
+        path.stat().st_size if path.is_file() else 0
+        for path in (data_path, manifest_path)
     )
+    reservation = None
+    if storage_guard is None:
+        required_free = (
+            int(min_free_bytes)
+            + int(additional_free_reserve_bytes)
+            + estimated_write_bytes
+        )
+        actual_free = int(shutil.disk_usage(root).free)
+        if actual_free < required_free:
+            raise ScoreBatchDiskReserveError(
+                "insufficient disk for probability checkpoint: "
+                f"free={actual_free}, required={required_free}",
+                transient=True,
+            )
+    else:
+        reservation = storage_guard.reserve(
+            storage_operation,
+            write_bytes=estimated_write_bytes,
+            additional_reserve_bytes=max(
+                0, int(additional_free_reserve_bytes)
+            ),
+            # ``pending_write_bytes`` protects the full atomic temporary file;
+            # managed growth is only the projected final delta after replacing
+            # this exact checkpoint pair.
+            managed_growth_bytes=max(
+                0, estimated_write_bytes - previous_bytes
+            ),
+        )
+    temporary: str | None = None
     try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{data_path.name}.", suffix=".tmp", dir=root
+        )
         with os.fdopen(descriptor, "wb") as handle:
             np.save(handle, array, allow_pickle=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, data_path)
+        temporary = None
         _fsync_directory(root)
+        entries = _expected_entries(items)
+        manifest = {
+            "schema_version": 1,
+            "format": "npy_float16_probability_batch",
+            "run_id": str(run_id),
+            "package_id": str(package_id),
+            "model_id": str(model_id),
+            "model_sha256": str(model_sha256),
+            "sequence": int(sequence),
+            "data_file": data_path.name,
+            "byte_count": data_path.stat().st_size,
+            "sha256": _sha256_file(data_path),
+            "dtype": "float16",
+            "shape": list(array.shape),
+            "entries": entries,
+        }
+        _atomic_json(manifest_path, manifest)
+        return _records(data_path, manifest_path, entries), manifest
     except Exception:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        # A new half-checkpoint has no recovery value.  Remove only targets that
+        # did not exist before this call; an older pair is never deleted by a
+        # failed replacement attempt.
+        for path, existed in previous_exists.items():
+            if not existed:
+                path.unlink(missing_ok=True)
         raise
-    entries = _expected_entries(items)
-    manifest = {
-        "schema_version": 1,
-        "format": "npy_float16_probability_batch",
-        "run_id": str(run_id),
-        "package_id": str(package_id),
-        "model_id": str(model_id),
-        "model_sha256": str(model_sha256),
-        "sequence": int(sequence),
-        "data_file": data_path.name,
-        "byte_count": data_path.stat().st_size,
-        "sha256": _sha256_file(data_path),
-        "dtype": "float16",
-        "shape": list(array.shape),
-        "entries": entries,
-    }
-    _atomic_json(manifest_path, manifest)
-    return _records(data_path, manifest_path, entries), manifest
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        if reservation is not None:
+            current_bytes = sum(
+                path.stat().st_size if path.is_file() else 0
+                for path in (data_path, manifest_path)
+            )
+            reservation.settle(current_bytes - previous_bytes)

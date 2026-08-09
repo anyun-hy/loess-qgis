@@ -51,6 +51,58 @@ class StorageReserveError(RuntimeError):
         )
 
 
+class StorageReservation:
+    """One write reservation that can be reconciled exactly once.
+
+    The guard charges the projected managed growth and physical write before
+    the caller starts mutating the filesystem.  ``settle`` releases the
+    physical-write reservation and replaces the projected growth with the
+    actual byte delta left on disk.  Keeping this state in a one-shot object
+    prevents an exception path from accidentally settling the same reservation
+    twice while another writer is active.
+    """
+
+    def __init__(
+        self,
+        guard: "StorageGuard",
+        *,
+        operation: str,
+        reserved_write_bytes: int,
+        reserved_growth_bytes: int,
+    ) -> None:
+        self._guard = guard
+        self.operation = str(operation)
+        self.reserved_write_bytes = max(0, int(reserved_write_bytes))
+        self.reserved_growth_bytes = max(0, int(reserved_growth_bytes))
+        self._settled = False
+        self._lock = threading.Lock()
+
+    @property
+    def settled(self) -> bool:
+        with self._lock:
+            return self._settled
+
+    def settle(self, actual_managed_growth_bytes: int = 0) -> int:
+        """Replace projected growth with the actual delta left on disk."""
+
+        with self._lock:
+            if self._settled:
+                raise RuntimeError(
+                    f"storage reservation already settled: {self.operation}"
+                )
+            managed_bytes = self._guard.adjust(
+                int(actual_managed_growth_bytes) - self.reserved_growth_bytes,
+                settled_write_bytes=self.reserved_write_bytes,
+            )
+            self._settled = True
+            return managed_bytes
+
+    def release(self) -> int:
+        """Release a failed write that left no managed bytes on disk."""
+
+        return self.settle(0)
+
+
 class StorageGuard:
     """Thread-safe runtime guard with an incremental managed-byte ledger."""
 
@@ -150,6 +202,36 @@ class StorageGuard:
             "reserved_write_bytes": write_size if reserve_managed_growth else 0,
             "pending_write_bytes": pending_after,
         }
+
+    def reserve(
+        self,
+        operation: str,
+        *,
+        write_bytes: int = 0,
+        additional_reserve_bytes: int = 0,
+        managed_growth_bytes: int | None = None,
+    ) -> StorageReservation:
+        """Atomically reserve one physical write and its managed growth.
+
+        This deliberately delegates to ``check`` so existing instrumentation
+        and fault injection observe the same decision boundary.  ``check``
+        performs the approval and ledger mutation under one lock; constructing
+        the one-shot handle afterwards does not open a second check/write race.
+        """
+
+        report = self.check(
+            operation,
+            write_bytes=write_bytes,
+            additional_reserve_bytes=additional_reserve_bytes,
+            managed_growth_bytes=managed_growth_bytes,
+            reserve_managed_growth=True,
+        )
+        return StorageReservation(
+            self,
+            operation=operation,
+            reserved_write_bytes=report["reserved_write_bytes"],
+            reserved_growth_bytes=report["reserved_growth_bytes"],
+        )
 
     def committed(self, byte_count: int) -> int:
         with self._lock:

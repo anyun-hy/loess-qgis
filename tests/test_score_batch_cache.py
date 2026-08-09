@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +15,7 @@ from score_batch_cache import (
     remove_owned_temporary_files,
     write_checkpoint,
 )
+from storage_guard import StorageGuard, StorageReserveError
 
 
 def _items(count=1):
@@ -212,3 +215,99 @@ def test_checkpoint_reserves_remaining_outputs_and_enforces_frozen_high_water(
             managed_cache_budget_bytes=estimated_write,
         )
     assert not root.exists() or not any(root.iterdir())
+
+
+def test_background_checkpoint_reservation_blocks_concurrent_partition_growth(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "score_batches" / "model-a"
+    probabilities = _probabilities()
+    estimated_write = (
+        probabilities.nbytes + score_batch_cache.CHECKPOINT_WRITE_OVERHEAD_BYTES
+    )
+    guard = StorageGuard(
+        tmp_path,
+        min_free_bytes=0,
+        managed_budget_bytes=estimated_write,
+    )
+    writer_reserved = threading.Event()
+    allow_writer = threading.Event()
+    real_save = score_batch_cache.np.save
+
+    def blocking_save(*args, **kwargs):
+        writer_reserved.set()
+        assert allow_writer.wait(timeout=5)
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(score_batch_cache.np, "save", blocking_save)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            write_checkpoint,
+            root,
+            run_id="run-a",
+            package_id="package-a",
+            model_id="model-a",
+            model_sha256="model-sha",
+            sequence=0,
+            items=_items(),
+            probabilities=probabilities,
+            storage_guard=guard,
+            storage_operation="score_checkpoint:model-a:0",
+        )
+        assert writer_reserved.wait(timeout=5)
+        try:
+            assert guard.pending_write_bytes == estimated_write
+            with pytest.raises(StorageReserveError) as blocked:
+                guard.reserve(
+                    "partition_rasters:model-a:partition-0",
+                    write_bytes=1,
+                    managed_growth_bytes=1,
+                )
+            assert blocked.value.reason == "managed_budget"
+        finally:
+            allow_writer.set()
+        records, _manifest = future.result(timeout=10)
+
+    actual_bytes = sum(path.stat().st_size for path in root.iterdir())
+    assert records
+    assert guard.pending_write_bytes == 0
+    assert guard.managed_bytes == actual_bytes
+
+
+def test_checkpoint_fault_releases_reservation_and_removes_new_partial_pair(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "score_batches" / "model-a"
+    guard = StorageGuard(
+        tmp_path,
+        min_free_bytes=0,
+        managed_budget_bytes=100 * 1024**2,
+    )
+
+    def fail_manifest(*_args, **_kwargs):
+        raise OSError("injected checkpoint manifest failure")
+
+    monkeypatch.setattr(score_batch_cache, "_atomic_json", fail_manifest)
+    with pytest.raises(OSError, match="injected checkpoint manifest failure"):
+        write_checkpoint(
+            root,
+            run_id="run-a",
+            package_id="package-a",
+            model_id="model-a",
+            model_sha256="model-sha",
+            sequence=0,
+            items=_items(),
+            probabilities=_probabilities(),
+            storage_guard=guard,
+            storage_operation="score_checkpoint:model-a:0",
+        )
+
+    assert guard.pending_write_bytes == 0
+    assert guard.managed_bytes == 0
+    assert not list(root.glob("batch_000000.*"))
+    retry = guard.reserve(
+        "score_checkpoint:model-a:0:retry",
+        write_bytes=1024,
+        managed_growth_bytes=1024,
+    )
+    retry.release()

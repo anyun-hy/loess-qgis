@@ -203,3 +203,47 @@ def test_settlement_cannot_release_an_unowned_pending_write(tmp_path):
 
     with pytest.raises(ValueError, match="exceed pending reservations"):
         guard.adjust(0, settled_write_bytes=1)
+
+
+def test_one_shot_reservation_reconciles_actual_growth_and_cannot_double_settle(
+    tmp_path,
+):
+    usage = SimpleNamespace(total=1_000, used=0, free=1_000)
+    guard = StorageGuard(
+        tmp_path,
+        min_free_bytes=0,
+        managed_budget_bytes=100,
+        initial_managed_bytes=10,
+        disk_usage=lambda _path: usage,
+    )
+
+    reservation = guard.reserve(
+        "score-writer",
+        write_bytes=70,
+        managed_growth_bytes=70,
+    )
+    assert reservation.settled is False
+    assert guard.pending_write_bytes == 70
+    assert guard.managed_bytes == 80
+    with pytest.raises(StorageReserveError):
+        guard.reserve(
+            "partition-writer",
+            write_bytes=30,
+            managed_growth_bytes=30,
+        )
+
+    assert reservation.settle(25) == 35
+    assert reservation.settled is True
+    assert guard.pending_write_bytes == 0
+    assert guard.managed_bytes == 35
+    with pytest.raises(RuntimeError, match="already settled"):
+        reservation.release()
+
+    failed = guard.reserve(
+        "failed-writer",
+        write_bytes=50,
+        managed_growth_bytes=50,
+    )
+    assert failed.release() == 35
+    assert guard.pending_write_bytes == 0
+    assert guard.managed_bytes == 35

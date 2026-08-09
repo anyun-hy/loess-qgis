@@ -480,6 +480,7 @@ def test_lease_loss_fences_persistent_session_before_next_package(
     "target_prefix",
     (
         "tile_cache:",
+        "score_checkpoint:a:",
         "partition_rasters:model:a:",
         "partition_rasters:fusion:fixture_fusion:",
     ),
@@ -627,6 +628,137 @@ def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(
     assert not (package_root / "accepted_scores").exists()
     assert not (package_root / "fusion").exists()
     assert not Path(spec["cache_root"]).exists()
+
+
+def test_fusion_accumulator_separates_atomic_write_from_final_managed_growth(
+    tmp_path, monkeypatch
+):
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260805_193700_a1b2c3",
+    )
+    observed = []
+    guards = set()
+    original_check = work_package_runtime.StorageGuard.check
+
+    def record_check(self, operation, **kwargs):
+        guards.add(self)
+        report = original_check(self, operation, **kwargs)
+        if str(operation).startswith("fusion_accumulator:"):
+            observed.append(
+                {
+                    "operation": str(operation),
+                    "write_bytes": int(kwargs.get("write_bytes") or 0),
+                    "managed_growth_bytes": int(
+                        kwargs.get("managed_growth_bytes") or 0
+                    ),
+                    "reserved_growth_bytes": int(
+                        report["reserved_growth_bytes"]
+                    ),
+                    "reserved_write_bytes": int(
+                        report["reserved_write_bytes"]
+                    ),
+                }
+            )
+        return report
+
+    monkeypatch.setattr(
+        work_package_runtime.StorageGuard, "check", record_check
+    )
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    database = RunStateDB(database_path)
+    package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
+        "package_id"
+    ]
+    result = run_work_package(
+        spec_path,
+        package_id,
+        device="cpu",
+        model_loader=lambda model_entry, _device: model_entry["model_id"],
+        infer_tile=infer,
+    )
+
+    assert result["status"] == "ready"
+    assert [item["operation"].rsplit(":", 1)[-1] for item in observed] == [
+        "a",
+        "b",
+    ]
+    first, second = observed
+    assert first["managed_growth_bytes"] == first["write_bytes"]
+    assert 0 < second["managed_growth_bytes"] < second["write_bytes"]
+    assert all(
+        item["reserved_write_bytes"] == item["write_bytes"]
+        and item["reserved_growth_bytes"] == item["managed_growth_bytes"]
+        for item in observed
+    )
+    assert guards
+    assert all(guard.pending_write_bytes == 0 for guard in guards)
+
+
+@pytest.mark.parametrize("failure_stage", ("partition", "fusion_accumulator"))
+def test_large_writer_failure_always_settles_package_storage_reservation(
+    tmp_path, monkeypatch, failure_stage
+):
+    run_id = {
+        "partition": "20260805_193800_a1b2c4",
+        "fusion_accumulator": "20260805_193800_a1b2c5",
+    }[failure_stage]
+    spec, spec_path, database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id=run_id,
+    )
+    guards = set()
+    original_check = work_package_runtime.StorageGuard.check
+
+    def record_check(self, operation, **kwargs):
+        guards.add(self)
+        return original_check(self, operation, **kwargs)
+
+    monkeypatch.setattr(
+        work_package_runtime.StorageGuard, "check", record_check
+    )
+    if failure_stage == "partition":
+        monkeypatch.setattr(
+            work_package_runtime,
+            "write_partition_rasters",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected partition writer failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            work_package_runtime.FusionAccumulator,
+            "add_model",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected fusion accumulator failure")
+            ),
+        )
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    database = RunStateDB(database_path)
+    package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
+        "package_id"
+    ]
+    with pytest.raises(RuntimeError, match=f"injected {failure_stage.replace('_', ' ')}"):
+        run_work_package(
+            spec_path,
+            package_id,
+            device="cpu",
+            model_loader=lambda model_entry, _device: model_entry["model_id"],
+            infer_tile=infer,
+        )
+
+    assert guards
+    assert all(guard.pending_write_bytes == 0 for guard in guards)
 
 
 @pytest.mark.parametrize("residual_status", ("queued", "interrupted", "running"))

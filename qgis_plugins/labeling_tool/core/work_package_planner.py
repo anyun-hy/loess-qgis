@@ -154,6 +154,51 @@ def fusion_accumulator_bytes_per_tile(
     return pixels * (channels + 1) * 4
 
 
+def fusion_accumulator_atomic_overhead(
+    profile: Mapping[str, Any] | None,
+    spatial_plan: Mapping[str, Any],
+) -> int:
+    """Return the largest next-generation accumulator write in one Package.
+
+    ``FusionAccumulator.add_model`` writes a complete next generation before
+    atomically switching state and unlinking the prior active array.  Only one
+    Partition is committed by the Package main thread at a time, so the peak
+    is one largest Halo window rather than a second copy of every accumulator
+    in the Package.
+    """
+
+    if not profile:
+        return 0
+    strategy = str(profile.get("strategy") or "")
+    if strategy == "linear_1x1":
+        model_count = len(list(profile.get("models") or []))
+        if model_count < 1:
+            raise WorkPackagePlanError(
+                "linear_1x1 fusion accumulator requires profile models"
+            )
+        channels = model_count * 14
+    else:
+        channels = 14
+    largest_halo_pixels = 0
+    for partition in spatial_plan.get("partitions") or []:
+        halo = partition.get("halo_window") or {}
+        try:
+            width = int(halo["x1"]) - int(halo["x0"])
+            height = int(halo["y1"]) - int(halo["y0"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise WorkPackagePlanError(
+                "Partition Halo window is incomplete or invalid"
+            ) from error
+        if width < 1 or height < 1:
+            raise WorkPackagePlanError("Partition Halo window must have positive area")
+        largest_halo_pixels = max(largest_halo_pixels, width * height)
+    if largest_halo_pixels < 1:
+        raise WorkPackagePlanError(
+            "fusion atomic planning requires spatial Partitions"
+        )
+    return largest_halo_pixels * channels * 4 + 64 * 1024
+
+
 def _format_gib(value: int) -> str:
     return f"{int(value) / GIB:.2f} GiB"
 
@@ -374,6 +419,7 @@ def storage_preflight(
     mask_confidence_workspace_bytes: int,
     safety_margin_bytes: int,
     fixed_temporary_overhead_bytes: int = 0,
+    fusion_atomic_write_overhead_bytes: int = 0,
     available_disk_bytes: int | None = None,
     total_disk_bytes: int | None = None,
     tile_batch_size: int = 1,
@@ -441,7 +487,13 @@ def storage_preflight(
         int(fixed_temporary_overhead_bytes)
         + CHECKPOINT_METADATA_OVERHEAD_BYTES
     )
-    if configured_reserve < 0 or atomic_checkpoint_overhead < CHECKPOINT_METADATA_OVERHEAD_BYTES:
+    fusion_atomic_overhead = int(fusion_atomic_write_overhead_bytes)
+    atomic_write_overhead = atomic_checkpoint_overhead + fusion_atomic_overhead
+    if (
+        configured_reserve < 0
+        or atomic_checkpoint_overhead < CHECKPOINT_METADATA_OVERHEAD_BYTES
+        or fusion_atomic_overhead < 0
+    ):
         raise WorkPackagePlanError("disk reserve and atomic overhead must be non-negative")
     components = {
         "input_tile_bytes": input_per_tile,
@@ -459,7 +511,7 @@ def storage_preflight(
         available
         - protected_permanent
         - effective_reserve
-        - atomic_checkpoint_overhead
+        - atomic_write_overhead
     )
     batch_size = resolve_frozen_tile_batch_size(tile_batch_size)
     if cache_budget_mode == "auto":
@@ -482,7 +534,7 @@ def storage_preflight(
             )
         working_cache_budget_bytes = raw_tile_limit * working_per_tile
         resolved_cache_budget_bytes = (
-            atomic_checkpoint_overhead + working_cache_budget_bytes
+            atomic_write_overhead + working_cache_budget_bytes
         )
         resolved_cache_budget_gb = resolved_cache_budget_bytes / GIB
     else:
@@ -498,7 +550,7 @@ def storage_preflight(
             )
         resolved_cache_budget_bytes = int(resolved_cache_budget_gb * GIB)
         working_cache_budget_bytes = max(
-            0, resolved_cache_budget_bytes - atomic_checkpoint_overhead
+            0, resolved_cache_budget_bytes - atomic_write_overhead
         )
     budget = calculate_package_tile_limit(
         score_cache_budget_gb=resolved_cache_budget_gb,
@@ -506,7 +558,7 @@ def storage_preflight(
         fusion_accumulator_bytes=fusion_accumulator_bytes,
         mask_confidence_workspace_bytes=mask_confidence_workspace_bytes,
         safety_margin_bytes=safety_margin_bytes,
-        fixed_temporary_overhead_bytes=atomic_checkpoint_overhead,
+        fixed_temporary_overhead_bytes=atomic_write_overhead,
         input_tile_bytes=input_per_tile,
         available_disk_bytes=available,
         min_free_disk_gb=effective_reserve / GIB,
@@ -523,7 +575,7 @@ def storage_preflight(
     working_cache_budget_bytes = package_tile_limit * budget["working_bytes_per_tile"]
     if cache_budget_mode == "auto":
         resolved_cache_budget_bytes = (
-            atomic_checkpoint_overhead + working_cache_budget_bytes
+            atomic_write_overhead + working_cache_budget_bytes
         )
         resolved_cache_budget_gb = resolved_cache_budget_bytes / GIB
     peak_temp = (
@@ -581,6 +633,8 @@ def storage_preflight(
         "filesystem_floor_bytes": filesystem_floor,
         "effective_min_free_disk_bytes": effective_reserve,
         "atomic_checkpoint_overhead_bytes": atomic_checkpoint_overhead,
+        "fusion_accumulator_atomic_overhead_bytes": fusion_atomic_overhead,
+        "atomic_write_overhead_bytes": atomic_write_overhead,
         "checkpoint_metadata_overhead_bytes": CHECKPOINT_METADATA_OVERHEAD_BYTES,
         "safe_headroom_bytes": safe_headroom,
         "auto_headroom_fraction": AUTO_HEADROOM_FRACTION,

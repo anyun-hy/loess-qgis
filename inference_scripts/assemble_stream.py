@@ -58,6 +58,91 @@ UNIT_INTERMEDIATE_SUFFIXES = {
 }
 
 
+def _strict_path_component(value: str, *, label: str) -> str:
+    """Return one safe filesystem component without normalising traversal."""
+
+    component = str(value)
+    if (
+        not component
+        or component in {".", ".."}
+        or "/" in component
+        or "\\" in component
+        or "\x00" in component
+        or Path(component).name != component
+    ):
+        raise StreamAssemblyError(f"unsafe {label} in unit Artifact metadata: {value!r}")
+    return component
+
+
+def _cleanup_tombstone(path: Path, artifact_id: int) -> Path:
+    return path.with_name(f".{path.name}.cleanup-{int(artifact_id)}.tombstone")
+
+
+def _rename_cleanup_file(source: Path, tombstone: Path) -> None:
+    os.rename(source, tombstone)
+
+
+def _unlink_cleanup_tombstone(tombstone: Path) -> None:
+    tombstone.unlink()
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes used by the cleanup transaction."""
+
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_regular_cleanup_file(
+    path: Path,
+    artifact: Mapping[str, Any],
+    *,
+    stage: str,
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise StreamAssemblyError(
+            f"unit intermediate is not a regular file during {stage}: {path}"
+        )
+    if (
+        path.stat().st_size != int(artifact["byte_count"])
+        or sha256_file(path) != str(artifact["sha256"])
+    ):
+        raise StreamAssemblyError(
+            f"unit intermediate changed during {stage}: {path}"
+        )
+
+
+@contextmanager
+def _unit_cleanup_lock(run_dir: Path):
+    """Serialize cleanup recovery without following a forged lock symlink."""
+
+    tmp_root = run_dir / "tmp"
+    if tmp_root.is_symlink():
+        raise StreamAssemblyError(
+            f"refusing symlinked Run temporary directory: {tmp_root}"
+        )
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    lock_path = tmp_root / ".unit-artifact-cleanup.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise StreamAssemblyError(
+            f"cannot open the unit cleanup lock safely: {lock_path}"
+        ) from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _remaining_permanent_reserve_bytes(
     spec: Mapping[str, Any],
     database: RunStateDB,
@@ -92,79 +177,161 @@ def _cleanup_stream_unit_artifacts(
     database: RunStateDB,
     stream_id: str,
 ) -> dict[str, Any]:
-    """Delete verified unit intermediates only after assembled outputs are ready."""
+    run_dir = Path(spec["run_dir"]).resolve()
+    with _unit_cleanup_lock(run_dir):
+        return _cleanup_stream_unit_artifacts_locked(spec, database, stream_id)
+
+
+def _cleanup_stream_unit_artifacts_locked(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    stream_id: str,
+) -> dict[str, Any]:
+    """Crash-safely delete owned unit intermediates after final assembly.
+
+    ``ready -> cleaning`` is committed before the file is moved to a
+    deterministic tombstone in the same directory.  The database is then
+    committed to ``cleaned`` before the tombstone is unlinked.  A later
+    invocation can therefore resume from the original file, a ``cleaning``
+    tombstone, or a post-commit ``cleaned`` tombstone without inferring a
+    successful deletion from a missing file alone.
+    """
 
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"]).resolve()
-    unit_root = (
-        run_dir / "tmp" / "unit_outputs" / str(stream_id).replace(":", "_")
+    stream_component = _strict_path_component(
+        str(stream_id).replace(":", "_"), label="stream_id"
     )
-    if unit_root.is_symlink():
-        raise StreamAssemblyError(
-            f"refusing to clean symlinked unit output directory: {unit_root}"
-        )
+    tmp_root = run_dir / "tmp"
+    output_root = tmp_root / "unit_outputs"
+    unit_root = output_root / stream_component
+    for owned_directory in (tmp_root, output_root, unit_root):
+        if owned_directory.is_symlink():
+            raise StreamAssemblyError(
+                "refusing to clean through a symlinked unit output directory: "
+                f"{owned_directory}"
+            )
     candidates = [
         dict(artifact)
         for artifact in database.artifacts_for_stream(
-            run_id, str(stream_id), status="ready"
+            run_id, str(stream_id), status=None
         )
         if str(artifact.get("kind") or "") in UNIT_INTERMEDIATE_KINDS
+        and str(artifact.get("status") or "") in {
+            "ready",
+            "cleaning",
+            "cleaned",
+        }
         and int(artifact.get("ref_count") or 0) == 0
     ]
 
-    # Validate every target before deleting the first file.  This prevents a
-    # forged/stale DB path from turning a cleanup pass into a partial deletion.
-    validated: list[tuple[dict[str, Any], Path]] = []
+    # Validate ownership and every extant file before changing the first row.
+    # Unknown files in the directory are never selected or removed.
+    validated: list[tuple[dict[str, Any], Path, Path]] = []
     for artifact in candidates:
         kind = str(artifact["kind"])
-        unit_id = str(artifact["unit_id"])
+        unit_id = _strict_path_component(
+            str(artifact["unit_id"]), label="unit_id"
+        )
         path = Path(str(artifact["path"]))
         expected = unit_root / f"{unit_id}{UNIT_INTERMEDIATE_SUFFIXES[kind]}"
-        if path.is_symlink() or path.resolve() != expected.resolve():
+        if not path.is_absolute() or path != expected or path.parent != unit_root:
             raise StreamAssemblyError(
-                "unit intermediate cleanup path is outside the owned Stream "
-                f"directory: {path}"
+                "unit intermediate cleanup path is not an exact direct child "
+                f"of the owned Stream directory: {path}"
             )
-        if not path.is_file():
+        artifact_id = int(artifact["artifact_id"])
+        tombstone = _cleanup_tombstone(path, artifact_id)
+        original_present = path.is_symlink() or path.exists()
+        tombstone_present = tombstone.is_symlink() or tombstone.exists()
+        if original_present and tombstone_present:
             raise StreamAssemblyError(
-                f"unit intermediate is missing before verified cleanup: {path}"
+                "unit intermediate and cleanup tombstone both exist; refusing "
+                f"ambiguous deletion: {path}"
             )
-        if (
-            path.stat().st_size != int(artifact["byte_count"])
-            or sha256_file(path) != str(artifact["sha256"])
-        ):
-            raise StreamAssemblyError(
-                f"unit intermediate changed before verified cleanup: {path}"
+        status = str(artifact["status"])
+        if status == "ready":
+            if tombstone_present:
+                raise StreamAssemblyError(
+                    f"unclaimed cleanup tombstone already exists: {tombstone}"
+                )
+            _assert_regular_cleanup_file(path, artifact, stage="pre-claim validation")
+        elif status == "cleaned":
+            if original_present:
+                raise StreamAssemblyError(
+                    "cleaned unit intermediate unexpectedly reappeared: "
+                    f"{path}"
+                )
+            if not tombstone_present:
+                continue
+            _assert_regular_cleanup_file(
+                tombstone, artifact, stage="post-commit tombstone recovery"
             )
-        validated.append((artifact, path))
+        elif original_present:
+            _assert_regular_cleanup_file(path, artifact, stage="cleanup recovery")
+        elif tombstone_present:
+            _assert_regular_cleanup_file(
+                tombstone, artifact, stage="tombstone recovery"
+            )
+        # ``cleaning`` with neither path is accepted only as recovery for Runs
+        # interrupted by the pre-tombstone implementation.  New transactions
+        # always commit ``cleaned`` before unlinking the tombstone.
+        validated.append((artifact, path, tombstone))
 
     kind_counts: dict[str, int] = {}
     cleaned_bytes = 0
-    for artifact, path in validated:
+    for artifact, path, tombstone in validated:
         artifact_id = int(artifact["artifact_id"])
-        claimed = database.claim_artifact_cleanup(artifact_id)
-        if claimed is None:
+        claimed = artifact
+        if str(artifact["status"]) == "ready":
+            claimed = database.claim_artifact_cleanup(artifact_id)
+            if claimed is None:
+                raise StreamAssemblyError(
+                    f"unit intermediate cleanup claim changed: {path}"
+                )
+        current = database.get_artifact(artifact_id)
+        current_status = str((current or {}).get("status") or "")
+        if (
+            current is None
+            or current_status not in {"cleaning", "cleaned"}
+            or int(current["ref_count"]) != 0
+        ):
             raise StreamAssemblyError(
-                f"unit intermediate cleanup claim changed: {path}"
+                f"unit intermediate cleanup state changed after claim: {path}"
             )
-        try:
-            if (
-                path.is_symlink()
-                or not path.is_file()
-                or path.stat().st_size != int(claimed["byte_count"])
-                or sha256_file(path) != str(claimed["sha256"])
-            ):
+
+        if path.is_symlink() or tombstone.is_symlink():
+            raise StreamAssemblyError(
+                f"refusing symlink during unit intermediate cleanup: {path}"
+            )
+        if current_status == "cleaned" and path.exists():
+            raise StreamAssemblyError(
+                f"cleaned unit intermediate unexpectedly reappeared: {path}"
+            )
+        if current_status == "cleaning" and path.exists():
+            if tombstone.exists():
                 raise StreamAssemblyError(
-                    f"unit intermediate changed after cleanup claim: {path}"
+                    f"cleanup tombstone appeared before rename: {tombstone}"
                 )
-            path.unlink()
-            if not database.finish_artifact_cleanup(artifact_id, success=True):
-                raise StreamAssemblyError(
-                    f"unit intermediate cleanup state changed: {path}"
-                )
-        except Exception:
-            database.finish_artifact_cleanup(artifact_id, success=False)
-            raise
+            _assert_regular_cleanup_file(path, claimed, stage="post-claim validation")
+            _rename_cleanup_file(path, tombstone)
+            _fsync_directory(unit_root)
+        if tombstone.is_symlink():
+            raise StreamAssemblyError(
+                f"refusing symlinked cleanup tombstone: {tombstone}"
+            )
+        if current_status == "cleaning" and not database.finish_artifact_cleanup(
+            artifact_id, success=True
+        ):
+            raise StreamAssemblyError(
+                f"unit intermediate cleanup state changed: {path}"
+            )
+        if tombstone.exists():
+            _assert_regular_cleanup_file(
+                tombstone, claimed, stage="pre-unlink validation"
+            )
+            _unlink_cleanup_tombstone(tombstone)
+            _fsync_directory(unit_root)
         kind = str(artifact["kind"])
         kind_counts[kind] = kind_counts.get(kind, 0) + 1
         cleaned_bytes += int(artifact["byte_count"])
@@ -178,8 +345,8 @@ def _cleanup_stream_unit_artifacts(
         "artifact_count": len(validated),
         "cleaned_bytes": cleaned_bytes,
         "kind_counts": dict(sorted(kind_counts.items())),
-        "path_policy": "run_tmp_unit_outputs_exact_file",
-        "integrity_policy": "db_claim_size_sha256",
+        "path_policy": "strict_direct_child_no_symlink",
+        "integrity_policy": "db_claim_tombstone_size_sha256",
     }
     database.append_event(
         run_id,
@@ -735,6 +902,15 @@ def _reuse_ready_assembly(
             kind,
         )
         if artifact is None or artifact["status"] != "ready" or not path.is_file():
+            # A failed Stream may legitimately contain only the raw/formal
+            # pair from a previously completed assembly attempt.  In that
+            # state the caller must continue through the normal full or
+            # report-resume validation path; treating it as a corrupt ready
+            # Stream prevents the strict unit-report checks from running.
+            # A Stream still marked ready, however, must remain an immutable
+            # completed set and missing members are a hard integrity error.
+            if stream_status == "failed":
+                return None
             raise StreamAssemblyError(
                 f"ready stream is missing assembled Artifact: {stream_id}/{kind}"
             )

@@ -29,6 +29,7 @@ from labeling_tool.core.run_spec import (
 )
 from labeling_tool.core.work_package_planner import (
     WorkPackagePlanError,
+    fusion_accumulator_atomic_overhead,
     permanent_output_reserve,
     resolve_frozen_tile_batch_size,
     storage_preflight,
@@ -190,6 +191,11 @@ def prepare(source_run: Path, output_root: Path, *, device: str, run_id: str | N
             * 14
             * 2
             * tile_batch_size
+        ),
+        fusion_atomic_write_overhead_bytes=(
+            fusion_accumulator_atomic_overhead(
+                profile_entry["profile"], spatial_plan
+            )
         ),
         tile_batch_size=tile_batch_size,
     )
