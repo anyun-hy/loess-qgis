@@ -7,6 +7,7 @@ from labeling_tool.core.work_package_planner import (
     PERMANENT_RASTER_BYTES_PER_PIXEL_PER_STREAM,
     WorkPackagePlanError,
     calculate_package_tile_limit,
+    fusion_accumulator_atomic_overhead,
     fusion_accumulator_bytes_per_tile,
     permanent_output_reserve,
     plan_work_packages,
@@ -28,6 +29,73 @@ def test_fusion_accumulator_budget_matches_strategy_channels():
         },
         pixel_count=10,
     ) == 10 * 71 * 4
+
+
+def test_fusion_atomic_overhead_uses_one_largest_partition_halo_generation():
+    spatial = plan_spatial_units(
+        tile_rows=3,
+        tile_cols=5,
+        tile_size=512,
+        overlap=128,
+        partition_tile_rows=2,
+        partition_tile_cols=3,
+        seam_band_px=64,
+        halo_px=128,
+    )
+    largest_halo_pixels = max(
+        (item["halo_window"]["x1"] - item["halo_window"]["x0"])
+        * (item["halo_window"]["y1"] - item["halo_window"]["y0"])
+        for item in spatial["partitions"]
+    )
+    average = {
+        "strategy": "equal_probability_average",
+        "models": [{"model_id": "a"}, {"model_id": "b"}],
+    }
+    linear = {
+        "strategy": "linear_1x1",
+        "models": [{"model_id": str(index)} for index in range(5)],
+    }
+
+    assert fusion_accumulator_atomic_overhead(None, spatial) == 0
+    assert fusion_accumulator_atomic_overhead(average, spatial) == (
+        largest_halo_pixels * 14 * 4 + 64 * 1024
+    )
+    assert fusion_accumulator_atomic_overhead(linear, spatial) == (
+        largest_halo_pixels * 70 * 4 + 64 * 1024
+    )
+
+
+def test_storage_preflight_freezes_fusion_atomic_peak_separately(tmp_path):
+    raster_bytes, vector_reserve = _permanent_bytes(1, 1)
+    fusion_atomic = 128 * 1024 * 1024
+    report = storage_preflight(
+        tmp_path,
+        tile_count=64,
+        stream_count=1,
+        permanent_raster_bytes=raster_bytes,
+        vector_output_reserve_bytes=vector_reserve,
+        permanent_core_pixel_count=1,
+        input_tile_bytes_per_tile=1024,
+        score_cache_budget_gb="auto",
+        min_free_disk_gb=1,
+        current_model_probability_bytes=2048,
+        fusion_accumulator_bytes=4096,
+        mask_confidence_workspace_bytes=1024,
+        safety_margin_bytes=1024,
+        fixed_temporary_overhead_bytes=64 * 1024 * 1024,
+        fusion_atomic_write_overhead_bytes=fusion_atomic,
+        available_disk_bytes=900 * GIB,
+        total_disk_bytes=1024 * GIB,
+        tile_batch_size=16,
+    )
+
+    assert report["fusion_accumulator_atomic_overhead_bytes"] == fusion_atomic
+    assert report["atomic_write_overhead_bytes"] == (
+        report["atomic_checkpoint_overhead_bytes"] + fusion_atomic
+    )
+    assert report["fixed_temporary_overhead_bytes"] == report[
+        "atomic_write_overhead_bytes"
+    ]
 
 
 def _budget(tile_limit=80):

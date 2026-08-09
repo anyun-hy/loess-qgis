@@ -969,15 +969,15 @@ def _run_work_package_impl(
         remaining_permanent_bytes=remaining_permanent_reserve_bytes,
     )
 
-    def guard_write(
+    def reserve_write(
         operation: str,
         write_bytes: int = 0,
         *,
         managed_growth_bytes: int | None = None,
-    ) -> None:
+    ):
         if lease_guard is not None:
             lease_guard()
-        storage_guard.check(
+        return storage_guard.reserve(
             operation,
             write_bytes=max(0, int(write_bytes)),
             managed_growth_bytes=managed_growth_bytes,
@@ -1234,19 +1234,26 @@ def _run_work_package_impl(
                         path.stat().st_size if path.is_file() else 0
                         for path in (score_path, metadata_path)
                     )
-                    guard_write(
+                    estimated_write_bytes = int(probabilities.nbytes) + 64 * 1024
+                    reservation = reserve_write(
                         f"accepted_score:{tile_id}",
-                        int(probabilities.nbytes) + 64 * 1024,
+                        estimated_write_bytes,
+                        managed_growth_bytes=max(
+                            0, estimated_write_bytes - previous_bytes
+                        ),
                     )
-                    _atomic_npz(
-                        score_path, probabilities=probabilities.astype(np.float16)
-                    )
-                    _atomic_json(metadata_path, expected)
-                    storage_guard.adjust(
-                        score_path.stat().st_size
-                        + metadata_path.stat().st_size
-                        - previous_bytes
-                    )
+                    try:
+                        _atomic_npz(
+                            score_path,
+                            probabilities=probabilities.astype(np.float16),
+                        )
+                        _atomic_json(metadata_path, expected)
+                    finally:
+                        current_bytes = sum(
+                            path.stat().st_size if path.is_file() else 0
+                            for path in (score_path, metadata_path)
+                        )
+                        reservation.settle(current_bytes - previous_bytes)
                 accepted_count += 1
                 record_score(
                     item,
@@ -1373,25 +1380,39 @@ def _run_work_package_impl(
                     np.asarray(arrays["core_mask"]).nbytes
                     + np.asarray(arrays["core_confidence"]).nbytes
                 )
-                guard_write(
+                raster_write_overhead_bytes = 3 * 64 * 1024
+                reservation = reserve_write(
                     f"partition_rasters:{stream_id}:{partition_id}",
-                    probability_write_bytes + permanent_write_bytes,
-                    managed_growth_bytes=probability_write_bytes,
+                    probability_write_bytes
+                    + permanent_write_bytes
+                    + raster_write_overhead_bytes,
+                    managed_growth_bytes=max(
+                        0,
+                        probability_write_bytes
+                        + 64 * 1024
+                        - previous_probability_bytes,
+                    ),
                 )
-                paths = write_partition_rasters(
-                    arrays,
-                    partition,
-                    global_transform=transform,
-                    crs=crs,
-                    output_probability=probability_path,
-                    output_mask=raster_root / f"{partition_id}_mask.tif",
-                    output_confidence=raster_root
-                    / f"{partition_id}_confidence.tif",
-                )
-                storage_guard.adjust(
-                    Path(paths["probability"]).stat().st_size
-                    - previous_probability_bytes
-                )
+                try:
+                    paths = write_partition_rasters(
+                        arrays,
+                        partition,
+                        global_transform=transform,
+                        crs=crs,
+                        output_probability=probability_path,
+                        output_mask=raster_root / f"{partition_id}_mask.tif",
+                        output_confidence=raster_root
+                        / f"{partition_id}_confidence.tif",
+                    )
+                finally:
+                    current_probability_bytes = (
+                        probability_path.stat().st_size
+                        if probability_path.is_file()
+                        else 0
+                    )
+                    reservation.settle(
+                        current_probability_bytes - previous_probability_bytes
+                    )
                 for kind, key in (
                     ("partition_probability", "probability"),
                     ("core_mask", "mask"),
@@ -1438,17 +1459,55 @@ def _run_work_package_impl(
                         * halo_probabilities.shape[2]
                         * np.dtype(np.float32).itemsize
                     )
-                    guard_write(
+                    accumulator_estimated_write_bytes = (
+                        accumulator_write_bytes + 64 * 1024
+                    )
+                    completed_accumulator_models = (
+                        accumulator.completed_model_ids()
+                    )
+                    generation = len(completed_accumulator_models) + 1
+                    next_accumulator_path = (
+                        accumulator.root
+                        / f"accumulator_{generation:03d}.npy"
+                    )
+                    previous_accumulator_path = (
+                        accumulator.root
+                        / f"accumulator_{generation - 1:03d}.npy"
+                        if generation > 1
+                        else None
+                    )
+                    replaced_accumulator_bytes = (
+                        next_accumulator_path.stat().st_size
+                        if next_accumulator_path.is_file()
+                        else 0
+                    ) + (
+                        previous_accumulator_path.stat().st_size
+                        if previous_accumulator_path is not None
+                        and previous_accumulator_path.is_file()
+                        else 0
+                    )
+                    reservation = reserve_write(
                         f"fusion_accumulator:{partition_id}:{model_id}",
-                        accumulator_write_bytes,
-                        managed_growth_bytes=accumulator_write_bytes,
+                        accumulator_estimated_write_bytes,
+                        # Physical pending reserves the whole next generation
+                        # while the prior one coexists.  Managed growth models
+                        # the final directory: replace an existing target and
+                        # delete only the prior active generation, never
+                        # subtract unrelated files from the whole directory.
+                        managed_growth_bytes=max(
+                            0,
+                            accumulator_estimated_write_bytes
+                            - replaced_accumulator_bytes,
+                        ),
                     )
-                    accumulator.add_model(
-                        model_id, arrays["halo_probabilities"]
-                    )
-                    storage_guard.adjust(
-                        directory_size(accumulator.root) - accumulator_before
-                    )
+                    try:
+                        accumulator.add_model(
+                            model_id, arrays["halo_probabilities"]
+                        )
+                    finally:
+                        reservation.settle(
+                            directory_size(accumulator.root) - accumulator_before
+                        )
 
             partition_cursor = 0
             partition_future: Future[tuple[dict[str, np.ndarray], float]] | None = None
@@ -1525,17 +1584,8 @@ def _run_work_package_impl(
                 group: list[dict[str, Any]],
                 probabilities: np.ndarray,
                 current_score_cache_bytes: int,
-                remaining_output_reserve_bytes: int,
             ) -> tuple[list[dict[str, Any]], dict[str, Any], float]:
                 write_started = time.monotonic()
-                checkpoint_peak_bytes = int(probabilities.nbytes) + int(
-                    CHECKPOINT_WRITE_OVERHEAD_BYTES
-                )
-                guard_write(
-                    f"score_checkpoint:{model_id}:{sequence}",
-                    checkpoint_peak_bytes,
-                    managed_growth_bytes=checkpoint_peak_bytes,
-                )
                 records, manifest = write_checkpoint(
                     score_batch_root,
                     run_id=run_id,
@@ -1545,15 +1595,15 @@ def _run_work_package_impl(
                     sequence=sequence,
                     items=group,
                     probabilities=probabilities,
-                    min_free_bytes=effective_min_free_bytes,
-                    additional_free_reserve_bytes=(
-                        remaining_output_reserve_bytes
-                    ),
                     managed_cache_bytes=current_score_cache_bytes,
                     managed_cache_budget_bytes=(
                         score_cache_high_water_bytes
                         if score_cache_high_water_bytes > 0
                         else None
+                    ),
+                    storage_guard=storage_guard,
+                    storage_operation=(
+                        f"score_checkpoint:{model_id}:{sequence}"
                     ),
                 )
                 return records, manifest, time.monotonic() - write_started
@@ -1580,18 +1630,7 @@ def _run_work_package_impl(
                 checkpoint_write_sec += float(write_elapsed)
                 checkpoint_written_count += 1
                 checkpoint_written_bytes += int(manifest["byte_count"])
-                manifest_path = Path(records[0]["metadata_path"]) if records else None
-                managed_score_cache_bytes += int(manifest["byte_count"])
-                if manifest_path is not None and manifest_path.is_file():
-                    managed_score_cache_bytes += manifest_path.stat().st_size
-                storage_guard.committed(
-                    int(manifest["byte_count"])
-                    + (
-                        manifest_path.stat().st_size
-                        if manifest_path is not None and manifest_path.is_file()
-                        else 0
-                    )
-                )
+                managed_score_cache_bytes = directory_size(score_batch_root)
                 for item, record in zip(writer_group, records):
                     record_score(item, record)
                 peak_cache_bytes = max(
@@ -1742,7 +1781,6 @@ def _run_work_package_impl(
                             group,
                             probabilities,
                             managed_score_cache_bytes,
-                            remaining_permanent_reserve_bytes(),
                         )
                         result_queue_peak_batches = 1
                     drain_writer()
@@ -1839,24 +1877,39 @@ def _run_work_package_impl(
                     np.asarray(arrays["core_mask"]).nbytes
                     + np.asarray(arrays["core_confidence"]).nbytes
                 )
-                guard_write(
+                raster_write_overhead_bytes = 3 * 64 * 1024
+                reservation = reserve_write(
                     f"partition_rasters:{stream_id}:{partition_id}",
-                    probability_write_bytes + permanent_write_bytes,
-                    managed_growth_bytes=probability_write_bytes,
+                    probability_write_bytes
+                    + permanent_write_bytes
+                    + raster_write_overhead_bytes,
+                    managed_growth_bytes=max(
+                        0,
+                        probability_write_bytes
+                        + 64 * 1024
+                        - previous_probability_bytes,
+                    ),
                 )
-                paths = write_partition_rasters(
-                    arrays,
-                    partition,
-                    global_transform=transform,
-                    crs=crs,
-                    output_probability=probability_path,
-                    output_mask=raster_root / f"{partition_id}_mask.tif",
-                    output_confidence=raster_root / f"{partition_id}_confidence.tif",
-                )
-                storage_guard.adjust(
-                    Path(paths["probability"]).stat().st_size
-                    - previous_probability_bytes
-                )
+                try:
+                    paths = write_partition_rasters(
+                        arrays,
+                        partition,
+                        global_transform=transform,
+                        crs=crs,
+                        output_probability=probability_path,
+                        output_mask=raster_root / f"{partition_id}_mask.tif",
+                        output_confidence=raster_root
+                        / f"{partition_id}_confidence.tif",
+                    )
+                finally:
+                    current_probability_bytes = (
+                        probability_path.stat().st_size
+                        if probability_path.is_file()
+                        else 0
+                    )
+                    reservation.settle(
+                        current_probability_bytes - previous_probability_bytes
+                    )
                 for kind, key in (
                     ("partition_probability", "probability"),
                     ("core_mask", "mask"),

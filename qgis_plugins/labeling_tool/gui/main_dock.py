@@ -1,5 +1,7 @@
 import logging
 import os
+import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 import re
@@ -124,9 +126,10 @@ from ..core.v5_async_runner import V5AsyncInferenceRunner
 from ..core.tile_cache_probe_runner import TileCacheProbeRunner
 from ..core.model_registry import ModelRegistry
 from ..core.run_builder_v5 import create_v5_run
-from ..core.run_spec import reserve_run_directory, run_tile_cache_dir
+from ..core.run_spec import RESERVATION_FILE, reserve_run_directory, run_tile_cache_dir
 from ..core import run_index
 from ..core.work_package_planner import (
+    fusion_accumulator_atomic_overhead,
     fusion_accumulator_bytes_per_tile,
     permanent_output_reserve,
     resolve_frozen_tile_batch_size,
@@ -1345,15 +1348,10 @@ class LabelingDockWidget(QgsDockWidget):
             if self.skip_accepted_check.isChecked():
                 accepted_layer = target_accepted_layer
 
+        # Skip decisions are deliberately deferred until the post-probe
+        # accepted snapshot has been loaded and audited.  The live layer may
+        # still change while the asynchronous real-Tile probe is running.
         skipped_tiles = []
-        if accepted_layer is not None:
-            for tile in self._current_tiles:
-                if difference_filter.tile_is_fully_accepted(
-                    tile["bounds"], accepted_layer, raster.crs()
-                ):
-                    skipped = dict(tile)
-                    skipped["skip_reason"] = "fully_accepted"
-                    skipped_tiles.append(skipped)
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1381,6 +1379,7 @@ class LabelingDockWidget(QgsDockWidget):
         self._pipeline_stage_total = 5
         self._pending_run = {
             "raster": raster,
+            "scripts_dir": scripts_dir,
             "output_dir": output_dir,
             "output_gpkg": output_gpkg,
             "overlap": overlap,
@@ -1392,37 +1391,21 @@ class LabelingDockWidget(QgsDockWidget):
             "report": report,
             "accepted_layer": accepted_layer,
             "accepted_validation": accepted_validation,
+            "skip_accepted": bool(self.skip_accepted_check.isChecked()),
             "selected_model_ids": list(resolved_ids),
             "fusion_profile_id": self._fusion_profile_id,
             "boundary_smoothing_enabled": self._boundary_smoothing_enabled,
             "skipped_tiles": skipped_tiles,
             "grid_tiles": grid_tiles,
+            "active_tiles": list(self._current_tiles),
             "range_selection": self._range_selection_metadata(
                 grid_tiles, self._current_tiles
             ),
         }
 
-        try:
-            run_id, run_dir = reserve_run_directory(output_dir)
-        except Exception as exc:
-            self._finish_before_inference("创建运行目录失败", str(exc))
-            return
-        self._pending_run["run_id"] = run_id
-        self._pending_run["run_dir"] = str(run_dir)
+        self._pending_run["run_id"] = ""
+        self._pending_run["run_dir"] = ""
         self._pending_run["accepted_snapshot"] = ""
-        if accepted_layer is not None:
-            try:
-                self._pending_run["accepted_snapshot"] = (
-                    difference_filter.snapshot_accepted_layer(
-                        accepted_layer,
-                        Path(run_dir) / "accepted_snapshot.gpkg",
-                    )
-                )
-            except Exception as exc:
-                self._finish_before_inference(
-                    "冻结 accepted_labels 失败", str(exc)
-                )
-                return
 
         self.monitor_dialog.reset_run()
         self.monitor_dialog.attach_runner(self.runner)
@@ -1462,8 +1445,9 @@ class LabelingDockWidget(QgsDockWidget):
         if self._pipeline_state != "extracting" or not self._pending_run:
             return
         try:
+            ctx = self._pending_run
             active_tiles = sorted(
-                self._current_tiles,
+                ctx.get("active_tiles") or [],
                 key=lambda item: (int(item["row"]), int(item["col"])),
             )
             if not active_tiles:
@@ -1477,10 +1461,9 @@ class LabelingDockWidget(QgsDockWidget):
                 "col_no": col,
                 "bounds": self._extent_as_dict(sample["bounds"]),
             }
-            ctx = self._pending_run
             raster_path = ctx["raster"].source().split("|", 1)[0]
             probe = TileCacheProbeRunner(
-                self.script_path_edit.text().strip(), parent=self
+                ctx["scripts_dir"], parent=self
             )
             probe.succeeded.connect(self._on_tile_cache_probe_ready)
             probe.failed.connect(self._on_tile_cache_probe_failed)
@@ -1592,9 +1575,17 @@ class LabelingDockWidget(QgsDockWidget):
                 for model in selected_models
             ]
             storage_batch_size = max(selected_batch_sizes, default=tile_batch_size)
+            # The real Tile probe has already succeeded.  Freeze accepted data
+            # before measuring free disk so its actual bytes are included in
+            # the same-filesystem preflight.  Any failure before run_spec.json
+            # is written removes this marker-backed reservation.
+            run_id, run_dir = reserve_run_directory(ctx["output_dir"])
+            ctx["run_id"] = run_id
+            ctx["run_dir"] = str(run_dir)
+            self._freeze_pending_accepted_snapshot(ctx, run_dir)
             storage = storage_preflight(
                 ctx["output_dir"],
-                tile_count=len(self._current_tiles),
+                tile_count=len(ctx.get("active_tiles") or []),
                 stream_count=stream_count,
                 permanent_raster_bytes=permanent["permanent_raster_bytes"],
                 vector_output_reserve_bytes=permanent[
@@ -1619,6 +1610,12 @@ class LabelingDockWidget(QgsDockWidget):
                     * 2
                     * storage_batch_size
                 ),
+                fusion_atomic_write_overhead_bytes=(
+                    fusion_accumulator_atomic_overhead(
+                        (fusion or {}).get("profile"),
+                        spatial_plan,
+                    )
+                ),
                 tile_batch_size=storage_batch_size,
             )
             storage["input_tile_sample"] = tile_cache_sample
@@ -1635,7 +1632,7 @@ class LabelingDockWidget(QgsDockWidget):
             }
             selected_tile_keys = {
                 (int(tile["row"]), int(tile["col"]))
-                for tile in self._current_tiles
+                for tile in ctx.get("active_tiles") or []
             }
             tile_cache_dir = run_tile_cache_dir(
                 ctx["output_dir"], ctx["run_id"]
@@ -1709,7 +1706,7 @@ class LabelingDockWidget(QgsDockWidget):
                 accepted_gpkg=ctx.get("accepted_snapshot") or "",
                 accepted_target_gpkg=ctx["output_gpkg"],
                 accepted_validation=ctx.get("accepted_validation") or {},
-                skip_accepted=self.skip_accepted_check.isChecked(),
+                skip_accepted=bool(ctx.get("skip_accepted", False)),
                 config_fingerprint=report.get("config_fingerprint", ""),
                 range_selection=ctx.get("range_selection") or {},
             )
@@ -1831,6 +1828,7 @@ class LabelingDockWidget(QgsDockWidget):
     def _on_tile_extraction_stopped(self):
         self._release_tile_extractor()
         self._release_tile_cache_probe(cancel=True)
+        self._discard_pending_run_reservation()
         self._pipeline_running = False
         self._pipeline_state = "finished"
         self._pending_run = None
@@ -1854,8 +1852,95 @@ class LabelingDockWidget(QgsDockWidget):
                 probe.cleanup()
             probe.deleteLater()
 
+    def _freeze_pending_accepted_snapshot(self, ctx, run_dir):
+        """Freeze, re-audit and derive skip state from one accepted identity."""
+        live_layer = ctx.get("accepted_layer")
+        if live_layer is None:
+            ctx["accepted_snapshot"] = ""
+            ctx["skipped_tiles"] = []
+            return
+        snapshot_path = Path(run_dir) / "accepted_snapshot.gpkg"
+        ctx["accepted_snapshot"] = difference_filter.snapshot_accepted_layer(
+            live_layer,
+            snapshot_path,
+        )
+        frozen_layer = QgsVectorLayer(
+            f"{snapshot_path}|layername={LAYER_NAMES.ACCEPTED}",
+            f"{ctx.get('run_id', '')} accepted snapshot",
+            "ogr",
+        )
+        tolerance = float(
+            (ctx.get("accepted_validation") or {}).get(
+                "overlap_tolerance", 1.0e-18
+            )
+        )
+        frozen_validation = accepted_integrity.audit_accepted_layer(
+            frozen_layer,
+            overlap_tolerance=tolerance,
+            expected_crs=ctx["raster"].crs(),
+        )
+        frozen_validation["source"] = "run_snapshot"
+        skipped_tiles = []
+        for tile in ctx.get("active_tiles") or []:
+            if difference_filter.tile_is_fully_accepted(
+                tile["bounds"], frozen_layer, ctx["raster"].crs()
+            ):
+                skipped = dict(tile)
+                skipped["skip_reason"] = "fully_accepted"
+                skipped_tiles.append(skipped)
+        ctx["accepted_layer"] = frozen_layer
+        ctx["accepted_validation"] = frozen_validation
+        ctx["skipped_tiles"] = skipped_tiles
+
+    def _discard_pending_run_reservation(self):
+        """Remove only this attempt's unused, marker-backed Run reservation."""
+        ctx = self._pending_run or {}
+        run_id = str(ctx.get("run_id") or "")
+        run_dir_value = str(ctx.get("run_dir") or "")
+        output_value = str(ctx.get("output_dir") or "")
+        if not run_id or not run_dir_value or not output_value:
+            return
+        output_root = Path(output_value).expanduser().resolve()
+        expected_run_dir = output_root / "runs" / run_id
+        configured_run_dir = Path(run_dir_value).expanduser()
+        if configured_run_dir.is_symlink():
+            logger.error("拒绝清理符号链接形式的 Run 预留目录: %s", configured_run_dir)
+            return
+        run_dir = configured_run_dir.resolve()
+        if run_dir != expected_run_dir:
+            logger.error("拒绝清理不匹配的 Run 预留目录: %s", run_dir)
+            return
+        marker = run_dir / RESERVATION_FILE
+        if (
+            marker.is_symlink()
+            or not marker.is_file()
+            or (run_dir / "run_spec.json").exists()
+        ):
+            return
+        try:
+            reservation = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.error("拒绝清理身份无效的 Run 预留目录: %s", run_dir)
+            return
+        if str(reservation.get("run_id") or "") != run_id:
+            logger.error("拒绝清理身份不匹配的 Run 预留目录: %s", run_dir)
+            return
+        cache_root = run_tile_cache_dir(output_root, run_id).parent
+        for candidate in (cache_root, run_dir):
+            try:
+                if candidate.is_symlink():
+                    logger.error("拒绝清理符号链接形式的 Run 预留目录: %s", candidate)
+                elif candidate.exists():
+                    shutil.rmtree(candidate)
+            except OSError as exc:
+                logger.warning("清理未使用的 Run 预留目录失败 %s: %s", candidate, exc)
+        ctx["run_id"] = ""
+        ctx["run_dir"] = ""
+        ctx["accepted_snapshot"] = ""
+
     def _finish_before_inference(self, title, message):
         self._release_tile_cache_probe(cancel=True)
+        self._discard_pending_run_reservation()
         self._pipeline_running = False
         self._pipeline_state = "finished"
         self._pending_run = None
@@ -2825,6 +2910,7 @@ class LabelingDockWidget(QgsDockWidget):
         if self._tile_cache_probe is not None:
             self._tile_cache_probe.cleanup()
             self._tile_cache_probe = None
+        self._discard_pending_run_reservation()
         if self.refinement_dialog is not None:
             self.refinement_dialog.cleanup()
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,6 +25,7 @@ from tile_materializer import (
 
 PROBE_SCHEMA_VERSION = 1
 PROBE_KIND = "tile_cache_probe"
+PROBE_TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 class TileCacheProbeError(RuntimeError):
@@ -48,6 +52,8 @@ def measure_tile_cache(
     source_path: str | Path,
     output_root: str | Path,
     tile_request: str | Mapping[str, Any],
+    *,
+    probe_token: str = "",
 ) -> dict[str, Any]:
     """Materialize one disposable Tile and return exact byte evidence."""
 
@@ -64,12 +70,22 @@ def measure_tile_cache(
         raise TileCacheProbeError(f"output workspace is missing: {workspace}")
     tile = _tile_request(tile_request)
 
-    result: dict[str, Any]
-    with tempfile.TemporaryDirectory(
-        prefix=".loess-tile-cache-probe-",
-        dir=workspace,
-    ) as temporary:
-        result = _materialize_one(source, Path(temporary), tile)
+    token = str(probe_token or "")
+    if token and not PROBE_TOKEN_RE.fullmatch(token):
+        raise TileCacheProbeError("Tile probe token must contain 32 lowercase hex digits")
+    if token:
+        temporary_path = workspace / f".loess-tile-cache-probe-{token}"
+        temporary_path.mkdir(mode=0o700, exist_ok=False)
+        temporary_context = None
+    else:
+        temporary_context = tempfile.TemporaryDirectory(
+            prefix=".loess-tile-cache-probe-",
+            dir=workspace,
+        )
+        temporary_path = Path(temporary_context.name)
+
+    try:
+        result = _materialize_one(source, temporary_path, tile)
         if result.get("reused"):
             raise TileCacheProbeError("Tile cache probe unexpectedly reused a file")
         tile_path = Path(str(result["tile_path"]))
@@ -83,6 +99,9 @@ def measure_tile_cache(
             "schema_version": PROBE_SCHEMA_VERSION,
             "kind": PROBE_KIND,
             "status": "passed",
+            "probe_token": token,
+            "measurement_workspace": str(workspace),
+            "sample_artifact_directory": str(temporary_path.resolve()),
             "sample_source_path": str(source),
             "sample_tile_id": str(result["tile_id"]),
             "sample_row": int(result["row"]),
@@ -102,8 +121,12 @@ def measure_tile_cache(
             "measurement_method": "tile_materializer._materialize_one",
             "measurement_method_version": TILE_MATERIALIZATION_METHOD_VERSION,
         }
-
-    return payload
+        return payload
+    finally:
+        if temporary_context is not None:
+            temporary_context.cleanup()
+        else:
+            shutil.rmtree(temporary_path, ignore_errors=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -113,16 +136,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--raster", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--tile-json", required=True)
+    parser.add_argument("--probe-token", default="")
     return parser
+
+
+def _cancel_on_signal(signum, _frame):
+    raise TileCacheProbeError(f"Tile cache probe cancelled by signal {signum}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    previous_handlers = {}
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _cancel_on_signal)
     try:
         report = measure_tile_cache(
             args.raster,
             args.output_root,
             args.tile_json,
+            probe_token=args.probe_token,
         )
     except Exception as error:
         print(
@@ -138,12 +174,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             flush=True,
         )
-        return 1
-    print(
-        json.dumps(report, ensure_ascii=False, separators=(",", ":")),
-        flush=True,
-    )
-    return 0
+        exit_code = 1
+    else:
+        print(
+            json.dumps(report, ensure_ascii=False, separators=(",", ":")),
+            flush=True,
+        )
+        exit_code = 0
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    return exit_code
 
 
 if __name__ == "__main__":
