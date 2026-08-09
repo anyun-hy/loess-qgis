@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import gc
 import json
 import os
 import signal
@@ -407,16 +408,29 @@ def _default_infer_batch(
 
 
 def _clear_accelerator_cache(device: str) -> None:
+    device_value = str(device)
+    if not (
+        device_value.startswith("cuda")
+        or device_value.startswith("mps")
+    ):
+        return
     try:
         import torch
 
-        if str(device).startswith("cuda") and torch.cuda.is_available():
+        gc.collect()
+        if device_value.startswith("cuda") and torch.cuda.is_available():
+            synchronize = getattr(torch.cuda, "synchronize", None)
+            if callable(synchronize):
+                synchronize(device_value)
             torch.cuda.empty_cache()
         elif (
-            str(device).startswith("mps")
+            device_value.startswith("mps")
             and hasattr(torch.backends, "mps")
             and torch.backends.mps.is_available()
         ):
+            synchronize = getattr(torch.mps, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
             torch.mps.empty_cache()
     except Exception:
         pass
@@ -1041,6 +1055,13 @@ def _run_work_package_impl(
                 )
 
         for model_index, model_entry in enumerate(spec["models"], start=1):
+            # Keep every frozen model resident, but release allocator blocks
+            # left by the preceding model's activations before loading or
+            # running the next model.  The environment Batch probe uses this
+            # same lifecycle; without it a later model can spuriously OOM on
+            # reserved-but-unallocated CUDA memory and downgrade its Batch.
+            if model_index > 1:
+                _clear_accelerator_cache(effective_device)
             model_id = str(model_entry["model_id"])
             model_configured_batch_size = configured_batch_sizes_by_model.get(
                 model_id, configured_batch_size
@@ -1845,6 +1866,10 @@ def _run_work_package_impl(
                     "cache_hit_count": model_cache_hits,
                 }
             )
+
+        # Release the final model's activation cache for Fusion and the next
+        # Work Package without unloading PersistentModelProvider models.
+        _clear_accelerator_cache(effective_device)
 
         if profile:
             stream_id = f"fusion:{fusion_id}"

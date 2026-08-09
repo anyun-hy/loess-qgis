@@ -1,9 +1,11 @@
 import hashlib
 import json
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import fiona
 import numpy as np
@@ -182,6 +184,84 @@ def test_batch_downgrade_only_accepts_explicit_capacity_or_accelerator_oom():
         WorkPackageRuntimeError("Tile probability batch shape is wrong"),
         "cuda:0",
     )
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        ("cuda:0", ["gc", "cuda_sync:cuda:0", "cuda_empty"]),
+        ("mps", ["gc", "mps_sync", "mps_empty"]),
+    ],
+)
+def test_accelerator_cache_cleanup_synchronizes_before_release(
+    monkeypatch, device, expected
+):
+    events = []
+    cuda_available = device.startswith("cuda")
+    mps_available = device.startswith("mps")
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: cuda_available,
+            synchronize=lambda value: events.append(f"cuda_sync:{value}"),
+            empty_cache=lambda: events.append("cuda_empty"),
+        ),
+        backends=SimpleNamespace(
+            mps=SimpleNamespace(is_available=lambda: mps_available)
+        ),
+        mps=SimpleNamespace(
+            synchronize=lambda: events.append("mps_sync"),
+            empty_cache=lambda: events.append("mps_empty"),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        work_package_runtime.gc,
+        "collect",
+        lambda: events.append("gc"),
+    )
+
+    work_package_runtime._clear_accelerator_cache(device)
+
+    assert events == expected
+
+
+def test_model_boundaries_release_cache_without_unloading_resident_models(
+    tmp_path, monkeypatch
+):
+    _spec, spec_path, _database_path = _single_tile_two_model_run(
+        tmp_path,
+        run_id="20260809_230000_cache",
+    )
+    cleanup_calls = []
+    loaded = []
+    monkeypatch.setattr(
+        work_package_runtime,
+        "_clear_accelerator_cache",
+        cleanup_calls.append,
+    )
+
+    def loader(model_entry, _device):
+        model_id = str(model_entry["model_id"])
+        loaded.append(model_id)
+        return model_id
+
+    def infer(model_id, _tile_path, _device):
+        probabilities = np.zeros((14, 512, 512), dtype=np.float32)
+        probabilities[0 if model_id == "a" else 1] = 1.0
+        return probabilities
+
+    report = run_work_package(
+        spec_path,
+        "package_00000",
+        device="cpu",
+        model_provider=PersistentModelProvider(loader),
+        infer_tile=infer,
+    )
+
+    assert report["status"] == "ready"
+    assert cleanup_calls == ["cpu", "cpu"]
+    assert loaded == ["a", "b"]
+    assert [item["cold_load_count"] for item in report["models"]] == [1, 1]
 
 
 def test_late_second_model_failure_reuses_committed_first_model_outputs(tmp_path):
