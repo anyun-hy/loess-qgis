@@ -924,7 +924,7 @@ def test_monitor_tables_use_stable_user_resizable_columns():
     source = (
         PLUGIN_ROOT / "gui" / "inference_monitor.py"
     ).read_text(encoding="utf-8")
-    assert "((1, 92), (2, 86), (3, 70), (4, 76), (5, 62))" in source
+    assert "((1, 116), (2, 98), (3, 86), (4, 58), (5, 96))" in source
     assert "((0, 96), (1, 72), (2, 88))" in source
     assert "header.setSectionResizeMode(column, INTERACTIVE)" in source
     assert "splitter.setSizes([650, 530])" in source

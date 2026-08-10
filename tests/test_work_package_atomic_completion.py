@@ -225,6 +225,12 @@ def test_fail_or_requeue_uses_attempt_limit_atomically(tmp_path):
 
     for expected_attempt in (1, 2):
         assert job["attempt"] == expected_attempt
+        assert database.heartbeat(
+            job["job_id"],
+            job["lease_token"],
+            current=300,
+            total=382,
+        )
         assert database.fail_or_requeue_work_package_job(
             RUN_ID,
             "package_00000",
@@ -242,6 +248,8 @@ def test_fail_or_requeue_uses_attempt_limit_atomically(tmp_path):
             lease_seconds=120,
         )
         assert job is not None
+        assert job["progress_current"] == 0
+        assert job["progress_total"] == 0
         assert database.get_work_package(
             RUN_ID, "package_00000"
         )["status"] == "running"

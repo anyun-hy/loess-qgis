@@ -51,6 +51,15 @@ class RunStateDB:
         return connection
 
     @contextlib.contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield one short-lived connection and always close its file handles."""
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
@@ -65,7 +74,7 @@ class RunStateDB:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._connection() as connection:
             journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(journal_mode).lower() != "wal":
                 raise RunStateError(f"cannot enable SQLite WAL: {journal_mode}")
@@ -329,6 +338,8 @@ class RunStateDB:
                     ON jobs(run_id, stream_id, unit_id, status);
                 CREATE INDEX IF NOT EXISTS idx_jobs_tile
                     ON jobs(run_id, stream_id, tile_id, status);
+                CREATE INDEX IF NOT EXISTS idx_jobs_monitor
+                    ON jobs(run_id, job_type, status);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_state
                     ON artifacts(run_id, status, ref_count, artifact_id);
                 CREATE INDEX IF NOT EXISTS idx_unit_report_summaries_stream
@@ -361,7 +372,7 @@ class RunStateDB:
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def pragmas(self) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return {
                 "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
                 "foreign_keys": connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -396,7 +407,7 @@ class RunStateDB:
             )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return _row_dict(
                 connection.execute(
                     "SELECT * FROM runs WHERE run_id=?", (str(run_id),)
@@ -500,7 +511,7 @@ class RunStateDB:
         return count
 
     def get_work_package(self, run_id: str, package_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM work_packages WHERE run_id=? AND package_id=?",
                 (str(run_id), str(package_id)),
@@ -533,7 +544,7 @@ class RunStateDB:
             return connection.execute(sql, values).rowcount == 1
 
     def package_partitions(self, run_id: str, package_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """SELECT * FROM partitions WHERE run_id=? AND package_id=?
                    ORDER BY row_no, col_no""",
@@ -551,7 +562,7 @@ class RunStateDB:
 
     def partitions_for_run(self, run_id: str) -> list[dict[str, Any]]:
         """Return every Run Partition in deterministic row/column order."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """SELECT * FROM partitions WHERE run_id=?
                    ORDER BY row_no, col_no""",
@@ -568,7 +579,7 @@ class RunStateDB:
         return result
 
     def get_partition(self, run_id: str, partition_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM partitions WHERE run_id=? AND partition_id=?",
                 (str(run_id), str(partition_id)),
@@ -588,7 +599,7 @@ class RunStateDB:
             raise RunStateError(f"unknown Work Package: {package_id}")
         windows = list(package["metadata"].get("tile_windows") or [])
         selected: dict[str, dict[str, Any]] = {}
-        with self._connect() as connection:
+        with self._connection() as connection:
             for raw_window in windows:
                 if not isinstance(raw_window, list) or len(raw_window) != 4:
                     raise RunStateError(f"invalid Tile window in Work Package: {raw_window}")
@@ -622,7 +633,7 @@ class RunStateDB:
         }
         candidate_ids = set(candidates.values())
         blocked: set[str] = set()
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """SELECT package_id, status, metadata_json
                    FROM work_packages
@@ -654,7 +665,7 @@ class RunStateDB:
         ]
 
     def work_package_counts(self, run_id: str) -> dict[str, int]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return {
                 str(row["status"]): int(row["n"])
                 for row in connection.execute(
@@ -678,7 +689,7 @@ class RunStateDB:
             WHERE ud.run_id=?
             GROUP BY ud.unit_id
         """
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(unit_state, (str(run_id),)).fetchall()
             open_unit_ids = [
                 str(row["unit_id"])
@@ -721,7 +732,7 @@ class RunStateDB:
             values.append(str(status))
         sql += " ORDER BY sequence_no LIMIT ? OFFSET ?"
         values.extend((max(1, min(int(limit), 500)), max(0, int(offset))))
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(sql, values).fetchall()
         result = []
         for row in rows:
@@ -804,7 +815,7 @@ class RunStateDB:
         return len(unit_values)
 
     def get_spatial_unit(self, run_id: str, unit_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM spatial_units WHERE run_id=? AND unit_id=?",
                 (str(run_id), str(unit_id)),
@@ -816,7 +827,7 @@ class RunStateDB:
         return result
 
     def spatial_units(self, run_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """SELECT * FROM spatial_units WHERE run_id=?
                    ORDER BY unit_type, unit_id""",
@@ -887,7 +898,7 @@ class RunStateDB:
             ).rowcount == 1
 
     def stream_unit_counts(self, run_id: str, stream_id: str) -> dict[str, int]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return {
                 str(row["status"]): int(row["n"])
                 for row in connection.execute(
@@ -896,6 +907,27 @@ class RunStateDB:
                     (str(run_id), str(stream_id)),
                 ).fetchall()
             }
+
+    def stream_unit_type_counts(
+        self, run_id: str, stream_id: str
+    ) -> dict[str, dict[str, int]]:
+        """Return bounded status counts grouped by spatial-unit type."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT u.unit_type, su.status, COUNT(*) AS n
+                   FROM stream_units su
+                   JOIN spatial_units u
+                     ON u.run_id=su.run_id AND u.unit_id=su.unit_id
+                   WHERE su.run_id=? AND su.stream_id=?
+                   GROUP BY u.unit_type, su.status""",
+                (str(run_id), str(stream_id)),
+            ).fetchall()
+        result: dict[str, dict[str, int]] = {}
+        for row in rows:
+            result.setdefault(str(row["unit_type"]), {})[
+                str(row["status"])
+            ] = int(row["n"])
+        return result
 
     def insert_tiles(
         self, run_id: str, tiles: Iterable[Mapping[str, Any]]
@@ -935,14 +967,132 @@ class RunStateDB:
             )
         return count
 
-    def count_tiles(self, run_id: str, *, status: str | None = None) -> int:
+    def count_tiles(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        search: str = "",
+    ) -> int:
         sql = "SELECT COUNT(*) FROM tiles WHERE run_id=?"
         values: list[Any] = [str(run_id)]
         if status is not None:
             sql += " AND status=?"
             values.append(str(status))
-        with self._connect() as connection:
+        if search:
+            sql += " AND tile_id LIKE ? ESCAPE '\\'"
+            escaped = (
+                str(search)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            values.append(f"%{escaped}%")
+        with self._connection() as connection:
             return int(connection.execute(sql, values).fetchone()[0])
+
+    def active_work_package_job(self, run_id: str) -> dict[str, Any] | None:
+        """Return the single active accelerator Package, if one is leased."""
+        with self._connection() as connection:
+            return _row_dict(
+                connection.execute(
+                    """SELECT j.*, wp.sequence_no,
+                              wp.updated_at AS package_started_at
+                       FROM jobs j
+                       JOIN work_packages wp
+                         ON wp.run_id=j.run_id AND wp.package_id=j.package_id
+                       WHERE j.run_id=? AND j.job_type='work_package'
+                         AND j.status='running' AND wp.status='running'
+                       ORDER BY wp.sequence_no, j.job_id LIMIT 1""",
+                    (str(run_id),),
+                ).fetchone()
+            )
+
+    def monitor_snapshot(self, run_id: str) -> dict[str, Any]:
+        """Read the complete bounded monitor summary through one connection."""
+        identifier = str(run_id)
+        with self._connection() as connection:
+            # Keep every aggregate in one read transaction. Without an
+            # explicit BEGIN, SQLite may expose different commits to the
+            # individual SELECT statements in the same polling cycle.
+            connection.execute("BEGIN")
+            run = _row_dict(
+                connection.execute(
+                    "SELECT * FROM runs WHERE run_id=?", (identifier,)
+                ).fetchone()
+            )
+            job_counts = {"work_package": {}, "unit_fit": {}}
+            for row in connection.execute(
+                """SELECT job_type, status, COUNT(*) AS n FROM jobs
+                   WHERE run_id=? AND job_type IN ('work_package','unit_fit')
+                   GROUP BY job_type, status""",
+                (identifier,),
+            ).fetchall():
+                job_counts[str(row["job_type"])][str(row["status"])] = int(
+                    row["n"]
+                )
+            active_package = _row_dict(
+                connection.execute(
+                    """SELECT j.*, wp.sequence_no,
+                              wp.updated_at AS package_started_at
+                       FROM jobs j
+                       JOIN work_packages wp
+                         ON wp.run_id=j.run_id AND wp.package_id=j.package_id
+                       WHERE j.run_id=? AND j.job_type='work_package'
+                         AND j.status='running' AND wp.status='running'
+                       ORDER BY wp.sequence_no, j.job_id LIMIT 1""",
+                    (identifier,),
+                ).fetchone()
+            )
+            streams = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM streams WHERE run_id=? ORDER BY stream_id",
+                    (identifier,),
+                ).fetchall()
+            ]
+            stream_unit_type_counts: dict[
+                str, dict[str, dict[str, int]]
+            ] = {}
+            for row in connection.execute(
+                """SELECT su.stream_id, u.unit_type, su.status, COUNT(*) AS n
+                   FROM stream_units su
+                   JOIN spatial_units u
+                     ON u.run_id=su.run_id AND u.unit_id=su.unit_id
+                   WHERE su.run_id=?
+                   GROUP BY su.stream_id, u.unit_type, su.status""",
+                (identifier,),
+            ).fetchall():
+                stream_unit_type_counts.setdefault(
+                    str(row["stream_id"]), {}
+                ).setdefault(str(row["unit_type"]), {})[
+                    str(row["status"])
+                ] = int(row["n"])
+            stream_unit_job_type_counts: dict[
+                str, dict[str, dict[str, int]]
+            ] = {}
+            for row in connection.execute(
+                """SELECT j.stream_id, u.unit_type, j.status, COUNT(*) AS n
+                   FROM jobs j
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
+                   WHERE j.run_id=? AND j.job_type='unit_fit'
+                   GROUP BY j.stream_id, u.unit_type, j.status""",
+                (identifier,),
+            ).fetchall():
+                stream_unit_job_type_counts.setdefault(
+                    str(row["stream_id"]), {}
+                ).setdefault(str(row["unit_type"]), {})[
+                    str(row["status"])
+                ] = int(row["n"])
+        return {
+            "run": run,
+            "job_counts": job_counts,
+            "active_work_package": active_package,
+            "streams": streams,
+            "stream_unit_type_counts": stream_unit_type_counts,
+            "stream_unit_job_type_counts": stream_unit_job_type_counts,
+        }
 
     def update_tile_raster(
         self,
@@ -1000,7 +1150,7 @@ class RunStateDB:
             values.append(f"%{escaped}%")
         sql += " ORDER BY row_no, col_no LIMIT ? OFFSET ?"
         values.extend((page_size, max(0, int(offset))))
-        with self._connect() as connection:
+        with self._connection() as connection:
             return [dict(row) for row in connection.execute(sql, values).fetchall()]
 
     def count_stream_units(
@@ -1028,7 +1178,7 @@ class RunStateDB:
             sql += " AND su.unit_id LIKE ? ESCAPE '\\'"
             escaped = str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             values.append(f"%{escaped}%")
-        with self._connect() as connection:
+        with self._connection() as connection:
             return int(connection.execute(sql, values).fetchone()[0])
 
     def page_stream_units(
@@ -1062,14 +1212,14 @@ class RunStateDB:
             values.append(f"%{escaped}%")
         sql += " ORDER BY u.unit_type, su.unit_id LIMIT ? OFFSET ?"
         values.extend((page_size, max(0, int(offset))))
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = [dict(row) for row in connection.execute(sql, values).fetchall()]
         for row in rows:
             row["pixel_window"] = json.loads(row.pop("pixel_window_json"))
         return rows
 
     def stream_rows(self, run_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return [
                 dict(row)
                 for row in connection.execute(
@@ -1113,7 +1263,7 @@ class RunStateDB:
         return count
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return _row_dict(
                 connection.execute(
                     "SELECT * FROM jobs WHERE job_id=?", (int(job_id),)
@@ -1133,6 +1283,7 @@ class RunStateDB:
         job_id = int(row["job_id"])
         updated = connection.execute(
             """UPDATE jobs SET status='running', attempt=attempt+1,
+               progress_current=0, progress_total=0,
                worker_id=?, lease_token=?, lease_expires=?, heartbeat_at=?,
                updated_at=? WHERE job_id=?
                AND status IN ('queued','interrupted') AND attempt < max_attempts""",
@@ -1218,7 +1369,7 @@ class RunStateDB:
         preferred = list(frontier["neighbor_package_ids"])
         if int(frontier["unit_count"]) >= max(1, int(max_open_frontier_units)) and preferred:
             placeholders = ",".join("?" for _ in preferred)
-            with self._connect() as connection:
+            with self._connection() as connection:
                 row = connection.execute(
                     f"""SELECT j.job_id
                         FROM jobs j
@@ -1371,7 +1522,7 @@ class RunStateDB:
         token = str(lease_token)
         if not token:
             return False
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """SELECT 1 FROM jobs
                    WHERE job_id=? AND run_id=? AND job_type='work_package'
@@ -2221,7 +2372,7 @@ class RunStateDB:
             return int(row["artifact_id"])
 
     def get_artifact(self, artifact_id: int) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return _row_dict(
                 connection.execute(
                     "SELECT * FROM artifacts WHERE artifact_id=?", (int(artifact_id),)
@@ -2334,7 +2485,7 @@ class RunStateDB:
     def job_for_unit(
         self, run_id: str, stream_id: str, unit_id: str
     ) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return _row_dict(
                 connection.execute(
                     """SELECT * FROM jobs WHERE run_id=? AND stream_id=?
@@ -2358,7 +2509,7 @@ class RunStateDB:
             values.extend(str(item) for item in kinds)
         sql += " ORDER BY artifact_id LIMIT ?"
         values.append(max(1, min(int(limit), 1000)))
-        with self._connect() as connection:
+        with self._connection() as connection:
             return [dict(row) for row in connection.execute(sql, values).fetchall()]
 
     def claim_artifact_cleanup(self, artifact_id: int) -> dict[str, Any] | None:
@@ -2393,7 +2544,7 @@ class RunStateDB:
             ).rowcount == 1
 
     def artifact_cleanup_summary(self, run_id: str) -> dict[str, int]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """SELECT COUNT(*) AS artifact_count,
                           COALESCE(SUM(byte_count), 0) AS cleaned_bytes
@@ -2422,7 +2573,7 @@ class RunStateDB:
             sql += " AND status=?"
             values.append(str(status))
         sql += " ORDER BY unit_id, artifact_id"
-        with self._connect() as connection:
+        with self._connection() as connection:
             return [dict(row) for row in connection.execute(sql, values).fetchall()]
 
     def upsert_unit_report_summary(
@@ -2515,7 +2666,7 @@ class RunStateDB:
         stream_id: str,
     ) -> list[dict[str, Any]]:
         """Return summary rows, or no rows when the current contract is incomplete."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             exists = connection.execute(
                 """SELECT 1 FROM sqlite_master
                    WHERE type='table' AND name='unit_report_summaries'"""
@@ -2537,7 +2688,7 @@ class RunStateDB:
         stream_id: str,
     ) -> dict[str, Any]:
         """Aggregate report scalars inside SQLite without loading report JSON."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """SELECT COUNT(*) AS unit_count,
                           COALESCE(SUM(chain_count), 0) AS chain_count,
@@ -2572,7 +2723,7 @@ class RunStateDB:
         if not values:
             return {}
         result: dict[str, str] = {}
-        with self._connect() as connection:
+        with self._connection() as connection:
             for offset in range(0, len(values), 400):
                 batch = values[offset : offset + 400]
                 placeholders = ",".join("?" for _ in batch)
@@ -2654,7 +2805,7 @@ class RunStateDB:
             return cursor.rowcount == 1
 
     def object_link_count(self, run_id: str, stream_id: str) -> int:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return int(
                 connection.execute(
                     """SELECT COUNT(*) FROM object_links
@@ -2755,7 +2906,7 @@ class RunStateDB:
     def object_id_for_part(
         self, run_id: str, stream_id: str, part_id: str
     ) -> str:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """SELECT object_id FROM object_nodes
                    WHERE run_id=? AND stream_id=? AND part_id=?""",
@@ -2774,7 +2925,7 @@ class RunStateDB:
         *,
         status: str = "ready",
     ) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             return _row_dict(
                 connection.execute(
                     """SELECT * FROM artifacts WHERE run_id=? AND stream_id=?
@@ -2828,7 +2979,7 @@ class RunStateDB:
             sql += " AND job_type=?"
             values.append(str(job_type))
         sql += " GROUP BY status"
-        with self._connect() as connection:
+        with self._connection() as connection:
             return {
                 str(row["status"]): int(row["n"])
                 for row in connection.execute(sql, values).fetchall()

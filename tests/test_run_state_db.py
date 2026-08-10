@@ -158,6 +158,134 @@ def test_100k_tiles_are_paged_without_unbounded_result(tmp_path):
     assert first_page[-1]["tile_id"] == "1_99"
     assert second_page[0]["tile_id"] == "1_100"
     assert database.page_tiles(RUN_ID, search="249_399")[0]["tile_id"] == "249_399"
+    assert database.count_tiles(RUN_ID, search="249_399") == 1
+
+
+def test_tile_search_escapes_like_metacharacters_and_matches_page_count(tmp_path):
+    database = _database(tmp_path)
+    database.insert_tiles(
+        RUN_ID,
+        [
+            {"tile_id": "a_b", "row": 0, "col": 0, "status": "ready"},
+            {"tile_id": "axb", "row": 0, "col": 1, "status": "failed"},
+            {"tile_id": "a%b", "row": 0, "col": 2, "status": "ready"},
+            {"tile_id": "aXb", "row": 0, "col": 3, "status": "ready"},
+        ],
+    )
+
+    for search, expected in (("a_b", ["a_b"]), ("a%b", ["a%b"])):
+        page = database.page_tiles(RUN_ID, search=search)
+        assert [row["tile_id"] for row in page] == expected
+        assert database.count_tiles(RUN_ID, search=search) == len(page)
+
+    assert database.count_tiles(RUN_ID, status="ready", search="a_b") == 1
+    assert database.count_tiles(RUN_ID, status="failed", search="a_b") == 0
+
+
+def test_monitor_aggregates_unit_types_and_active_package(tmp_path):
+    database = _database(tmp_path)
+    database.register_streams(
+        RUN_ID,
+        [{"stream_id": "model:test", "kind": "model", "model_id": "test"}],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "core_00000",
+                "unit_type": "core",
+                "owner_key": "core_00000",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [],
+            },
+            {
+                "unit_id": "seam_horizontal_00000",
+                "unit_type": "seam_horizontal",
+                "owner_key": "seam_horizontal_00000",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 2, "y1": 1},
+                "dependency_ids": [],
+            },
+        ],
+    )
+    database.insert_stream_units(
+        RUN_ID, ["model:test"], ["core_00000", "seam_horizontal_00000"]
+    )
+    assert database.set_stream_unit_status(
+        RUN_ID, "model:test", "core_00000", "ready"
+    )
+    assert database.set_stream_unit_status(
+        RUN_ID, "model:test", "seam_horizontal_00000", "running"
+    )
+    assert database.stream_unit_type_counts(RUN_ID, "model:test") == {
+        "core": {"ready": 1},
+        "seam_horizontal": {"running": 1},
+    }
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "unit_fit",
+                "stream_id": "model:test",
+                "unit_id": "core_00000",
+                "status": "ready",
+            },
+            {
+                "job_type": "unit_fit",
+                "stream_id": "model:test",
+                "unit_id": "seam_horizontal_00000",
+                "status": "interrupted",
+            },
+        ],
+    )
+
+    database.insert_work_packages(
+        RUN_ID, [{"package_id": "package_00000", "sequence_no": 0}]
+    )
+    database.insert_jobs(
+        RUN_ID, [{"job_type": "work_package", "package_id": "package_00000"}]
+    )
+    leased = database.lease_next_work_package(
+        RUN_ID, "monitor-worker", max_open_frontier_units=64
+    )
+    assert leased is not None
+    active = database.active_work_package_job(RUN_ID)
+    assert active is not None
+    assert active["package_id"] == "package_00000"
+    assert active["sequence_no"] == 0
+    assert active["package_started_at"]
+
+    snapshot = database.monitor_snapshot(RUN_ID)
+    assert snapshot["run"]["run_id"] == RUN_ID
+    assert snapshot["job_counts"]["work_package"] == {"running": 1}
+    assert snapshot["job_counts"]["unit_fit"] == {"interrupted": 1, "ready": 1}
+    assert snapshot["active_work_package"]["package_id"] == "package_00000"
+    assert snapshot["stream_unit_type_counts"]["model:test"] == {
+        "core": {"ready": 1},
+        "seam_horizontal": {"running": 1},
+    }
+    assert snapshot["stream_unit_job_type_counts"]["model:test"] == {
+        "core": {"ready": 1},
+        "seam_horizontal": {"interrupted": 1},
+    }
+
+def test_monitor_snapshot_uses_one_explicitly_closed_connection(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path)
+    original_connect = database._connect
+    opened = []
+
+    def tracked_connect():
+        connection = original_connect()
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(database, "_connect", tracked_connect)
+    snapshot = database.monitor_snapshot(RUN_ID)
+    assert snapshot["run"]["run_id"] == RUN_ID
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[0].execute("SELECT 1")
 
 
 def test_job_lease_heartbeat_completion_and_recovery(tmp_path):
