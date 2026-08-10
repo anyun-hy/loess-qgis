@@ -262,8 +262,14 @@ class InferenceMonitorDialog(QDialog):
         self._streams.itemSelectionChanged.connect(self._render_selected_tiles)
         header = self._streams.horizontalHeader()
         header.setMinimumSectionSize(56)
-        header.setSectionResizeMode(0, STRETCH)
-        for column, width in ((1, 116), (2, 98), (3, 86), (4, 58), (5, 96)):
+        for column, width in (
+            (0, 180),
+            (1, 220),
+            (2, 120),
+            (3, 120),
+            (4, 64),
+            (5, 110),
+        ):
             header.setSectionResizeMode(column, INTERACTIVE)
             header.resizeSection(column, width)
         left_layout.addWidget(self._streams, stretch=2)
