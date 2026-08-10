@@ -1714,6 +1714,7 @@ class LabelingDockWidget(QgsDockWidget):
                 database_path,
                 spec["run_id"],
                 page_size=int(scaling.get("tile_page_size", 500)),
+                run_spec=spec,
             )
             self.runner.run_from_spec(
                 str(spec_path),
@@ -2092,6 +2093,7 @@ class LabelingDockWidget(QgsDockWidget):
                 spec["state_db"],
                 spec["run_id"],
                 page_size=int((spec.get("scaling") or {}).get("tile_page_size", 500)),
+                run_spec=spec,
             )
             self.monitor_dialog.attach_runner(self.runner)
             self.runner.pipeline_finished.connect(self._on_pipeline_finished)
