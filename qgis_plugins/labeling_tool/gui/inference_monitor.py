@@ -251,7 +251,7 @@ class InferenceMonitorDialog(QDialog):
                 "当前阶段",
                 "单元完成/总数",
                 "单元运行/等待",
-                "失败",
+                "单元失败",
                 "最近任务耗时",
             ]
         )
@@ -918,6 +918,7 @@ class InferenceMonitorDialog(QDialog):
             job_counts = snapshot.get("job_counts") or {}
             package_counts = job_counts.get("work_package") or {}
             unit_job_counts = job_counts.get("unit_fit") or {}
+            package_failed = int(package_counts.get("failed", 0))
             active_package = snapshot.get("active_work_package")
             if active_package is not None:
                 package_id = str(active_package.get("package_id") or "")
@@ -993,8 +994,15 @@ class InferenceMonitorDialog(QDialog):
                 elif run_status == "failed":
                     if stream_status == "ready":
                         stage, status = "组装完成 / Run 未通过", "成功"
+                    elif package_failed:
+                        stage, status = "上游 Work Package 失败", "失败"
                     else:
                         stage, status = "Run 失败", "失败"
+                elif package_failed:
+                    if stream_status == "ready":
+                        stage, status = "组装完成 / 上游 Package 失败", "成功"
+                    else:
+                        stage, status = "上游 Work Package 失败", "失败"
                 elif failed or stream_status == "failed":
                     stage, status = "空间单元任务失败", "失败"
                 elif active_stage == "顺序组装" or stream_status == "assembling":
@@ -1067,11 +1075,27 @@ class InferenceMonitorDialog(QDialog):
         if run_status == "ready":
             return "ready", "已完成", 1, 1
         if run_status == "failed":
+            package_failed = int(package_counts.get("failed", 0))
+            if package_failed:
+                return (
+                    "package_failed",
+                    "Work Package 失败，后续计算已停止",
+                    package_ready + package_failed,
+                    package_total,
+                )
             return "failed", "运行失败", 0, 1
         if run_status == "stopped":
             return "stopped", "已停止，可安全恢复", 0, 1
         if run_status == "resetting":
             return "resetting", "正在重置失败 Work Package", 0, 0
+        package_failed = int(package_counts.get("failed", 0))
+        if package_failed:
+            return (
+                "package_failed",
+                "Work Package 失败，后续计算已停止",
+                package_ready + package_failed,
+                package_total,
+            )
         if self._active_global_stage == "分区概率栅格收口":
             return "finalize", "分区概率栅格收口", raster_ready, stream_total
         if self._active_global_stage == "顺序组装":
@@ -1086,8 +1110,6 @@ class InferenceMonitorDialog(QDialog):
                 else "Work Package 推理"
             )
             return "packages", title, package_ready, package_total
-        if int(package_counts.get("failed", 0)):
-            return "package_failed", "Work Package 失败处理", package_ready, package_total
         if unit_active or unit_waiting:
             return "units", "空间单元拟合", unit_ready, unit_total
         if int(unit_job_counts.get("failed", 0)):
@@ -1199,6 +1221,11 @@ class InferenceMonitorDialog(QDialog):
         unit_running = int(unit_job_counts.get("running", 0))
         unit_waiting = _waiting_count(unit_job_counts)
         unit_failed = int(unit_job_counts.get("failed", 0))
+        blocker_text = (
+            f"阻塞（上游 Work Package 失败 {package_failed}） | "
+            if package_failed
+            else ""
+        )
         scaling = self._run_spec.get("scaling") or {}
         worker_key = (
             "max_cpu_partition_workers_with_package"
@@ -1211,7 +1238,7 @@ class InferenceMonitorDialog(QDialog):
             1 for stream in streams if str(stream.get("status")) == "ready"
         )
         self._unit_overview.setText(
-            f"CPU / 空间单元：完成 {unit_ready}/{unit_total} | "
+            f"CPU / 空间单元：{blocker_text}完成 {unit_ready}/{unit_total} | "
             f"运行 {unit_running} | 等待 {unit_waiting} | 失败 {unit_failed} | "
             f"并发上限 {worker_text} | 已组装结果流 {stream_ready}/{len(streams)}"
         )

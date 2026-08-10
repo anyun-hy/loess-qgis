@@ -658,6 +658,175 @@ def test_artifact_cleanup_claim_is_atomic_and_auditable(tmp_path):
     }
 
 
+def _partition_publish_state(tmp_path):
+    database = _database(tmp_path)
+    stream_id = "model:test"
+    partition_id = "partition_00000_00023"
+    database.register_streams(
+        RUN_ID,
+        [{"stream_id": stream_id, "kind": "model", "model_id": "test"}],
+    )
+    database.insert_work_packages(
+        RUN_ID,
+        [{"package_id": "package_00000", "sequence_no": 0}],
+    )
+    database.insert_partitions(
+        RUN_ID,
+        [
+            {
+                "partition_id": partition_id,
+                "row": 0,
+                "col": 23,
+                "core_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "halo_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "package_id": "package_00000",
+            }
+        ],
+    )
+    units = [
+        {
+            "unit_id": f"core_{index}",
+            "unit_type": "core",
+            "owner_key": f"core_{index}",
+            "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+            "dependency_ids": [partition_id],
+        }
+        for index in range(6)
+    ]
+    database.insert_spatial_units(RUN_ID, units)
+    database.insert_stream_units(
+        RUN_ID, [stream_id], [item["unit_id"] for item in units]
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "unit_fit",
+                "stream_id": stream_id,
+                "unit_id": item["unit_id"],
+            }
+            for item in units
+        ],
+    )
+    path = tmp_path / "partition_00000_00023.tif"
+    path.write_bytes(b"probability")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return database, stream_id, partition_id, path, digest
+
+
+def test_partition_publish_links_all_consumers_before_cleanup_visibility(tmp_path):
+    database, stream_id, partition_id, path, digest = _partition_publish_state(
+        tmp_path
+    )
+
+    artifact_id = database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        path,
+        byte_count=path.stat().st_size,
+        sha256=digest,
+    )
+
+    artifact = database.get_artifact(artifact_id)
+    assert artifact["status"] == "ready"
+    assert artifact["ref_count"] == 6
+    assert database.cleanup_candidates(
+        RUN_ID, kinds=("partition_probability",)
+    ) == []
+    with sqlite3.connect(database.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM artifact_dependencies WHERE artifact_id=?",
+            (artifact_id,),
+        ).fetchone()[0] == 6
+
+
+def test_partition_publish_rolls_back_ready_when_dependency_link_fails(tmp_path):
+    database, stream_id, partition_id, path, digest = _partition_publish_state(
+        tmp_path
+    )
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_partition_dependency
+               BEFORE INSERT ON artifact_dependencies
+               BEGIN SELECT RAISE(ABORT, 'injected dependency failure'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected dependency failure"):
+        database.publish_partition_artifact(
+            RUN_ID,
+            stream_id,
+            partition_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=digest,
+        )
+
+    assert database.artifact_for_stream_unit(
+        RUN_ID, stream_id, partition_id, "partition_probability"
+    ) is None
+    assert database.cleanup_candidates(
+        RUN_ID, kinds=("partition_probability",)
+    ) == []
+
+
+def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path):
+    database, stream_id, partition_id, path, digest = _partition_publish_state(
+        tmp_path
+    )
+    artifact_id = database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        path,
+        byte_count=path.stat().st_size,
+        sha256=digest,
+    )
+    with sqlite3.connect(database.path) as connection:
+        job_ids = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT job_id FROM jobs WHERE job_type='unit_fit'"
+            ).fetchall()
+        ]
+    for job_id in job_ids:
+        database.release_job_artifacts(job_id)
+    assert database.claim_artifact_cleanup(artifact_id) is not None
+    assert database.finish_artifact_cleanup(artifact_id, success=True)
+
+    assert database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        path,
+        byte_count=path.stat().st_size,
+        sha256=digest,
+    ) == artifact_id
+    restored = database.get_artifact(artifact_id)
+    assert restored["status"] == "ready"
+    assert restored["ref_count"] == 6
+
+
+def test_fail_open_streams_preserves_ready_streams(tmp_path):
+    database = _database(tmp_path)
+    database.register_streams(
+        RUN_ID,
+        [
+            {"stream_id": "model:ready", "kind": "model", "status": "ready"},
+            {"stream_id": "model:running", "kind": "model", "status": "running"},
+            {"stream_id": "fusion:test", "kind": "fusion", "status": "pending"},
+        ],
+    )
+
+    assert database.fail_open_streams(RUN_ID, "Package exhausted retries") == 2
+    rows = {row["stream_id"]: row for row in database.stream_rows(RUN_ID)}
+    assert rows["model:ready"]["status"] == "ready"
+    assert rows["model:ready"]["error"] == ""
+    assert rows["model:running"]["status"] == "failed"
+    assert rows["fusion:test"]["status"] == "failed"
+    assert rows["model:running"]["error"] == "Package exhausted retries"
+
+
 def test_frontier_limit_prioritizes_neighbor_package(tmp_path):
     database = _database(tmp_path)
     database.insert_work_packages(

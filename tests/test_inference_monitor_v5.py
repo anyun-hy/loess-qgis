@@ -116,6 +116,7 @@ def test_left_monitor_uses_run_package_and_unit_layers():
         "最近任务耗时",
     ):
         assert label in build_ui
+    assert '"单元失败"' in build_ui
 
 
 def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
@@ -235,6 +236,64 @@ def test_database_phase_terminal_states_are_unambiguous():
         nonterminal_counts,
         [{"status": "failed"}],
     ) == ("failed", "运行失败", 0, 1)
+    monitor._active_global_stage = ""
+    assert _execute_method(
+        "_database_phase",
+        monitor,
+        "running",
+        {"ready": 3, "running": 1, "queued": 2, "failed": 1},
+        nonterminal_counts,
+        [{"status": "running"}],
+    ) == (
+        "package_failed",
+        "Work Package 失败，后续计算已停止",
+        4,
+        7,
+    )
+
+
+def test_package_failure_marks_open_streams_failed_before_run_poll_catches_up():
+    snapshot = {
+        "run": {"status": "running"},
+        "job_counts": {
+            "work_package": {"failed": 1, "running": 1, "queued": 45},
+            "unit_fit": {"queued": 12},
+        },
+        "active_work_package": None,
+        "streams": [
+            {"stream_id": "model:test", "status": "running"},
+            {"stream_id": "fusion:test", "status": "pending"},
+        ],
+        "stream_unit_type_counts": {
+            "model:test": {"core": {"queued": 6}},
+            "fusion:test": {"core": {"queued": 6}},
+        },
+        "stream_unit_job_type_counts": {
+            "model:test": {"core": {"queued": 6}},
+            "fusion:test": {"core": {"queued": 6}},
+        },
+    }
+    rows = {}
+    errors = []
+    monitor = SimpleNamespace(
+        _database=SimpleNamespace(monitor_snapshot=lambda _run_id: snapshot),
+        _run_id="run-test",
+        _package_activity={},
+        _active_inference_stream="model:test",
+        _active_stage_for_stream=lambda _stream_id: "",
+        _set_stream=lambda stream_id, **values: rows.setdefault(stream_id, values),
+        _update_database_overviews=lambda **_kwargs: None,
+        _render_selected_tiles=lambda: None,
+        _log_panel=SimpleNamespace(append_system=errors.append),
+    )
+
+    _execute_method("_poll_database", monitor)
+
+    assert errors == []
+    assert rows["model:test"]["stage"] == "上游 Work Package 失败"
+    assert rows["model:test"]["status"] == "失败"
+    assert rows["model:test"]["failures"] == 0
+    assert rows["fusion:test"]["status"] == "失败"
 
 
 def test_same_package_new_attempt_resets_transient_monitor_activity():

@@ -530,6 +530,15 @@ def _commit_artifact(
     stream_id: str,
     unit_id: str,
 ) -> int:
+    if kind == "partition_probability":
+        return database.publish_partition_artifact(
+            run_id,
+            stream_id,
+            unit_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=sha256_file(path),
+        )
     artifact_id = database.register_artifact(
         run_id,
         kind,
@@ -1441,7 +1450,7 @@ def _run_work_package_impl(
                 ):
                     if lease_guard is not None:
                         lease_guard()
-                    artifact_id = _commit_artifact(
+                    _commit_artifact(
                         database,
                         run_id,
                         path=Path(paths[key]),
@@ -1449,11 +1458,7 @@ def _run_work_package_impl(
                         stream_id=stream_id,
                         unit_id=partition_id,
                     )
-                    if kind == "partition_probability":
-                        database.link_partition_artifact(
-                            run_id, stream_id, partition_id, artifact_id
-                        )
-                    elif kind in {"core_mask", "core_confidence"}:
+                    if kind in {"core_mask", "core_confidence"}:
                         ready_permanent_keys.add((stream_id, partition_id, kind))
                 if profile:
                     coverage = arrays["halo_weights"] > 0
@@ -1942,7 +1947,7 @@ def _run_work_package_impl(
                 ):
                     if lease_guard is not None:
                         lease_guard()
-                    artifact_id = _commit_artifact(
+                    _commit_artifact(
                         database,
                         run_id,
                         path=Path(paths[key]),
@@ -1950,11 +1955,7 @@ def _run_work_package_impl(
                         stream_id=stream_id,
                         unit_id=partition_id,
                     )
-                    if kind == "partition_probability":
-                        database.link_partition_artifact(
-                            run_id, stream_id, partition_id, artifact_id
-                        )
-                    elif kind in {"core_mask", "core_confidence"}:
+                    if kind in {"core_mask", "core_confidence"}:
                         ready_permanent_keys.add((stream_id, partition_id, kind))
             removed = _remove_tree_with_count(
                 package_root / "fusion" / fusion_id
@@ -2373,6 +2374,11 @@ def run_persistent_worker(
 
     session_fenced = False
     while not stopper.is_set() and not session_fenced:
+        if database.job_counts(run_id, job_type="work_package").get("failed", 0):
+            # One exhausted Package makes the complete local Run impossible.
+            # Do not spend accelerator time on later Packages after that hard
+            # gate has already failed.
+            break
         job = database.lease_next_work_package(
             run_id,
             str(worker_id),
