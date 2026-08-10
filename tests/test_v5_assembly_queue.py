@@ -288,6 +288,33 @@ def test_active_accelerator_process_prevents_a_second_worker(monkeypatch):
     assert starts == []
 
 
+def test_scheduler_stops_immediately_after_terminal_package_failure(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {"run_id": "run-1"}
+    cleanup_calls = []
+    finishes = []
+    runner._cleanup_released_artifacts = lambda: cleanup_calls.append("cleanup")
+    runner._finish = lambda success, error: finishes.append((success, error))
+    runner._database = types.SimpleNamespace(
+        job_counts=lambda *_args, **_kwargs: {"failed": 1, "queued": 45},
+    )
+
+    runner._schedule()
+
+    assert cleanup_calls == []
+    assert finishes == [
+        (
+            False,
+            "Work Package exhausted retries; remaining work was stopped: "
+            "{'failed': 1, 'queued': 45}",
+        )
+    ]
+
+
 def test_accelerator_launch_uses_worker_mode_without_package_lease(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)
@@ -393,6 +420,7 @@ def test_failed_finish_kills_and_interrupts_other_active_children(
         job_counts=lambda *_args, **_kwargs: {},
         artifact_cleanup_summary=lambda *_args: {},
         set_run_status=lambda *_args, **_kwargs: True,
+        fail_open_streams=lambda *_args, **_kwargs: 0,
     )
     runner._record_startup_index = lambda *_args: None
     runner.pipeline_finished = _Signal()
@@ -573,6 +601,52 @@ def test_accelerator_exit_with_pending_package_interrupts_and_restarts(
     assert finishes == []
     assert runner._accelerator_done is False
     assert runner._accelerator_crash_count == 1
+
+
+def test_accelerator_terminal_package_failure_finishes_without_restart(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._processes = {
+        "accelerator": {
+            "process": _FinishedProcess(),
+            "context": {
+                "kind": "accelerator_worker",
+                "label": "accelerator_worker",
+                "worker_id": "qgis-test-accelerator",
+            },
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+        }
+    }
+    interrupted = []
+    finishes = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._finish = lambda success, error: finishes.append((success, error))
+    runner._database = types.SimpleNamespace(
+        interrupt_work_package_worker=lambda run_id, worker_id: interrupted.append(
+            (run_id, worker_id)
+        ),
+        job_counts=lambda *_args, **_kwargs: {"failed": 1, "queued": 45},
+    )
+    runner.step_finished = _Signal()
+
+    runner._process_finished("accelerator", 2, None)
+
+    assert interrupted == [("run-1", "qgis-test-accelerator")]
+    assert finishes == [
+        (
+            False,
+            "Work Package exhausted retries; remaining work was stopped: "
+            "{'failed': 1, 'queued': 45}",
+        )
+    ]
+    assert runner._accelerator_done is True
+    assert runner._accelerator_crash_count == 0
 
 
 def test_graceful_worker_stop_escalates_when_sigterm_does_not_exit(monkeypatch):

@@ -243,6 +243,17 @@ class V5AsyncInferenceRunner(QObject):
             return
         if self._phase != "jobs":
             return
+        package_counts = self._database.job_counts(
+            self._spec["run_id"],
+            job_type="work_package",
+        )
+        if int(package_counts.get("failed", 0)):
+            self._finish(
+                False,
+                "Work Package exhausted retries; remaining work was stopped: "
+                + str(package_counts),
+            )
+            return
         try:
             self._cleanup_released_artifacts()
         except RuntimeError as error:
@@ -263,10 +274,6 @@ class V5AsyncInferenceRunner(QObject):
         unit_active = sum(1 for job in active_jobs if job and job["job_type"] == "unit_fit")
         started = False
 
-        package_counts = self._database.job_counts(
-            self._spec["run_id"],
-            job_type="work_package",
-        )
         package_pending = any(
             package_counts.get(status, 0)
             for status in ("queued", "interrupted", "running")
@@ -527,6 +534,19 @@ class V5AsyncInferenceRunner(QObject):
                 self._spec["run_id"],
                 job_type="work_package",
             )
+            if int(package_counts.get("failed", 0)):
+                error = (
+                    "Work Package exhausted retries; remaining work was stopped: "
+                    + str(package_counts)
+                )
+                self.step_finished.emit(
+                    label,
+                    int(exit_code),
+                    {"success": False, "error": error, "stream_id": ""},
+                )
+                self._accelerator_done = True
+                self._finish(False, error)
+                return
             package_pending = any(
                 package_counts.get(status, 0)
                 for status in ("queued", "interrupted", "running")
@@ -866,6 +886,16 @@ class V5AsyncInferenceRunner(QObject):
                         job["job_id"], job["lease_token"]
                     )
             self._processes.clear()
+        if not success and not self._stopped:
+            self._database.set_run_status(
+                self._spec["run_id"],
+                "failed",
+                expected=("running", "raster_ready"),
+            )
+            self._database.fail_open_streams(
+                self._spec["run_id"],
+                str(error),
+            )
         ready_streams = (
             [self._result_stream(stream) for stream in self._spec.get("streams", [])]
             if success else []
@@ -922,10 +952,6 @@ class V5AsyncInferenceRunner(QObject):
         if success:
             self._database.set_run_status(
                 self._spec["run_id"], "ready", expected=("running", "raster_ready")
-            )
-        elif not self._stopped:
-            self._database.set_run_status(
-                self._spec["run_id"], "failed", expected=("running", "raster_ready")
             )
         self._record_startup_index(result["status"])
         self.pipeline_finished.emit(result)

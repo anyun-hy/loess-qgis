@@ -474,6 +474,15 @@ class RunStateDB:
                 (str(status), str(error), _now(), str(run_id), str(stream_id)),
             ).rowcount == 1
 
+    def fail_open_streams(self, run_id: str, error: str) -> int:
+        """Fail every non-ready stream after a terminal Run failure."""
+        with self.transaction() as connection:
+            return connection.execute(
+                """UPDATE streams SET status='failed', error=?, updated_at=?
+                   WHERE run_id=? AND status!='ready'""",
+                (str(error), _now(), str(run_id)),
+            ).rowcount
+
     def insert_work_packages(
         self, run_id: str, packages: Iterable[Mapping[str, Any]]
     ) -> int:
@@ -1325,10 +1334,14 @@ class RunStateDB:
             "AND status IN ('queued','interrupted') AND attempt < max_attempts "
             "AND EXISTS (SELECT 1 FROM runs r WHERE r.run_id=jobs.run_id "
             "AND r.status IN ('preflight','planned','running','raster_ready')) "
-            "AND (job_type!='work_package' OR EXISTS ("
+            "AND (job_type!='work_package' OR (EXISTS ("
             " SELECT 1 FROM work_packages wp WHERE wp.run_id=jobs.run_id"
             " AND wp.package_id=jobs.package_id"
-            " AND wp.status IN ('queued','interrupted'))) "
+            " AND wp.status IN ('queued','interrupted'))"
+            " AND NOT EXISTS (SELECT 1 FROM jobs failed_package"
+            " WHERE failed_package.run_id=jobs.run_id"
+            " AND failed_package.job_type='work_package'"
+            " AND failed_package.status='failed'))) "
             "AND (job_type!='unit_fit' OR "
             "((SELECT COUNT(*) FROM artifact_dependencies ad"
             " WHERE ad.job_id=jobs.job_id)="
@@ -1378,6 +1391,12 @@ class RunStateDB:
                         WHERE j.run_id=? AND j.job_type='work_package'
                           AND j.status IN ('queued','interrupted')
                           AND j.attempt < j.max_attempts
+                          AND NOT EXISTS (
+                            SELECT 1 FROM jobs failed_package
+                            WHERE failed_package.run_id=j.run_id
+                              AND failed_package.job_type='work_package'
+                              AND failed_package.status='failed'
+                          )
                           AND EXISTS (
                             SELECT 1 FROM runs r WHERE r.run_id=j.run_id
                               AND r.status IN (
@@ -1427,6 +1446,12 @@ class RunStateDB:
                      WHERE wp.run_id=jobs.run_id
                        AND wp.package_id=jobs.package_id
                        AND wp.status IN ('queued','interrupted')
+                   ))
+                   AND (job_type!='work_package' OR NOT EXISTS (
+                     SELECT 1 FROM jobs failed_package
+                     WHERE failed_package.run_id=jobs.run_id
+                       AND failed_package.job_type='work_package'
+                       AND failed_package.status='failed'
                    ))
                    AND (job_type!='unit_fit' OR
                      ((SELECT COUNT(*) FROM artifact_dependencies ad
@@ -2400,6 +2425,128 @@ class RunStateDB:
                    WHERE artifact_id=? AND status IN ('writing','failed')""",
                 (int(byte_count), str(sha256).lower(), _now(), int(artifact_id)),
             ).rowcount == 1
+
+    def publish_partition_artifact(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        path: str | Path,
+        *,
+        byte_count: int,
+        sha256: str,
+    ) -> int:
+        """Publish one Partition probability and link live consumers atomically.
+
+        The scheduler is allowed to delete a ready probability Artifact with a
+        zero reference count.  Therefore the ready transition and dependency
+        insertion must be committed by the same transaction; exposing ready in
+        an earlier transaction creates a cleanup race.
+
+        A cleaned row may be republished only when none of its dependent jobs
+        has started.  This supports an immediate Work Package retry after the
+        old race without resurrecting inputs already consumed by completed
+        geometry jobs.
+        """
+        size = int(byte_count)
+        if size < 0:
+            raise ValueError("artifact byte_count cannot be negative")
+        digest = str(sha256).lower()
+        if len(digest) != 64:
+            raise ValueError("artifact sha256 must contain 64 hexadecimal characters")
+        try:
+            int(digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                "artifact sha256 must contain 64 hexadecimal characters"
+            ) from error
+
+        identifier = str(run_id)
+        stream = str(stream_id)
+        partition = str(partition_id)
+        resolved_path = str(Path(path).expanduser().resolve())
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO artifacts
+                   (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
+                   VALUES (?, ?, ?, 'partition_probability', ?, ?, ?)
+                   ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
+                (identifier, stream, partition, resolved_path, now, now),
+            )
+            artifact = connection.execute(
+                """SELECT * FROM artifacts
+                   WHERE run_id=? AND stream_id=? AND unit_id=?
+                     AND kind='partition_probability' AND path=?""",
+                (identifier, stream, partition, resolved_path),
+            ).fetchone()
+            if artifact is None:
+                raise RunStateError(
+                    "partition Artifact registration did not create or find a row"
+                )
+
+            status = str(artifact["status"])
+            artifact_id = int(artifact["artifact_id"])
+            if status == "ready":
+                if (
+                    int(artifact["byte_count"]) != size
+                    or str(artifact["sha256"]) != digest
+                ):
+                    raise RunStateError(
+                        f"ready Partition Artifact changed on disk: {resolved_path}"
+                    )
+            elif status == "cleaned":
+                started = connection.execute(
+                    """SELECT COUNT(*) FROM jobs j
+                       JOIN unit_dependencies d
+                         ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                       WHERE j.run_id=? AND j.stream_id=?
+                         AND j.job_type='unit_fit' AND d.partition_id=?
+                         AND j.status NOT IN ('queued','interrupted')""",
+                    (identifier, stream, partition),
+                ).fetchone()[0]
+                if int(artifact["ref_count"]) != 0 or int(started) != 0:
+                    raise RunStateError(
+                        "cleaned Partition Artifact requires a full Package reset"
+                    )
+                connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
+                       updated_at=? WHERE artifact_id=? AND status='cleaned'
+                       AND ref_count=0""",
+                    (size, digest, now, artifact_id),
+                )
+            elif status in {"writing", "failed"}:
+                changed = connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
+                       updated_at=? WHERE artifact_id=?
+                       AND status IN ('writing','failed')""",
+                    (size, digest, now, artifact_id),
+                ).rowcount
+                if changed != 1:
+                    raise RunStateError(
+                        f"cannot publish Partition Artifact: {resolved_path}"
+                    )
+            else:
+                raise RunStateError(
+                    f"Partition Artifact is unavailable for publish ({status}): "
+                    + resolved_path
+                )
+
+            # Link only jobs that can still consume this input. Completed or
+            # exhausted jobs have already released their dependencies and must
+            # not gain a reference that can never be released.
+            connection.execute(
+                """INSERT OR IGNORE INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, ?, ? FROM jobs j
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   WHERE j.run_id=? AND j.stream_id=?
+                     AND j.job_type='unit_fit' AND d.partition_id=?
+                     AND j.status IN ('queued','interrupted','running')""",
+                (artifact_id, now, identifier, stream, partition),
+            )
+            return artifact_id
 
     def mark_artifact_failed(self, artifact_id: int) -> bool:
         with self.transaction() as connection:

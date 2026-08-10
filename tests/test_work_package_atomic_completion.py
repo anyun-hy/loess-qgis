@@ -72,6 +72,55 @@ def test_package_and_exact_leased_job_commit_ready_together(tmp_path):
     assert completed["lease_expires"] is None
 
 
+def test_terminal_package_failure_blocks_every_later_package_lease(tmp_path):
+    database = RunStateDB(tmp_path / "run_state.sqlite")
+    database.initialize()
+    database.create_run(RUN_ID, "a" * 64)
+    database.insert_work_packages(
+        RUN_ID,
+        [
+            {"package_id": "package_00000", "sequence_no": 0},
+            {"package_id": "package_00001", "sequence_no": 1},
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {"job_type": "work_package", "package_id": "package_00000"},
+            {"job_type": "work_package", "package_id": "package_00001"},
+        ],
+    )
+    first = database.lease_next_work_package(
+        RUN_ID,
+        "atomic-test",
+        max_open_frontier_units=64,
+        lease_seconds=120,
+    )
+    assert first["package_id"] == "package_00000"
+    assert database.fail_work_package_job(
+        RUN_ID,
+        "package_00000",
+        first["job_id"],
+        first["lease_token"],
+        error="exhausted",
+    )
+
+    assert database.lease_next_work_package(
+        RUN_ID,
+        "must-not-run",
+        max_open_frontier_units=64,
+        lease_seconds=120,
+    ) is None
+    with sqlite3.connect(database.path) as connection:
+        second_job_id = int(
+            connection.execute(
+                "SELECT job_id FROM jobs WHERE package_id='package_00001'"
+            ).fetchone()[0]
+        )
+    assert database.lease_job(second_job_id, "must-not-run") is None
+    assert database.get_job(second_job_id)["status"] == "queued"
+
+
 @pytest.mark.parametrize("target", ["ready", "failed", "interrupted"])
 def test_exact_lease_transitions_package_and_job_together(tmp_path, target):
     database, job = _leased_package(tmp_path)
