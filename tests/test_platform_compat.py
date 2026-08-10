@@ -924,9 +924,21 @@ def test_monitor_tables_use_stable_user_resizable_columns():
     source = (
         PLUGIN_ROOT / "gui" / "inference_monitor.py"
     ).read_text(encoding="utf-8")
-    assert "((1, 116), (2, 98), (3, 86), (4, 58), (5, 96))" in source
+    stream_header = source.split(
+        "header = self._streams.horizontalHeader()", 1
+    )[1].split("left_layout.addWidget(self._streams", 1)[0]
+    for expected_width in (
+        "(0, 180)",
+        "(1, 220)",
+        "(2, 120)",
+        "(3, 120)",
+        "(4, 64)",
+        "(5, 110)",
+    ):
+        assert expected_width in stream_header
+    assert "header.setSectionResizeMode(0, STRETCH)" not in stream_header
+    assert "header.setSectionResizeMode(column, INTERACTIVE)" in stream_header
     assert "((0, 96), (1, 72), (2, 88))" in source
-    assert "header.setSectionResizeMode(column, INTERACTIVE)" in source
     assert "splitter.setSizes([650, 530])" in source
 
 
