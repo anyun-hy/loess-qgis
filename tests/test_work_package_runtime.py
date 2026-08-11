@@ -107,6 +107,7 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         "weights": [[0.5, 0.5] for _ in range(14)],
     }
     return create_v5_run(
+        state_database=tmp_path / f"{run_id}_state.sqlite",
         output_root=tmp_path / f"{run_id}_output",
         raster={
             "path": tile,
@@ -916,6 +917,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         "weights": [[0.5, 0.5] for _ in range(14)],
     }
     spec, spec_path, database_path = create_v5_run(
+        state_database=tmp_path / "state.sqlite",
         output_root=tmp_path / "output",
         raster={
             "path": tile,
@@ -1117,7 +1119,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert assembled["status"] == "passed"
     assert assembled["assembly_mode"] == "full"
     assert assembled["report_queue_capacity"] == 32
-    assert assembled["report_summary_source"] == "sqlite"
+    assert assembled["report_summary_source"] == "run_state_database"
     assert assembled["report_processed_count"] == 1
     assert assembled["report_peak_loaded_count"] == 0
     assert assembled["report_json_parse_count"] == 0
@@ -1140,7 +1142,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert completed[0]["current"] == completed[0]["total"] == 1
     assert completed[0]["report_queue_capacity"] == 32
     assert completed[0]["report_peak_loaded_count"] == 0
-    assert completed[0]["report_summary_source"] == "sqlite"
+    assert completed[0]["report_summary_source"] == "run_state_database"
     assert completed[0]["report_json_parse_count"] == 0
     assert completed[0]["summary_validation_peak_in_flight"] >= 1
     assert completed[0]["failed_unit_count"] == 0
@@ -1219,6 +1221,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         "partition_tile_cols": 2,
     }
     spec, spec_path, database_path = create_v5_run(
+        state_database=tmp_path / "state.sqlite",
         output_root=tmp_path / "output",
         raster={
             "path": tile,
@@ -1879,7 +1882,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
     assert report["report_processed_count"] == 64
     assert report["report_queue_capacity"] == 32
     assert report["report_peak_loaded_count"] == 0
-    assert report["report_summary_source"] == "sqlite"
+    assert report["report_summary_source"] == "run_state_database"
     assert report["report_json_parse_count"] == 0
     assert report["summary_validation_peak_in_flight"] <= 32
     stream_root = run_dir / "models" / "a"
@@ -1945,7 +1948,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
     assert resumed["status"] == "passed"
     assert resumed["assembly_mode"] == "report_resume"
     assert resumed["report_processed_count"] == 64
-    assert resumed["report_summary_source"] == "sqlite"
+    assert resumed["report_summary_source"] == "run_state_database"
     assert resumed["report_json_parse_count"] == 0
     assert _sha(raw_path) == output_hashes["raw"]
     assert _sha(formal_path) == output_hashes["formal"]

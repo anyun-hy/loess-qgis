@@ -650,7 +650,8 @@ def _resolved_object_state(
     run_id: str,
     stream_id: str,
 ) -> tuple[int, int]:
-    with _readonly_sqlite(Path(state_db)) as connection:
+    database = RunStateDB(state_db)
+    with database._connection() as connection:
         row = connection.execute(
             """SELECT COUNT(*) AS part_count,
                       COALESCE(SUM(CASE WHEN object_id IS NULL OR object_id=''
@@ -846,7 +847,7 @@ def _validated_summary_inputs(
         missing = sorted(expected_edge_units - set(edges_by_unit))
         unexpected = sorted(set(edges_by_unit) - expected_edge_units)
         raise StreamAssemblyError(
-            "unit fitted-edge Artifacts do not match SQLite summaries; "
+            "unit fitted-edge Artifacts do not match database summaries; "
             f"missing={missing[:3]}, unexpected={unexpected[:3]}"
         )
     for unit_id in sorted(edges_by_unit):
@@ -939,7 +940,7 @@ def _reuse_ready_assembly(
         ASSEMBLY_VALIDATION_MAX_IN_FLIGHT,
     )
     report.setdefault("report_peak_loaded_count", 0)
-    report.setdefault("report_summary_source", "sqlite")
+    report.setdefault("report_summary_source", "run_state_database")
     report.setdefault("report_json_parse_count", 0)
     report["object_link_count"] = database.object_link_count(run_id, stream_id)
     report["recovered_stream_status"] = stream_status
@@ -1126,7 +1127,7 @@ def _assemble_stream_impl(
     )
     if int(summary_aggregate["unit_count"]) != expected_units:
         raise StreamAssemblyError(
-            "SQLite report aggregate does not cover every ready unit"
+            "run-state report aggregate does not cover every ready unit"
         )
     model_id = str(stream.get("model_id") or "")
     profile_id = str(stream.get("profile_id") or "")
@@ -1360,7 +1361,7 @@ def _assemble_stream_impl(
         "stream_id": stream_id,
         "assembly_mode": "report_resume" if resume_from_reports else "full",
         "report_queue_capacity": ASSEMBLY_VALIDATION_MAX_IN_FLIGHT,
-        "report_summary_source": "sqlite",
+        "report_summary_source": "run_state_database",
         "report_processed_count": expected_units,
         "report_peak_loaded_count": 0,
         "report_json_parse_count": 0,
@@ -1469,7 +1470,7 @@ def _assemble_stream_impl(
                         "report_queue_capacity": aggregate[
                             "report_queue_capacity"
                         ],
-                        "report_summary_source": "sqlite",
+                        "report_summary_source": "run_state_database",
                         "report_json_parse_count": 0,
                         "summary_validation_workers": aggregate[
                             "summary_validation_workers"

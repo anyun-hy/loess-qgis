@@ -56,6 +56,7 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         "status": "passed",
     }
     spec, spec_path, database_path = create_v5_run(
+        state_database=tmp_path / "state.sqlite",
         output_root=tmp_path / "output",
         raster={
             "path": raster,

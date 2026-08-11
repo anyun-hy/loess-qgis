@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import sqlite3
 import sys
 import threading
 import time
@@ -22,7 +21,11 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from labeling_tool.core.run_builder_v5 import create_v5_run
 from labeling_tool.core.run_spec import atomic_write_json, sha256_file
-from labeling_tool.core.run_state_db import MAX_TILE_PAGE_SIZE, RunStateDB
+from labeling_tool.core.run_state_db import (
+    MAX_TILE_PAGE_SIZE,
+    RunStateDB,
+    production_state_database,
+)
 
 
 TILE_ROWS = 1000
@@ -66,7 +69,7 @@ def _tiles():
             }
 
 
-def _table_counts(database_path: Path) -> tuple[dict[str, int], str]:
+def _table_counts(database: RunStateDB, run_id: str) -> dict[str, int]:
     tables = (
         "tiles",
         "partitions",
@@ -77,16 +80,24 @@ def _table_counts(database_path: Path) -> tuple[dict[str, int], str]:
         "work_packages",
         "jobs",
     )
-    with sqlite3.connect(database_path) as connection:
-        journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    with database._connection() as connection:
         counts = {
-            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            table: int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()[0]
+            )
             for table in tables
         }
-    return counts, journal_mode
+    return counts
 
 
-def run_acceptance(output_root: Path, run_id: str | None = None) -> dict:
+def run_acceptance(
+    output_root: Path,
+    run_id: str | None = None,
+    state_database: str | None = None,
+) -> dict:
     identifier = run_id or (
         dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_c500k"
     )
@@ -111,6 +122,7 @@ def run_acceptance(output_root: Path, run_id: str | None = None) -> dict:
         "max_job_retries": 2,
     }
     spec, spec_path, database_path = create_v5_run(
+        state_database=state_database or production_state_database(),
         output_root=output_root,
         run_id=identifier,
         raster={
@@ -164,13 +176,21 @@ def run_acceptance(output_root: Path, run_id: str | None = None) -> dict:
     first_stream = spec["streams"][0]["stream_id"]
     unit_page = database.page_stream_units(identifier, first_stream, limit=10_000)
     page_elapsed = time.monotonic() - page_started
-    counts, journal_mode = _table_counts(database_path)
-    with sqlite3.connect(database_path) as connection:
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    counts = _table_counts(database, identifier)
+    health = database.pragmas()
+    with database._connection() as connection:
+        database_bytes = int(
+            connection.execute(
+                """SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)
+                   FROM pg_class c
+                   JOIN pg_namespace n ON n.oid=c.relnamespace
+                   WHERE n.nspname=current_schema()
+                     AND c.relkind IN ('r','m')"""
+            ).fetchone()[0]
+        )
     sampler.stop()
 
     run_spec_bytes = spec_path.stat().st_size
-    database_bytes = database_path.stat().st_size
     peak_increase = max(0, sampler.peak - sampler.baseline)
     ui_source = (
         ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "inference_monitor.py"
@@ -181,7 +201,10 @@ def run_acceptance(output_root: Path, run_id: str | None = None) -> dict:
         "all_stream_units_materialized": (
             counts["stream_units"] == counts["spatial_units"] * STREAM_COUNT
         ),
-        "wal_enabled": journal_mode.lower() == "wal",
+        "postgresql_18_mvcc": (
+            health.get("backend") == "postgresql"
+            and str(health.get("server_version") or "").startswith("18.")
+        ),
         "tile_page_hard_cap_500": len(oversized_page) == MAX_TILE_PAGE_SIZE,
         "last_tile_page_50": len(last_page) == 50,
         "unit_page_hard_cap_500": len(unit_page) == MAX_TILE_PAGE_SIZE,
@@ -219,8 +242,9 @@ def run_acceptance(output_root: Path, run_id: str | None = None) -> dict:
         "artifacts": {
             "run_spec_bytes": run_spec_bytes,
             "run_spec_sha256": sha256_file(spec_path),
-            "state_db_bytes": database_bytes,
-            "state_db_sha256": sha256_file(database_path),
+            "state_backend": health.get("backend"),
+            "state_schema_bytes": database_bytes,
+            "state_schema": health.get("schema"),
         },
         "elapsed_seconds": time.monotonic() - started,
         "gates": gates,
@@ -241,8 +265,16 @@ def main(argv=None) -> int:
         default=str(ROOT / "output" / "v5_control_plane"),
     )
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--state-database",
+        default=production_state_database(),
+    )
     args = parser.parse_args(argv)
-    report = run_acceptance(Path(args.output_root), args.run_id)
+    report = run_acceptance(
+        Path(args.output_root),
+        args.run_id,
+        args.state_database,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

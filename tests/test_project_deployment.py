@@ -22,7 +22,12 @@ GIT_SHA = subprocess.run(
     stdout=subprocess.PIPE,
     check=True,
 ).stdout.strip()
-SHARED_NAMES = ("run_spec.py", "run_state_db.py", "ownership_neighbors.py")
+SHARED_NAMES = (
+    "run_spec.py",
+    "run_state_db.py",
+    "postgres_state.py",
+    "ownership_neighbors.py",
+)
 
 
 def _run(command, *, env=None, check=True):

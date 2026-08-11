@@ -69,7 +69,7 @@ class WorkPackageRuntimeError(RuntimeError):
 
 
 class LeaseLostError(WorkPackageRuntimeError):
-    """The current worker no longer owns the exact SQLite lease."""
+    """The current worker no longer owns the exact database lease."""
 
 
 class WorkerStopRequested(WorkPackageRuntimeError):
@@ -819,7 +819,7 @@ def _run_work_package_impl(
             lease_token,
         ):
             raise WorkPackageRuntimeError(
-                "Work Package job identity or lease does not match SQLite state"
+                "Work Package job identity or lease does not match database state"
             )
         if str(package.get("status")) != "running":
             raise WorkPackageRuntimeError(

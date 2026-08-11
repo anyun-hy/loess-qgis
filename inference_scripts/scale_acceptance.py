@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
@@ -72,9 +71,8 @@ def _scale_level(run_dir: Path, tile_count: int) -> str:
     return "ungraded"
 
 
-def _database_metrics(database_path: Path, run_id: str) -> dict[str, Any]:
-    with sqlite3.connect(database_path) as connection:
-        connection.row_factory = sqlite3.Row
+def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
+    with database._connection() as connection:
         counts = {}
         for table in ("tiles", "partitions", "spatial_units", "work_packages"):
             counts[table] = int(
@@ -89,7 +87,9 @@ def _database_metrics(database_path: Path, run_id: str) -> dict[str, Any]:
         job_counts = {str(row["status"]): int(row["n"]) for row in job_rows}
         retry_count = int(
             connection.execute(
-                "SELECT COALESCE(SUM(MAX(attempt - 1, 0)), 0) FROM jobs WHERE run_id=?",
+                """SELECT COALESCE(SUM(
+                     CASE WHEN attempt>0 THEN attempt-1 ELSE 0 END
+                   ), 0) FROM jobs WHERE run_id=?""",
                 (run_id,),
             ).fetchone()[0]
         )
@@ -159,12 +159,11 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         raise ScaleAcceptanceError("scale acceptance requires run_spec schema 2")
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"])
-    database_path = Path(spec["state_db"])
-    database = RunStateDB(database_path)
+    database = RunStateDB(spec["state_db"])
     package_report_paths = run_dir.glob(
         "tmp/work_packages/*/package_report.json"
     )
-    metrics = _database_metrics(database_path, run_id)
+    metrics = _database_metrics(database, run_id)
     cleanup = database.artifact_cleanup_summary(run_id)
     timing = _pipeline_timing(run_dir / "logs" / "pipeline.jsonl")
 

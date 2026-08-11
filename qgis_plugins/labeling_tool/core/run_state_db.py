@@ -1,19 +1,32 @@
-"""SQLite/WAL state store for large, resumable inference runs."""
+"""PostgreSQL production state store for large, resumable inference runs."""
 
 from __future__ import annotations
 
 import contextlib
 import datetime as _datetime
 import json
+import os
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from .postgres_state import (
+    DEFAULT_POSTGRES_DSN,
+    DEFAULT_POSTGRES_SCHEMA,
+    connect_postgres,
+    initialize_postgres,
+    is_postgres_location,
+    postgres_health,
+    validate_schema,
+)
+
 
 SCHEMA_VERSION = 2
 MAX_TILE_PAGE_SIZE = 500
+STATE_DB_DSN_ENV = "LOESS_STATE_DB_DSN"
+STATE_DB_SCHEMA_ENV = "LOESS_STATE_DB_SCHEMA"
 
 
 class RunStateError(RuntimeError):
@@ -28,18 +41,63 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+def _row_dict(row: Any | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
-class RunStateDB:
-    """Short-transaction database API safe for QGIS and worker processes."""
+def production_state_database() -> str:
+    """Return the password-free PostgreSQL DSN frozen into new Run Specs."""
 
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5000):
-        self.path = Path(path).expanduser().resolve()
+    return str(os.environ.get(STATE_DB_DSN_ENV) or DEFAULT_POSTGRES_DSN).strip()
+
+
+def production_state_schema() -> str:
+    return validate_schema(
+        os.environ.get(STATE_DB_SCHEMA_ENV) or DEFAULT_POSTGRES_SCHEMA
+    )
+
+
+class RunStateDB:
+    """Run-state API backed by PostgreSQL for production and SQLite for legacy.
+
+    New formal Run Specs contain a PostgreSQL DSN.  Filesystem paths remain
+    supported only so historical Run directories and isolated unit tests stay
+    readable while the production control plane migrates.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = 5000,
+        postgres_schema: str | None = None,
+    ):
+        location = str(path).strip()
+        self.backend = "postgresql" if is_postgres_location(location) else "sqlite"
+        self.location = location
+        self.postgres_schema = validate_schema(
+            postgres_schema or production_state_schema()
+        )
+        self.path = (
+            None
+            if self.backend == "postgresql"
+            else Path(path).expanduser().resolve()
+        )
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
 
-    def _connect(self) -> sqlite3.Connection:
+    @property
+    def is_postgresql(self) -> bool:
+        return self.backend == "postgresql"
+
+    def _connect(self, *, autocommit: bool = True):
+        if self.is_postgresql:
+            return connect_postgres(
+                self.location,
+                schema=self.postgres_schema,
+                autocommit=autocommit,
+            )
+        if self.path is None:
+            raise RunStateError("SQLite state path is unavailable")
         connection = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_ms / 1000.0,
@@ -51,7 +109,7 @@ class RunStateDB:
         return connection
 
     @contextlib.contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self) -> Iterator[Any]:
         """Yield one short-lived connection and always close its file handles."""
         connection = self._connect()
         try:
@@ -60,10 +118,11 @@ class RunStateDB:
             connection.close()
 
     @contextlib.contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def transaction(self) -> Iterator[Any]:
+        connection = self._connect(autocommit=False)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if not self.is_postgresql:
+                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except Exception:
@@ -73,6 +132,16 @@ class RunStateDB:
             connection.close()
 
     def initialize(self) -> None:
+        if self.is_postgresql:
+            initialize_postgres(
+                self.location,
+                schema=self.postgres_schema,
+                schema_version=SCHEMA_VERSION,
+                now=_now(),
+            )
+            return
+        if self.path is None:
+            raise RunStateError("SQLite state path is unavailable")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
@@ -372,6 +441,18 @@ class RunStateDB:
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def pragmas(self) -> dict[str, Any]:
+        if self.is_postgresql:
+            report = postgres_health(
+                self.location,
+                schema=self.postgres_schema,
+                schema_version=SCHEMA_VERSION,
+            )
+            return {
+                **report,
+                "journal_mode": "postgresql-mvcc",
+                "foreign_keys": 1,
+                "user_version": SCHEMA_VERSION,
+            }
         with self._connection() as connection:
             return {
                 "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
@@ -1022,9 +1103,13 @@ class RunStateDB:
         identifier = str(run_id)
         with self._connection() as connection:
             # Keep every aggregate in one read transaction. Without an
-            # explicit BEGIN, SQLite may expose different commits to the
-            # individual SELECT statements in the same polling cycle.
-            connection.execute("BEGIN")
+            # explicit repeatable-read snapshot, different commits may be
+            # exposed to individual SELECT statements in one polling cycle.
+            connection.execute(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                if self.is_postgresql
+                else "BEGIN"
+            )
             run = _row_dict(
                 connection.execute(
                     "SELECT * FROM runs WHERE run_id=?", (identifier,)
@@ -1281,8 +1366,8 @@ class RunStateDB:
 
     def _lease_selected_job(
         self,
-        connection: sqlite3.Connection,
-        row: sqlite3.Row,
+        connection: Any,
+        row: Any,
         worker_id: str,
         token: str,
         expires: float,
@@ -1361,6 +1446,8 @@ class RunStateDB:
             sql += " AND job_type IN (" + ",".join("?" for _ in job_types) + ")"
             values.extend(str(item) for item in job_types)
         sql += " ORDER BY priority DESC, job_id LIMIT 1"
+        if self.is_postgresql:
+            sql += " FOR UPDATE SKIP LOCKED"
         with self.transaction() as connection:
             row = connection.execute(sql, values).fetchone()
             if row is None:
@@ -1432,6 +1519,7 @@ class RunStateDB:
         expires = time.time() + max(1.0, float(lease_seconds))
         now = _now()
         with self.transaction() as connection:
+            lock_clause = " FOR UPDATE SKIP LOCKED" if self.is_postgresql else ""
             row = connection.execute(
                 """SELECT * FROM jobs WHERE job_id=?
                    AND status IN ('queued','interrupted') AND attempt < max_attempts
@@ -1468,7 +1556,8 @@ class RunStateDB:
                         WHERE ud.run_id=jobs.run_id
                           AND ud.unit_id=jobs.unit_id
                           AND COALESCE(wp.status,'')!='ready'
-                      )))""",
+                      )))"""
+                + lock_clause,
                 (int(job_id),),
             ).fetchone()
             if row is None:
@@ -1922,7 +2011,7 @@ class RunStateDB:
     def begin_failed_package_reset(self, run_id: str) -> dict[str, Any]:
         """Freeze and inventory every Package implicated by failed work.
 
-        The filesystem is intentionally not touched inside the SQLite
+        The filesystem is intentionally not touched inside the database
         transaction.  Callers delete only the returned, run-owned paths and
         then call :meth:`complete_failed_package_reset`.  If deletion is
         interrupted, calling this method again resumes the same ``resetting``
@@ -2474,10 +2563,12 @@ class RunStateDB:
                    ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                 (identifier, stream, partition, resolved_path, now, now),
             )
+            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
             artifact = connection.execute(
                 """SELECT * FROM artifacts
                    WHERE run_id=? AND stream_id=? AND unit_id=?
-                     AND kind='partition_probability' AND path=?""",
+                     AND kind='partition_probability' AND path=?"""
+                + artifact_lock,
                 (identifier, stream, partition, resolved_path),
             ).fetchone()
             if artifact is None:
@@ -2559,9 +2650,11 @@ class RunStateDB:
     def add_artifact_dependency(self, job_id: int, artifact_id: int) -> bool:
         """Attach a ready input to a job; the trigger updates ref_count atomically."""
         with self.transaction() as connection:
+            artifact_lock = " FOR UPDATE OF a" if self.is_postgresql else ""
             relation = connection.execute(
                 """SELECT 1 FROM jobs j JOIN artifacts a ON a.run_id=j.run_id
-                   WHERE j.job_id=? AND a.artifact_id=? AND a.status='ready'""",
+                   WHERE j.job_id=? AND a.artifact_id=? AND a.status='ready'"""
+                + artifact_lock,
                 (int(job_id), int(artifact_id)),
             ).fetchone()
             if relation is None:
@@ -2584,10 +2677,12 @@ class RunStateDB:
     ) -> int:
         """Link one ready Partition probability to every dependent unit job."""
         with self.transaction() as connection:
+            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
             artifact = connection.execute(
                 """SELECT 1 FROM artifacts WHERE artifact_id=? AND run_id=?
                    AND stream_id=? AND unit_id=? AND kind='partition_probability'
-                   AND status='ready'""",
+                   AND status='ready'"""
+                + artifact_lock,
                 (int(artifact_id), str(run_id), str(stream_id), str(partition_id)),
             ).fetchone()
             if artifact is None:
@@ -2625,6 +2720,27 @@ class RunStateDB:
 
     def release_job_artifacts(self, job_id: int) -> int:
         with self.transaction() as connection:
+            if self.is_postgresql:
+                artifact_ids = [
+                    int(row["artifact_id"])
+                    for row in connection.execute(
+                        """SELECT artifact_id FROM artifact_dependencies
+                           WHERE job_id=? ORDER BY artifact_id""",
+                        (int(job_id),),
+                    ).fetchall()
+                ]
+                if artifact_ids:
+                    placeholders = ",".join("?" for _ in artifact_ids)
+                    # Every releaser locks shared Artifact rows in the same
+                    # order before DELETE triggers decrement ref_count.  This
+                    # prevents cross-unit deadlocks without reducing worker
+                    # concurrency.
+                    connection.execute(
+                        f"""SELECT artifact_id FROM artifacts
+                            WHERE artifact_id IN ({placeholders})
+                            ORDER BY artifact_id FOR UPDATE""",
+                        artifact_ids,
+                    ).fetchall()
             return connection.execute(
                 "DELETE FROM artifact_dependencies WHERE job_id=?", (int(job_id),)
             ).rowcount
@@ -2814,12 +2930,13 @@ class RunStateDB:
     ) -> list[dict[str, Any]]:
         """Return summary rows, or no rows when the current contract is incomplete."""
         with self._connection() as connection:
-            exists = connection.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type='table' AND name='unit_report_summaries'"""
-            ).fetchone()
-            if exists is None:
-                return []
+            if not self.is_postgresql:
+                exists = connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                       WHERE type='table' AND name='unit_report_summaries'"""
+                ).fetchone()
+                if exists is None:
+                    return []
             return [
                 dict(row)
                 for row in connection.execute(
@@ -2834,7 +2951,7 @@ class RunStateDB:
         run_id: str,
         stream_id: str,
     ) -> dict[str, Any]:
-        """Aggregate report scalars inside SQLite without loading report JSON."""
+        """Aggregate report scalars in the state database without loading JSON."""
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT COUNT(*) AS unit_count,
@@ -3096,7 +3213,8 @@ class RunStateDB:
             cursor = connection.execute(
                 """INSERT INTO events
                    (run_id, timestamp, level, event_type, stream_id, job_id,
-                    message, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    message, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   RETURNING event_id""",
                 (
                     str(run_id),
                     _now(),
@@ -3108,7 +3226,10 @@ class RunStateDB:
                     _json(dict(payload or {})),
                 ),
             )
-            return int(cursor.lastrowid)
+            row = cursor.fetchone()
+            if row is None:
+                raise RunStateError("event insert did not return an event_id")
+            return int(row[0])
 
     def job_counts(
         self,

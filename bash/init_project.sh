@@ -180,7 +180,7 @@ esac
   echo "Missing platform environment lock: ${ENV_FILE}" >&2
   exit 1
 }
-for shared_name in run_spec.py run_state_db.py ownership_neighbors.py; do
+for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neighbors.py; do
   [[ -f "${PLUGIN_SRC}/core/${shared_name}" ]] || {
     echo "Missing shared runtime source: ${shared_name}" >&2
     exit 1
@@ -501,7 +501,7 @@ install -m 0644 "${PLUGIN_SRC}/__init__.py" \
   "${STAGE_ROOT}/runtime/labeling_tool/__init__.py"
 install -m 0644 "${PLUGIN_SRC}/core/__init__.py" \
   "${STAGE_ROOT}/runtime/labeling_tool/core/__init__.py"
-for shared_name in run_spec.py run_state_db.py ownership_neighbors.py; do
+for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neighbors.py; do
   install -m 0644 "${PLUGIN_SRC}/core/${shared_name}" \
     "${STAGE_ROOT}/runtime/labeling_tool/core/${shared_name}"
 done
@@ -551,7 +551,7 @@ launcher_sha256 = hashlib.sha256(launcher_path.read_bytes()).hexdigest()
 
 shared = {}
 aggregate = hashlib.sha256()
-for name in sorted(("run_spec.py", "run_state_db.py", "ownership_neighbors.py")):
+for name in sorted(("run_spec.py", "run_state_db.py", "postgres_state.py", "ownership_neighbors.py")):
     canonical = f"qgis_plugins/labeling_tool/core/{name}"
     path = stage / "runtime" / "labeling_tool" / "core" / name
     digest = hashlib.sha256(path.read_bytes()).hexdigest()

@@ -825,7 +825,7 @@ def run_unit_fit(
     unit = database.get_spatial_unit(run_id, unit_id)
     job = database.job_for_unit(run_id, stream_id, unit_id)
     if unit is None or job is None or int(job["job_id"]) != int(job_id):
-        raise UnitRuntimeError("unit job identity does not match SQLite state")
+        raise UnitRuntimeError("unit job identity does not match database state")
     if job["status"] != "running" or job["lease_token"] != lease_token:
         raise UnitRuntimeError("unit job does not hold the supplied lease")
     database.set_stream_unit_status(run_id, stream_id, unit_id, "running")

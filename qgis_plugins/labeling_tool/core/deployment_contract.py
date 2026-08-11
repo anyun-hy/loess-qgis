@@ -17,6 +17,8 @@ SHARED_RUNTIME_FILES = {
         "runtime/labeling_tool/core/run_spec.py",
     "qgis_plugins/labeling_tool/core/run_state_db.py":
         "runtime/labeling_tool/core/run_state_db.py",
+    "qgis_plugins/labeling_tool/core/postgres_state.py":
+        "runtime/labeling_tool/core/postgres_state.py",
     "qgis_plugins/labeling_tool/core/ownership_neighbors.py":
         "runtime/labeling_tool/core/ownership_neighbors.py",
 }
