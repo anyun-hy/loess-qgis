@@ -19,6 +19,16 @@ import tempfile
 import warnings
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+for import_root in (PROJECT_ROOT / "runtime", PROJECT_ROOT / "qgis_plugins"):
+    if import_root.is_dir() and str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from labeling_tool.core.run_state_db import (
+    RunStateDB,
+    production_state_database,
+)
+
 warnings.filterwarnings(
     "ignore",
     message=r"Failed to load image Python extension.*",
@@ -994,6 +1004,7 @@ def build_report(args):
         "psutil",
         "yaml",
         "skimage",
+        "psycopg2",
     ):
         module, version, error = import_dependency(name)
         dependencies[name] = module
@@ -1157,33 +1168,36 @@ def build_report(args):
         f"install scipy=1.17.1 in Conda environment {args.conda_env}",
     )
 
-    sqlite_error = ""
-    sqlite_value = f"sqlite {sqlite3.sqlite_version}"
+    postgres_error = ""
+    postgres_value = "not available"
     try:
-        with tempfile.TemporaryDirectory(prefix="loess_sqlite_check_") as temp_dir:
-            db_path = Path(temp_dir) / "state.sqlite"
-            connection = sqlite3.connect(db_path)
-            try:
-                journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-                connection.execute("PRAGMA foreign_keys=ON")
-                foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
-                json_valid = connection.execute("SELECT json_valid('{}')").fetchone()[0]
-                if str(journal_mode).lower() != "wal" or foreign_keys != 1 or json_valid != 1:
-                    raise RuntimeError(
-                        f"WAL={journal_mode}, foreign_keys={foreign_keys}, json1={json_valid}"
-                    )
-            finally:
-                connection.close()
+        state = RunStateDB(production_state_database())
+        state.initialize()
+        health = state.pragmas()
+        postgres_value = (
+            f"PostgreSQL {health['server_version']} / "
+            f"{health['database']} / {health['schema']}"
+        )
     except Exception as exc:
-        sqlite_error = str(exc)
+        postgres_error = str(exc)
     add_check(
         checks,
-        "dependency_sqlite_wal",
-        "ready" if not sqlite_error else "error",
-        sqlite_value,
+        "dependency_postgresql_state",
+        "ready" if not postgres_error else "error",
+        postgres_value,
         f"Conda environment {args.conda_env}",
-        sqlite_error or "WAL, foreign keys and JSON1 are available",
-        f"install sqlite=3.53.3 in Conda environment {args.conda_env}",
+        postgres_error or "PostgreSQL control-plane schema is writable and compatible",
+        f"install psycopg2 in {args.conda_env} and verify the local PostgreSQL service",
+    )
+
+    add_check(
+        checks,
+        "dependency_geopackage_sqlite",
+        "ready",
+        f"sqlite {sqlite3.sqlite_version}",
+        "Python standard library / GeoPackage",
+        "SQLite remains available only for GeoPackage integrity checks",
+        "",
     )
 
     gdal_versions = []

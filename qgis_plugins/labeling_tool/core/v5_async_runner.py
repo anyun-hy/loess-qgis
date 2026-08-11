@@ -1,4 +1,4 @@
-"""Qt orchestration for the SQLite-backed bounded v5 pipeline."""
+"""Qt orchestration for the PostgreSQL-backed bounded v5 pipeline."""
 
 from __future__ import annotations
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .deployment_contract import deployment_fingerprint, verify_project_runtime
+from .postgres_state import is_postgres_location
 from .run_spec import RUN_ID_PATTERN, sha256_file
 from .run_state_db import RunStateDB, SCHEMA_VERSION
 
@@ -96,16 +97,24 @@ def validate_recovery_run(
             "旧 Run 不能继续，请使用当前部署创建新 Run"
         )
 
-    declared_state_path = Path(str(spec.get("state_db") or "")).expanduser()
-    if declared_state_path.is_symlink():
-        raise RecoveryContractError(
-            f"Run 状态库不能是符号链接: {declared_state_path}"
-        )
-    state_path = declared_state_path.resolve()
-    if state_path != run_dir / "run_state.sqlite" or not state_path.is_file():
-        raise RecoveryContractError("Run 状态库路径或文件身份无效")
-
-    database = RunStateDB(state_path)
+    state_backend = str(spec.get("state_backend") or "sqlite")
+    state_location = str(spec.get("state_db") or "").strip()
+    if state_backend == "postgresql":
+        if not is_postgres_location(state_location):
+            raise RecoveryContractError("PostgreSQL Run 状态库连接标识无效")
+        database = RunStateDB(state_location)
+    elif state_backend == "sqlite":
+        declared_state_path = Path(state_location).expanduser()
+        if declared_state_path.is_symlink():
+            raise RecoveryContractError(
+                f"Run 状态库不能是符号链接: {declared_state_path}"
+            )
+        state_path = declared_state_path.resolve()
+        if state_path != run_dir / "run_state.sqlite" or not state_path.is_file():
+            raise RecoveryContractError("Run 状态库路径或文件身份无效")
+        database = RunStateDB(state_path)
+    else:
+        raise RecoveryContractError(f"不支持的 Run 状态库后端: {state_backend}")
     try:
         run = database.get_run(run_id)
     except Exception as error:

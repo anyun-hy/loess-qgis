@@ -1,4 +1,4 @@
-"""Create a v5 run whose detailed state lives in SQLite, not run_spec JSON."""
+"""Create a v5 run whose detailed state lives in PostgreSQL."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ from .run_spec import (
     run_tile_cache_dir,
     sha256_file,
 )
-from .run_state_db import RunStateDB
+from .postgres_state import is_postgres_location
+from .run_state_db import RunStateDB, production_state_database
 from .spatial_planner import plan_spatial_units
 from .work_package_planner import plan_work_packages
 
@@ -74,7 +75,8 @@ def create_v5_run(
     range_selection: Mapping[str, Any] | None = None,
     run_id: str | None = None,
     reserved_run_dir: str | Path | None = None,
-) -> tuple[dict[str, Any], Path, Path]:
+    state_database: str | Path | None = None,
+) -> tuple[dict[str, Any], Path, str | Path]:
     """Freeze a small run spec and atomically populate the detailed state DB."""
     if not models:
         raise RunBuilderV5Error("at least one semantic model is required")
@@ -230,6 +232,10 @@ def create_v5_run(
             parents=True, exist_ok=True
         )
 
+    state_location = str(state_database or production_state_database()).strip()
+    state_backend = (
+        "postgresql" if is_postgres_location(state_location) else "sqlite"
+    )
     spec = {
         "schema_version": RUN_SPEC_SCHEMA_VERSION,
         "run_id": identifier,
@@ -287,14 +293,19 @@ def create_v5_run(
         "class_mapping_snapshot": str(class_path),
         "config_snapshot": str(config_snapshot_path),
         "config_fingerprint": str(config_fingerprint),
-        "state_db": str(run_dir / "run_state.sqlite"),
+        "state_backend": state_backend,
+        "state_db": state_location,
     }
     spec["run_spec_content_sha256"] = _json_sha(spec)
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)
 
-    database_path = run_dir / "run_state.sqlite"
-    database = RunStateDB(database_path)
+    database_location: str | Path = (
+        state_location
+        if state_backend == "postgresql"
+        else Path(state_location).expanduser().resolve()
+    )
+    database = RunStateDB(database_location)
     database.initialize()
     database.create_run(
         identifier,
@@ -395,4 +406,4 @@ def create_v5_run(
         record_run_state(output, identifier, status="planned")
     except (OSError, ValueError) as exc:
         logger.warning("无法更新轻量 Run 启动索引: %s", exc)
-    return spec, spec_path, database_path
+    return spec, spec_path, database_location

@@ -126,7 +126,7 @@ bash/init_project.sh
 12. 人工可以保留 Fusion、采用 SAM3、以 Fusion 为基础编辑或以 SAM3 为基础编辑；最终保存的边界始终位于当前类别工作层。类别判断错误时，用户通过显式“更正类别”把选中对象移动到目标类别工作层，不需要重新勾画正确几何，也不得由 SAM3 自动改类。
 13. 插件运行时只加载 TorchScript 部署模型，不复制训练工程中的模型结构。
 14. 被拒绝的融合 profile 可显示用于追溯，但禁止启动正式融合或初始化正式分类工作区。
-15. 每次运行以 SQLite/WAL 保存 Tile、分区、结果流、Seam、Artifact、重试和事件状态；JSON 只保存小型不可变配置快照与摘要，禁止把五十万 Tile 状态写成一个巨大 JSON。
+15. 每次运行以本机 PostgreSQL 18/MVCC 保存 Tile、分区、结果流、Seam、Artifact、重试和事件状态；JSON 只保存小型不可变配置快照与摘要，禁止把五十万 Tile 状态写成一个巨大 JSON。
 16. 插件只在用户明确请求范围绘制或 SAM3 点选时临时接管地图工具，完成、取消、关闭或异常后必须恢复原地图工具。
 
 ## 4. 总体架构
@@ -146,7 +146,7 @@ bash/init_project.sh
 
 异步运行器
   ├── 共享 Tile 提取
-  ├── SQLite/WAL 任务库 + 有界工作包 + 背压
+  ├── PostgreSQL 行级锁任务库 + 有界工作包 + 背压
   ├── 单 MPS/CUDA 语义 worker，按工作包顺序执行所需模型
   ├── 分区 probability mosaic + raw polygonize
   ├── 相邻 Polygon 公共分界线提取 + 单次 Cubic B-Spline + 误差受限自适应稀疏
@@ -299,7 +299,7 @@ linear_1x1
 
 ## 7. 单次运行输入
 
-启动前插件生成小型不可变 `run_spec.json`，并创建 `run_state.sqlite`。`run_spec.json` 只保存配置、范围、模型与哈希；Tile、分区和事件明细进入 SQLite。
+启动前插件生成小型不可变 `run_spec.json`，并在 PostgreSQL `loess_qgis` Schema 创建该 Run 的状态图。`run_spec.json` 只保存配置、范围、模型、数据库连接标识与哈希；Tile、分区和事件明细进入 PostgreSQL。正式 DSN 使用本机 Unix socket peer 认证，不在 Run Spec 中保存密码。
 
 | 输入 | 来源 | 说明 |
 |---|---|---|
@@ -339,7 +339,7 @@ linear_1x1
 
 ### 8.2 有界工作包与执行并发
 
-调度器把相邻 Partition 组成 Work Package。Package 必须包含完整 Partition 及其 Halo 依赖，大小由 `score_cache_budget_gb`、可用磁盘、结果流数和单 Tile 实测缓存字节数动态计算，至少 1 个 Partition，不得超过预算。工作包计划在启动前写入 SQLite；运行中只能因低磁盘或失败细分而缩小，不能静默扩大。
+调度器把相邻 Partition 组成 Work Package。Package 必须包含完整 Partition 及其 Halo 依赖，大小由 `score_cache_budget_gb`、可用磁盘、结果流数和单 Tile 实测缓存字节数动态计算，至少 1 个 Partition，不得超过预算。工作包计划在启动前写入 PostgreSQL；运行中只能因低磁盘或失败细分而缩小，不能静默扩大。
 
 `score_cache_budget_gb=auto` 是正式默认值。启动 Run 时先从当前可用空间中扣除全部永久 raster/vector 估算、永久结果 25% 误差余量、`max(min_free_disk_gb, 文件系统容量的 5%)` 和 Batch 原子替换峰值。对扣除后的安全 headroom 只使用 50%，并同时不得超过文件系统容量的 20%、512 GiB 和本 Run 全部 Tile 工作集；Tile 上限按冻结的 `tile_batch_size` 向下对齐。解析后的 GiB 数值、当时文件系统总量/可用量、各项扣减量和公式版本必须冻结到 Run Spec，恢复时沿用，不因后续磁盘波动重新放大 Package。显式正数仅用于受控试验或用户主动设置更小上限，不得用固定小值作为高容量机器的默认值。
 
@@ -373,18 +373,18 @@ package_tile_limit = floor(
 ```
 
 - MPS/CUDA 正式只允许 1 个持久语义 worker 进程。该进程自行按确定顺序租用 Work Package；每个模型 Artifact 在本进程中只做一次 SHA256 校验和一次冷加载，后续 Package 复用同一常驻模型对象，不得由 QGIS 逐包重启 Python。worker 重启属于新会话，必须在追加式模型加载日志中保留前后会话及冷加载次数。模型仍按 A/B/C 顺序执行，避免多模型争用统一内存；`tile_batch_size=auto` 在环境检查时按当前加速器显存/统一内存解析为小批量，Run 创建时冻结整数。生产推理必须真正按该值堆叠 Tile；模型拒绝批量或显存不足时按 1/2 递减并记录实际批量，不得启动第二个 GPU worker。
-- 单模型 Package 内的生产流水线固定为：容量 2 的有界输入预取队列读取并按 Tile 顺序组装 `B×3×512×512`，单一 MPS/CUDA worker 执行批推理，容量 1 的结果队列提交 Batch 检查点，单一 Partition 消费者按数据库中的确定顺序执行 Core+Halo mosaic。输入、写盘和纯数组 mosaic 可以与下一批推理重叠；Artifact 写入、SQLite 状态变更和 Fusion accumulator 提交仍由 Package 主线程顺序执行，禁止从后台线程并发修改正式状态。
+- 单模型 Package 内的生产流水线固定为：容量 2 的有界输入预取队列读取并按 Tile 顺序组装 `B×3×512×512`，单一 MPS/CUDA worker 执行批推理，容量 1 的结果队列提交 Batch 检查点，单一 Partition 消费者按数据库中的确定顺序执行 Core+Halo mosaic。输入、写盘和纯数组 mosaic 可以与下一批推理重叠；Artifact 写入、PostgreSQL 状态变更和 Fusion accumulator 提交仍由 Package 主线程顺序执行，禁止从后台线程并发修改正式状态。
 - 模型概率临时缓存不再逐 Tile 写压缩 NPZ。每个配置批次写一份连续 `float16 NPY` 和一份 JSON 清单；提交顺序固定为数据临时文件 `fsync -> atomic rename -> SHA256 -> manifest fsync -> atomic rename`。清单冻结 Run、Package、模型及模型哈希、批次序号、Tile 顺序、输入哈希、数组 shape/dtype/byte count 和数据 SHA256。只有数据与清单全部一致的 Batch 才能恢复复用；损坏、缺清单或身份不一致的 Batch 只能在本 Package 的受管理目录内删除并重算。
 - 批量因显存不足按 1/2 降档时，只改变同一批次内部的 GPU forward 子批大小；成功输出仍按原配置批次和原 Tile 顺序合并成一个检查点，避免恢复契约随临时显存状态变化。一次成功降档必须按模型和设备记在当前 worker 内，后续 Package 直接从已证实的有效批量开始，不得每包重复 OOM 探测。每次写 Batch 前重新检查文件系统保留量、尚未生成的永久 raster、非衰减 vector/不确定性预留和冻结工作缓存上限；并发 Tile 写入必须先原子占用预算。只有文件系统可用空间不足属于可等待状态，worker 保持同一 lease、心跳和 attempt 等待恢复；冻结缓存上限不足属于确定性契约失败，禁止无限等待。
 - 当前正式硬件实测基线为 RTX 3090 24 GiB 取 16、M2 Max 32 GiB 统一内存取 8。RTX 3090 的三模型 batch 16 峰值预留显存约 4.6–9.0 GiB，batch 32 最高约 17.5 GiB 且额外吞吐不超过约 1.4%；M2 Max 三模型 batch 8 最高约 6.1 GiB，batch 16 虽可运行但最高约 9.0 GiB，会压缩 QGIS 与并行几何的统一内存余量。硬件阈值变化必须重新取得同口径正式模型证据。
 - `tile_io_workers`、`max_cpu_partition_workers` 和 `assembly_validation_workers` 默认使用 `auto`。环境检查按物理核心数、系统内存和加速器类型一次解析，Run Spec 同时记录硬件快照、解析公式版本和实际整数，恢复时沿用原值，不因机器当前负载重新猜测。
 - CPU 几何 worker 与下一批语义推理流水重叠。无 Work Package 时可使用受内存约束的物理核心上限；Work Package 运行时必须从几何池扣除该 Package 获得的 CPU 线程预算，使二者总预算不超过物理核心数。每个独立几何子进程的 OpenMP/MKL/OpenBLAS/Accelerate/NumExpr 线程固定为 1，禁止进程并发与库内线程形成乘法超订阅；必须继续使用有界队列和背压。
-- 每个几何 worker 是独立子进程。停止或超时只终止当前 Partition，不杀死 QGIS；父调度器根据 SQLite 状态决定重试、细分或失败。
+- 每个几何 worker 是独立子进程。停止或超时只终止当前 Partition，不杀死 QGIS；父调度器根据 PostgreSQL 状态决定重试、细分或失败。
 - 不能为 500,000 Tile 创建 500,000 个常驻 Qt 行、Python Future 或内存对象。
 - Fusion 使用磁盘分块增量 accumulator。`equal_probability_average`、`calibrated_global_weighted` 和 `calibrated_class_weighted` 按模型依次累加；`linear_1x1` 保存 profile 明确要求的最小中间通道。禁止为了 Fusion 同时保留整个 run 的全部模型概率。
 - 单模型 Batch probability 只有在本模型当前 Package 的全部 Partition raster 与 Fusion accumulator 提交后才删除；跨 Package 长期保留只使用已提交的 Partition Artifact 和引用计数，不保留整个 Run 的逐 Tile 概率。崩溃恢复先复用通过身份、shape、字节数和 SHA256 验证的完整 Batch，再重算未提交或损坏 Batch，不从头重跑整个工作包。
 - Work Package 只有在自身模型流、Fusion 和正式 Partition 资产全部提交后，才可释放本包引用。仍被未完成邻包 Halo、重试或恢复引用的 Tile 缓存继续保留；最后一个依赖释放时同时删除 Tile 与其 metadata。失败、停止或未提交状态保留缓存用于安全恢复。
-- 同一 Package 的全部文件系统修改必须持有跨进程排他锁；新 lease 在旧进程仍压缩或原子替换时只能等待，旧进程失去 lease 后不得与新 worker 并发覆盖固定正式路径。Package/Job 的 ready、failed、interrupted 和自动重试必须在同一 SQLite 事务内按未过期 lease compare-and-set；过期心跳不得复活 lease，停止和纯 interruption 不消耗失败 attempt。
+- 同一 Package 的全部文件系统修改必须持有跨进程排他锁；新 lease 在旧进程仍压缩或原子替换时只能等待，旧进程失去 lease 后不得与新 worker 并发覆盖固定正式路径。Package/Job 的 ready、failed、interrupted 和自动重试必须在同一 PostgreSQL 事务内按未过期 lease compare-and-set；任务领取使用 `FOR UPDATE SKIP LOCKED`，过期心跳不得复活 lease，停止和纯 interruption 不消耗失败 attempt。
 - Tile 清理只能删除经路径归属校验、直接位于本 Run `tile_cache` 下的文件；来源影像、用户 Tile、其他 Run cache 和 `runs/<run_id>/` 永久结果均不得成为清理目标。
 
 ### 8.3 分区概率拼接和永久栅格
@@ -408,7 +408,7 @@ Tile 14-class probabilities
 
 每个实际模型都对相同 Partition 生成独立 mask、confidence、raw、formal 和报告。Fusion 在同一 Work Package 内按 profile 逐模型增量累加，不要求多个模型全量 probability 同时存在；最后生成 fused probabilities，再走与模型流完全相同的分区拼接和边界拟合。
 
-当一个 Partition 的模型流、Fusion、相关 Seam/Junction 和哈希全部通过后，SQLite Artifact 引用计数归零的 Tile score 与 probability 分区才可删除。任何仍被 Fusion、重试、Seam 或报告引用的缓存不得提前清理。
+当一个 Partition 的模型流、Fusion、相关 Seam/Junction 和哈希全部通过后，PostgreSQL Artifact 引用计数归零的 Tile score 与 probability 分区才可删除。任何仍被 Fusion、重试、Seam 或报告引用的缓存不得提前清理。
 
 ### 8.5 公共分界 Polyline 单次曲线拟合（当前 E5S 唯一范围）
 
@@ -497,9 +497,8 @@ output/
 │           └── tile_<row>_<col>_meta.json
 └── runs/
     └── <run_id>/
-        ├── run_spec.json
+        ├── run_spec.json  # 含 PostgreSQL backend/DSN 身份
         ├── run_manifest.json
-        ├── run_state.sqlite
         ├── config_snapshot.json
         ├── class_mapping_snapshot.json
         ├── accepted_snapshot.gpkg
@@ -547,9 +546,9 @@ output/
             └── failed_jobs/
 ```
 
-`run_id` 使用时间戳加随机短标识，跨进程、跨日期不撞车。禁止新运行覆盖旧 run 目录或同名 cache。`runs/<run_id>/` 只保存运行状态、正式结果和可恢复的非 Tile 工作资产；可删除的输入 Tile 物化副本只允许位于 `cache/<run_id>/tile_cache/`。Run 规范必须冻结 `cache_root` 和 `tile_cache_dir` 的绝对路径；运行时拒绝路径漂移和符号链接。`run_state.sqlite` 是运行明细真值源；`run_manifest.json` 是从数据库生成的小型结果摘要，不复制 Tile 明细。数据库启用 WAL、外键和事务，任何 Artifact 只有在临时文件 fsync、原子重命名、SHA256 写入成功后才可标记 ready。
+`run_id` 使用时间戳加随机短标识，跨进程、跨日期不撞车。禁止新运行覆盖旧 run 目录或同名 cache。`runs/<run_id>/` 只保存运行状态、正式结果和可恢复的非 Tile 工作资产；可删除的输入 Tile 物化副本只允许位于 `cache/<run_id>/tile_cache/`。Run 规范必须冻结 `cache_root` 和 `tile_cache_dir` 的绝对路径；运行时拒绝路径漂移和符号链接。PostgreSQL 是运行明细真值源；`run_manifest.json` 是从数据库生成的小型结果摘要，不复制 Tile 明细。数据库启用外键、事务、MVCC 和行级锁，任何 Artifact 只有在临时文件 fsync、原子重命名、SHA256 写入成功后才可标记 ready。
 
-`semantic_polygons_raw.gpkg`、`semantic_polygons.gpkg` 和诊断 GPKG 都按空间单元使用 GDAL/Fiona 批量事务流式追加并创建 RTree 索引；禁止逐要素提交事务，写入过程不得回读全部要素。`object_id` 必须按有界要素批次从 SQLite 查询，禁止每个要素单独建立数据库连接。每个空间单元完成时同时把报告标量摘要写入 SQLite，并把需要保留的诊断边写入单元诊断 GPKG；最终组装只从数据库聚合摘要并直接批量追加单元诊断 GPKG，不再保留重新解析全部 JSON 报告的旧组装路径。缺少摘要或诊断分片的旧 Run 必须明确拒绝组装，不能静默回退。最终文件只有在所有事务提交、`PRAGMA integrity_check`、图层字段/CRS/feature count 和 SHA256 通过后才进入 Artifact `ready`。
+`semantic_polygons_raw.gpkg`、`semantic_polygons.gpkg` 和诊断 GPKG 都按空间单元使用 GDAL/Fiona 批量事务流式追加并创建 RTree 索引；禁止逐要素提交事务，写入过程不得回读全部要素。`object_id` 必须按有界要素批次从 PostgreSQL 查询，禁止每个要素单独建立数据库连接。每个空间单元完成时同时把报告标量摘要写入 PostgreSQL，并把需要保留的诊断边写入单元诊断 GPKG；最终组装只从数据库聚合摘要并直接批量追加单元诊断 GPKG，不再保留重新解析全部 JSON 报告的旧组装路径。缺少摘要或诊断分片的旧 Run 必须明确拒绝组装，不能静默回退。最终 GPKG 只有在所有事务提交、`PRAGMA integrity_check`、图层字段/CRS/feature count 和 SHA256 通过后才进入 Artifact `ready`。
 
 ## 10. 结果流与图层命名
 
@@ -831,9 +830,9 @@ sam_session_id | sam_score | reviewed | created_at | updated_at
 
 环境检查必须是用户明确点击的操作。推理脚本目录、输出工作区或 accepted 路径变化时，主面板只标记“配置已变化，请检查推理环境”，禁止自动启动耗时检查；环境检查完成前禁用“选择模型与 Fusion”和“开始标注”。环境检查通过后必须在推理方案弹窗中应用本次模型与 Fusion 选择，“开始标注”才可启用。“查看完整检查结果”是检查后的诊断入口，不属于正常必点步骤，复制命令放在详情窗口内部。
 
-QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在创建、进入运行态和终止时原子更新 `output/run_index.json`，索引只记录最新 Run、状态和最新 Ready Run 的合法 `run_id`。启动时最多读取该索引及其明确指向的 `run_spec.json`、`run_manifest.json` 小型元数据；禁止枚举 `output/runs/`，禁止读取 `run_state.sqlite`，禁止在启动路径校验模型权重、VRT、GeoTIFF、GeoPackage、Tile cache 或历史 Artifact 哈希。索引缺失、损坏、超限或指向无效时直接视为没有自动恢复候选，不得回退全目录扫描。
+QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在创建、进入运行态和终止时原子更新 `output/run_index.json`，索引只记录最新 Run、状态和最新 Ready Run 的合法 `run_id`。启动时最多读取该索引及其明确指向的 `run_spec.json`、`run_manifest.json` 小型元数据；禁止枚举 `output/runs/`，禁止在启动路径连接 PostgreSQL 或校验模型权重、VRT、GeoTIFF、GeoPackage、Tile cache、历史 Artifact 哈希。索引缺失、损坏、超限或指向无效时直接视为没有自动恢复候选，不得回退全目录扫描。
 
-索引中的可恢复 Run 只用于显示状态和启用显式恢复动作；点击恢复后才读取该 Run 的 SQLite。索引中的 Ready Run 只显示为“验证并打开最近 Run”，点击后才对这一个 Run 执行完整输入、结果、边界报告、Fusion approval 和 SHA256 校验；校验通过前不得把它设置为当前正式结果或初始化分类工作区。用户仍可通过“加载已有 Run 人工整理”明确选择未进入索引的历史 Run。
+索引中的可恢复 Run 只用于显示状态和启用显式恢复动作；点击恢复后才读取该 Run 的 PostgreSQL 状态。索引中的 Ready Run 只显示为“验证并打开最近 Run”，点击后才对这一个 Run 执行完整输入、结果、边界报告、Fusion approval 和 SHA256 校验；校验通过前不得把它设置为当前正式结果或初始化分类工作区。用户仍可通过“加载已有 Run 人工整理”明确选择未进入索引的历史 Run。
 
 “打开分类修整与组装”只在当前 run 存在边界拟合与全部 Seam/Junction `passed`、`ready` 且 `approved` 的 Fusion 流时启用。未选择 Fusion、缺少 report、存在 failed unit 或 formal hash 不匹配时，按钮必须显示具体阻塞原因，不能退回 raw 或某个模型层偷偷初始化工作区。
 
@@ -863,7 +862,7 @@ QGIS 插件启动的 Run 恢复必须是常数成本。每个 Schema v2 Run 在�
 | 结果流 | 阶段 | 当前/总数 | 状态 | 耗时 | 失败数 |
 |---|---|---:|---|---:|---:|
 
-次级详情默认显示当前结果流的 Partition/Seam/Junction 状态，不默认加载全部 Tile。Tile 明细通过筛选和分页从 SQLite 查询，每页最多 `tile_page_size`（默认 500），可按失败、Partition、Tile ID 搜索；标题必须显示完整结果流名称、当前明细类型和已记录总数。
+次级详情默认显示当前结果流的 Partition/Seam/Junction 状态，不默认加载全部 Tile。Tile 明细通过筛选和分页从 PostgreSQL 查询，每页最多 `tile_page_size`（默认 500），可按失败、Partition、Tile ID 搜索；标题必须显示完整结果流名称、当前明细类型和已记录总数。
 
 结果流阶段固定为：
 
@@ -946,11 +945,11 @@ idle -> preflight -> queued -> running -> assembling
 -> validating -> semantic_ready / partial_failed / failed / stopped
 ```
 
-Work Package、Partition stream、Seam 和 Junction 各自拥有独立状态；父级状态只能由 SQLite 聚合查询产生，不能靠 UI 猜测。结果流只有 formal、report、所有空间单元和哈希全部通过后才是 ready。SAM3 与 final assembly 是 semantic_ready 后的独立阶段。
+Work Package、Partition stream、Seam 和 Junction 各自拥有独立状态；父级状态只能由 PostgreSQL 聚合查询产生，不能靠 UI 猜测。结果流只有 formal、report、所有空间单元和哈希全部通过后才是 ready。SAM3 与 final assembly 是 semantic_ready 后的独立阶段。
 
-### 16.1 SQLite/WAL 数据契约
+### 16.1 PostgreSQL 18/MVCC 数据契约
 
-`run_state.sqlite` 至少包含以下表；几何本体和大日志保存在文件资产中，数据库只保存窗口、关系、状态、摘要、路径和哈希：
+PostgreSQL `loess_qgis` Schema 至少包含以下表；几何本体和大日志保存在文件资产中，数据库只保存窗口、关系、状态、摘要、路径和哈希：
 
 | 表 | 主键与核心字段 | 用途 |
 |---|---|---|
@@ -967,9 +966,9 @@ Work Package、Partition stream、Seam 和 Junction 各自拥有独立状态；�
 | `object_links` | `stream_id, left_part_id, right_part_id, class_code` | 跨所有权单元连通分量 |
 | `events` | `event_id, timestamp, level, event_type, stream_id, job_id, message` | 可复制日志和审计事件 |
 
-必须为 `jobs(status, stream_id, unit_id)`、`tiles(row,col,status)`、`partitions(status,package_id)`、`spatial_units(status,unit_type)`、`artifacts(status,ref_count)` 和 `events(timestamp)` 建索引。`events` 按配置保留最近明细并滚动归档 JSONL，禁止无限增大 WAL。
+必须为 `jobs(status, stream_id, unit_id)`、`tiles(row,col,status)`、`partitions(status,package_id)`、`spatial_units(status,unit_type)`、`artifacts(status,ref_count)` 和 `events(timestamp)` 建索引。`events` 按配置保留最近明细并滚动归档 JSONL，禁止无限增大 PostgreSQL 表与 WAL。
 
-状态转换使用 `BEGIN IMMEDIATE` 短事务和 compare-and-set；只有持有 lease 的 worker 可以把 job 从 `queued/interrupted` 改为 `running`。心跳超时后 lease 才可回收。Artifact 必须按“临时文件写完并 fsync -> 原子 rename -> 计算 SHA -> 数据库事务标记 ready”提交。恢复时所有 `running` job 先改为 `interrupted`，不能直接判成功或失败。
+状态转换使用 PostgreSQL 短事务和 compare-and-set；worker 通过 `SELECT ... FOR UPDATE SKIP LOCKED` 并行领取互不相同的 job，只有持有 lease 的 worker 可以把 job 从 `queued/interrupted` 改为 `running`。同一 Artifact 的引用计数变更按固定 `artifact_id` 顺序取得行锁，避免交叉释放产生死锁；不同 job 和不同 Artifact 仍可并发提交。心跳超时后 lease 才可回收。Artifact 必须按“临时文件写完并 fsync -> 原子 rename -> 计算 SHA -> 数据库事务标记 ready”提交。恢复时所有 `running` job 先改为 `interrupted`，不能直接判成功或失败。
 
 ### 16.2 正式 Shell 接口
 
@@ -1001,7 +1000,7 @@ run_sam3_interactive.sh --session-root <run/refinement/sam3>
 - 人工重做删除目标 Package 独占的 score/package 临时目录、Partition probability、core mask/confidence、受影响单元的 raw/formal/report/fitted-edge，以及已经失效的全流 VRT、总组装和 scale acceptance 输出；同时删除相应 Artifact、报告摘要和对象连通状态，再从仍然 ready 的未受影响 Partition 重建依赖引用。操作必须可重复执行，中途失败时 Run 保持 `resetting`，不得把部分清理后的状态当作可运行或 ready。
 - `output/cache/<run_id>/tile_cache/` 是本 Run 的共享原始 Tile 缓存，人工重做失败包时不得清理、移动或重新建立另一套缓存目录。重做的 Package 直接复用其中哈希有效的 Tile；只有整个正常生命周期的最后一个依赖释放后，正式清理逻辑才可以删除对应缓存。
 - 人工重做只能用于尚未完成的 `failed/stopped/resetting` Run；存在运行中 Job、没有可定位的失败 Package，或者 Run 已经 `ready` 时必须拒绝。人工确认、分类工作区和 accepted_labels 都在 semantic Run 完整成功之后，因此失败包重做不得读取、修改或回滚人工确认数据。
-- Artifact 状态由 SQLite 事务和 SHA 决定；resume 比较 run_spec、模型/profile SHA、Tile 元数据、Partition raster、raw/formal/report、Seam/Junction 与 VRT 引用。
+- Artifact 状态由 PostgreSQL 事务和 SHA 决定；resume 比较 run_spec、模型/profile SHA、Tile 元数据、Partition raster、raw/formal/report、Seam/Junction 与 VRT 引用。
 - QGIS 或 worker 非正常退出后，`running` job 在恢复时变成 `interrupted`；验证临时文件后选择复用、重跑或清理，不把它直接当 failed/ready。
 - 磁盘低于预留阈值时停止产生新 score，完成可安全提交的在途单元后进入 `paused_low_disk`，不得写坏已有结果。
 - 停止时只终止当前子进程组，不结束 QGIS，不破坏地图工具。
@@ -1129,7 +1128,7 @@ SAM3 运行链均已删除，并由自动测试禁止恢复。本项目不维护
 | 阶段 | 工作 | 阶段验收 |
 |---|---|---|
 | E0 | 冻结当前契约并清除生产双轨 | 主 pipeline 中没有整幅亚像元线网、整幅 dissolve 或 Tile 内矢量化入口 |
-| E1 | `run_state.sqlite`、WAL、迁移、索引和 Artifact 事务 | 500,000 Tile 明细可写入、分页、恢复；JSON 不承载明细 |
+| E1 | PostgreSQL Schema、MVCC、行级锁、索引和 Artifact 事务 | 500,000 Tile 明细可写入、分页、恢复；JSON 不承载明细 |
 | E2 | Partition/Halo/Core、Seam/Junction 和磁盘预检 | 任意范围得到确定性互斥所有权；空间与缓存不足时启动前阻止 |
 | E3 | 有界 Work Package、持久单加速器 worker、模型独立结果和增量 Fusion | 每模型每 worker 会话只冷加载一次；缓存、队列和进程数受限；失败可从最小单元恢复 |
 | E4 | 分区概率 mosaic、Core raster 分块/VRT、raw coverage | cosine 结果与小范围整图参考一致；不生成单 Tile formal polygon |
@@ -1147,10 +1146,10 @@ E1 到 E8 先使用确定性 fixture 完成软件契约，E9 必须使用正式�
 本次改造是一个完整 Goal，不再把“大 Tile”和“边界光滑”拆成两套方案。按以下顺序实施；前一项硬门槛未通过时，不接入后一项正式链路：
 
 1. 冻结现有成功 run 为只读回归资产；从 production pipeline 移除 `subpixel_vectorizer.py`、整幅 probability mosaic 和整幅 geometry union/dissolve 调用；A/B 只使用已冻结输出资产，不保留第二套正式执行分支。
-2. 创建 `run_state.sqlite` schema、版本迁移和索引，导入小型 `run_spec.json`，把 Tile、Partition、Work Package、Stream、Seam、Junction、Artifact、Dependency、Retry、Event 全部改为数据库记录。
+2. 创建 PostgreSQL Schema、版本元数据和索引，导入小型 `run_spec.json`，把 Tile、Partition、Work Package、Stream、Seam、Junction、Artifact、Dependency、Retry、Event 全部改为数据库记录。
 3. 实现确定性空间规划器，生成 Tile -> Partition -> Core interior/Seam/Junction 所有权；把计划、像素窗口、affine、依赖和预估字节写入数据库。
 4. 实现存储预检和低磁盘保护。启动前用真实单 Tile 缓存字节数估计峰值，运行中低于 `min_free_disk_gb` 时完成当前原子写入后进入 `paused_low_disk`，不得继续产生新概率。
-5. 重构 semantic 调度为有界 Work Package：单个持久 MPS/CUDA worker 进程自行串行租用 Package，各模型每进程只冷加载一次并跨 Package 常驻；容量 2 的输入队列、容量 1 的 Batch 检查点写入队列和单一确定性 Partition 消费者与推理形成背压流水线，后台只做输入、检查点和纯数组计算，Artifact/SQLite/Fusion 提交保持主线程顺序。
+5. 重构 semantic 调度为有界 Work Package：单个持久 MPS/CUDA worker 进程自行串行租用 Package，各模型每进程只冷加载一次并跨 Package 常驻；容量 2 的输入队列、容量 1 的 Batch 检查点写入队列和单一确定性 Partition 消费者与推理形成背压流水线，后台只做输入、检查点和纯数组计算，Artifact/PostgreSQL/Fusion 提交保持主线程顺序。
 6. 实现逐模型独立分区结果和 Fusion 增量 accumulator。每个模型完成一个 Package 后先提交自身 Partition 资产并更新 accumulator，再按引用计数释放缓存；禁止等待全 run 三模型概率同时齐备。
 7. 实现 Partition `Core+Halo` probability cosine mosaic、Core mask/confidence 分块 GeoTIFF 和 VRT；在小范围 fixture 上与整幅参考逐像素对比。
 8. 对每个 Partition 生成永久 raw coverage；超过 segment/feature/时间门槛时递归细分，所有几何子进程都有心跳、超时和单元级重试。
@@ -1195,7 +1194,7 @@ Ubuntu 历史正式 Run 已出现约 868 GiB 的结果目录和百万级极小 P
    根据类别面积、邻接、窄长地物保留、拓扑、面数、顶点数和字节数共同
    确定。人工 QSDK 只作为结构与尺度参考，因覆盖范围不同，不能直接充当
    阈值。
-3. 单元报告默认只保留 SQLite 标量摘要、计数和哈希。完整坐标诊断只能作为
+3. 单元报告默认只保留 PostgreSQL 标量摘要、计数和哈希。完整坐标诊断只能作为
    有界抽样或显式启用的压缩 debug 资产，不能随全部对象无限增长。
 4. 单元 raw/formal/report/fitted-edge 在 Stream 最终文件原子提交、完整性
    校验和 SHA256 通过前必须保留；Stream 进入 `ready` 后才按 Artifact
@@ -1232,7 +1231,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - 14 类顺序和无 background 测试。
 - TorchScript 输入输出契约和设备测试。
 - 四种 fusion 策略固定向量测试，特别验证 `log_softmax/temperature/weights` 顺序。
-- SQLite migration、外键、WAL、事务、Artifact 原子提交和损坏恢复测试。
+- PostgreSQL Schema 版本、外键、MVCC、行锁事务、Artifact 原子提交和恢复测试。
 - 500,000 Tile、对应 Partition/Seam/Junction 元数据压力测试；分页查询每页不超过 500，禁止把全部行实例化到 UI。
 - 任意行列数的 Partition/Halo/Core 规划测试；Core interior、Seam 和 Junction 的 union 等于 processing extent，pairwise intersection 面积为 0。
 - Work Package 预算、队列背压、低磁盘暂停、引用计数清理、单元失败重试和停止/resume 测试。
@@ -1243,11 +1242,11 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 - 峰值 Tile probability 数不超过计划预算；已提交且无依赖的缓存被清理，仍被 Fusion/Seam/retry 引用的缓存不会提前删除。
 - mosaic 重叠区按二维 cosine window 在 14 类概率空间加权，归一化后再统一生成 mask/confidence；Partition 结果与小范围整幅参考一致，禁止回退到中心线硬切。
 - Core raster 分块、VRT、scale、CRS、完整 affine、类别顺序、nodata、哈希和量化误差测试。
-- raw/formal/report 齐全性、哈希和 resume 失效测试；SQLite 报告摘要与 JSON Artifact 哈希必须一致，摘要完整时最终组装不得重复解析无诊断 JSON；任一拟合或 Seam/Junction 失败时不得留下 ready formal。
+- raw/formal/report 齐全性、哈希和 resume 失效测试；PostgreSQL 报告摘要与 JSON Artifact 哈希必须一致，摘要完整时最终组装不得重复解析无诊断 JSON；任一拟合或 Seam/Junction 失败时不得留下 ready formal。
 - accepted 全库审计测试覆盖字段缺失、错误类别映射、`reviewed!=1`、无效几何、重复复合身份、同类重叠和异类重叠；Run 创建前任一错误必须阻止。
 - accepted 快照/长期目标分离测试冻结 `accepted_gpkg` 快照 SHA，同时验证最终写入只允许 `accepted_target_gpkg`，目标路径不一致或等于快照时必须阻止。
 - final/accepted 重叠双门测试同时验证 `topology_issues.accepted_overlap` 和写入器独立拒绝；即使跳过拓扑或勾选带问题入库，长期确认库哈希也不得变化。
-- 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 SQLite 连接。
+- 组装性能回归：`object_id` 使用有界批量查询，raw/formal/诊断 GPKG 使用 `writerecords` 批量事务，报告/诊断分片校验并发数和在途任务数有硬上限；12,635 单元不得产生等量内存对象或逐要素 PostgreSQL 连接。
 - raster affine 像素坐标往返测试，覆盖 EPSG:4490、负像元高、旋转/剪切 transform，禁止直接把 px 当地图单位。
 - Polyline B-Spline 测试：开线端点严格不动，闭合线首尾一致；生产路径不物化完整 `0.5 px` 曲线，直接 Bézier 自适应细分的每段控制凸包弦误差上界 `<=0.25 px`、控制多边形弧长上界 `<=8 px`；另用高密度独立采样验证实际曲线到输出折线的距离不超过报告上界，并验证曲线求值数和最终顶点数不随曲线长度按固定 `0.5 px` 线性膨胀。
 - 两个相邻面的台阶分界只产生一份拟合坐标；两侧重建后提取到的公共线与该坐标正向或反向完全一致。
@@ -1296,7 +1295,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 | L2 耐久规模 | >=10,000 Tile | 正式三模型 + Fusion 全链路 | 连续运行、磁盘预算、缓存回收、RSS 平台化、监控分页通过 |
 | L3 正式上限 | 500,000 Tile | 正式三模型 + Fusion 全链路 | 全部流 ready、无未处理 failed unit、产物哈希完整、恢复与 QGIS 抽查通过 |
 
-此外必须先做 500,000 Tile 元数据/调度 fixture 压力测试，证明 SQLite、分页、计划生成和 UI 不随 Tile 数线性占用常驻内存。该压力测试只能证明控制面可扩展，不能代替 L3 的正式模型运行。只有 L3 实际执行通过后，才能写“已验收支持 500,000 Tile”；在此之前只能写“按 500,000 Tile 设计，已通过 Lx”。
+此外必须先做 500,000 Tile 元数据/调度 fixture 压力测试，证明 PostgreSQL、分页、计划生成和 UI 不随 Tile 数线性占用常驻内存。该压力测试只能证明控制面可扩展，不能代替 L3 的正式模型运行。只有 L3 实际执行通过后，才能写“已验收支持 500,000 Tile”；在此之前只能写“按 500,000 Tile 设计，已通过 Lx”。
 
 每一级保存 `scale_acceptance_report.json`，至少包括 Tile/Partition/Seam/Junction/Package 数、每流完成数、失败和重试、模型加载次数、峰值缓存、峰值 RSS、磁盘预估与实测、清理字节数、吞吐、总耗时、最长无心跳时间、停止/恢复位置和 Artifact 校验。运行期间内存与临时空间必须在预检上限内形成平台，不得随已完成 Tile 数持续单调增长；磁盘实测偏离预估超过 20% 必须标记 warning 并在下一级前修正估算器。
 
@@ -1326,7 +1325,7 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 任务二只有同时满足以下条件才算完成：
 
 - Schema v2 成为唯一配置格式，旧单模型格式不再运行。
-- `run_state.sqlite` 是明细真值源，Tile/Partition/Seam/Junction/Artifact 可以事务恢复和分页查询；50 万 Tile 不进入单个 JSON 或常驻 UI 表。
+- PostgreSQL 是明细真值源，Tile/Partition/Seam/Junction/Artifact 可以事务恢复和分页查询；50 万 Tile 不进入单个 JSON 或常驻 UI 表。
 - 所有规模使用同一套有界 Work Package、Partition/Halo/Core、Seam/Junction 链路；不存在单 Tile 矢量化、小图整幅矢量化或大图另一套算法。
 - 每个执行模型和 Fusion 都有独立且永久保存的 Core mask/confidence 分块、VRT、raw polygons、formal polygons 和 boundary fitting report；临时概率只在全部依赖提交后按引用计数清理。
 - 每个模型流和 Fusion 流都完成 14 类概率空间 cosine 加权 Partition mosaic；Fusion 使用增量 accumulator，不能要求全 run 多模型概率同时常驻。
@@ -1355,10 +1354,10 @@ Fusion/Mamba Core、Seam、Junction A/B 解决，并选定上述保守档。其�
 | 阶段 | 当前状态 | 已取得证据 |
 |---|---|---|
 | E0 | 方案已冻结 | 本文已明确唯一当前 production pipeline；旧边界算法源码、回退分支和测试已删除 |
-| E1-E2 | 待实施 | 当前 run 仍使用 JSON manifest 和整图路径；尚无 SQLite/WAL、空间所有权计划和 100k 预检证据 |
+| E1-E2 | 待实施 | 当前 run 仍使用 JSON manifest 和整图路径；尚无 PostgreSQL/MVCC、空间所有权计划和 100k 预检证据 |
 | E3-E4 | 待实施 | 正式多模型与概率 cosine 已有历史能力，但尚未改为有界 Work Package、增量 Fusion、Partition raster 和 VRT |
 | E5-E6 | 待实机验收 | 单 Tile 亚像元 A/B 曾通过；238 Tile 运行证明整幅线网不可用；当前改为公共分界线单次 B-Spline，仍需新 run 目视验收 |
-| E7 | 部分历史能力可复用 | 监控已有结果流标题和增量 Tile 刷新，但尚未改为 SQLite 的 Partition/Seam/Junction 聚合和分页查询 |
+| E7 | 部分历史能力可复用 | 监控已有结果流标题和增量 Tile 刷新，但尚未改为 PostgreSQL 的 Partition/Seam/Junction 聚合和分页查询 |
 | E8 | 历史闭环已通过，需对新 formal 回归 | QGIS4 的 14 类、交互式 SAM3、final/topology/accepted 已有证据；当前 Fusion formal 尚需复验 |
 | E9 | 部分通过 | 正式模型、Fusion、MPS、SAM3 CPU 和 QGIS4 已有证据；公共分界线 B-Spline 当前全链路和安装后实机尚未通过 |
 | E10 | 未通过 | L0 的 238 Tile 旧链路未完成；L1/L2/L3 尚未执行，不能声明 1k/10k/100k 已支持 |

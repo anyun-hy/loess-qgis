@@ -1358,7 +1358,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.progress_bar.setRange(0, len(self._current_tiles))
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("准备提取切片")
-        # Tile details are persisted in run_state.sqlite and paged in the
+        # Tile details are persisted in PostgreSQL and paged in the
         # monitor. Never instantiate one widget row per Tile.
         self.tile_table.setRowCount(0)
 

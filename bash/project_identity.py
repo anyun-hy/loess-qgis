@@ -29,6 +29,7 @@ GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHARED_FILES = {
     "qgis_plugins/labeling_tool/core/run_spec.py",
     "qgis_plugins/labeling_tool/core/run_state_db.py",
+    "qgis_plugins/labeling_tool/core/postgres_state.py",
     "qgis_plugins/labeling_tool/core/ownership_neighbors.py",
 }
 

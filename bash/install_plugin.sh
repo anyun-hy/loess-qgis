@@ -141,7 +141,7 @@ if contains(source_root, destination) or contains(destination, source_root):
   echo "Missing plugin entry point" >&2
   exit 1
 }
-for shared_name in run_spec.py run_state_db.py ownership_neighbors.py; do
+for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neighbors.py; do
   [[ -f "${PLUGIN_SRC}/core/${shared_name}" ]] || {
     echo "Missing shared runtime source: ${shared_name}" >&2
     exit 1
@@ -277,7 +277,7 @@ for path in sorted(p for p in root.rglob("*") if p.is_file()):
 
 shared = {}
 aggregate = hashlib.sha256()
-for name in sorted(("run_spec.py", "run_state_db.py", "ownership_neighbors.py")):
+for name in sorted(("run_spec.py", "run_state_db.py", "postgres_state.py", "ownership_neighbors.py")):
     canonical = f"qgis_plugins/labeling_tool/core/{name}"
     digest = files[f"core/{name}"]
     shared[canonical] = digest

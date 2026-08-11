@@ -78,6 +78,7 @@ def test_work_package_skips_model_for_fully_accepted_tile(tmp_path):
     _accepted(accepted, box(0, 0, 512, 512))
     model.write_bytes(b"fixture")
     spec, spec_path, database_path = create_v5_run(
+        state_database=tmp_path / "state.sqlite",
         output_root=tmp_path / "output",
         raster={
             "path": tile,

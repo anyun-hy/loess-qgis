@@ -426,7 +426,7 @@ class InferenceMonitorDialog(QDialog):
         message = str(info.get("message") or "")
         if self._database is not None and self._run_id:
             # V5 的 runner 总数把 Work Package 和 unit_fit 两种成本完全不同的
-            # Job 相加。SQLite 绑定后由左侧分层概览分别显示，不能再把这个
+            # Job 相加。数据库绑定后由左侧分层概览分别显示，不能再把这个
             # 混合总数作为用户进度条。
             self._runner_message = message
             return
