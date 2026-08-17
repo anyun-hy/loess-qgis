@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import tempfile
 import uuid
@@ -19,6 +20,7 @@ from qgis.core import (
     QgsFeatureRequest,
     QgsField,
     QgsFieldConstraints,
+    QgsTask,
     QgsVectorFileWriter,
     QgsVectorLayer,
     QgsWkbTypes,
@@ -52,8 +54,28 @@ class ClassWorkspaceError(RuntimeError):
     pass
 
 
+class ClassWorkspaceCancelled(ClassWorkspaceError):
+    pass
+
+
 def _now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _sha256_file(path, is_canceled=None):
+    """Hash a potentially large artifact while allowing a QgsTask to stop."""
+    if is_canceled is None:
+        return sha256_file(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            if is_canceled():
+                raise ClassWorkspaceCancelled("类别工作区后台任务已取消")
+            chunk = handle.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def workspace_paths(run_spec):
@@ -76,7 +98,7 @@ def stream_by_id(streams, stream_id):
     return matches[0]
 
 
-def approved_fusion_streams(run_spec, streams):
+def approved_fusion_streams(run_spec, streams, *, is_canceled=None):
     if run_spec.get("manual_only"):
         return [
             stream for stream in streams
@@ -96,15 +118,25 @@ def approved_fusion_streams(run_spec, streams):
         ):
             continue
         try:
-            _validate_boundary_report(stream)
-            _validate_fusion_profile(run_spec, stream)
+            _validate_boundary_report(stream, is_canceled=is_canceled)
+            _validate_fusion_profile(
+                run_spec, stream, is_canceled=is_canceled
+            )
+        except ClassWorkspaceCancelled:
+            raise
         except ClassWorkspaceError:
             continue
         approved.append(stream)
     return approved
 
 
-def _validate_manual_layer(layer, *, expected_code=None, allow_empty=False):
+def _validate_manual_layer(
+    layer,
+    *,
+    expected_code=None,
+    allow_empty=False,
+    is_canceled=None,
+):
     if not layer.isValid():
         raise ClassWorkspaceError(f"无法打开人工分类图层: {layer.source()}")
     if QgsWkbTypes.geometryType(layer.wkbType()) != Qgis.GeometryType.Polygon:
@@ -116,6 +148,8 @@ def _validate_manual_layer(layer, *, expected_code=None, allow_empty=False):
     count = 0
     empty_feature_ids = []
     for feature in layer.getFeatures():
+        if is_canceled is not None and count % 2048 == 0 and is_canceled():
+            raise ClassWorkspaceCancelled("人工分类图层后台校验已取消")
         try:
             class_code = int(feature.attribute("class_code"))
         except (TypeError, ValueError):
@@ -147,9 +181,11 @@ def _validate_manual_layer(layer, *, expected_code=None, allow_empty=False):
     return count, empty_feature_ids
 
 
-def validate_manual_fusion_stream(stream):
+def validate_manual_fusion_stream(stream, *, is_canceled=None):
     layer, path, layer_name = _source_layer(stream)
-    count, _empty_ids = _validate_manual_layer(layer)
+    count, _empty_ids = _validate_manual_layer(
+        layer, is_canceled=is_canceled
+    )
     if count <= 0:
         raise ClassWorkspaceError(f"Fusion 图层没有要素: {path}")
     stream["manual_validated"] = True
@@ -186,10 +222,13 @@ def validate_manual_workspace(workspace):
     return {"feature_count": total, "removed_empty": removed_empty}
 
 
-def _validate_fusion_profile(run_spec, stream):
+def _validate_fusion_profile(run_spec, stream, *, is_canceled=None):
     fusion = run_spec.get("fusion") or {}
     snapshot = Path(str(fusion.get("snapshot_path") or ""))
-    if not snapshot.is_file() or sha256_file(snapshot) != fusion.get("sha256"):
+    if (
+        not snapshot.is_file()
+        or _sha256_file(snapshot, is_canceled) != fusion.get("sha256")
+    ):
         raise ClassWorkspaceError("Fusion profile snapshot is missing or its SHA256 changed")
     with open(snapshot, "r", encoding="utf-8") as handle:
         profile = json.load(handle)
@@ -199,7 +238,7 @@ def _validate_fusion_profile(run_spec, stream):
         raise ClassWorkspaceError("Fusion stream does not match the approved profile")
 
 
-def _validate_boundary_report(stream):
+def _validate_boundary_report(stream, *, is_canceled=None):
     paths = stream.get("paths") or {}
     raw_path = Path(str(paths.get("semantic_polygons_raw") or ""))
     formal_path = Path(str(paths.get("semantic_polygons") or ""))
@@ -213,9 +252,9 @@ def _validate_boundary_report(stream):
         or (report.get("validation") or {}).get("passed") is not True
     ):
         raise ClassWorkspaceError("Fusion common-divider boundary fitting report did not pass")
-    if report.get("input_sha256") != sha256_file(raw_path):
+    if report.get("input_sha256") != _sha256_file(raw_path, is_canceled):
         raise ClassWorkspaceError("Fusion raw polygon SHA256 does not match the boundary report")
-    if report.get("output_sha256") != sha256_file(formal_path):
+    if report.get("output_sha256") != _sha256_file(formal_path, is_canceled):
         raise ClassWorkspaceError("Fusion formal polygon SHA256 does not match the boundary report")
     return report
 
@@ -296,7 +335,9 @@ def apply_class_constraints(
     return layer
 
 
-def _memory_class_layer(source, class_code, baseline_stream_id):
+def _memory_class_layer(
+    source, class_code, baseline_stream_id, *, is_canceled=None
+):
     memory = QgsVectorLayer(
         f"MultiPolygon?crs={source.crs().authid()}",
         LAYER_NAMES.CLASS_POLYGONS,
@@ -313,7 +354,10 @@ def _memory_class_layer(source, class_code, baseline_stream_id):
     request = QgsFeatureRequest().setFilterExpression(f'"class_code" = {int(class_code)}')
     created_at = _now()
     features = []
+    count = 0
     for source_feature in source.getFeatures(request):
+        if is_canceled is not None and count % 2048 == 0 and is_canceled():
+            raise ClassWorkspaceCancelled("类别工作区初始化已取消")
         feature = QgsFeature(fields)
         geometry = source_feature.geometry()
         if geometry is None or geometry.isNull() or geometry.isEmpty() or not geometry.isGeosValid():
@@ -338,10 +382,25 @@ def _memory_class_layer(source, class_code, baseline_stream_id):
         for name, value in values.items():
             feature.setAttribute(name, value)
         features.append(feature)
-    provider.addFeatures(features)
+        count += 1
+        if len(features) >= 4096:
+            added = provider.addFeatures(features)
+            added_ok = added[0] if isinstance(added, tuple) else added
+            if not added_ok:
+                raise ClassWorkspaceError(
+                    f"cannot stage class {class_code} workspace features"
+                )
+            features = []
+    if features:
+        added = provider.addFeatures(features)
+        added_ok = added[0] if isinstance(added, tuple) else added
+        if not added_ok:
+            raise ClassWorkspaceError(
+                f"cannot stage class {class_code} workspace features"
+            )
     memory.updateExtents()
     apply_class_constraints(memory, class_code)
-    return memory, len(features)
+    return memory, count
 
 
 def _write_class_layer(memory, destination):
@@ -354,15 +413,47 @@ def _write_class_layer(memory, destination):
         raise ClassWorkspaceError(f"cannot write class workspace layer: {message}")
 
 
-def initialize_workspace(run_spec, stream, *, replace=False):
+def initialize_workspace(
+    run_spec,
+    stream,
+    *,
+    replace=False,
+    is_canceled=None,
+    progress=None,
+):
     paths = workspace_paths(run_spec)
     if paths["workspace"].is_file() and not replace:
-        return load_workspace(run_spec, expected_stream_id=stream.get("stream_id"))
-    if stream not in approved_fusion_streams(run_spec, [stream]):
-        if run_spec.get("manual_only"):
+        return load_workspace(
+            run_spec,
+            expected_stream_id=stream.get("stream_id"),
+            is_canceled=is_canceled,
+        )
+    if run_spec.get("manual_only"):
+        if (
+            stream.get("kind") != "fusion"
+            or stream.get("status") != "ready"
+            or stream.get("manual_validated") is not True
+        ):
             raise ClassWorkspaceError("人工工作区需要一个已校验的 ready Fusion 流")
-        raise ClassWorkspaceError("workspace requires one ready, approved, regularized Fusion stream")
-    report = None if run_spec.get("manual_only") else _validate_boundary_report(stream)
+        report = None
+    else:
+        fusion = run_spec.get("fusion") or {}
+        expected_id = f"fusion:{fusion.get('profile_id')}" if fusion else ""
+        if (
+            stream.get("kind") != "fusion"
+            or stream.get("status") != "ready"
+            or stream.get("stream_id") != expected_id
+            or stream.get("boundary_fitting_status") != "passed"
+        ):
+            raise ClassWorkspaceError(
+                "workspace requires one ready, approved, regularized Fusion stream"
+            )
+        report = _validate_boundary_report(
+            stream, is_canceled=is_canceled
+        )
+        _validate_fusion_profile(
+            run_spec, stream, is_canceled=is_canceled
+        )
     source, source_path, source_layer_name = _source_layer(stream)
     directory = paths["directory"]
     directory.mkdir(parents=True, exist_ok=True)
@@ -370,8 +461,15 @@ def initialize_workspace(run_spec, stream, *, replace=False):
     class_records = {}
     total = 0
     try:
-        for code in CLASS_ORDER:
-            memory, count = _memory_class_layer(source, code, stream["stream_id"])
+        for position, code in enumerate(CLASS_ORDER):
+            if is_canceled is not None and is_canceled():
+                raise ClassWorkspaceCancelled("类别工作区初始化已取消")
+            memory, count = _memory_class_layer(
+                source,
+                code,
+                stream["stream_id"],
+                is_canceled=is_canceled,
+            )
             temporary_path = temporary / f"class_{code}.gpkg"
             _write_class_layer(memory, temporary_path)
             class_records[str(code)] = {
@@ -380,17 +478,38 @@ def initialize_workspace(run_spec, stream, *, replace=False):
                 "path": str(class_layer_path(run_spec, code)),
                 "layer_name": LAYER_NAMES.CLASS_POLYGONS,
                 "feature_count": count,
-                "sha256": sha256_file(temporary_path),
+                "sha256": _sha256_file(temporary_path, is_canceled),
                 "state": "editing" if count else "unreviewed_empty",
                 "confirmed": False,
                 "modified": False,
                 "updated_at": _now(),
             }
             total += count
+            if progress is not None:
+                progress(5.0 + 80.0 * (position + 1) / len(CLASS_ORDER))
         if total != source.featureCount():
             raise ClassWorkspaceError(
                 f"14-class split changed feature count: {source.featureCount()} -> {total}"
             )
+        if is_canceled is not None and is_canceled():
+            raise ClassWorkspaceCancelled("类别工作区初始化已取消")
+        source_sha256 = _sha256_file(source_path, is_canceled)
+        formal_path = Path(stream["paths"]["semantic_polygons"]).resolve()
+        formal_sha256 = (
+            source_sha256
+            if formal_path == source_path.resolve()
+            else _sha256_file(formal_path, is_canceled)
+        )
+        report_sha256 = (
+            "" if report is None
+            else _sha256_file(
+                stream["paths"]["boundary_fitting_report"], is_canceled
+            )
+        )
+        if is_canceled is not None and is_canceled():
+            raise ClassWorkspaceCancelled("类别工作区初始化已取消")
+        # The commit section is intentionally short and non-cancellable: either
+        # all 14 final files and workspace.json become visible, or none do.
         for code in CLASS_ORDER:
             os.replace(
                 temporary / f"class_{code}.gpkg",
@@ -405,16 +524,15 @@ def initialize_workspace(run_spec, stream, *, replace=False):
         "baseline_stream_id": stream["stream_id"],
         "baseline_source_path": str(source_path.resolve()),
         "baseline_source_layer": source_layer_name,
-        "baseline_source_sha256": sha256_file(source_path),
-        "formal_path": str(Path(stream["paths"]["semantic_polygons"]).resolve()),
-        "formal_sha256": sha256_file(source_path),
+        "baseline_source_sha256": source_sha256,
+        "formal_path": str(formal_path),
+        "formal_sha256": formal_sha256,
         "boundary_report_path": (
             "" if report is None
             else str(Path(stream["paths"]["boundary_fitting_report"]).resolve())
         ),
         "boundary_report_sha256": (
-            "" if report is None
-            else sha256_file(stream["paths"]["boundary_fitting_report"])
+            report_sha256
         ),
         "manual_only": bool(run_spec.get("manual_only")),
         "initialized_at": now,
@@ -427,10 +545,14 @@ def initialize_workspace(run_spec, stream, *, replace=False):
     atomic_write_json(paths["workspace"], workspace)
     if not paths["history"].exists():
         paths["history"].touch()
+    if progress is not None:
+        progress(100.0)
     return workspace
 
 
-def load_workspace(run_spec, expected_stream_id=""):
+def load_workspace(
+    run_spec, expected_stream_id="", *, is_canceled=None, progress=None
+):
     paths = workspace_paths(run_spec)
     if not paths["workspace"].is_file():
         raise ClassWorkspaceError("class workspace has not been initialized")
@@ -442,31 +564,265 @@ def load_workspace(run_spec, expected_stream_id=""):
         raise ClassWorkspaceError("class workspace belongs to a different run")
     if expected_stream_id and workspace.get("baseline_stream_id") != expected_stream_id:
         raise ClassWorkspaceError("existing workspace uses a different Fusion baseline")
-    baseline = Path(str(workspace.get("baseline_source_path") or ""))
-    formal = Path(str(workspace.get("formal_path") or ""))
-    report = Path(str(workspace.get("boundary_report_path") or ""))
-    expected_files = [
-        (baseline, workspace.get("baseline_source_sha256"), "Fusion baseline"),
-        (formal, workspace.get("formal_sha256"), "formal Fusion"),
-    ]
+    expected_files = []
     if not run_spec.get("manual_only"):
-        expected_files.append(
-            (report, workspace.get("boundary_report_sha256"), "boundary report")
-        )
-    for path, expected_sha, label in expected_files:
-        if not path.is_file() or sha256_file(path) != expected_sha:
-            raise ClassWorkspaceError(f"{label} is missing or its SHA256 changed: {path}")
+        baseline = Path(str(workspace.get("baseline_source_path") or ""))
+        formal = Path(str(workspace.get("formal_path") or ""))
+        report = Path(str(workspace.get("boundary_report_path") or ""))
+        expected_files.extend([
+            (baseline, workspace.get("baseline_source_sha256"), "Fusion baseline"),
+            (formal, workspace.get("formal_sha256"), "formal Fusion"),
+            (report, workspace.get("boundary_report_sha256"), "boundary report"),
+        ])
     classes = workspace.get("classes") or {}
     if set(classes) != {str(code) for code in CLASS_ORDER}:
         raise ClassWorkspaceError("class workspace does not contain exactly 14 class records")
+    unique_files = []
+    seen_paths = {}
+    for path, expected_sha, label in expected_files:
+        key = str(path.resolve()) if path else ""
+        if key in seen_paths:
+            if seen_paths[key] != expected_sha:
+                raise ClassWorkspaceError(
+                    f"workspace records conflicting SHA256 values for {path}"
+                )
+            continue
+        seen_paths[key] = expected_sha
+        unique_files.append((path, expected_sha, label))
     for code in CLASS_ORDER:
         record = classes[str(code)]
-        path = Path(str(record.get("path") or ""))
-        if not path.is_file() or sha256_file(path) != record.get("sha256"):
-            raise ClassWorkspaceError(
-                f"class {code} working layer changed outside the recorded workspace state"
-            )
+        unique_files.append((
+            Path(str(record.get("path") or "")),
+            record.get("sha256"),
+            f"class {code} working layer",
+        ))
+    for position, (path, expected_sha, label) in enumerate(unique_files):
+        if not path.is_file() or _sha256_file(path, is_canceled) != expected_sha:
+            raise ClassWorkspaceError(f"{label} is missing or its SHA256 changed: {path}")
+        if progress is not None:
+            progress(5.0 + 75.0 * (position + 1) / max(len(unique_files), 1))
     return workspace
+
+
+def workspace_source_statistics(workspace, *, is_canceled=None, progress=None):
+    """Read per-class source counts without constructing QGIS vector layers."""
+    statistics = {}
+    classes = workspace.get("classes") or {}
+    for position, code in enumerate(CLASS_ORDER):
+        if is_canceled is not None and is_canceled():
+            raise ClassWorkspaceCancelled("类别工作区后台统计已取消")
+        record = classes[str(code)]
+        path = Path(record["path"])
+        layer_name = str(record["layer_name"])
+        quoted_layer = '"' + layer_name.replace('"', '""') + '"'
+        connection = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro", uri=True, timeout=5.0
+        )
+        try:
+            rows = connection.execute(
+                f"SELECT geometry_source, COUNT(*) FROM {quoted_layer} "
+                "GROUP BY geometry_source"
+            ).fetchall()
+        finally:
+            connection.close()
+        values = {"fusion": 0, "sam3": 0, "manual_edited": 0}
+        for source, count in rows:
+            key = str(source or "fusion")
+            values[key] = int(count)
+        statistics[int(code)] = values
+        if progress is not None:
+            progress(80.0 + 20.0 * (position + 1) / len(CLASS_ORDER))
+    return statistics
+
+
+def workspace_review_refresh_status(run_spec, workspace, stream):
+    """Describe whether a newer review source can safely replace a workspace."""
+
+    paths = stream.get("paths") or {}
+    active_value = str(
+        stream.get("review_polygons") or paths.get("semantic_polygons") or ""
+    )
+    baseline_value = str(workspace.get("baseline_source_path") or "")
+    if not active_value:
+        raise ClassWorkspaceError("Fusion review source path is empty")
+    active_path = Path(active_value).resolve()
+    baseline_path = Path(baseline_value).resolve() if baseline_value else Path()
+    required = active_path != baseline_path
+    reasons = []
+    if workspace.get("locked"):
+        reasons.append("workspace_locked")
+    if str(workspace.get("active_sam_session_id") or ""):
+        reasons.append("active_sam_session")
+    for code in CLASS_ORDER:
+        record = (workspace.get("classes") or {}).get(str(code)) or {}
+        if bool(record.get("modified")):
+            reasons.append(f"class_{code}_modified")
+        if bool(record.get("confirmed")):
+            reasons.append(f"class_{code}_confirmed")
+        if str(record.get("state") or "") not in {
+            "editing",
+            "unreviewed_empty",
+        }:
+            reasons.append(f"class_{code}_state_{record.get('state')}")
+    history_path = workspace_paths(run_spec)["history"]
+    if history_path.is_file() and history_path.stat().st_size > 0:
+        reasons.append("edit_history_not_empty")
+    return {
+        "required": required,
+        "safe_to_replace": required and not reasons,
+        "blocking_reasons": sorted(set(reasons)),
+        "baseline_source_path": str(baseline_path),
+        "active_review_source_path": str(active_path),
+        "policy": (
+            (stream.get("fragmentation_postprocess") or {}).get("policy_version")
+            or ""
+        ),
+    }
+
+
+class ClassWorkspaceProbeTask(QgsTask):
+    """Validate and inspect a workspace without blocking the QGIS GUI thread."""
+
+    def __init__(self, generation, run_spec, streams):
+        super().__init__("后台校验分类工作区", QgsTask.Flag.CanCancel)
+        self.generation = int(generation)
+        self.run_spec = dict(run_spec)
+        self.streams = [dict(stream) for stream in streams]
+        self.result_data = None
+        self.error_message = ""
+
+    def run(self):
+        try:
+            workspace = None
+            workspace_path = workspace_paths(self.run_spec)["workspace"]
+            if workspace_path.is_file():
+                workspace = load_workspace(
+                    self.run_spec,
+                    is_canceled=self.isCanceled,
+                    progress=self.setProgress,
+                )
+                baseline_id = str(workspace.get("baseline_stream_id") or "")
+                baseline = stream_by_id(self.streams, baseline_id)
+                if self.run_spec.get("manual_only"):
+                    eligible = [baseline]
+                else:
+                    fusion = self.run_spec.get("fusion") or {}
+                    expected_id = (
+                        f"fusion:{fusion.get('profile_id')}" if fusion else ""
+                    )
+                    if (
+                        baseline.get("kind") != "fusion"
+                        or baseline.get("status") != "ready"
+                        or baseline.get("stream_id") != expected_id
+                        or baseline.get("boundary_fitting_status") != "passed"
+                    ):
+                        raise ClassWorkspaceError(
+                            "existing workspace baseline is no longer an approved Fusion"
+                        )
+                    _validate_fusion_profile(
+                        self.run_spec,
+                        baseline,
+                        is_canceled=self.isCanceled,
+                    )
+                    eligible = [baseline]
+                refresh = workspace_review_refresh_status(
+                    self.run_spec, workspace, baseline
+                )
+                statistics = (
+                    {}
+                    if refresh["required"] and refresh["safe_to_replace"]
+                    else workspace_source_statistics(
+                        workspace,
+                        is_canceled=self.isCanceled,
+                        progress=self.setProgress,
+                    )
+                )
+            else:
+                if self.run_spec.get("manual_only"):
+                    eligible = []
+                    candidates = [
+                        stream for stream in self.streams
+                        if stream.get("kind") == "fusion"
+                        and stream.get("status") == "ready"
+                    ]
+                    for position, stream in enumerate(candidates):
+                        validate_manual_fusion_stream(
+                            stream, is_canceled=self.isCanceled
+                        )
+                        eligible.append(stream)
+                        self.setProgress(
+                            100.0 * (position + 1) / max(len(candidates), 1)
+                        )
+                else:
+                    eligible = approved_fusion_streams(
+                        self.run_spec,
+                        self.streams,
+                        is_canceled=self.isCanceled,
+                    )
+                statistics = {}
+                refresh = {
+                    "required": False,
+                    "safe_to_replace": False,
+                    "blocking_reasons": [],
+                }
+                self.setProgress(100.0)
+            if self.isCanceled():
+                return False
+            self.result_data = {
+                "eligible_fusions": eligible,
+                "workspace": workspace,
+                "statistics": statistics,
+                "review_refresh": refresh,
+            }
+            return True
+        except ClassWorkspaceCancelled:
+            return False
+        except Exception as exc:
+            self.error_message = str(exc)
+            return False
+
+
+class ClassWorkspaceInitializeTask(QgsTask):
+    """Build the 14-class files in a cancellable worker task."""
+
+    def __init__(self, generation, run_spec, stream, *, replace=False):
+        super().__init__("后台初始化 14 类工作层", QgsTask.Flag.CanCancel)
+        self.generation = int(generation)
+        self.run_spec = dict(run_spec)
+        self.stream = dict(stream)
+        self.replace = bool(replace)
+        self.result_data = None
+        self.error_message = ""
+
+    def run(self):
+        try:
+            workspace = initialize_workspace(
+                self.run_spec,
+                self.stream,
+                replace=self.replace,
+                is_canceled=self.isCanceled,
+                progress=self.setProgress,
+            )
+            try:
+                statistics = workspace_source_statistics(
+                    workspace,
+                    is_canceled=self.isCanceled,
+                )
+            except ClassWorkspaceCancelled:
+                # Initialization has already committed atomically. A late
+                # cancellation may skip optional table statistics, but must not
+                # hide the successfully created workspace from the UI.
+                statistics = {}
+            self.result_data = {
+                "workspace": workspace,
+                "statistics": statistics,
+            }
+            return True
+        except ClassWorkspaceCancelled:
+            return False
+        except Exception as exc:
+            self.error_message = str(exc)
+            return False
 
 
 def save_workspace(run_spec, workspace):

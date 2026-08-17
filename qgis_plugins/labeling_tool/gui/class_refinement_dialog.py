@@ -28,6 +28,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis,
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -85,6 +86,17 @@ class ClassRefinementDialog(QDialog):
         self._scripts_dir = ""
         self._eligible_fusions = []
         self._workspace = None
+        self._workspace_task = None
+        self._workspace_generation = 0
+        self._workspace_statistics = {}
+        self._workspace_refresh = {}
+        self._pending_class_codes = []
+        self._pending_active_class_code = None
+        self._layer_load_paused = False
+        self._layer_load_timer = QTimer(self)
+        self._layer_load_timer.setSingleShot(True)
+        self._layer_load_timer.setInterval(250)
+        self._layer_load_timer.timeout.connect(self._load_next_workspace_layer)
         self._manual_only = False
         self._class_layers = {}
         self._connected_layer_ids = set()
@@ -164,6 +176,10 @@ class ClassRefinementDialog(QDialog):
         self.initialize_btn = QPushButton("初始化 14 类工作层")
         self.initialize_btn.clicked.connect(self._initialize_workspace)
         baseline.addWidget(self.initialize_btn)
+        self.cancel_load_btn = QPushButton("取消后台加载")
+        self.cancel_load_btn.clicked.connect(self._cancel_background_load)
+        self.cancel_load_btn.hide()
+        baseline.addWidget(self.cancel_load_btn)
         self.baseline_label = QLabel("尚未加载运行结果")
         self.baseline_label.setWordWrap(True)
         baseline.addWidget(self.baseline_label, stretch=2)
@@ -187,7 +203,7 @@ class ClassRefinementDialog(QDialog):
         header.setSectionResizeMode(3, STRETCH)
         for row, code in enumerate(CLASS_ORDER):
             visible = QCheckBox()
-            visible.setChecked(True)
+            visible.setChecked(False)
             visible.toggled.connect(lambda checked, c=code: self._set_visible(c, checked))
             visible_box = QWidget()
             visible_layout = QHBoxLayout(visible_box)
@@ -504,6 +520,8 @@ class ClassRefinementDialog(QDialog):
         self._update_actions()
 
     def set_run(self, result, run_spec, sam_config, scripts_dir):
+        self._cancel_background_load(silent=True)
+        self._workspace_generation += 1
         self._connect_iface_layer_signal()
         self._connect_map_tool_signal()
         self._clear_qgis_smooth_preview()
@@ -514,6 +532,9 @@ class ClassRefinementDialog(QDialog):
         self._disconnect_layer_signals()
         self._snapshots.clear()
         self._workspace = None
+        self._workspace_statistics = {}
+        self._workspace_refresh = {}
+        self._pending_active_class_code = None
         self._class_layers = {}
         self._result = dict(result)
         self._run_spec = dict(run_spec)
@@ -526,116 +547,206 @@ class ClassRefinementDialog(QDialog):
         self.table.setColumnHidden(5, self._manual_only)
         self.session_group.hide()
         self._confidence_raster = None
+        for code, checkbox in self._visibility_checks.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
         streams = [
             item for item in result.get("ready_streams") or []
             if item.get("status") == "ready"
         ]
-        self._eligible_fusions = class_workspace.approved_fusion_streams(
-            self._run_spec, streams
+        self._eligible_fusions = []
+        self.fusion_combo.clear()
+        self.fusion_combo.setEnabled(False)
+        self.initialize_btn.setEnabled(False)
+        self.baseline_label.setText(
+            f"Run {run_spec.get('run_id')}；正在后台校验工作区文件..."
         )
+        self.cancel_load_btn.show()
+        self._refresh_table()
+        task = class_workspace.ClassWorkspaceProbeTask(
+            self._workspace_generation,
+            self._run_spec,
+            streams,
+        )
+        self._workspace_task = task
+        task.progressChanged.connect(self._workspace_task_progress)
+        task.taskCompleted.connect(self._workspace_probe_completed)
+        task.taskTerminated.connect(self._workspace_task_terminated)
+        QgsApplication.taskManager().addTask(task)
+
+    def _workspace_task_progress(self, progress):
+        task = self.sender()
+        if task is not self._workspace_task:
+            return
+        action = (
+            "初始化 14 类工作层"
+            if isinstance(task, class_workspace.ClassWorkspaceInitializeTask)
+            else "校验工作区文件"
+        )
+        self.baseline_label.setText(
+            f"Run {self._run_spec.get('run_id')}；正在后台{action}... {int(progress)}%"
+        )
+
+    def _apply_eligible_fusions(self, streams):
+        self._eligible_fusions = list(streams or [])
         self.fusion_combo.clear()
         for stream in self._eligible_fusions:
             self.fusion_combo.addItem(stream["stream_id"], stream["stream_id"])
-        self.initialize_btn.setEnabled(bool(self._eligible_fusions))
-        workspace_path = class_workspace.workspace_paths(self._run_spec)["workspace"]
-        if workspace_path.is_file():
-            try:
-                self._workspace = class_workspace.load_workspace(self._run_spec)
-                self._load_workspace_layers()
-                self.fusion_combo.setCurrentText(self._workspace["baseline_stream_id"])
-                self.fusion_combo.setEnabled(False)
-                self.initialize_btn.setEnabled(False)
-            except Exception as exc:
-                self._workspace = None
-                QMessageBox.warning(self, "恢复类别工作区失败", str(exc))
-        if self._workspace is None:
-            self.baseline_label.setText(
-                f"Run {run_spec.get('run_id')}；可用 Fusion {len(self._eligible_fusions)} 个"
+
+    def _workspace_probe_completed(self):
+        task = self.sender()
+        if (
+            task is not self._workspace_task
+            or task.generation != self._workspace_generation
+        ):
+            return
+        self._workspace_task = None
+        data = task.result_data or {}
+        self._apply_eligible_fusions(data.get("eligible_fusions"))
+        self._workspace = data.get("workspace")
+        self._workspace_statistics = data.get("statistics") or {}
+        self._workspace_refresh = data.get("review_refresh") or {}
+        if self._workspace is not None:
+            self.fusion_combo.setCurrentText(
+                self._workspace["baseline_stream_id"]
             )
-        if self._manual_only and self._workspace is None and len(self._eligible_fusions) == 1:
+            self.fusion_combo.setEnabled(False)
+            if self._workspace_refresh.get("required"):
+                safe = bool(self._workspace_refresh.get("safe_to_replace"))
+                self.initialize_btn.setText("重建为 V3 14 类工作层")
+                self.initialize_btn.setEnabled(safe)
+                if safe:
+                    self.cancel_load_btn.hide()
+                    self.baseline_label.setText(
+                        "V3 派生结果已就绪；现有工作区无人工修改，可在后台原子重建"
+                    )
+                    self._refresh_table()
+                    return
+                self.baseline_label.setText(
+                    "V3 派生结果已就绪，但现有工作区含人工修改/确认记录，"
+                    "为防止数据丢失已禁止自动覆盖"
+                )
+            else:
+                self.initialize_btn.setText("初始化 14 类工作层")
+                self.initialize_btn.setEnabled(False)
+            self._load_workspace_layers()
+            return
+        self.cancel_load_btn.hide()
+        self.fusion_combo.setEnabled(bool(self._eligible_fusions))
+        self.initialize_btn.setEnabled(bool(self._eligible_fusions))
+        self.baseline_label.setText(
+            f"Run {self._run_spec.get('run_id')}；"
+            f"可用 Fusion {len(self._eligible_fusions)} 个"
+        )
+        self._refresh_table()
+        if self._manual_only and len(self._eligible_fusions) == 1:
             self.fusion_combo.setCurrentIndex(0)
             self._initialize_workspace()
+
+    def _workspace_task_terminated(self):
+        task = self.sender()
+        if task is not self._workspace_task:
+            return
+        self._workspace_task = None
+        self.cancel_load_btn.hide()
+        if task.error_message:
+            title = (
+                "初始化 14 类工作层失败"
+                if isinstance(task, class_workspace.ClassWorkspaceInitializeTask)
+                else "恢复类别工作区失败"
+            )
+            self.baseline_label.setText(f"后台任务失败：{task.error_message}")
+            QMessageBox.warning(self, title, task.error_message)
         else:
-            self._refresh_table()
+            self.baseline_label.setText("后台加载已取消；QGIS 主界面仍可继续操作")
+        self.fusion_combo.setEnabled(bool(self._eligible_fusions))
+        self.initialize_btn.setEnabled(bool(self._eligible_fusions))
+        self._refresh_table()
 
     def _initialize_workspace(self):
+        if self._workspace_task is not None:
+            return
         stream_id = str(self.fusion_combo.currentData() or "")
         if not stream_id:
             QMessageBox.warning(self, "初始化工作区", "没有通过规则化和审批的 Fusion")
             return
         try:
-            stream = class_workspace.stream_by_id(self._eligible_fusions, stream_id)
-            self._workspace = class_workspace.initialize_workspace(
-                self._run_spec, stream
+            stream = class_workspace.stream_by_id(
+                self._eligible_fusions, stream_id
             )
-            self._load_workspace_layers()
-            self.fusion_combo.setEnabled(False)
-            self.initialize_btn.setEnabled(False)
-            self._refresh_table()
         except Exception as exc:
             QMessageBox.warning(self, "初始化 14 类工作层失败", str(exc))
+            return
+        replace = bool(
+            self._workspace_refresh.get("required")
+            and self._workspace_refresh.get("safe_to_replace")
+        )
+        if replace:
+            answer = QMessageBox.question(
+                self,
+                "重建 V3 工作区",
+                "已确认当前 14 类工作区没有人工修改、类别确认或编辑历史。\n\n"
+                "继续后将用 V3 派生结果原子重建 14 个类别文件；"
+                "原始 Fusion 成果和 V3 总成果均保留。是否继续？",
+                YES | NO,
+                NO,
+            )
+            if answer != YES:
+                return
+        self.fusion_combo.setEnabled(False)
+        self.initialize_btn.setEnabled(False)
+        self.cancel_load_btn.show()
+        self.baseline_label.setText("正在后台初始化 14 类工作层... 0%")
+        task = class_workspace.ClassWorkspaceInitializeTask(
+            self._workspace_generation,
+            self._run_spec,
+            stream,
+            replace=replace,
+        )
+        self._workspace_task = task
+        task.progressChanged.connect(self._workspace_task_progress)
+        task.taskCompleted.connect(self._workspace_initialize_completed)
+        task.taskTerminated.connect(self._workspace_task_terminated)
+        QgsApplication.taskManager().addTask(task)
+
+    def _workspace_initialize_completed(self):
+        task = self.sender()
+        if (
+            task is not self._workspace_task
+            or task.generation != self._workspace_generation
+        ):
+            return
+        self._workspace_task = None
+        data = task.result_data or {}
+        self._workspace = data.get("workspace")
+        self._workspace_statistics = data.get("statistics") or {}
+        self._workspace_refresh = {}
+        self.initialize_btn.setText("初始化 14 类工作层")
+        if self._workspace is None:
+            self.baseline_label.setText("后台初始化没有返回工作区")
+            return
+        self.fusion_combo.setEnabled(False)
+        self.initialize_btn.setEnabled(False)
+        self._load_workspace_layers()
 
     def _load_workspace_layers(self):
-        self._class_layers = self.layer_manager.load_workspace_classes(
-            self._run_spec["run_id"], self._workspace
-        )
-        for code, layer_id in self._class_layers.items():
-            layer = QgsProject.instance().mapLayer(layer_id)
-            if layer is None:
-                continue
-            class_workspace.apply_class_constraints(
-                layer,
-                code,
-                run_id=self._run_spec["run_id"],
-                baseline_stream_id=self._workspace["baseline_stream_id"],
+        self._pending_class_codes = [
+            code for code in CLASS_ORDER if code not in self._class_layers
+        ]
+        self._layer_load_paused = False
+        self.cancel_load_btn.show()
+        self.baseline_label.setText(
+            self._workspace_summary_text(
+                f"后台分批挂载 {len(self._pending_class_codes)} 个类别图层"
             )
-            if layer.isEditable() and code not in self._snapshots:
-                self._snapshots[code] = self._persisted_snapshot(code)
-            if layer.id() not in self._connected_layer_ids:
-                started_slot = lambda c=code: self._editing_started(c)
-                committed_slot = lambda c=code: self._editing_stopped(c)
-                stopped_slot = lambda c=code: self._editing_stopped(c)
-                layer.editingStarted.connect(started_slot)
-                layer.afterCommitChanges.connect(committed_slot)
-                layer.editingStopped.connect(stopped_slot)
-                self._layer_signal_slots[layer.id()] = (
-                    started_slot, committed_slot, stopped_slot
-                )
-                selection_slot = lambda *_args, c=code: self._selection_changed(c)
-                layer.selectionChanged.connect(selection_slot)
-                self._selection_signal_slots[layer.id()] = selection_slot
-                changed_slots = []
-                for signal_name in (
-                    "geometryChanged",
-                    "featureAdded",
-                    "featureDeleted",
-                    "attributeValueChanged",
-                ):
-                    signal = getattr(layer, signal_name, None)
-                    if signal is None:
-                        continue
-                    slot = lambda *_args, c=code: self._layer_edit_changed(c)
-                    signal.connect(slot)
-                    changed_slots.append((signal_name, slot))
-                self._edit_change_signal_slots[layer.id()] = changed_slots
-                undo_stack = layer.undoStack()
-                undo_slot = lambda *_args, c=code: self._layer_edit_changed(c)
-                undo_stack.indexChanged.connect(undo_slot)
-                self._undo_stack_signal_slots[layer.id()] = (
-                    undo_stack, undo_slot
-                )
-                self._connected_layer_ids.add(layer.id())
-            tree_layer = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
-            if tree_layer is not None:
-                self._sync_visibility_from_layer_tree(code)
-                if layer.id() not in self._tree_visibility_slots:
-                    visibility_slot = (
-                        lambda _node=None, c=code: self._sync_visibility_from_layer_tree(c)
-                    )
-                    tree_layer.visibilityChanged.connect(visibility_slot)
-                    self._tree_visibility_slots[layer.id()] = (
-                        tree_layer, visibility_slot
-                    )
+        )
+        self._refresh_table()
+        self._layer_load_timer.start()
+
+    def _workspace_summary_text(self, suffix=""):
+        if not self._workspace:
+            return "类别工作区尚未加载"
         text = (
             f"基准 {self._workspace['baseline_stream_id']} | "
             f"formal SHA {self._workspace['formal_sha256'][:12]}... | "
@@ -646,9 +757,144 @@ class ClassRefinementDialog(QDialog):
             text += f" | report SHA {report_sha[:12]}..."
         if self._manual_only:
             text += " | 纯人工模式"
-        self.baseline_label.setText(text)
+        if self._workspace.get("portable_classes_only"):
+            text += " | Fusion 基准离线"
+        if suffix:
+            text += f" | {suffix}"
+        return text
+
+    def _prioritize_class_load(self, class_code, *, activate=False):
+        class_code = int(class_code)
+        if activate:
+            checkbox = self._visibility_checks[class_code]
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
+        if class_code in self._class_layers:
+            if activate:
+                self._select_class_context(class_code, activate_layer=True)
+            return
+        if class_code in self._pending_class_codes:
+            self._pending_class_codes.remove(class_code)
+        self._pending_class_codes.insert(0, class_code)
+        if activate:
+            self._pending_active_class_code = class_code
+        self._layer_load_paused = False
+        if not self._layer_load_timer.isActive():
+            self.cancel_load_btn.show()
+            self._layer_load_timer.start(0)
+
+    def _load_next_workspace_layer(self):
+        if self._layer_load_paused or not self._workspace:
+            return
+        if not self._pending_class_codes:
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText(self._workspace_summary_text("工作层已就绪"))
+            self._refresh_table()
+            return
+        code = self._pending_class_codes.pop(0)
+        record = self._workspace["classes"][str(code)]
+        try:
+            layer_id = self.layer_manager.load_workspace_class(
+                self._run_spec["run_id"], record, visible=False
+            )
+            self._class_layers[code] = layer_id
+            self._register_workspace_layer(code, layer_id)
+            self.layer_manager.set_layer_visibility(
+                layer_id, self._visibility_checks[code].isChecked()
+            )
+        except Exception as exc:
+            self._layer_load_paused = True
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText(f"类别 {code} 挂载失败：{exc}")
+            QMessageBox.warning(self, f"类别 {code} 挂载失败", str(exc))
+            self._refresh_table()
+            return
+        pending_active = self._pending_active_class_code
+        if pending_active == code:
+            self._pending_active_class_code = None
+            self._select_class_context(code, activate_layer=True)
+        self._refresh_table()
+        self.baseline_label.setText(
+            self._workspace_summary_text(
+                f"后台分批挂载，剩余 {len(self._pending_class_codes)} 类"
+            )
+        )
+        self._layer_load_timer.start()
+
+    def _register_workspace_layer(self, code, layer_id):
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if layer is None:
+            raise RuntimeError(f"class {code} working layer was not added")
+        class_workspace.apply_class_constraints(
+            layer,
+            code,
+            run_id=self._run_spec["run_id"],
+            baseline_stream_id=self._workspace["baseline_stream_id"],
+        )
+        if layer.isEditable() and code not in self._snapshots:
+            self._snapshots[code] = self._persisted_snapshot(code)
+        if layer.id() not in self._connected_layer_ids:
+            started_slot = lambda c=code: self._editing_started(c)
+            committed_slot = lambda c=code: self._editing_stopped(c)
+            stopped_slot = lambda c=code: self._editing_stopped(c)
+            layer.editingStarted.connect(started_slot)
+            layer.afterCommitChanges.connect(committed_slot)
+            layer.editingStopped.connect(stopped_slot)
+            self._layer_signal_slots[layer.id()] = (
+                started_slot, committed_slot, stopped_slot
+            )
+            selection_slot = lambda *_args, c=code: self._selection_changed(c)
+            layer.selectionChanged.connect(selection_slot)
+            self._selection_signal_slots[layer.id()] = selection_slot
+            changed_slots = []
+            for signal_name in (
+                "geometryChanged",
+                "featureAdded",
+                "featureDeleted",
+                "attributeValueChanged",
+            ):
+                signal = getattr(layer, signal_name, None)
+                if signal is None:
+                    continue
+                slot = lambda *_args, c=code: self._layer_edit_changed(c)
+                signal.connect(slot)
+                changed_slots.append((signal_name, slot))
+            self._edit_change_signal_slots[layer.id()] = changed_slots
+            undo_stack = layer.undoStack()
+            undo_slot = lambda *_args, c=code: self._layer_edit_changed(c)
+            undo_stack.indexChanged.connect(undo_slot)
+            self._undo_stack_signal_slots[layer.id()] = (undo_stack, undo_slot)
+            self._connected_layer_ids.add(layer.id())
+        tree_layer = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
+        if tree_layer is not None and layer.id() not in self._tree_visibility_slots:
+            visibility_slot = (
+                lambda _node=None, c=code: self._sync_visibility_from_layer_tree(c)
+            )
+            tree_layer.visibilityChanged.connect(visibility_slot)
+            self._tree_visibility_slots[layer.id()] = (
+                tree_layer, visibility_slot
+            )
+        self._sync_visibility_from_layer_tree(code)
         self._active_layer_changed(self.iface.activeLayer())
         self._update_manual_panel()
+
+    def _cancel_background_load(self, _checked=False, *, silent=False):
+        task = self._workspace_task
+        if task is not None:
+            task.cancel()
+            self._workspace_task = None
+        self._layer_load_timer.stop()
+        self._layer_load_paused = True
+        if not silent:
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText(
+                "后台加载已暂停；点击需要的类别可按需继续挂载"
+            )
+            self.fusion_combo.setEnabled(bool(self._eligible_fusions))
+            self.initialize_btn.setEnabled(
+                self._workspace is None and bool(self._eligible_fusions)
+            )
 
     def _disconnect_layer_signals(self):
         for layer_id, slots in list(self._layer_signal_slots.items()):
@@ -772,6 +1018,8 @@ class ClassRefinementDialog(QDialog):
         layer_id = self._class_layers.get(class_code)
         if layer_id:
             self.layer_manager.set_layer_visibility(layer_id, visible)
+        elif visible and self._workspace:
+            self._prioritize_class_load(class_code)
 
     def _sync_visibility_from_layer_tree(self, class_code):
         layer_id = self._class_layers.get(int(class_code))
@@ -800,6 +1048,12 @@ class ClassRefinementDialog(QDialog):
     def _select_class_context(self, class_code, activate_layer=True):
         class_code = int(class_code)
         if class_code not in self._class_layers:
+            if self._workspace:
+                row = CLASS_ORDER.index(class_code)
+                self.table.item(row, 3).setText("正在按需挂载...")
+                self._prioritize_class_load(
+                    class_code, activate=activate_layer
+                )
             return
         locked_code = self._manual_locked_class_code()
         if locked_code is not None and class_code != locked_code:
@@ -819,6 +1073,9 @@ class ClassRefinementDialog(QDialog):
             )
             if activate_layer:
                 layer = self._layer(class_code)
+                checkbox = self._visibility_checks[class_code]
+                if not checkbox.isChecked():
+                    checkbox.setChecked(True)
                 active_layer = self.iface.activeLayer()
                 if active_layer is None or active_layer.id() != layer.id():
                     self.iface.setActiveLayer(layer)
@@ -3764,22 +4021,36 @@ class ClassRefinementDialog(QDialog):
         has_unsaved_edits = bool(self._editable_modified_layers())
         for row, code in enumerate(CLASS_ORDER):
             record = self._workspace["classes"][str(code)]
-            layer = self._layer(code)
-            stats = class_workspace.source_statistics(layer)
-            if self._manual_only:
+            layer = None
+            if code in self._class_layers:
+                layer = QgsProject.instance().mapLayer(self._class_layers[code])
+            stats = self._workspace_statistics.get(code)
+            if stats and self._manual_only:
                 status_text = (
                     f"原始 {stats.get('fusion', 0)} / "
                     f"人工 {stats.get('manual_edited', 0)}"
                 )
-            else:
+            elif stats:
                 status_text = (
                     f"Fusion {stats.get('fusion', 0)} / SAM3 {stats.get('sam3', 0)} / "
                     f"人工 {stats.get('manual_edited', 0)}"
                 )
+            elif layer is not None:
+                status_text = "工作层已挂载"
+            elif code in self._pending_class_codes:
+                status_text = "等待后台分批挂载"
+            else:
+                status_text = "尚未挂载；点击可按需加载"
             self.table.item(row, 3).setText(status_text)
-            self.table.item(row, 4).setText(str(layer.featureCount()))
+            feature_count = (
+                layer.featureCount()
+                if layer is not None
+                else int(record.get("feature_count") or 0)
+            )
+            self.table.item(row, 4).setText(str(feature_count))
             sam_enabled = bool(
-                not self._manual_only
+                layer is not None
+                and not self._manual_only
                 and self._sam_available()
                 and not self._active_session
                 and not self._manual_task
@@ -3790,16 +4061,19 @@ class ClassRefinementDialog(QDialog):
             )
             self._sam_missed_actions[code].setEnabled(sam_enabled)
             self._sam_buttons[code].setToolTip(
-                "" if sam_enabled else "SAM3 不可用、会话活动或环境未通过"
+                "" if sam_enabled else (
+                    "工作层尚未挂载" if layer is None
+                    else "SAM3 不可用、会话活动或环境未通过"
+                )
             )
-            manual_enabled = not self._active_session
+            manual_enabled = layer is not None and not self._active_session
             self._edit_buttons[code].setEnabled(manual_enabled)
             confirm = self._confirm_buttons[code]
             confirm.blockSignals(True)
             confirm.setChecked(bool(record.get("confirmed")))
             confirm.setText(
                 "整类已确认" if record.get("confirmed")
-                else "确认本范围无该类" if layer.featureCount() == 0
+                else "确认本范围无该类" if feature_count == 0
                 else "确认整类"
             )
             confirm.blockSignals(False)
@@ -3807,6 +4081,7 @@ class ClassRefinementDialog(QDialog):
                 not self._active_session
                 and not self._manual_task
                 and not has_unsaved_edits
+                and layer is not None
             )
         self._update_manual_panel()
         self._update_actions()
@@ -3922,6 +4197,8 @@ class ClassRefinementDialog(QDialog):
         )
 
     def cleanup(self):
+        self._cancel_background_load(silent=True)
+        self._workspace_generation += 1
         self._clear_qgis_smooth_preview()
         self._manual_smoothing_timer.stop()
         self._cancel_manual_capture_transition()
@@ -3971,6 +4248,7 @@ class ClassRefinementDialog(QDialog):
                 event.ignore()
                 return
         self._cancel_active_session(record=True)
+        self._cancel_background_load(silent=True)
         if self._worker is not None:
             self._worker.stop()
             self._worker = None

@@ -92,6 +92,13 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         run_id="20260717_210000_fixture",
     )
     assert spec["schema_version"] == 2
+    assert spec["fragmentation_regularization"] == {
+        "enabled": True,
+        "policy_id": "semantic_optimized_200_v3",
+        "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "buffer_pixels": 256,
+        "max_workers": 4,
+    }
     assert "tiles" not in spec
     assert spec_path.stat().st_size < 50_000
     expected_tile_cache = (

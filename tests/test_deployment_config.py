@@ -159,6 +159,13 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
         effective["boundary_fitting"]["mode"]
         == "divider_cubic_bspline_adaptive_v2"
     )
+    assert effective["fragmentation_regularization"]["enabled"] is True
+    assert (
+        effective["fragmentation_regularization"]["policy_id"]
+        == "semantic_optimized_200_v3"
+    )
+    assert effective["fragmentation_regularization"]["buffer_pixels"] == 256
+    assert effective["fragmentation_regularization"]["max_workers"] >= 1
 
 
 def test_score_cache_budget_accepts_auto_and_rejects_invalid_values(tmp_path):

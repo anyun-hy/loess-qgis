@@ -143,7 +143,7 @@ class LayerManager(QObject):
         layer.triggerRepaint()
         return layer.id()
 
-    def load_workspace_class(self, run_id, record):
+    def load_workspace_class(self, run_id, record, *, visible=False):
         class_code = int(record["class_code"])
         for layer in self.project.mapLayers().values():
             if (
@@ -153,6 +153,9 @@ class LayerManager(QObject):
                 and str(layer.customProperty("labeling_tool/workspace_path", ""))
                 == str(record["path"])
             ):
+                tree_layer = self.project.layerTreeRoot().findLayer(layer.id())
+                if tree_layer is not None:
+                    tree_layer.setItemVisibilityChecked(bool(visible))
                 return layer.id()
         display_name = (
             f"{run_id} | Class | {class_code} "
@@ -169,12 +172,14 @@ class LayerManager(QObject):
         layer.setCustomProperty("labeling_tool/class_code", class_code)
         layer.setCustomProperty("labeling_tool/workspace_path", str(record["path"]))
         self._add_managed_layer(layer, run_id, "Classes", f"class:{class_code}")
-        layer.triggerRepaint()
+        tree_layer = self.project.layerTreeRoot().findLayer(layer.id())
+        if tree_layer is not None:
+            tree_layer.setItemVisibilityChecked(bool(visible))
         return layer.id()
 
     def load_workspace_classes(self, run_id, workspace):
         return {
-            int(code): self.load_workspace_class(run_id, record)
+            int(code): self.load_workspace_class(run_id, record, visible=False)
             for code, record in (workspace.get("classes") or {}).items()
         }
 

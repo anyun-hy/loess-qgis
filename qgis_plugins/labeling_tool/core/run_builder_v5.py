@@ -66,6 +66,7 @@ def create_v5_run(
     scaling: Mapping[str, Any],
     boundary_fitting: Mapping[str, Any],
     storage_report: Mapping[str, Any],
+    fragmentation_regularization: Mapping[str, Any] | None = None,
     fusion: Mapping[str, Any] | None = None,
     accepted_gpkg: str | Path = "",
     accepted_target_gpkg: str | Path = "",
@@ -103,6 +104,31 @@ def create_v5_run(
         raise RunBuilderV5Error(
             "boundary_fitting.mode must equal "
             "divider_cubic_bspline_adaptive_v2"
+        )
+    fragmentation_value = dict(fragmentation_regularization or {})
+    fragmentation_value.setdefault("enabled", True)
+    fragmentation_value.setdefault("policy_id", "semantic_optimized_200_v3")
+    fragmentation_value.setdefault(
+        "policy_version", "semantic_optimized_200_v3_core_bounded_v1"
+    )
+    fragmentation_value.setdefault("buffer_pixels", 256)
+    fragmentation_value.setdefault("max_workers", 4)
+    if not isinstance(fragmentation_value.get("enabled"), bool):
+        raise RunBuilderV5Error(
+            "fragmentation_regularization.enabled must be true or false"
+        )
+    if fragmentation_value.get("policy_id") != "semantic_optimized_200_v3":
+        raise RunBuilderV5Error(
+            "fragmentation_regularization.policy_id must equal "
+            "semantic_optimized_200_v3"
+        )
+    if int(fragmentation_value.get("buffer_pixels") or 0) != 256:
+        raise RunBuilderV5Error(
+            "fragmentation_regularization.buffer_pixels must equal 256"
+        )
+    if int(fragmentation_value.get("max_workers") or 0) < 1:
+        raise RunBuilderV5Error(
+            "fragmentation_regularization.max_workers must be positive"
         )
     range_value = dict(range_selection or {})
     range_mode = str(range_value.get("mode") or "extent")
@@ -186,6 +212,7 @@ def create_v5_run(
         "models": model_values,
         "fusion": fusion_value,
         "boundary_fitting": boundary_value,
+        "fragmentation_regularization": fragmentation_value,
         "range_selection": range_value,
         "config_fingerprint": str(config_fingerprint),
     }
@@ -279,6 +306,7 @@ def create_v5_run(
         "resource_tuning": dict(resource_tuning or {}),
         "scaling": scaling_value,
         "boundary_fitting": boundary_value,
+        "fragmentation_regularization": fragmentation_value,
         "storage_preflight": dict(storage_report),
         "models": model_values,
         "fusion": fusion_value,

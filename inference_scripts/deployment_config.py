@@ -334,6 +334,7 @@ def validate_deployment_config(
         "fusion_profiles": [],
         "sam3": {},
         "boundary_fitting": {},
+        "fragmentation_regularization": {},
         "classes": {},
     }
 
@@ -674,6 +675,58 @@ def validate_deployment_config(
             "/boundary_fitting/diagnostic_level", "must be changed_and_failed or all"
         ))
     effective["boundary_fitting"] = normalized_boundary
+
+    fragmentation = _mapping(
+        config.get("fragmentation_regularization", {}),
+        "/fragmentation_regularization",
+        issues,
+    )
+    raw_enabled = fragmentation.get("enabled", True)
+    if not isinstance(raw_enabled, bool):
+        issues.append(ValidationIssue(
+            "/fragmentation_regularization/enabled", "must be boolean"
+        ))
+    policy_id = str(
+        fragmentation.get("policy_id") or "semantic_optimized_200_v3"
+    )
+    if policy_id != "semantic_optimized_200_v3":
+        issues.append(ValidationIssue(
+            "/fragmentation_regularization/policy_id",
+            "must equal semantic_optimized_200_v3",
+        ))
+    try:
+        buffer_pixels = int(fragmentation.get("buffer_pixels", 256))
+    except (TypeError, ValueError):
+        buffer_pixels = 0
+    if buffer_pixels != 256:
+        issues.append(ValidationIssue(
+            "/fragmentation_regularization/buffer_pixels",
+            "must equal the verified V3 context size 256",
+        ))
+    raw_workers = fragmentation.get("max_workers", "auto")
+    if str(raw_workers).strip().lower() == "auto":
+        requested_workers: int | str = "auto"
+        max_workers = min(4, os.cpu_count() or 1)
+    else:
+        try:
+            requested_workers = int(raw_workers)
+        except (TypeError, ValueError):
+            requested_workers = 0
+        max_workers = int(requested_workers)
+        if max_workers < 1 or max_workers > (os.cpu_count() or 1):
+            issues.append(ValidationIssue(
+                "/fragmentation_regularization/max_workers",
+                "must be auto or between 1 and the available CPU count",
+            ))
+    effective["fragmentation_regularization"] = {
+        "enabled": raw_enabled is True,
+        "policy_id": policy_id,
+        "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "buffer_pixels": buffer_pixels,
+        "requested_max_workers": requested_workers,
+        "max_workers": max(1, max_workers),
+        "stream_kind": "fusion",
+    }
 
     classes = _mapping(config.get("classes"), "/classes", issues)
     raw_index = _mapping(classes.get("index_to_code"), "/classes/index_to_code", issues)

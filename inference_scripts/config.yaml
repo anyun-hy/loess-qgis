@@ -69,6 +69,15 @@ boundary_fitting:
   max_segment_arc_length_px: 8.0
   diagnostic_level: changed_and_failed
 
+# Runs after Fusion assembly. It reuses committed mask/confidence partitions,
+# writes a derived review result under run_dir/postprocess, and never replaces
+# the original Fusion products.
+fragmentation_regularization:
+  enabled: true
+  policy_id: semantic_optimized_200_v3
+  buffer_pixels: 256
+  max_workers: auto
+
 classes:
   # -1 is only the no-result/nodata sentinel. It is not a model class.
   background_index: -1

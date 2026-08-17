@@ -148,8 +148,9 @@ def test_main_dock_startup_restore_is_metadata_only():
     open_block = source.split("def _on_open_refinement", 1)[1].split(
         "def _on_load_manual_run", 1
     )[0]
-    assert "valid_ready_stream_ids" in open_block
-    assert "len(valid_streams) != len(declared_streams)" in open_block
+    assert "valid_ready_stream_ids" not in open_block
+    assert "approved_fusion_streams" not in open_block
+    assert "将在分类窗口中后台校验" in open_block
 
 
 def test_v5_runner_updates_index_at_running_and_terminal_boundaries():

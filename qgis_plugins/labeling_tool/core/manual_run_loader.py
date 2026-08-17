@@ -1,4 +1,9 @@
-"""Load a copied ready Run for portable, manual-only class refinement."""
+"""Load a copied ready Run for portable, manual-only class refinement.
+
+An initialized 14-class workspace is the portable editing authority.  The
+original Fusion polygon file remains part of the provenance recorded in the
+workspace and manifest, but it does not need to be copied to every reviewer.
+"""
 
 from __future__ import annotations
 
@@ -55,7 +60,9 @@ def _rebound_candidate(raw_path, old_root: Path | None, new_root: Path, run_id: 
     return None
 
 
-def _rebind_stream(stream, old_root, run_root, run_id):
+def _rebind_stream(
+    stream, old_root, run_root, run_id, *, require_semantic=True
+):
     rebound = copy.deepcopy(stream)
     stream_id = str(rebound.get("stream_id") or "")
     profile_id = str(rebound.get("fusion_profile_id") or "")
@@ -76,21 +83,26 @@ def _rebind_stream(stream, old_root, run_root, run_id):
         elif candidate is not None:
             paths[name] = str(candidate)
 
-    semantic = Path(str(paths.get("semantic_polygons") or ""))
-    if not semantic.is_file():
+    semantic_value = str(paths.get("semantic_polygons") or "").strip()
+    semantic = Path(semantic_value) if semantic_value else None
+    if semantic is None or not semantic.is_file():
         fallback = expected_dir / "semantic_polygons.gpkg"
         if fallback.is_file():
             semantic = fallback.resolve()
             paths["semantic_polygons"] = str(semantic)
-        else:
+        elif require_semantic:
             raise ManualRunLoadError(
                 f"Fusion {stream_id} 缺少 semantic_polygons.gpkg: {fallback}"
             )
     rebound["paths"] = paths
     rebound["fusion_profile_id"] = profile_id
-    rebound["review_polygons"] = str(semantic.resolve())
+    semantic_available = semantic is not None and semantic.is_file()
+    rebound["review_polygons"] = (
+        str(semantic.resolve()) if semantic_available else ""
+    )
     rebound["review_layer_name"] = "semantic_polygons"
     rebound["manual_validated"] = False
+    rebound["manual_offline"] = not semantic_available
     return rebound
 
 
@@ -116,31 +128,29 @@ def _prepare_workspace(run_root, run_id, fusion_streams):
         raise ManualRunLoadError(
             f"类别工作区引用的 Fusion 不存在或不可用: {baseline_id}"
         )
-    baseline_path = Path(stream_map[baseline_id]["review_polygons"]).resolve()
-    baseline_sha = _sha256(baseline_path)
     rebound = copy.deepcopy(workspace)
-    rebound["baseline_source_path"] = str(baseline_path)
-    rebound["formal_path"] = str(baseline_path)
-    rebound["baseline_source_sha256"] = baseline_sha
-    rebound["formal_sha256"] = baseline_sha
+    baseline_value = str(
+        stream_map[baseline_id].get("review_polygons") or ""
+    ).strip()
+    baseline_path = Path(baseline_value).resolve() if baseline_value else None
+    baseline_available = baseline_path is not None and baseline_path.is_file()
+    if baseline_available:
+        rebound["baseline_source_path"] = str(baseline_path)
+        rebound["formal_path"] = str(baseline_path)
+    rebound["baseline_available"] = baseline_available
+    rebound["portable_classes_only"] = not baseline_available
     report_path = Path(
         str((stream_map[baseline_id].get("paths") or {}).get("boundary_fitting_report") or "")
     )
     if report_path.is_file():
         rebound["boundary_report_path"] = str(report_path.resolve())
-        rebound["boundary_report_sha256"] = _sha256(report_path)
-    else:
-        rebound["boundary_report_path"] = ""
-        rebound["boundary_report_sha256"] = ""
 
     for code in CLASS_ORDER:
         record = dict(classes[str(code)])
         class_path = (run_root / "classes" / f"class_{code}.gpkg").resolve()
         if not class_path.is_file():
             raise ManualRunLoadError(f"缺少类别工作层: {class_path}")
-        actual_sha = _sha256(class_path)
         record["path"] = str(class_path)
-        record["sha256"] = actual_sha
         rebound["classes"][str(code)] = record
     rebound["manual_only"] = True
     return rebound
@@ -173,11 +183,18 @@ def load_manual_run(run_directory) -> dict:
 
     old_root_value = str(original_spec.get("run_dir") or "").strip()
     old_root = Path(old_root_value).expanduser() if old_root_value else None
+    has_workspace = (run_root / "classes" / "workspace.json").is_file()
     fusion_streams = []
     for stream in manifest.get("streams") or []:
         if stream.get("kind") == "fusion" and stream.get("status") == "ready":
             fusion_streams.append(
-                _rebind_stream(stream, old_root, run_root, run_id)
+                _rebind_stream(
+                    stream,
+                    old_root,
+                    run_root,
+                    run_id,
+                    require_semantic=not has_workspace,
+                )
             )
     if not fusion_streams:
         raise ManualRunLoadError("run_manifest.json 中没有 ready Fusion 结果")
@@ -231,6 +248,9 @@ def load_manual_run(run_directory) -> dict:
         "ready_streams": fusion_streams,
         "failed_streams": [],
         "manual_only": True,
+        "portable_classes_only": bool(
+            workspace and workspace.get("portable_classes_only")
+        ),
         "error": "",
     }
     return {
@@ -243,20 +263,16 @@ def load_manual_run(run_directory) -> dict:
 
 
 def persist_rebound_workspace(bundle):
+    """Persist portable paths without synchronously re-hashing large files.
+
+    The background workspace probe validates the recorded class SHA256 values.
+    Keeping this function metadata-only is essential because it is called from
+    the QGIS UI before that cancellable task starts.
+    """
     workspace = bundle.get("workspace")
     if workspace is None:
         return
     workspace = copy.deepcopy(workspace)
-    baseline_path = Path(workspace["baseline_source_path"])
-    formal_path = Path(workspace["formal_path"])
-    workspace["baseline_source_sha256"] = _sha256(baseline_path)
-    workspace["formal_sha256"] = _sha256(formal_path)
-    report_path = Path(str(workspace.get("boundary_report_path") or ""))
-    if report_path.is_file():
-        workspace["boundary_report_sha256"] = _sha256(report_path)
-    for record in (workspace.get("classes") or {}).values():
-        class_path = Path(record["path"])
-        record["sha256"] = _sha256(class_path)
     bundle["workspace"] = workspace
     path = Path(bundle["workspace_path"])
     temporary = path.with_name(path.name + ".tmp")

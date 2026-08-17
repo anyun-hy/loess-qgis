@@ -210,6 +210,14 @@ def valid_ready_stream_ids(catalog: Mapping[str, Any]) -> tuple[str, ...]:
                     for key in required
                 ):
                     continue
+                review_path = str(stream.get("review_polygons") or "")
+                if (
+                    review_path
+                    and review_path != str(paths.get("semantic_polygons") or "")
+                    and checksums.get("review_polygons")
+                    != artifact_sha256(review_path)
+                ):
+                    continue
                 with open(paths["boundary_fitting_report"], "r", encoding="utf-8") as handle:
                     report = json.load(handle)
             except (KeyError, OSError, json.JSONDecodeError):

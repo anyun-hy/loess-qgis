@@ -1,4 +1,6 @@
 import importlib
+import hashlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -80,8 +82,21 @@ def _runner(module):
     runner._assembly_queue = [
         {"stream_id": "model:a"},
         {"stream_id": "model:b"},
-        {"stream_id": "fusion:approved"},
+        {
+            "stream_id": "fusion:approved",
+            "kind": "fusion",
+            "profile_id": "approved",
+        },
     ]
+    runner._fragmentation_queue = None
+    runner._spec = {
+        "streams": list(runner._assembly_queue),
+        "fragmentation_regularization": {
+            "enabled": True,
+            "max_workers": 4,
+            "buffer_pixels": 256,
+        },
+    }
     runner._processes = {}
     runner._phase = "assembly"
     runner._spec_path = "/tmp/run_spec.json"
@@ -103,14 +118,84 @@ def test_assembly_queue_starts_streams_in_run_spec_order(monkeypatch):
     runner._start_assembly()
     runner._start_assembly()
     runner._start_assembly()
+    runner._start_fragmentation()
 
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
         "assemble_stream:fusion:approved",
+        "fragmentation_v3:fusion:approved",
         "scale_acceptance",
     ]
     assert runner._phase == "acceptance"
+    fragmentation = starts[3]
+    assert fragmentation[1] == "run_fragmentation_postprocess.sh"
+    assert fragmentation[2] == [
+        "--run-spec",
+        "/tmp/run_spec.json",
+        "--stream-id",
+        "fusion:approved",
+        "--workers",
+        "4",
+        "--buffer-pixels",
+        "256",
+    ]
+
+
+def test_passed_fragmentation_manifest_becomes_fusion_review_source(
+    tmp_path, monkeypatch
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    run_dir = tmp_path / "run"
+    root = (
+        run_dir
+        / "postprocess"
+        / "semantic_optimized_200_v3"
+        / "fusion"
+        / "approved"
+    )
+    root.mkdir(parents=True)
+    review = root / "semantic_polygons.gpkg"
+    review.write_bytes(b"review")
+    report = root / "fragmentation_v3_report.json"
+    report.write_text('{"status":"passed"}', encoding="utf-8")
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = {
+        "status": "passed",
+        "run_id": "run-1",
+        "stream_id": "fusion:approved",
+        "policy_id": "semantic_optimized_200_v3",
+        "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "semantic_polygons": str(review),
+        "semantic_polygons_layer": "semantic_polygons",
+        "semantic_polygons_sha256": digest(review),
+        "report_path": str(report),
+        "report_sha256": digest(report),
+    }
+    (root / "fragmentation_v3_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    runner._spec = {
+        "run_id": "run-1",
+        "run_dir": str(run_dir),
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "semantic_optimized_200_v3",
+            "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        },
+    }
+
+    value = runner._validated_fragmentation_review(
+        {
+            "stream_id": "fusion:approved",
+            "kind": "fusion",
+            "profile_id": "approved",
+        }
+    )
+
+    assert value["semantic_polygons"] == str(review)
+    assert value["semantic_polygons_sha256"] == digest(review)
 
 
 def test_active_assembly_process_blocks_second_stream(monkeypatch):
