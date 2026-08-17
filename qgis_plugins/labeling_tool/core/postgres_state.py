@@ -8,7 +8,9 @@ the legacy qmark SQL parameters during the backend migration.
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 from typing import Any, Iterable, Sequence
 
 
@@ -18,6 +20,18 @@ DEFAULT_POSTGRES_DSN = (
 DEFAULT_POSTGRES_SCHEMA = "loess_qgis"
 POSTGRES_SCHEME_PREFIXES = ("postgresql://", "postgres://")
 _SAFE_SCHEMA = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+def _resolve_postgres_dsn(dsn: str) -> str:
+    text = str(dsn or "").strip()
+    if (
+        sys.platform == "darwin"
+        and "host=/var/run/postgresql" in text
+        and not os.path.isdir("/var/run/postgresql")
+        and os.path.exists("/tmp/.s.PGSQL.5432")
+    ):
+        return text.replace("host=/var/run/postgresql", "host=/tmp")
+    return text
 
 
 class PostgresDependencyError(RuntimeError):
@@ -115,7 +129,7 @@ def connect_postgres(
 ) -> PostgresConnection:
     psycopg2, dict_cursor, execute_batch = _driver()
     raw = psycopg2.connect(
-        str(dsn),
+        _resolve_postgres_dsn(dsn),
         connect_timeout=10,
         application_name="loess-qgis",
     )
@@ -461,7 +475,7 @@ def initialize_postgres(
     psycopg2, _dict_cursor, _execute_batch = _driver()
     safe_schema = validate_schema(schema)
     raw = psycopg2.connect(
-        str(dsn),
+        _resolve_postgres_dsn(dsn),
         connect_timeout=10,
         application_name="loess-qgis-schema",
     )
