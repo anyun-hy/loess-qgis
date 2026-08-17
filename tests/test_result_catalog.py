@@ -1,6 +1,7 @@
 import json
 
 from labeling_tool.core import result_catalog
+from labeling_tool.core.run_spec import sha256_file
 
 
 def _write_run(root, run_id, *, workspace=False, status="ready"):
@@ -83,3 +84,61 @@ def test_vrt_non_statistics_metadata_remains_part_of_integrity_hash(tmp_path):
         encoding="utf-8",
     )
     assert result_catalog.artifact_sha256(path) != original
+
+
+def test_v2_ready_stream_requires_derived_review_checksum(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    spec_path = run_dir / "run_spec.json"
+    spec_path.write_text(
+        json.dumps({"schema_version": 2, "models": []}), encoding="utf-8"
+    )
+    paths = {}
+    for name in (
+        "mask_mosaic",
+        "confidence_mosaic",
+        "semantic_polygons_raw",
+        "semantic_polygons",
+        "fitted_edges",
+    ):
+        path = run_dir / f"{name}.bin"
+        path.write_bytes(name.encode("utf-8"))
+        paths[name] = str(path)
+    report_path = run_dir / "boundary_fitting_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "validation": {"passed": True},
+                "input_sha256": sha256_file(paths["semantic_polygons_raw"]),
+                "output_sha256": sha256_file(paths["semantic_polygons"]),
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths["boundary_fitting_report"] = str(report_path)
+    review = run_dir / "derived_review.gpkg"
+    review.write_bytes(b"derived-review")
+    checksums = {
+        key: result_catalog.artifact_sha256(path) for key, path in paths.items()
+    }
+    checksums["review_polygons"] = result_catalog.artifact_sha256(review)
+    catalog = {
+        "schema_version": 2,
+        "run_spec": str(spec_path),
+        "run_spec_sha256": sha256_file(spec_path),
+        "streams": [
+            {
+                "stream_id": "fusion:test",
+                "status": "ready",
+                "boundary_fitting_status": "passed",
+                "paths": paths,
+                "review_polygons": str(review),
+                "output_sha256": checksums,
+            }
+        ],
+    }
+
+    assert result_catalog.valid_ready_stream_ids(catalog) == ("fusion:test",)
+    review.write_bytes(b"tampered")
+    assert result_catalog.valid_ready_stream_ids(catalog) == ()

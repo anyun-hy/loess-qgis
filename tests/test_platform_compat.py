@@ -295,6 +295,93 @@ def test_completed_run_restores_on_startup_without_environment_check():
     assert "QTimer.singleShot(0, self._restore_latest_ready_run)" in constructor
 
 
+def test_refinement_workspace_open_is_background_cancellable_and_incremental():
+    dock_source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(
+        encoding="utf-8"
+    )
+    opener = dock_source.split("def _on_open_refinement", 1)[1].split(
+        "def _on_load_manual_run", 1
+    )[0]
+    assert "valid_ready_stream_ids(" not in opener
+    assert "approved_fusion_streams(" not in opener
+
+    dialog_source = (
+        PLUGIN_ROOT / "gui" / "class_refinement_dialog.py"
+    ).read_text(encoding="utf-8")
+    set_run = dialog_source.split("def set_run", 1)[1].split(
+        "def _workspace_task_progress", 1
+    )[0]
+    assert "ClassWorkspaceProbeTask(" in set_run
+    assert "QgsApplication.taskManager().addTask(task)" in set_run
+    assert "approved_fusion_streams(" not in set_run
+    assert "load_workspace(" not in set_run
+
+    initialize = dialog_source.split("def _initialize_workspace", 1)[1].split(
+        "def _workspace_initialize_completed", 1
+    )[0]
+    assert "ClassWorkspaceInitializeTask(" in initialize
+    assert "initialize_workspace(" not in initialize
+
+    layer_load = dialog_source.split("def _load_workspace_layers", 1)[1].split(
+        "def _workspace_summary_text", 1
+    )[0]
+    assert "load_workspace_classes(" not in layer_load
+    assert "self._layer_load_timer.start()" in layer_load
+    assert 'QPushButton("取消后台加载")' in dialog_source
+
+    refresh = dialog_source.split("def _refresh_table", 1)[1].split(
+        "def _editable_modified_layers", 1
+    )[0]
+    assert "source_statistics(" not in refresh
+    assert "self._workspace_statistics.get(code)" in refresh
+
+    workspace_source = (
+        PLUGIN_ROOT / "core" / "class_workspace.py"
+    ).read_text(encoding="utf-8")
+    assert "class ClassWorkspaceProbeTask(QgsTask):" in workspace_source
+    assert "class ClassWorkspaceInitializeTask(QgsTask):" in workspace_source
+    assert "is_canceled=self.isCanceled" in workspace_source
+    assert "SELECT geometry_source, COUNT(*)" in workspace_source
+
+    manager_source = (
+        PLUGIN_ROOT / "core" / "layer_manager.py"
+    ).read_text(encoding="utf-8")
+    workspace_loader = manager_source.split(
+        "def load_workspace_class", 1
+    )[1].split("def load_workspace_classes", 1)[0]
+    assert "visible=False" in workspace_loader
+    assert "setItemVisibilityChecked(bool(visible))" in workspace_loader
+    assert "triggerRepaint()" not in workspace_loader
+
+
+def test_portable_manual_workspace_does_not_require_fusion_polygon_copy():
+    loader_source = (
+        PLUGIN_ROOT / "core" / "manual_run_loader.py"
+    ).read_text(encoding="utf-8")
+    assert "require_semantic=not has_workspace" in loader_source
+    assert 'rebound["portable_classes_only"] = not baseline_available' in loader_source
+
+    workspace_source = (
+        PLUGIN_ROOT / "core" / "class_workspace.py"
+    ).read_text(encoding="utf-8")
+    load_workspace = workspace_source.split("def load_workspace", 1)[1].split(
+        "def workspace_source_statistics", 1
+    )[0]
+    assert 'if not run_spec.get("manual_only"):' in load_workspace
+    assert "Fusion baseline" in load_workspace
+
+    dock_source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(
+        encoding="utf-8"
+    )
+    manual_open = dock_source.split("def _on_load_manual_run", 1)[1].split(
+        "# ── Helpers", 1
+    )[0]
+    assert "validate_manual_fusion_stream(" not in manual_open
+    assert "validate_manual_workspace(" not in manual_open
+    assert "persist_rebound_workspace(bundle)" in manual_open
+    assert "正在后台校验" in manual_open
+
+
 def test_workspace_edit_tracking_survives_project_restored_edit_mode():
     source = (
         PLUGIN_ROOT / "gui" / "class_refinement_dialog.py"

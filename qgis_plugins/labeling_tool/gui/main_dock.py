@@ -136,7 +136,6 @@ from ..core.work_package_planner import (
     storage_preflight,
 )
 from ..core.environment_report import compact_problem, format_check_details
-from ..core.result_catalog import valid_ready_stream_ids
 from ..core.run_state_db import RunStateDB
 from ..core.spatial_planner import plan_spatial_units
 
@@ -534,7 +533,8 @@ class LabelingDockWidget(QgsDockWidget):
         result_layout.addWidget(self.open_refinement_btn)
         self.load_manual_run_btn = QPushButton("加载已有 Run 人工整理")
         self.load_manual_run_btn.setToolTip(
-            "选择任意位置的完整 Run 副本；不检查推理环境，不运行 SAM3"
+            "选择任意位置的 Run 副本；已有完整14类工作区时无需复制 Fusion 大文件，"
+            "不检查推理环境，不运行 SAM3"
         )
         result_layout.addWidget(self.load_manual_run_btn)
         layout.addWidget(result_group)
@@ -1376,7 +1376,7 @@ class LabelingDockWidget(QgsDockWidget):
 
         self._pipeline_running = True
         self._pipeline_state = "extracting"
-        self._pipeline_stage_total = 5
+        self._pipeline_stage_total = 6
         self._pending_run = {
             "raster": raster,
             "scripts_dir": scripts_dir,
@@ -1701,6 +1701,9 @@ class LabelingDockWidget(QgsDockWidget):
                     **registry.boundary_fitting,
                     "enabled": bool(ctx["boundary_smoothing_enabled"]),
                 },
+                fragmentation_regularization=(
+                    effective.get("fragmentation_regularization") or {}
+                ),
                 storage_report=storage,
                 fusion=fusion,
                 accepted_gpkg=ctx.get("accepted_snapshot") or "",
@@ -2102,7 +2105,7 @@ class LabelingDockWidget(QgsDockWidget):
             self.runner.step_finished.connect(self._on_tile_step_finished)
             self._pipeline_running = True
             self._pipeline_state = "inferencing"
-            self._pipeline_stage_total = 5
+            self._pipeline_stage_total = 6
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             self.resume_btn.setEnabled(False)
@@ -2127,44 +2130,22 @@ class LabelingDockWidget(QgsDockWidget):
             and self._startup_ready_candidate is not None
         ):
             result, spec = self._startup_ready_candidate
-            try:
-                valid_ids = set(valid_ready_stream_ids(result))
-                declared_streams = list(result.get("ready_streams") or [])
-                valid_streams = [
-                    item for item in declared_streams
-                    if str(item.get("stream_id") or "") in valid_ids
-                ]
-                if len(valid_streams) != len(declared_streams):
-                    raise ValueError(
-                        "最近 Run 存在未通过正式文件或 SHA256 校验的结果流"
-                    )
-                eligible = class_workspace.approved_fusion_streams(
-                    spec, valid_streams
-                )
-                if not eligible:
-                    raise ValueError(
-                        "最近 Run 的 Fusion 正式文件、哈希或 approval 校验未通过"
-                    )
-                result = {
-                    **result,
-                    "streams": valid_streams,
-                    "ready_streams": valid_streams,
-                }
-                self._last_run_result = result
-                self._last_run_spec = spec
-                self._startup_ready_candidate = None
-                self.open_refinement_btn.setText("打开分类修整与组装")
-                self.result_summary_label.setText(
-                    f"已验证 Run {result['run_id']}；approved Fusion: "
-                    + ", ".join(item["stream_id"] for item in eligible)
-                )
-            except (OSError, KeyError, TypeError, ValueError) as exc:
+            declared_streams = list(result.get("ready_streams") or [])
+            if not declared_streams:
                 QMessageBox.warning(
                     self,
-                    "最近 Run 校验失败",
-                    str(exc) + "\n\n可使用“加载已有 Run 人工整理”明确选择其他 Run。",
+                    "最近 Run 不可用",
+                    "最近 Run 没有声明 ready 结果流。\n\n"
+                    "可使用“加载已有 Run 人工整理”明确选择其他 Run。",
                 )
                 return
+            self._last_run_result = result
+            self._last_run_spec = spec
+            self._startup_ready_candidate = None
+            self.open_refinement_btn.setText("打开分类修整与组装")
+            self.result_summary_label.setText(
+                f"Run {result['run_id']} 将在分类窗口中后台校验"
+            )
         if self.refinement_dialog is None or not self._last_run_result or not self._last_run_spec:
             QMessageBox.warning(self, "分类修整", "当前没有可用的 semantic_ready 运行结果")
             return
@@ -2198,19 +2179,9 @@ class LabelingDockWidget(QgsDockWidget):
             bundle = manual_run_loader.load_manual_run(run_dir)
             result = bundle["result"]
             run_spec = bundle["run_spec"]
-            fusion_counts = []
-            for stream in result["ready_streams"]:
-                count = class_workspace.validate_manual_fusion_stream(stream)
-                fusion_counts.append(f"{stream['stream_id']}={count}")
             workspace = bundle.get("workspace")
-            cleanup_text = ""
             if workspace is not None:
-                validation = class_workspace.validate_manual_workspace(workspace)
                 manual_run_loader.persist_rebound_workspace(bundle)
-                if validation["removed_empty"]:
-                    cleanup_text = (
-                        f"；已清理 {validation['removed_empty']} 条空几何记录"
-                    )
             self._last_run_result = result
             self._last_run_spec = run_spec
             self._recovery_run_spec = None
@@ -2218,10 +2189,13 @@ class LabelingDockWidget(QgsDockWidget):
             self._startup_recovery_status = None
             self.open_refinement_btn.setText("打开分类修整与组装")
             self.open_refinement_btn.setEnabled(True)
+            mode_text = (
+                "14 类离线工作区"
+                if result.get("portable_classes_only")
+                else "人工工作区"
+            )
             self.result_summary_label.setText(
-                f"已加载人工 Run {result['run_id']}；"
-                + ", ".join(fusion_counts)
-                + cleanup_text
+                f"已载入 {mode_text} {result['run_id']}；正在后台校验"
             )
             settings.setValue(
                 "plugins/labeling_tool/last_manual_run_dir", str(Path(run_dir).resolve())
