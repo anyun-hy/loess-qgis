@@ -95,8 +95,16 @@ def physical_pixel_area_m2(
         linear_units = str(getattr(raster_crs, "linear_units", "") or "").lower()
         if linear_units in {"metre", "meter", "metres", "meters", "m"}:
             return affine_area
+    if raster_crs.is_geographic:
+        _center_x, center_y = transform * (float(width) / 2.0, float(height) / 2.0)
+        lat_rad = math.radians(float(center_y))
+        meters_per_deg_lat = 111132.954 - 559.822 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
+        meters_per_deg_lon = (math.pi / 180.0) * 6378137.0 * math.cos(lat_rad)
+        dx_m = abs(float(transform.a)) * meters_per_deg_lon
+        dy_m = abs(float(transform.e)) * meters_per_deg_lat
+        return float(dx_m * dy_m)
     raise SmallComponentRegularizationError(
-        f"physical pixel area requires a projected metre CRS or EPSG:3857, got {raster_crs}"
+        f"physical pixel area requires a projected metre CRS, EPSG:3857, or geographic CRS, got {raster_crs}"
     )
 
 
