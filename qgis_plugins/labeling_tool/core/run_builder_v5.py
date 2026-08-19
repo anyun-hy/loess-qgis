@@ -280,6 +280,11 @@ def create_v5_run(
         "requested_extent": _extent(requested_extent),
         "processing_extent": _extent(processing_extent),
         "range_selection": range_value,
+        "range_vector_path": str(
+            range_value.get("vector_source")
+            or range_value.get("vector_path")
+            or ""
+        ),
         "tile_grid": {
             "rows": int(tile_rows),
             "cols": int(tile_cols),

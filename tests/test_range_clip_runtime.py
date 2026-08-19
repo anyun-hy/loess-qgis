@@ -1,0 +1,121 @@
+"""Automated unit tests for adaptive range clipping runtime."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import tempfile
+import pytest
+import fiona
+from fiona.crs import CRS
+from shapely.geometry import Polygon, box, mapping
+
+from inference_scripts.range_clip_runtime import (
+    apply_adaptive_range_clip,
+    extract_range_mask_geometry,
+)
+
+
+@pytest.fixture
+def sample_data(tmp_path: Path):
+    """Create test source polygons and mask vector layers."""
+    crs = CRS.from_epsg(3857)
+    schema = {
+        "geometry": "Polygon",
+        "properties": {
+            "object_id": "int",
+            "class_code": "int",
+            "part_id": "str",
+        },
+    }
+
+    # 1. Create source polygons: 4 squares covering (0, 0) to (200, 200)
+    source_path = tmp_path / "semantic_polygons.gpkg"
+    with fiona.open(source_path, "w", driver="GPKG", layer="semantic_polygons", schema=schema, crs=crs) as dst:
+        polygons = [
+            (Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]), 1, 13, "part_01"),
+            (Polygon([(100, 0), (200, 0), (200, 100), (100, 100)]), 2, 31, "part_02"),
+            (Polygon([(0, 100), (100, 100), (100, 200), (0, 200)]), 3, 52, "part_03"),
+            (Polygon([(100, 100), (200, 100), (200, 200), (100, 200)]), 4, 71, "part_04"),
+        ]
+        for poly, obj_id, code, part_id in polygons:
+            dst.write({
+                "geometry": mapping(poly),
+                "properties": {"object_id": obj_id, "class_code": code, "part_id": part_id},
+            })
+
+    # 2. Create vector range mask: Circle/Polygon centered at (100, 100) with radius 60
+    mask_path = tmp_path / "custom_range_mask.gpkg"
+    mask_poly = Polygon([(50, 50), (150, 50), (150, 150), (50, 150)])
+    mask_schema = {"geometry": "Polygon", "properties": {"name": "str"}}
+    with fiona.open(mask_path, "w", driver="GPKG", layer="mask", schema=mask_schema, crs=crs) as dst:
+        dst.write({
+            "geometry": mapping(mask_poly),
+            "properties": {"name": "test_mask"},
+        })
+
+    return {
+        "source_path": source_path,
+        "mask_path": mask_path,
+        "tmp_path": tmp_path,
+        "crs": crs,
+    }
+
+
+def test_clip_with_vector_mask(sample_data):
+    """Test clipping with an explicit vector range file."""
+    source_path = sample_data["source_path"]
+    mask_path = sample_data["mask_path"]
+
+    spec = {
+        "range_vector_path": str(mask_path),
+        "requested_extent": {"xmin": 0, "ymin": 0, "xmax": 200, "ymax": 200},
+    }
+
+    result = apply_adaptive_range_clip(source_path, spec)
+    assert result["status"] == "passed"
+    assert result["source_feature_count"] == 4
+    assert result["output_feature_count"] == 4
+    assert result["trimmed_feature_count"] == 4
+
+    # Verify geometries are inside (50, 50, 150, 150)
+    with fiona.open(source_path, layer="semantic_polygons") as src:
+        assert len(src) == 4
+        for feature in src:
+            bounds = fiona.bounds(feature["geometry"])
+            assert bounds[0] >= 50 - 1e-5
+            assert bounds[1] >= 50 - 1e-5
+            assert bounds[2] <= 150 + 1e-5
+            assert bounds[3] <= 150 + 1e-5
+
+
+def test_clip_with_requested_extent_bbox(sample_data):
+    """Test clipping with requested_extent when no vector file is specified."""
+    source_path = sample_data["source_path"]
+
+    spec = {
+        "range_vector_path": "",
+        "requested_extent": {
+            "xmin": 20,
+            "ymin": 20,
+            "xmax": 80,
+            "ymax": 80,
+        },
+    }
+
+    result = apply_adaptive_range_clip(source_path, spec)
+    assert result["status"] == "passed"
+    assert result["source_feature_count"] == 4
+    # Only the first polygon (0..100, 0..100) overlaps (20..80, 20..80)
+    assert result["output_feature_count"] == 1
+    assert result["discarded_feature_count"] == 3
+
+    with fiona.open(source_path, layer="semantic_polygons") as src:
+        features = list(src)
+        assert len(features) == 1
+        assert features[0]["properties"]["class_code"] == 13
+        bounds = fiona.bounds(features[0]["geometry"])
+        assert bounds[0] == pytest.approx(20)
+        assert bounds[1] == pytest.approx(20)
+        assert bounds[2] == pytest.approx(80)
+        assert bounds[3] == pytest.approx(80)
