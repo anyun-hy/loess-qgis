@@ -374,32 +374,39 @@ class V5AsyncInferenceRunner(QObject):
         )
 
     def _start_assembly(self):
+        scaling = self._spec.get("scaling") or {}
+        max_concurrent = int(scaling.get("max_concurrent_assembly", 4))
+        while self._assembly_queue:
+            active_assemblies = [
+                entry
+                for entry in self._processes.values()
+                if (entry.get("context") or {}).get("kind") == "assemble"
+            ]
+            if len(active_assemblies) >= max_concurrent:
+                active_stream = str(
+                    (active_assemblies[0].get("context") or {}).get("stream_id")
+                    or "unknown"
+                )
+                self.log_line.emit(
+                    "system",
+                    "[assembly-queue] waiting for active stream: "
+                    + active_stream,
+                )
+                return
+            stream = self._assembly_queue.pop(0)
+            self._start_process(
+                f"assemble_stream:{stream['stream_id']}",
+                "run_assemble_stream.sh",
+                ["--run-spec", self._spec_path, "--stream-id", stream["stream_id"]],
+                {"kind": "assemble", "stream_id": stream["stream_id"]},
+            )
         active_assemblies = [
             entry
             for entry in self._processes.values()
             if (entry.get("context") or {}).get("kind") == "assemble"
         ]
-        if active_assemblies:
-            active_stream = str(
-                (active_assemblies[0].get("context") or {}).get("stream_id")
-                or "unknown"
-            )
-            self.log_line.emit(
-                "system",
-                "[assembly-queue] waiting for active stream: "
-                + active_stream,
-            )
-            return
-        if not self._assembly_queue:
+        if not active_assemblies and not self._assembly_queue:
             QTimer.singleShot(0, self._start_fragmentation)
-            return
-        stream = self._assembly_queue.pop(0)
-        self._start_process(
-            f"assemble_stream:{stream['stream_id']}",
-            "run_assemble_stream.sh",
-            ["--run-spec", self._spec_path, "--stream-id", stream["stream_id"]],
-            {"kind": "assemble", "stream_id": stream["stream_id"]},
-        )
 
     def _start_fragmentation(self):
         config = self._spec.get("fragmentation_regularization") or {}

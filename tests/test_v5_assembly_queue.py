@@ -112,14 +112,28 @@ def test_assembly_queue_starts_streams_in_run_spec_order(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)
     starts = []
-    runner._start_process = lambda *args: starts.append(args)
+    def fake_start_process(label, script, args, context):
+        starts.append((label, script, args, context))
+        runner._processes[label] = {
+            "context": context,
+            "token": label,
+        }
+    runner._start_process = fake_start_process
 
     runner._start_assembly()
+    assert [item[0] for item in starts] == [
+        "assemble_stream:model:a",
+        "assemble_stream:model:b",
+        "assemble_stream:fusion:approved",
+    ]
+    # Simulate all assemblies finished -> triggers fragmentation
+    runner._processes.clear()
     runner._start_assembly()
-    runner._start_assembly()
-    runner._start_assembly()
+    assert runner._phase == "fragmentation"
+    # Simulate fragmentation finished -> triggers scale_acceptance
+    runner._processes.clear()
     runner._start_fragmentation()
-
+    assert runner._phase == "acceptance"
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
@@ -127,7 +141,6 @@ def test_assembly_queue_starts_streams_in_run_spec_order(monkeypatch):
         "fragmentation_v3:fusion:approved",
         "scale_acceptance",
     ]
-    assert runner._phase == "acceptance"
     fragmentation = starts[3]
     assert fragmentation[1] == "run_fragmentation_postprocess.sh"
     assert fragmentation[2] == [
@@ -201,6 +214,7 @@ def test_passed_fragmentation_manifest_becomes_fusion_review_source(
 def test_active_assembly_process_blocks_second_stream(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)
+    runner._spec["scaling"] = {"max_concurrent_assembly": 1}
     runner._processes = {
         "active": {
             "context": {

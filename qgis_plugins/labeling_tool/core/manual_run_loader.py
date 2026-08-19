@@ -151,6 +151,7 @@ def _prepare_workspace(run_root, run_id, fusion_streams):
         if not class_path.is_file():
             raise ManualRunLoadError(f"缺少类别工作层: {class_path}")
         record["path"] = str(class_path)
+        record["sha256"] = _sha256(class_path)
         rebound["classes"][str(code)] = record
     rebound["manual_only"] = True
     return rebound
