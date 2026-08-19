@@ -638,6 +638,23 @@ def workspace_source_statistics(workspace, *, is_canceled=None, progress=None):
 def workspace_review_refresh_status(run_spec, workspace, stream):
     """Describe whether a newer review source can safely replace a workspace."""
 
+    if (
+        run_spec.get("manual_only")
+        or workspace.get("portable_classes_only")
+        or not workspace.get("baseline_available", True)
+    ):
+        return {
+            "required": False,
+            "safe_to_replace": False,
+            "blocking_reasons": ["portable_classes_only"],
+            "baseline_source_path": str(workspace.get("baseline_source_path") or ""),
+            "active_review_source_path": "",
+            "policy": (
+                (stream.get("fragmentation_postprocess") or {}).get("policy_version")
+                or ""
+            ),
+        }
+
     paths = stream.get("paths") or {}
     active_value = str(
         stream.get("review_polygons") or paths.get("semantic_polygons") or ""

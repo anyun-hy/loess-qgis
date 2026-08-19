@@ -23,3 +23,10 @@ htmlcov/
 /weights/
 *.tmp
 *.partial
+.agents/plugins/qgis-mcp/mcp_config.json
+.agents/plugins/qgis-mcp/plugin.json
+*.zip
+generate_fusion_30m.py
+load_fusion_30m_to_qgis.py
+inference_scripts/manual_groundtruth_benchmarks.json
+docs/FUSION_DENOISING_PIPELINE.md

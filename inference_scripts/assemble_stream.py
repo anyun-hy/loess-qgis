@@ -22,8 +22,11 @@ from shapely.strtree import STRtree
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "qgis_plugins"
+RUNTIME_ROOT = ROOT / "runtime"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
 
 from labeling_tool.core.ownership_neighbors import ownership_neighbors
 from labeling_tool.core.run_state_db import RunStateDB

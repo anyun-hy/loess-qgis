@@ -180,3 +180,22 @@ def test_portable_workspace_rejects_a_missing_class_file(tmp_path):
 
     with pytest.raises(ManualRunLoadError, match="class_51.gpkg"):
         load_manual_run(run_root)
+
+
+def test_portable_workspace_syncs_recalculated_class_sha(tmp_path):
+    run_root, _spec_path, _manifest_path, _snapshot = _copied_run(tmp_path)
+    semantic = run_root / "fusion" / "fixture" / "semantic_polygons.gpkg"
+    semantic.unlink()
+    workspace_path = _initialized_workspace(run_root, "20260729_200000_manual")
+
+    # Modify class 12 file on disk
+    class_12_path = run_root / "classes" / "class_12.gpkg"
+    class_12_path.write_bytes(b"modified-class-12-content")
+
+    bundle = load_manual_run(run_root)
+    assert bundle["workspace"]["classes"]["12"]["sha256"] == sha256_file(class_12_path)
+    persist_rebound_workspace(bundle)
+
+    persisted = json.loads(workspace_path.read_text(encoding="utf-8"))
+    assert persisted["classes"]["12"]["sha256"] == sha256_file(class_12_path)
+
