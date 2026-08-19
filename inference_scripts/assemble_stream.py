@@ -31,6 +31,7 @@ from labeling_tool.core.run_spec import sha256_file
 
 from deployment_config import load_json
 from difference_runtime import apply_accepted_difference
+from range_clip_runtime import apply_adaptive_range_clip
 from semantic_batch import _atomic_json
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
@@ -455,6 +456,23 @@ def _guarded_accepted_difference(
         _estimate_source_gpkg_bytes((source_path,), multiplier=2),
     ):
         return apply_accepted_difference(source_path, accepted_path, output_path)
+
+
+def _guarded_range_clip(
+    source_path: Path,
+    spec: Mapping[str, Any],
+    *,
+    storage_guard: StorageGuard | None,
+    storage_lock_path: Path | None,
+    operation: str,
+) -> dict[str, Any]:
+    with _reserved_vector_write(
+        storage_guard,
+        storage_lock_path,
+        operation,
+        _estimate_source_gpkg_bytes((source_path,), multiplier=2),
+    ):
+        return apply_adaptive_range_clip(source_path, spec)
 
 
 def _stream_root(spec: Mapping[str, Any], stream: Mapping[str, Any]) -> Path:
@@ -1559,6 +1577,14 @@ def _assemble_stream_impl(
             )
             if not fitting_passed:
                 raise StreamAssemblyError("boundary fitting contains failed units")
+            range_clip = _guarded_range_clip(
+                formal_path,
+                spec,
+                storage_guard=storage_guard,
+                storage_lock_path=storage_lock_path,
+                operation=f"stream_range_clip:{stream_id}",
+            )
+            aggregate["range_clip"] = range_clip
             if resume_from_reports:
                 aggregate["input_sha256"] = resume_inputs["raw"]["sha256"]
                 aggregate["output_sha256"] = resume_inputs["formal"]["sha256"]
