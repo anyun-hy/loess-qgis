@@ -38,6 +38,11 @@ from polyline_smoother import SmoothingConfig
 from deployment_config import load_json
 from runtime_metrics import peak_rss_bytes
 from rasterio_compat import quiet_deprecated_memory_driver
+from small_component_regularizer import (
+    physical_pixel_area_m2,
+    regularize_small_components,
+)
+from fragmentation_v3 import production_policy
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
 
@@ -246,6 +251,9 @@ def _polygonize(
     unit: Mapping[str, Any],
     class_codes: list[int],
     valid_mask: np.ndarray | None = None,
+    *,
+    regularize: bool = False,
+    pixel_area_m2: float = 1.0,
 ):
     mask = probabilities.argmax(axis=0).astype(np.int16)
     valid = (
@@ -255,6 +263,17 @@ def _polygonize(
     )
     if valid.shape != mask.shape:
         raise UnitRuntimeError("unit validity mask shape does not match probabilities")
+    if regularize and pixel_area_m2 > 0:
+        confidence = probabilities.max(axis=0).astype(np.float32)
+        mask, _ = regularize_small_components(
+            mask,
+            class_codes=class_codes,
+            pixel_area_m2=float(pixel_area_m2),
+            policy=production_policy(),
+            valid_mask=valid,
+            confidence=confidence,
+            probabilities=probabilities,
+        )
     window = unit["pixel_window"]
     transform = Affine.translation(int(window["x0"]), int(window["y0"]))
     records = []
@@ -611,13 +630,20 @@ def _fit_or_subdivide(
     min_core_px: int,
     force_split: bool = False,
     smoothing_enabled: bool = True,
+    regularize: bool = False,
+    pixel_area_m2: float = 1.0,
     depth: int = 0,
     output_transform: tuple[float, ...] | None = None,
 ):
     if valid_mask is None:
         valid_mask = np.ones(probabilities.shape[1:], dtype=bool)
     raw_records = _polygonize(
-        probabilities, unit, class_codes, valid_mask=valid_mask
+        probabilities,
+        unit,
+        class_codes,
+        valid_mask=valid_mask,
+        regularize=regularize,
+        pixel_area_m2=pixel_area_m2,
     )
     if not raw_records:
         return [], [], {
@@ -717,6 +743,8 @@ def _fit_or_subdivide(
                 min_core_px=min_core_px,
                 force_split=False,
                 smoothing_enabled=smoothing_enabled,
+                regularize=regularize,
+                pixel_area_m2=pixel_area_m2,
                 depth=depth + 1,
                 output_transform=output_transform,
             )
@@ -864,6 +892,23 @@ def run_unit_fit(
             transform.c,
             transform.f,
         )
+        frag_config = spec.get("fragmentation_regularization") or {}
+        frag_enabled = bool(frag_config.get("enabled", True))
+        target_stream_kind = str(frag_config.get("stream_kind") or "fusion")
+        is_fusion = stream_id.startswith("fusion:") or any(
+            s.get("stream_id") == stream_id and s.get("kind") == "fusion"
+            for s in spec.get("streams", [])
+        )
+        apply_regularization = frag_enabled and (
+            target_stream_kind == "all"
+            or (target_stream_kind == "fusion" and is_fusion)
+        )
+        pixel_area_m2 = physical_pixel_area_m2(
+            transform,
+            spec["raster"]["crs"],
+            height=probabilities.shape[1],
+            width=probabilities.shape[2],
+        )
         raw_records, formal_records, report = _fit_or_subdivide(
             probabilities,
             unit,
@@ -875,6 +920,8 @@ def run_unit_fit(
             min_core_px=2 * int(spec["tile_grid"]["stride"]),
             force_split=force_marker.is_file(),
             smoothing_enabled=smoothing_enabled,
+            regularize=apply_regularization,
+            pixel_area_m2=pixel_area_m2,
             output_transform=output_transform,
         )
         _attach_confidence(raw_records, probabilities, valid_mask, unit)

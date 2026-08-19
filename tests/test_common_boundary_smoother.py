@@ -329,3 +329,66 @@ def test_partition_unit_runtime_uses_common_divider_mode():
     assert report["fit_version"] == "divider_cubic_bspline_adaptive_v2"
     assert report["spline_count"] == 1
     assert all(record["fit_status"] == "changed" for record in formal)
+
+
+def test_partition_unit_runtime_with_small_component_regularization():
+    probabilities = np.zeros((14, 24, 24), dtype=np.float32)
+    # Background class 12, class 13, class 21 with stepped diagonal boundaries
+    for row in range(24):
+        t1 = 6 + row // 4
+        t2 = 14 + row // 4
+        probabilities[0, row, :t1] = 1.0   # class 12
+        probabilities[1, row, t1:t2] = 1.0  # class 13 main body
+        probabilities[2, row, t2:] = 1.0  # class 21 main body
+    # Add a tiny 2x2 island of class 13 inside class 21 (class 13 -> 21 compatible, 0.55 < 0.65)
+    probabilities[2, 5:7, 20:22] = 0.45
+    probabilities[1, 5:7, 20:22] = 0.55  # class 13 noise island inside class 21
+
+    # Without regularization: 4 polygons (class 12, class 13 main, class 21 with hole, class 13 island)
+    raw_unreg, formal_unreg, rep_unreg = _fit_or_subdivide(
+        probabilities,
+        {
+            "unit_id": "core_00000_00000",
+            "pixel_window": {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
+        },
+        [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71],
+        smoothing_config=SmoothingConfig(
+            smoothing_factor=1.0,
+            curve_sampling_spacing=0.5,
+            max_deviation=None,
+            min_point_count=4,
+        ),
+        max_features=1000,
+        max_segments=10000,
+        min_core_px=4,
+        regularize=False,
+    )
+    assert len(raw_unreg) == 4
+
+    # With regularization: the 2x2 tiny island of class 13 is absorbed into class 21,
+    # leaving 3 clean main polygons that are all smoothly fitted with B-spline!
+    raw_reg, formal_reg, rep_reg = _fit_or_subdivide(
+        probabilities,
+        {
+            "unit_id": "core_00000_00000",
+            "pixel_window": {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
+        },
+        [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71],
+        smoothing_config=SmoothingConfig(
+            smoothing_factor=1.0,
+            curve_sampling_spacing=0.5,
+            max_deviation=None,
+            min_point_count=4,
+        ),
+        max_features=1000,
+        max_segments=10000,
+        min_core_px=4,
+        regularize=True,
+        pixel_area_m2=4.0,
+    )
+    assert len(raw_reg) == 3
+    assert len(formal_reg) == 3
+    assert rep_reg["spline_count"] >= 2
+    assert rep_reg["fit_version"] == "divider_cubic_bspline_adaptive_v2"
+    assert all(record["fit_status"] == "changed" for record in formal_reg)
+
