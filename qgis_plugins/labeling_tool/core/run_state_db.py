@@ -3079,93 +3079,94 @@ class RunStateDB:
             )
 
     def resolve_object_components(self, run_id: str, stream_id: str) -> int:
-        """Resolve object links with a disk-backed union-find and deterministic IDs."""
+        """Resolve object links with an in-memory union-find and deterministic IDs."""
         import hashlib
 
         with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT part_id, parent_id, rank_value FROM object_nodes
+                   WHERE run_id=? AND stream_id=? ORDER BY part_id""",
+                (str(run_id), str(stream_id)),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            parent: dict[str, str] = {
+                str(row["part_id"]): str(row["parent_id"] or row["part_id"])
+                for row in rows
+            }
+            rank: dict[str, int] = {
+                str(row["part_id"]): int(row["rank_value"] or 0)
+                for row in rows
+            }
+
             def find(part_id: str) -> str:
                 path = []
-                current = part_id
-                while True:
-                    row = connection.execute(
-                        """SELECT parent_id FROM object_nodes
-                           WHERE run_id=? AND stream_id=? AND part_id=?""",
-                        (str(run_id), str(stream_id), current),
-                    ).fetchone()
-                    if row is None:
-                        raise RunStateError(f"object node is missing: {current}")
-                    parent = str(row["parent_id"])
-                    if parent == current:
-                        root = current
-                        break
-                    path.append(current)
-                    current = parent
+                curr = part_id
+                while parent.get(curr, curr) != curr:
+                    path.append(curr)
+                    curr = parent[curr]
                 for child in path:
-                    connection.execute(
-                        """UPDATE object_nodes SET parent_id=?, updated_at=?
-                           WHERE run_id=? AND stream_id=? AND part_id=?""",
-                        (root, _now(), str(run_id), str(stream_id), child),
-                    )
-                return root
+                    parent[child] = curr
+                return curr
 
             links = connection.execute(
                 """SELECT left_part_id, right_part_id FROM object_links
                    WHERE run_id=? AND stream_id=? ORDER BY left_part_id, right_part_id""",
                 (str(run_id), str(stream_id)),
-            )
-            for link in links:
-                left_root = find(str(link["left_part_id"]))
-                right_root = find(str(link["right_part_id"]))
-                if left_root == right_root:
-                    continue
-                left_rank = int(
-                    connection.execute(
-                        """SELECT rank_value FROM object_nodes
-                           WHERE run_id=? AND stream_id=? AND part_id=?""",
-                        (str(run_id), str(stream_id), left_root),
-                    ).fetchone()[0]
-                )
-                right_rank = int(
-                    connection.execute(
-                        """SELECT rank_value FROM object_nodes
-                           WHERE run_id=? AND stream_id=? AND part_id=?""",
-                        (str(run_id), str(stream_id), right_root),
-                    ).fetchone()[0]
-                )
-                if left_rank < right_rank or (left_rank == right_rank and left_root > right_root):
-                    left_root, right_root = right_root, left_root
-                    left_rank, right_rank = right_rank, left_rank
-                connection.execute(
-                    """UPDATE object_nodes SET parent_id=?, updated_at=?
-                       WHERE run_id=? AND stream_id=? AND part_id=?""",
-                    (left_root, _now(), str(run_id), str(stream_id), right_root),
-                )
-                if left_rank == right_rank:
-                    connection.execute(
-                        """UPDATE object_nodes SET rank_value=rank_value+1, updated_at=?
-                           WHERE run_id=? AND stream_id=? AND part_id=?""",
-                        (_now(), str(run_id), str(stream_id), left_root),
-                    )
+            ).fetchall()
 
-            part_ids = [
-                str(row["part_id"])
-                for row in connection.execute(
-                    """SELECT part_id FROM object_nodes
-                       WHERE run_id=? AND stream_id=? ORDER BY part_id""",
-                    (str(run_id), str(stream_id)),
-                ).fetchall()
-            ]
-            roots = {part_id: find(part_id) for part_id in part_ids}
-            for part_id, root in roots.items():
+            for link in links:
+                left = str(link["left_part_id"])
+                right = str(link["right_part_id"])
+                if left not in parent or right not in parent:
+                    continue
+                root_left = find(left)
+                root_right = find(right)
+                if root_left == root_right:
+                    continue
+                rank_left = rank[root_left]
+                rank_right = rank[root_right]
+                if rank_left < rank_right or (
+                    rank_left == rank_right and root_left > root_right
+                ):
+                    root_left, root_right = root_right, root_left
+                    rank_left, rank_right = rank_right, rank_left
+                parent[root_right] = root_left
+                if rank_left == rank_right:
+                    rank[root_left] = rank_left + 1
+
+            now = _now()
+            update_rows = []
+            distinct_roots = set()
+            for part_id in parent:
+                root = find(part_id)
+                distinct_roots.add(root)
                 digest = hashlib.sha1(
                     f"{run_id}|{stream_id}|{root}".encode("utf-8")
                 ).hexdigest()[:24]
-                connection.execute(
-                    """UPDATE object_nodes SET object_id=?, updated_at=?
-                       WHERE run_id=? AND stream_id=? AND part_id=?""",
-                    (f"obj_{digest}", _now(), str(run_id), str(stream_id), part_id),
+                obj_id = f"obj_{digest}"
+                update_rows.append(
+                    (
+                        root,
+                        rank.get(part_id, 0),
+                        obj_id,
+                        now,
+                        str(run_id),
+                        str(stream_id),
+                        part_id,
+                    )
                 )
-            return len(set(roots.values()))
+
+            for offset in range(0, len(update_rows), 2000):
+                chunk = update_rows[offset : offset + 2000]
+                connection.executemany(
+                    """UPDATE object_nodes
+                       SET parent_id=?, rank_value=?, object_id=?, updated_at=?
+                       WHERE run_id=? AND stream_id=? AND part_id=?""",
+                    chunk,
+                )
+            return len(distinct_roots)
 
     def object_id_for_part(
         self, run_id: str, stream_id: str, part_id: str
