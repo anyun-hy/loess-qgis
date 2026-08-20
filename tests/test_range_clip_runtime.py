@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import tempfile
 import pytest
@@ -13,6 +14,7 @@ from shapely.geometry import Polygon, box, mapping
 from inference_scripts.range_clip_runtime import (
     apply_adaptive_range_clip,
     extract_range_mask_geometry,
+    RangeClipRuntimeError,
 )
 
 
@@ -119,3 +121,96 @@ def test_clip_with_requested_extent_bbox(sample_data):
         assert bounds[1] == pytest.approx(20)
         assert bounds[2] == pytest.approx(80)
         assert bounds[3] == pytest.approx(80)
+
+
+def test_vector_mode_rejects_missing_vector_instead_of_using_requested_extent(
+    sample_data,
+):
+    """A vector-range run must never silently publish its bounding rectangle."""
+    spec = {
+        "range_selection": {
+            "mode": "vector_tile_intersection",
+            "vector_source": str(sample_data["tmp_path"] / "missing.gpkg"),
+            "clip_outputs": True,
+        },
+        "requested_extent": {"xmin": 0, "ymin": 0, "xmax": 200, "ymax": 200},
+    }
+
+    with pytest.raises(RangeClipRuntimeError, match="cannot read required vector"):
+        extract_range_mask_geometry(spec, "EPSG:3857")
+
+
+def test_extent_mode_uses_requested_extent_even_if_legacy_vector_path_is_present(
+    sample_data,
+):
+    """View and hand-drawn extent runs retain the requested rectangle contract."""
+    spec = {
+        "range_selection": {"mode": "extent", "clip_outputs": True},
+        "range_vector_path": str(sample_data["mask_path"]),
+        "requested_extent": {"xmin": 20, "ymin": 20, "xmax": 80, "ymax": 80},
+    }
+
+    geometry = extract_range_mask_geometry(spec, "EPSG:3857")
+
+    assert geometry.bounds == pytest.approx((20, 20, 80, 80))
+
+
+def test_vector_mode_intersects_exact_boundary_with_available_raster_extent(
+    sample_data,
+):
+    """Topology and publication must not demand coverage outside the raster."""
+    mask_path = sample_data["mask_path"]
+    spec = {
+        "range_selection": {
+            "mode": "vector_tile_intersection",
+            "vector_source": str(mask_path),
+            "vector_sha256": hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+            "clip_outputs": True,
+        },
+        "raster": {"crs": "EPSG:3857"},
+        "requested_extent": {
+            "xmin": 0,
+            "ymin": 0,
+            "xmax": 100,
+            "ymax": 100,
+        },
+    }
+
+    geometry = extract_range_mask_geometry(spec, "EPSG:3857")
+
+    assert geometry.bounds == pytest.approx((50, 50, 100, 100))
+
+
+def test_reapplying_the_same_range_clip_keeps_the_formal_gpkg_fingerprint(
+    sample_data,
+):
+    """A report-resume safety gate must not rewrite an already exact result."""
+    source_path = sample_data["source_path"]
+    spec = {
+        "range_selection": {"mode": "extent", "clip_outputs": True},
+        "requested_extent": {"xmin": 20, "ymin": 20, "xmax": 80, "ymax": 80},
+    }
+    apply_adaptive_range_clip(source_path, spec)
+    before = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    result = apply_adaptive_range_clip(source_path, spec)
+
+    assert result["status"] == "already_clipped"
+    assert hashlib.sha256(source_path.read_bytes()).hexdigest() == before
+
+
+def test_already_clipped_source_is_copied_when_a_distinct_output_is_requested(
+    sample_data,
+):
+    source_path = sample_data["source_path"]
+    output_path = sample_data["tmp_path"] / "copied_formal.gpkg"
+    spec = {
+        "range_selection": {"mode": "extent", "clip_outputs": True},
+        "requested_extent": {"xmin": 20, "ymin": 20, "xmax": 80, "ymax": 80},
+    }
+    apply_adaptive_range_clip(source_path, spec)
+
+    result = apply_adaptive_range_clip(source_path, spec, output_path=output_path)
+
+    assert result["status"] == "already_clipped"
+    assert output_path.is_file()

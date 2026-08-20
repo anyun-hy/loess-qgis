@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QCheckBox,
     QDialog,
     QComboBox,
     QHBoxLayout,
@@ -46,6 +45,15 @@ STATUS_COLORS = {
     "跳过": "#777777",
     "已停止": "#9a6700",
 }
+
+ASSEMBLY_PROGRESS_SCALE = 1000
+PIPELINE_STAGES = (
+    ("compute", "推理与拟合"),
+    ("finalize", "栅格收口"),
+    ("assembly", "并行组装"),
+    ("acceptance", "整体验收"),
+    ("ready", "完成"),
+)
 
 RUN_STATUS_LABELS = {
     "preflight": "预检",
@@ -121,7 +129,7 @@ def _stage_from_step(name: str) -> str:
     if name.startswith("unit_fit:"):
         return "空间单元拟合"
     if name.startswith("assemble_stream:"):
-        return "顺序组装"
+        return "并行组装"
     if name.startswith("model_batch:") or name.startswith("fusion_batch:"):
         return "Work Package 推理"
     if name.startswith("mosaic:"):
@@ -172,6 +180,19 @@ def _waiting_count(counts) -> int:
     )
 
 
+def _assembly_fraction(stream_status, progress) -> float:
+    if str(stream_status) == "ready" or str(progress.get("status") or "") == "completed":
+        return 1.0
+    phase_total = int(progress.get("phase_total") or 0)
+    phase_index = int(progress.get("phase_index") or 0)
+    if phase_total < 1 or phase_index < 1:
+        return 0.0
+    current = int(progress.get("progress_current") or 0)
+    total = int(progress.get("progress_total") or 0)
+    within_phase = min(1.0, max(0.0, current / total)) if total else 0.0
+    return min(1.0, max(0.0, (phase_index - 1 + within_phase) / phase_total))
+
+
 def _unit_stage_label(type_counts) -> str:
     running_types = {
         unit_type
@@ -213,6 +234,9 @@ class InferenceMonitorDialog(QDialog):
         self._stage_key = ""
         self._stage_started_at = time.monotonic()
         self._runner_message = ""
+        self._runtime_progress = {}
+        self._log_error_count = 0
+        self._log_warning_count = 0
         self._detail_signature = None
         self._database = None
         self._run_id = ""
@@ -225,34 +249,48 @@ class InferenceMonitorDialog(QDialog):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
+        header = QHBoxLayout()
         self._phase = QLabel("准备中")
         self._phase.setWordWrap(True)
-        root.addWidget(self._phase)
+        header.addWidget(self._phase, stretch=1)
+        self._log_toggle = QPushButton("显示日志")
+        self._log_toggle.setCheckable(True)
+        self._log_toggle.toggled.connect(self._set_log_visible)
+        header.addWidget(self._log_toggle)
+        root.addLayout(header)
 
-        splitter = QSplitter(HORIZONTAL)
+        self._stage_rail = QLabel("")
+        self._stage_rail.setWordWrap(True)
+        root.addWidget(self._stage_rail)
+        self._update_stage_rail("compute")
+
+        self._splitter = QSplitter(HORIZONTAL)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         self._run_overview = QLabel("Run：准备中")
         self._package_overview = QLabel("Work Package：等待计划")
         self._unit_overview = QLabel("空间单元拟合：等待计划")
+        self._assembly_overview = QLabel("结果流组装：等待上游计算")
         for overview in (
             self._run_overview,
             self._package_overview,
             self._unit_overview,
+            self._assembly_overview,
         ):
             overview.setWordWrap(True)
             left_layout.addWidget(overview)
 
-        self._streams = QTableWidget(0, 6)
+        self._streams = QTableWidget(0, 7)
         self._streams.setHorizontalHeaderLabels(
             [
                 "结果流",
                 "当前阶段",
-                "单元完成/总数",
-                "单元运行/等待",
-                "单元失败",
-                "最近任务耗时",
+                "当前进度",
+                "运行/等待",
+                "输出面数",
+                "失败",
+                "阶段耗时",
             ]
         )
         self._streams.verticalHeader().setVisible(False)
@@ -266,9 +304,10 @@ class InferenceMonitorDialog(QDialog):
             (0, 180),
             (1, 220),
             (2, 120),
-            (3, 120),
-            (4, 64),
-            (5, 110),
+            (3, 100),
+            (4, 100),
+            (5, 64),
+            (6, 110),
         ):
             header.setSectionResizeMode(column, INTERACTIVE)
             header.resizeSection(column, width)
@@ -311,14 +350,16 @@ class InferenceMonitorDialog(QDialog):
         self._detail_search.textChanged.connect(self._reset_detail_page)
         self._previous_page.clicked.connect(self._previous_detail_page)
         self._next_page.clicked.connect(self._next_detail_page)
-        splitter.addWidget(left)
+        self._splitter.addWidget(left)
 
         self._log_panel = LogPanel(self)
-        splitter.addWidget(self._log_panel)
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 4)
-        splitter.setSizes([650, 530])
-        root.addWidget(splitter, stretch=1)
+        self._log_panel.cleared.connect(self._reset_log_counts)
+        self._splitter.addWidget(self._log_panel)
+        self._splitter.setStretchFactor(0, 5)
+        self._splitter.setStretchFactor(1, 4)
+        self._log_panel.setVisible(False)
+        self._splitter.setSizes([1180, 0])
+        root.addWidget(self._splitter, stretch=1)
 
         self._summary = QLabel("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
         root.addWidget(self._summary)
@@ -329,13 +370,6 @@ class InferenceMonitorDialog(QDialog):
         bottom.addWidget(self._stop)
         self._bar = QProgressBar()
         bottom.addWidget(self._bar, stretch=1)
-        self._cb_out = QCheckBox("stdout")
-        self._cb_err = QCheckBox("stderr")
-        self._cb_sys = QCheckBox("系统")
-        for checkbox in (self._cb_out, self._cb_err, self._cb_sys):
-            checkbox.setChecked(True)
-            checkbox.toggled.connect(self._apply_filter)
-            bottom.addWidget(checkbox)
         root.addLayout(bottom)
 
     def attach_runner(self, runner: QObject):
@@ -388,6 +422,49 @@ class InferenceMonitorDialog(QDialog):
     def clear_log(self):
         self._log_panel.clear()
 
+    def _set_log_visible(self, visible):
+        shown = bool(visible)
+        self._log_panel.setVisible(shown)
+        self._splitter.setSizes([720, 460] if shown else [1180, 0])
+        self._update_log_toggle()
+
+    def _reset_log_counts(self):
+        self._log_error_count = 0
+        self._log_warning_count = 0
+        self._update_log_toggle()
+
+    def _update_log_toggle(self):
+        action = "收起日志" if self._log_toggle.isChecked() else "显示日志"
+        counts = []
+        if self._log_error_count:
+            counts.append(f"{self._log_error_count}错误")
+        if self._log_warning_count:
+            counts.append(f"{self._log_warning_count}警告")
+        self._log_toggle.setText(
+            action + (" · " + "/".join(counts) if counts else "")
+        )
+
+    def _update_stage_rail(self, active_key):
+        order = [key for key, _name in PIPELINE_STAGES]
+        active = str(active_key or "compute")
+        active_index = order.index(active) if active in order else 0
+        parts = []
+        for index, (key, name) in enumerate(PIPELINE_STAGES):
+            if index < active_index or active == "ready":
+                color = "#2d7a52"
+                marker = "✓"
+            elif key == active:
+                color = "#2f6f9f"
+                marker = "●"
+            else:
+                color = "#7b8794"
+                marker = "○"
+            parts.append(
+                f'<span style="color:{color}; font-weight:600">'
+                f"{marker} {name}</span>"
+            )
+        self._stage_rail.setText("&nbsp;&nbsp;→&nbsp;&nbsp;".join(parts))
+
     def reset_run(self, tiles=None):
         del tiles
         self.unbind_state_database()
@@ -404,6 +481,7 @@ class InferenceMonitorDialog(QDialog):
         self._active_inference_stream = ""
         self._package_activity.clear()
         self._runner_message = ""
+        self._runtime_progress.clear()
         self._detail_signature = None
         self._stage_key = ""
         self._stage_started_at = time.monotonic()
@@ -411,6 +489,8 @@ class InferenceMonitorDialog(QDialog):
         self._run_overview.setText("Run：准备中")
         self._package_overview.setText("Work Package：等待计划")
         self._unit_overview.setText("空间单元拟合：等待计划")
+        self._assembly_overview.setText("结果流组装：等待上游计算")
+        self._update_stage_rail("compute")
         self._tile_detail_title.setText("选中结果流：未选择 | 空间单元详情")
         self._summary.setText("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
         self._bar.setRange(0, 0)
@@ -456,6 +536,8 @@ class InferenceMonitorDialog(QDialog):
         self._bar.setRange(0, 1)
         self._bar.setValue(1)
         self._bar.setFormat(text)
+        if text == "已完成":
+            self._update_stage_rail("ready")
         self.setWindowTitle(f"推理监控 - {text}")
 
     def _ensure_stream(self, stream_id):
@@ -468,7 +550,9 @@ class InferenceMonitorDialog(QDialog):
             "stage": "等待计划",
             "progress": "-",
             "unit_progress": "-",
+            "stage_progress": "-",
             "activity": "0/0",
+            "feature_count": 0,
             "status": "等待",
             "elapsed": "-",
             "failures": 0,
@@ -488,12 +572,19 @@ class InferenceMonitorDialog(QDialog):
     def _write_stream_row(self, stream_id):
         row = self._stream_rows[stream_id]
         state = self._stream_state[stream_id]
-        unit_progress = state.get("unit_progress") or state.get("progress") or "-"
+        current_progress = (
+            state.get("stage_progress")
+            or state.get("unit_progress")
+            or state.get("progress")
+            or "-"
+        )
+        feature_count = int(state.get("feature_count") or 0)
         values = [
             self._stream_display_name(stream_id),
             state["stage"],
-            unit_progress,
+            current_progress,
             state.get("activity") or "0/0",
+            f"{feature_count:,}" if feature_count else "—",
             str(state["failures"]),
             state["elapsed"],
         ]
@@ -508,12 +599,24 @@ class InferenceMonitorDialog(QDialog):
             self._streams.setItem(row, column, item)
 
     def _on_log(self, level, message):
+        lowered = str(message).lower()
+        warning = any(token in lowered for token in ("warning", "warn", "警告"))
+        failure = any(
+            token in lowered
+            for token in ('"event":"stream_assembly_failed"', " error", "failed")
+        )
         if level == "stdout":
             self._log_panel.append_stdout(message)
         elif level == "stderr":
             self._log_panel.append_stderr(message)
         else:
             self._log_panel.append_system(message)
+        if warning:
+            self._log_warning_count += 1
+        elif level == "stderr" or failure:
+            self._log_error_count += 1
+        if warning or level == "stderr" or failure:
+            self._update_log_toggle()
 
     def _on_step_started(self, name):
         stream_id = _stream_from_step(name)
@@ -565,6 +668,31 @@ class InferenceMonitorDialog(QDialog):
         current = int(info.get("current") or 0)
         total = int(info.get("total") or 0)
         failure = str(info.get("error") or "")
+        if event == "assembly_progress":
+            progress_status = str(info.get("status") or "running")
+            status = {
+                "completed": "成功",
+                "failed": "失败",
+            }.get(progress_status, "运行中")
+            self._runtime_progress[stream_id] = dict(info)
+            self._set_stream(
+                stream_id,
+                stage=str(info.get("phase_name") or "并行组装"),
+                stage_progress=(
+                    f"{current}/{total}"
+                    if total
+                    else f"步骤 {int(info.get('phase_index') or 0)}/"
+                    f"{int(info.get('phase_total') or 0)}"
+                ),
+                activity="—",
+                feature_count=int(info.get("feature_count") or 0),
+                elapsed=_elapsed_text(float(info.get("elapsed_sec") or 0)),
+                status=status,
+                failures=int(
+                    self._stream_state.get(stream_id, {}).get("failures", 0)
+                ) + (1 if progress_status == "failed" else 0),
+            )
+            return
         status = "失败" if event.endswith("failed") else "运行中"
         self._set_stream(
             stream_id,
@@ -729,7 +857,7 @@ class InferenceMonitorDialog(QDialog):
     def _active_stage_for_stream(self, stream_id: str) -> str:
         stage_counts = self._active_stream_stages.get(stream_id) or {}
         for stage in (
-            "顺序组装",
+            "并行组装",
             "Accepted 差分",
             "边界矢量化",
             "空间单元拟合",
@@ -954,6 +1082,13 @@ class InferenceMonitorDialog(QDialog):
                 self._active_inference_stream = ""
 
             streams = snapshot.get("streams") or []
+            all_runtime_progress = (
+                snapshot.get("stream_runtime_progress") or {}
+            )
+            self._runtime_progress = {
+                str(key): dict(value)
+                for key, value in all_runtime_progress.items()
+            }
             all_type_counts = snapshot.get("stream_unit_type_counts") or {}
             all_job_type_counts = (
                 snapshot.get("stream_unit_job_type_counts") or {}
@@ -980,6 +1115,11 @@ class InferenceMonitorDialog(QDialog):
                 waiting = _waiting_count(stream_unit_job_counts)
                 failed = int(stream_unit_job_counts.get("failed", 0))
                 stream_status = str(stream.get("status") or "pending")
+                assembly_info = all_runtime_progress.get(stream_id) or {}
+                assembly_status = str(assembly_info.get("status") or "")
+                assembly_phase = str(
+                    assembly_info.get("phase_name") or "并行组装"
+                )
                 active_stage = self._active_stage_for_stream(stream_id)
                 inference_active = (
                     int(package_counts.get("running", 0)) > 0
@@ -1003,16 +1143,18 @@ class InferenceMonitorDialog(QDialog):
                         stage, status = "组装完成 / 上游 Package 失败", "成功"
                     else:
                         stage, status = "上游 Work Package 失败", "失败"
+                elif assembly_status == "failed":
+                    stage, status = f"组装失败：{assembly_phase}", "失败"
                 elif failed or stream_status == "failed":
                     stage, status = "空间单元任务失败", "失败"
-                elif active_stage == "顺序组装" or stream_status == "assembling":
-                    stage, status = "顺序组装", "运行中"
+                elif active_stage == "并行组装" or stream_status == "assembling":
+                    stage, status = assembly_phase, "运行中"
                 elif stream_status == "ready" and run_status == "ready":
                     stage, status = "完成", "成功"
                 elif stream_status == "ready":
                     stage, status = "已组装 / 等待整体验收", "成功"
                 elif stream_status == "raster_ready":
-                    stage, status = "等待顺序组装", "等待"
+                    stage, status = "等待并行组装", "等待"
                 elif inference_active and running:
                     stage = f"推理 + {_unit_stage_label(job_type_counts)}"
                     status = "运行中"
@@ -1031,13 +1173,46 @@ class InferenceMonitorDialog(QDialog):
                 else:
                     stage, status = "等待计划", "等待"
 
+                stage_progress = f"{ready}/{total}" if total else "-"
+                activity = f"{running}/{waiting}"
+                feature_count = 0
+                elapsed = getattr(self, "_stream_state", {}).get(stream_id, {}).get(
+                    "elapsed", "-"
+                )
+                if assembly_info:
+                    assembly_current = int(
+                        assembly_info.get("progress_current") or 0
+                    )
+                    assembly_total = int(
+                        assembly_info.get("progress_total") or 0
+                    )
+                    phase_index = int(assembly_info.get("phase_index") or 0)
+                    phase_total = int(assembly_info.get("phase_total") or 0)
+                    stage_progress = (
+                        f"{assembly_current}/{assembly_total}"
+                        if assembly_total
+                        else f"步骤 {phase_index}/{phase_total}"
+                    )
+                    activity = "—"
+                    feature_count = int(
+                        assembly_info.get("feature_count") or 0
+                    )
+                    phase_started = _timestamp_epoch(
+                        assembly_info.get("phase_started_at") or ""
+                    )
+                    if phase_started is not None:
+                        elapsed = _elapsed_text(time.time() - phase_started)
+
                 self._set_stream(
                     stream_id,
                     stage=stage,
                     unit_progress=f"{ready}/{total}" if total else "-",
-                    activity=f"{running}/{waiting}",
+                    stage_progress=stage_progress,
+                    activity=activity,
+                    feature_count=feature_count,
                     status=status,
-                    failures=failed,
+                    failures=failed + (1 if assembly_status == "failed" else 0),
+                    elapsed=elapsed,
                 )
 
             self._update_database_overviews(
@@ -1046,6 +1221,7 @@ class InferenceMonitorDialog(QDialog):
                 unit_job_counts=unit_job_counts,
                 active_package=active_package,
                 streams=streams,
+                stream_runtime_progress=all_runtime_progress,
             )
             self._render_selected_tiles()
         except Exception as error:
@@ -1098,8 +1274,8 @@ class InferenceMonitorDialog(QDialog):
             )
         if self._active_global_stage == "分区概率栅格收口":
             return "finalize", "分区概率栅格收口", raster_ready, stream_total
-        if self._active_global_stage == "顺序组装":
-            return "assembly", "结果流顺序组装", stream_ready, stream_total
+        if self._active_global_stage == "并行组装":
+            return "assembly", "结果流并行组装", stream_ready, stream_total
         if self._active_global_stage == "整体验收":
             return "acceptance", "整体验收", 0, 0
         if package_active or package_waiting:
@@ -1117,11 +1293,18 @@ class InferenceMonitorDialog(QDialog):
         if stream_total and stream_ready == stream_total:
             return "acceptance", "整体验收", 0, 0
         if raster_ready:
-            return "assembly", "结果流顺序组装", stream_ready, stream_total
+            return "assembly", "结果流并行组装", stream_ready, stream_total
         return "finalize", "分区概率栅格收口", raster_ready, stream_total
 
     def _update_database_overviews(
-        self, *, run_status, package_counts, unit_job_counts, active_package, streams
+        self,
+        *,
+        run_status,
+        package_counts,
+        unit_job_counts,
+        active_package,
+        streams,
+        stream_runtime_progress,
     ):
         stage_key, stage, current, total = self._database_phase(
             run_status, package_counts, unit_job_counts, streams
@@ -1132,7 +1315,50 @@ class InferenceMonitorDialog(QDialog):
         stage_elapsed = _elapsed_text(time.monotonic() - self._stage_started_at)
         self._phase.setText(f"{stage} | 当前阶段观察 {stage_elapsed}")
         self.setWindowTitle(f"推理监控 - {stage}")
-        if total > 0:
+        rail_key = {
+            "packages": "compute",
+            "units": "compute",
+            "unit_failed": "compute",
+            "package_failed": "compute",
+            "resetting": "compute",
+            "stopped": "compute",
+            "failed": (
+                "assembly"
+                if any(
+                    str(item.get("status") or "") == "failed"
+                    for item in stream_runtime_progress.values()
+                )
+                else "compute"
+            ),
+        }.get(stage_key, stage_key)
+        self._update_stage_rail(rail_key)
+
+        if stage_key == "assembly" and streams:
+            assembly_units = round(
+                sum(
+                    _assembly_fraction(
+                        stream.get("status"),
+                        stream_runtime_progress.get(str(stream["stream_id"])) or {},
+                    )
+                    for stream in streams
+                )
+                * ASSEMBLY_PROGRESS_SCALE
+            )
+            stream_ready = sum(
+                1 for stream in streams if str(stream.get("status")) == "ready"
+            )
+            stream_running = sum(
+                1
+                for stream in streams
+                if str(stream.get("status")) == "assembling"
+            )
+            self._bar.setRange(0, len(streams) * ASSEMBLY_PROGRESS_SCALE)
+            self._bar.setValue(assembly_units)
+            self._bar.setFormat(
+                f"{stage} | 完成 {stream_ready}/{len(streams)} | "
+                f"运行 {stream_running}"
+            )
+        elif total > 0:
             self._bar.setRange(0, total)
             self._bar.setValue(min(current, total))
             self._bar.setFormat(f"{stage}  {current}/{total}")
@@ -1243,6 +1469,48 @@ class InferenceMonitorDialog(QDialog):
             f"并发上限 {worker_text} | 已组装结果流 {stream_ready}/{len(streams)}"
         )
 
+        assembly_running = sum(
+            1 for stream in streams if str(stream.get("status")) == "assembling"
+        )
+        assembly_failed = sum(
+            1
+            for stream in streams
+            if str(
+                (stream_runtime_progress.get(str(stream["stream_id"])) or {}).get(
+                    "status"
+                )
+                or ""
+            )
+            == "failed"
+        )
+        assembly_waiting = max(
+            0,
+            len(streams) - stream_ready - assembly_running - assembly_failed,
+        )
+        assembly_limit = int(
+            (self._run_spec.get("scaling") or {}).get(
+                "max_concurrent_assembly", 2
+            )
+            or 2
+        )
+        active_phases = []
+        for stream in streams:
+            stream_id = str(stream["stream_id"])
+            info = stream_runtime_progress.get(stream_id) or {}
+            if str(info.get("status") or "") != "running":
+                continue
+            active_phases.append(
+                f"{self._stream_display_name(stream_id)}："
+                f"{info.get('phase_name') or '并行组装'}"
+            )
+        active_text = " | 当前 " + "；".join(active_phases) if active_phases else ""
+        self._assembly_overview.setText(
+            f"结果流组装：完成 {stream_ready}/{len(streams)} | "
+            f"运行 {assembly_running} | 等待 {assembly_waiting} | "
+            f"失败 {assembly_failed} | 并发 {assembly_running}/{assembly_limit}"
+            f"{active_text}"
+        )
+
     def _update_selected_tile(self, stream_id, tile_id, state):
         if stream_id != self._selected_stream():
             return
@@ -1291,16 +1559,6 @@ class InferenceMonitorDialog(QDialog):
             f"运行: {states.count('运行中')}  |  等待: {waiting}  |  "
             f"停止: {states.count('已停止')}  |  失败: {states.count('失败')}"
         )
-
-    def _apply_filter(self):
-        levels = set()
-        if self._cb_out.isChecked():
-            levels.add("stdout")
-        if self._cb_err.isChecked():
-            levels.add("stderr")
-        if self._cb_sys.isChecked():
-            levels.add("system")
-        self._log_panel.set_visible_levels(levels)
 
     def _request_stop(self):
         self.stop_requested.emit()

@@ -228,7 +228,7 @@ def test_new_v5_run_builds_its_complete_control_graph_in_postgres(
             scaling={
                 "partition_tile_rows": 2,
                 "partition_tile_cols": 2,
-                "partition_halo_px": 192,
+                "partition_halo_px": 256,
                 "seam_band_px": 64,
                 "max_job_retries": 2,
             },

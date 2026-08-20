@@ -175,6 +175,26 @@ CREATE TABLE IF NOT EXISTS streams (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS stream_runtime_progress (
+    run_id TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL DEFAULT '',
+    phase_name TEXT NOT NULL DEFAULT '',
+    phase_index INTEGER NOT NULL DEFAULT 0,
+    phase_total INTEGER NOT NULL DEFAULT 0,
+    progress_current BIGINT NOT NULL DEFAULT 0,
+    progress_total BIGINT NOT NULL DEFAULT 0,
+    feature_count BIGINT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message TEXT NOT NULL DEFAULT '',
+    phase_started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, stream_id),
+    FOREIGN KEY (run_id, stream_id)
+        REFERENCES streams(run_id, stream_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS work_packages (
     run_id TEXT NOT NULL,
     package_id TEXT NOT NULL,
@@ -386,6 +406,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_streams_status
     ON streams(run_id, status, stream_id);
+CREATE INDEX IF NOT EXISTS idx_stream_progress_stage
+    ON stream_runtime_progress(run_id, stage, status, stream_id);
 CREATE INDEX IF NOT EXISTS idx_packages_status
     ON work_packages(run_id, status, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_partitions_status

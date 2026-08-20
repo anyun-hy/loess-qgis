@@ -1015,18 +1015,20 @@ def test_monitor_tables_use_stable_user_resizable_columns():
         "header = self._streams.horizontalHeader()", 1
     )[1].split("left_layout.addWidget(self._streams", 1)[0]
     for expected_width in (
-        "(0, 180)",
-        "(1, 220)",
-        "(2, 120)",
-        "(3, 120)",
-        "(4, 64)",
-        "(5, 110)",
+            "(0, 180)",
+            "(1, 220)",
+            "(2, 120)",
+            "(3, 100)",
+            "(4, 100)",
+            "(5, 64)",
+            "(6, 110)",
     ):
         assert expected_width in stream_header
     assert "header.setSectionResizeMode(0, STRETCH)" not in stream_header
     assert "header.setSectionResizeMode(column, INTERACTIVE)" in stream_header
     assert "((0, 96), (1, 72), (2, 88))" in source
-    assert "splitter.setSizes([650, 530])" in source
+    assert "self._splitter.setSizes([1180, 0])" in source
+    assert "self._splitter.setSizes([720, 460] if shown else [1180, 0])" in source
 
 
 def test_monitor_updates_large_tile_tables_incrementally_and_names_selected_stream():

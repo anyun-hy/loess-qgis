@@ -37,6 +37,26 @@ def _write_resume_gpkg(path):
         )
 
 
+def test_resume_formal_validation_allows_exact_clip_to_change_feature_count(tmp_path):
+    """Raw parts are count-locked; clipped formal output is identity-locked instead."""
+    path = tmp_path / "semantic_polygons_raw.gpkg"
+    _write_resume_gpkg(path)
+
+    validated = assemble_stream._validate_existing_gpkg(
+        path,
+        layer="semantic_polygons_raw",
+        schema={
+            "geometry": "MultiPolygon",
+            "properties": {"run_id": "str:48", "stream_id": "str:96"},
+        },
+        crs="EPSG:4326",
+        identity={"run_id": "run-1", "stream_id": "model:a"},
+        expected_feature_count=None,
+    )
+
+    assert validated["feature_count"] == 1
+
+
 def test_100_reverse_report_summaries_are_validated_in_unit_id_order(
     monkeypatch,
     tmp_path,

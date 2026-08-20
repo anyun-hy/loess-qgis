@@ -2,6 +2,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon, box
 from shapely.ops import linemerge, split
 
+import boundary_fitting.unit_runtime as unit_runtime
 from boundary_fitting.unit_runtime import _fit_or_subdivide
 from common_boundary_smoother import (
     CommonBoundarySmoothingError,
@@ -308,7 +309,7 @@ def test_partition_unit_runtime_uses_common_divider_mode():
         probabilities[0, row, :threshold] = 1.0
         probabilities[1, row, threshold:] = 1.0
     raw, formal, report = _fit_or_subdivide(
-        probabilities,
+        probabilities.argmax(axis=0).astype(np.int16),
         {
             "unit_id": "core_00000_00000",
             "pixel_window": {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
@@ -331,7 +332,7 @@ def test_partition_unit_runtime_uses_common_divider_mode():
     assert all(record["fit_status"] == "changed" for record in formal)
 
 
-def test_partition_unit_runtime_with_small_component_regularization():
+def test_partition_unit_runtime_polygonizes_supplied_authoritative_labels():
     probabilities = np.zeros((14, 24, 24), dtype=np.float32)
     # Background class 12, class 13, class 21 with stepped diagonal boundaries
     for row in range(24):
@@ -344,9 +345,9 @@ def test_partition_unit_runtime_with_small_component_regularization():
     probabilities[2, 5:7, 20:22] = 0.45
     probabilities[1, 5:7, 20:22] = 0.55  # class 13 noise island inside class 21
 
-    # Without regularization: 4 polygons (class 12, class 13 main, class 21 with hole, class 13 island)
-    raw_unreg, formal_unreg, rep_unreg = _fit_or_subdivide(
-        probabilities,
+    labels = probabilities.argmax(axis=0).astype(np.int16)
+    raw, formal, report = _fit_or_subdivide(
+        labels,
         {
             "unit_id": "core_00000_00000",
             "pixel_window": {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
@@ -361,34 +362,35 @@ def test_partition_unit_runtime_with_small_component_regularization():
         max_features=1000,
         max_segments=10000,
         min_core_px=4,
-        regularize=False,
     )
-    assert len(raw_unreg) == 4
+    # The 2x2 island remains because fragmentation repair belongs upstream in
+    # the authoritative Halo/Core raster stage, never in a Unit crop.
+    assert len(raw) == 4
+    assert len(formal) == 4
+    assert report["spline_count"] >= 2
+    assert report["fit_version"] == "divider_cubic_bspline_adaptive_v2"
+    assert any(record["fit_status"] == "changed" for record in formal)
 
-    # With regularization: the 2x2 tiny island of class 13 is absorbed into class 21,
-    # leaving 3 clean main polygons that are all smoothly fitted with B-spline!
-    raw_reg, formal_reg, rep_reg = _fit_or_subdivide(
-        probabilities,
-        {
-            "unit_id": "core_00000_00000",
-            "pixel_window": {"x0": 0, "y0": 0, "x1": 24, "y1": 24},
-        },
+
+def test_forced_subdivision_polygonizes_only_leaf_rasters(monkeypatch):
+    labels = np.zeros((8, 8), dtype=np.int16)
+    labels[:, 4:] = 1
+    calls = []
+    original = unit_runtime._polygonize
+
+    def counted(*args, **kwargs):
+        calls.append(np.asarray(args[0]).shape)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(unit_runtime, "_polygonize", counted)
+    _fit_or_subdivide(
+        labels,
+        {"unit_id": "core", "pixel_window": {"x0": 0, "y0": 0, "x1": 8, "y1": 8}},
         [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71],
-        smoothing_config=SmoothingConfig(
-            smoothing_factor=1.0,
-            curve_sampling_spacing=0.5,
-            max_deviation=None,
-            min_point_count=4,
-        ),
+        smoothing_config=SmoothingConfig(min_point_count=4),
         max_features=1000,
         max_segments=10000,
         min_core_px=4,
-        regularize=True,
-        pixel_area_m2=4.0,
+        force_split=True,
     )
-    assert len(raw_reg) == 3
-    assert len(formal_reg) == 3
-    assert rep_reg["spline_count"] >= 2
-    assert rep_reg["fit_version"] == "divider_cubic_bspline_adaptive_v2"
-    assert all(record["fit_status"] == "changed" for record in formal_reg)
-
+    assert calls == [(4, 4), (4, 4), (4, 4), (4, 4)]

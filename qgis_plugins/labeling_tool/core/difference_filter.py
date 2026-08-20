@@ -17,19 +17,28 @@ from .qgis_writer import write_vector_layer
 logger = logging.getLogger("labeling_tool.difference_filter")
 
 
-def snapshot_accepted_layer(accepted_layer, output_path):
-    if not accepted_layer or not accepted_layer.isValid():
-        raise ValueError("accepted layer is invalid")
+def snapshot_vector_layer(vector_layer, output_path, *, layer_name):
+    """Persist a QGIS vector layer as a run-local GeoPackage snapshot."""
+    if not vector_layer or not vector_layer.isValid():
+        raise ValueError("vector layer is invalid")
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
-    options.layerName = LAYER_NAMES.ACCEPTED
+    options.layerName = str(layer_name)
     options.actionOnExistingFile = (
         QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
     )
-    error, message = write_vector_layer(accepted_layer, output_path, options)
+    error, message = write_vector_layer(vector_layer, output_path, options)
     if error != QgsVectorFileWriter.WriterError.NoError:
-        raise RuntimeError(message or f"failed to snapshot accepted_labels: {error}")
+        raise RuntimeError(message or f"failed to snapshot vector layer: {error}")
     return str(output_path)
+
+
+def snapshot_accepted_layer(accepted_layer, output_path):
+    return snapshot_vector_layer(
+        accepted_layer,
+        output_path,
+        layer_name=LAYER_NAMES.ACCEPTED,
+    )
 
 
 def tile_is_fully_accepted(

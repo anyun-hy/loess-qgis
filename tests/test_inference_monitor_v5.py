@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,6 +55,10 @@ def _execute_method(name: str, instance, *args):
         ),
         "_unit_stage_label": lambda _counts: "空间单元拟合",
         "_timestamp_epoch": lambda _value: 123.0,
+        "_elapsed_text": lambda seconds: f"elapsed:{int(seconds)}",
+        "_assembly_fraction": lambda _status, _progress: 0.5,
+        "ASSEMBLY_PROGRESS_SCALE": 1000,
+        "time": time,
     }
     exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
     return namespace[name](instance, *args)
@@ -102,21 +107,22 @@ def test_left_monitor_uses_run_package_and_unit_layers():
     assert any(
         len(call.args) >= 2
         and isinstance(call.args[1], ast.Constant)
-        and call.args[1].value == 6
+        and call.args[1].value == 7
         for call in table_calls
     )
 
     for label in (
         "结果流",
         "当前阶段",
-        "单元完成",
+        "当前进度",
         "运行",
         "等待",
+        "输出面数",
         "失败",
-        "最近任务耗时",
+        "阶段耗时",
     ):
         assert label in build_ui
-    assert '"单元失败"' in build_ui
+    assert "self._assembly_overview = QLabel(" in build_ui
 
 
 def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
@@ -194,7 +200,7 @@ def test_database_phase_uses_only_the_current_lane_denominator():
         streams,
     ) == ("units", "空间单元拟合", 5, 10)
 
-    monitor._active_global_stage = "顺序组装"
+    monitor._active_global_stage = "并行组装"
     assert _execute_method(
         "_database_phase",
         monitor,
@@ -202,7 +208,7 @@ def test_database_phase_uses_only_the_current_lane_denominator():
         {"ready": 3, "running": 1, "queued": 2},
         {"ready": 5, "running": 2, "queued": 3},
         streams,
-    ) == ("assembly", "结果流顺序组装", 0, 2)
+    ) == ("assembly", "结果流并行组装", 0, 2)
     monitor._active_global_stage = ""
 
 
@@ -213,11 +219,11 @@ def test_database_phase_uses_only_the_current_lane_denominator():
         {"ready": 6},
         {"ready": 10},
         [{"status": "raster_ready"}, {"status": "pending"}],
-    ) == ("assembly", "结果流顺序组装", 0, 2)
+    ) == ("assembly", "结果流并行组装", 0, 2)
 
 
 def test_database_phase_terminal_states_are_unambiguous():
-    monitor = SimpleNamespace(_active_global_stage="顺序组装")
+    monitor = SimpleNamespace(_active_global_stage="并行组装")
     nonterminal_counts = {"ready": 3, "running": 1, "queued": 2}
 
     assert _execute_method(
@@ -433,20 +439,71 @@ def test_terminal_snapshot_does_not_disable_a_subsequent_resume():
     )
 
 
-def test_elapsed_column_is_the_latest_completed_task_not_a_run_total():
+def test_elapsed_column_tracks_the_current_persisted_assembly_phase():
     build_ui = _method_source("_build_ui")
     step_finished = _method_source("_on_step_finished")
     poll = _method_source("_poll_database")
 
-    assert "最近任务耗时" in build_ui
+    assert "阶段耗时" in build_ui
     assert "elapsed" in step_finished
     assert "_set_stream" in step_finished
-    for node in ast.walk(_method("_poll_database")):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr != "_set_stream":
-            continue
-        assert all(keyword.arg != "elapsed" for keyword in node.keywords)
+    assert "phase_started_at" in poll
+    assert "elapsed=elapsed" in poll
+
+
+def test_persisted_assembly_progress_replaces_completed_unit_counts():
+    snapshot = {
+        "run": {"status": "running"},
+        "job_counts": {"work_package": {"ready": 1}, "unit_fit": {"ready": 12}},
+        "active_work_package": None,
+        "streams": [{"stream_id": "model:test", "status": "assembling"}],
+        "stream_runtime_progress": {
+            "model:test": {
+                "status": "running",
+                "phase_name": "写入正式 GPKG",
+                "phase_index": 5,
+                "phase_total": 9,
+                "progress_current": 4,
+                "progress_total": 12,
+                "feature_count": 999,
+                "phase_started_at": "2026-08-20T00:00:00+00:00",
+            }
+        },
+        "stream_unit_type_counts": {"model:test": {"core": {"ready": 12}}},
+        "stream_unit_job_type_counts": {"model:test": {"core": {"ready": 12}}},
+    }
+    rows = {}
+    errors = []
+    monitor = SimpleNamespace(
+        _database=SimpleNamespace(monitor_snapshot=lambda _run_id: snapshot),
+        _run_id="run-test",
+        _package_activity={},
+        _active_inference_stream="",
+        _stream_state={},
+        _active_stage_for_stream=lambda _stream_id: "并行组装",
+        _set_stream=lambda stream_id, **values: rows.update({stream_id: values}),
+        _update_database_overviews=lambda **_kwargs: None,
+        _render_selected_tiles=lambda: None,
+        _log_panel=SimpleNamespace(append_system=errors.append),
+    )
+
+    _execute_method("_poll_database", monitor)
+
+    assert errors == []
+    assert rows["model:test"]["stage"] == "写入正式 GPKG"
+    assert rows["model:test"]["unit_progress"] == "12/12"
+    assert rows["model:test"]["stage_progress"] == "4/12"
+    assert rows["model:test"]["feature_count"] == 999
+    assert rows["model:test"]["activity"] == "—"
+
+
+def test_log_panel_is_retained_but_collapsed_by_default():
+    build_ui = _method_source("_build_ui")
+    toggle = _method_source("_set_log_visible")
+    assert 'QPushButton("显示日志")' in build_ui
+    assert "self._log_panel.setVisible(False)" in build_ui
+    assert "[720, 460] if shown else [1180, 0]" in toggle
+    assert "self._log_panel.setVisible(shown)" in toggle
 
 
 def test_tile_and_spatial_unit_details_remain_bounded_and_paged():

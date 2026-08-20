@@ -126,7 +126,12 @@ from ..core.v5_async_runner import V5AsyncInferenceRunner
 from ..core.tile_cache_probe_runner import TileCacheProbeRunner
 from ..core.model_registry import ModelRegistry
 from ..core.run_builder_v5 import create_v5_run
-from ..core.run_spec import RESERVATION_FILE, reserve_run_directory, run_tile_cache_dir
+from ..core.run_spec import (
+    RESERVATION_FILE,
+    reserve_run_directory,
+    run_tile_cache_dir,
+    sha256_file,
+)
 from ..core import run_index
 from ..core.work_package_planner import (
     fusion_accumulator_atomic_overhead,
@@ -280,7 +285,9 @@ class LabelingDockWidget(QgsDockWidget):
         self.radio_vector = QRadioButton("加载矢量范围")
         self.radio_rect.setEnabled(True)
         self.radio_rect.setToolTip("在地图上拖拽绘制标注范围")
-        self.radio_vector.setToolTip("使用已加载面图层筛选相交的完整 Tile，不裁剪输出")
+        self.radio_vector.setToolTip(
+            "相交 Tile 仅用于处理；结果会按矢量边界精确裁剪"
+        )
         self.radio_view.setChecked(True)
         self.extent_group.addButton(self.radio_view)
         self.extent_group.addButton(self.radio_rect)
@@ -1176,7 +1183,7 @@ class LabelingDockWidget(QgsDockWidget):
                     f"矢量图层「{layer.name()}」与影像层没有重叠"
                 )
             self.extent_status_label.setText(
-                f"矢量范围: {layer.name()}；只筛选相交完整 Tile，不裁剪结果"
+                f"矢量范围: {layer.name()}；相交 Tile 用于处理，结果按矢量边界精确裁剪"
             )
         except ValueError as exc:
             self.extent_status_label.setText(str(exc))
@@ -1406,6 +1413,7 @@ class LabelingDockWidget(QgsDockWidget):
         self._pending_run["run_id"] = ""
         self._pending_run["run_dir"] = ""
         self._pending_run["accepted_snapshot"] = ""
+        self._pending_run["range_snapshot"] = ""
 
         self.monitor_dialog.reset_run()
         self.monitor_dialog.attach_runner(self.runner)
@@ -1526,9 +1534,21 @@ class LabelingDockWidget(QgsDockWidget):
                     "profile": dict(registered_profile.profile),
                 }
             scaling = dict(registry.scaling)
+            fragmentation = dict(effective.get("fragmentation_regularization") or {})
+            fragmentation_buffer = (
+                int(fragmentation.get("buffer_pixels", 256))
+                if bool(fragmentation.get("enabled", True))
+                else 0
+            )
             if str(scaling.get("partition_halo_px", "auto")).lower() == "auto":
                 scaling["partition_halo_px"] = max(
-                    int(ctx["overlap"]), int(scaling.get("seam_band_px", 64))
+                    int(ctx["overlap"]),
+                    int(scaling.get("seam_band_px", 64)),
+                    fragmentation_buffer,
+                )
+            else:
+                scaling["partition_halo_px"] = max(
+                    int(scaling["partition_halo_px"]), fragmentation_buffer
                 )
             pixel_count = 512 * 512
             tile_cache_sample = dict(ctx.get("tile_cache_sample") or {})
@@ -1582,6 +1602,7 @@ class LabelingDockWidget(QgsDockWidget):
             run_id, run_dir = reserve_run_directory(ctx["output_dir"])
             ctx["run_id"] = run_id
             ctx["run_dir"] = str(run_dir)
+            self._freeze_pending_range_snapshot(ctx, run_dir)
             self._freeze_pending_accepted_snapshot(ctx, run_dir)
             storage = storage_preflight(
                 ctx["output_dir"],
@@ -1896,6 +1917,48 @@ class LabelingDockWidget(QgsDockWidget):
         ctx["accepted_validation"] = frozen_validation
         ctx["skipped_tiles"] = skipped_tiles
 
+    def _freeze_pending_range_snapshot(self, ctx, run_dir):
+        """Freeze the exact vector boundary used by every later runtime stage."""
+        selection = dict(ctx.get("range_selection") or {})
+        if selection.get("mode") != "vector_tile_intersection":
+            ctx["range_snapshot"] = ""
+            return
+        live_layer = self._get_valid_vector_range_layer()
+        snapshot_path = Path(run_dir) / "range_snapshot.gpkg"
+        difference_filter.snapshot_vector_layer(
+            live_layer,
+            snapshot_path,
+            layer_name="range_mask",
+        )
+        frozen_layer = QgsVectorLayer(
+            f"{snapshot_path}|layername=range_mask",
+            f"{ctx.get('run_id', '')} range snapshot",
+            "ogr",
+        )
+        if not frozen_layer.isValid() or not frozen_layer.crs().isValid():
+            raise ValueError("范围矢量快照无效或缺少可转换 CRS")
+        selected_tiles = tile_manager.select_tiles_intersecting_vector(
+            ctx.get("grid_tiles") or [],
+            frozen_layer,
+            ctx["raster"].crs(),
+        )
+        if not selected_tiles:
+            raise ValueError("冻结的范围矢量没有选中任何完整 Tile")
+        selection.update(
+            {
+                "vector_source": str(snapshot_path),
+                "vector_path": str(snapshot_path),
+                "vector_sha256": sha256_file(snapshot_path),
+                "vector_crs": frozen_layer.crs().authid(),
+                "clip_outputs": True,
+                "selected_tile_count": len(selected_tiles),
+                "excluded_tile_count": len(ctx.get("grid_tiles") or []) - len(selected_tiles),
+            }
+        )
+        ctx["range_snapshot"] = str(snapshot_path)
+        ctx["range_selection"] = selection
+        ctx["active_tiles"] = selected_tiles
+
     def _discard_pending_run_reservation(self):
         """Remove only this attempt's unused, marker-backed Run reservation."""
         ctx = self._pending_run or {}
@@ -1941,6 +2004,7 @@ class LabelingDockWidget(QgsDockWidget):
         ctx["run_id"] = ""
         ctx["run_dir"] = ""
         ctx["accepted_snapshot"] = ""
+        ctx["range_snapshot"] = ""
 
     def _finish_before_inference(self, title, message):
         self._release_tile_cache_probe(cancel=True)
@@ -2438,7 +2502,7 @@ class LabelingDockWidget(QgsDockWidget):
             name = layer.name() if layer is not None else "未选择"
             return (
                 f"矢量范围: {name}；外包范围 {self._format_extent(extent)} "
-                f"[{raster.crs().authid()}]；只筛选完整 Tile，不裁剪结果"
+                f"[{raster.crs().authid()}]；相交 Tile 用于处理，结果按矢量边界精确裁剪"
             )
         return (
             f"{mode}范围: {self._format_extent(extent)} "
@@ -2475,7 +2539,7 @@ class LabelingDockWidget(QgsDockWidget):
                 "mode": "extent",
                 "selected_tile_count": len(selected_tiles),
                 "excluded_tile_count": 0,
-                "clip_outputs": False,
+                "clip_outputs": True,
             }
         layer = self._get_valid_vector_range_layer()
         return {
@@ -2486,7 +2550,7 @@ class LabelingDockWidget(QgsDockWidget):
             "vector_crs": layer.crs().authid(),
             "selected_tile_count": len(selected_tiles),
             "excluded_tile_count": len(grid_tiles) - len(selected_tiles),
-            "clip_outputs": False,
+            "clip_outputs": True,
         }
 
     def _watch_vector_range_layer(self, layer):
@@ -2687,11 +2751,18 @@ class LabelingDockWidget(QgsDockWidget):
         effective = (self.config_manager.last_report or {}).get("effective") or {}
         scaling = effective.get("scaling") or {}
         seam = int(scaling.get("seam_band_px", 64))
+        fragmentation = dict(effective.get("fragmentation_regularization") or {})
+        fragmentation_buffer = (
+            int(fragmentation.get("buffer_pixels", 256))
+            if bool(fragmentation.get("enabled", True))
+            else 0
+        )
         raw_halo = scaling.get("partition_halo_px", "auto")
         halo = (
-            max(self.overlap_spin.value(), seam)
+            max(self.overlap_spin.value(), seam, fragmentation_buffer)
             if str(raw_halo).lower() == "auto" else int(raw_halo)
         )
+        halo = max(halo, fragmentation_buffer)
         try:
             spatial = plan_spatial_units(
                 tile_rows=rows,

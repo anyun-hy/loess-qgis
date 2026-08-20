@@ -54,7 +54,7 @@ def _scaling():
     return {
         "partition_tile_rows": 8,
         "partition_tile_cols": 8,
-        "partition_halo_px": 192,
+        "partition_halo_px": 256,
         "seam_band_px": 64,
         "max_job_retries": 2,
     }
@@ -82,7 +82,7 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         height=512,
         count=3,
         dtype="uint8",
-        crs="EPSG:4490",
+        crs="EPSG:3857",
         transform=from_origin(0, 512, 1, 1),
     ) as destination:
         destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
@@ -111,7 +111,7 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         output_root=tmp_path / f"{run_id}_output",
         raster={
             "path": tile,
-            "crs": "EPSG:4490",
+            "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, 512],
             "nodata": None,
         },
@@ -144,12 +144,9 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
 
 
 def test_unit_polygonize_does_not_emit_deprecated_memory_driver_warning(capfd):
-    probabilities = np.zeros((14, 2, 2), dtype=np.float32)
-    probabilities[0, 0, 0] = 1.0
-    probabilities[1, 0, 1] = 1.0
-    probabilities[1, 1, :] = 1.0
+    labels = np.array([[0, 1], [1, 1]], dtype=np.int16)
     records = _polygonize(
-        probabilities,
+        labels,
         {
             "unit_id": "core_00000_00000",
             "pixel_window": {"x0": 0, "y0": 0, "x1": 2, "y1": 2},
@@ -898,7 +895,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         height=512,
         count=3,
         dtype="uint8",
-        crs="EPSG:4490",
+        crs="EPSG:3857",
         transform=from_origin(0, 512, 1, 1),
         compress="deflate",
     ) as destination:
@@ -921,7 +918,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         output_root=tmp_path / "output",
         raster={
             "path": tile,
-            "crs": "EPSG:4490",
+            "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, 512],
             "nodata": None,
         },
@@ -1146,6 +1143,28 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert completed[0]["report_json_parse_count"] == 0
     assert completed[0]["summary_validation_peak_in_flight"] >= 1
     assert completed[0]["failed_unit_count"] == 0
+    assembly_progress = [
+        event for event in events if event.get("event") == "assembly_progress"
+    ]
+    assert {
+        event["phase"] for event in assembly_progress
+    } == {
+        "validate_inputs",
+        "register_objects",
+        "link_objects",
+        "write_raw",
+        "write_formal",
+        "aggregate_reports",
+        "range_clip",
+        "accepted_difference",
+        "publish_cleanup",
+    }
+    assert assembly_progress[-1]["status"] == "completed"
+    persisted_progress = database.monitor_snapshot(spec["run_id"])[
+        "stream_runtime_progress"
+    ]["fusion:fixture_fusion"]
+    assert persisted_progress["phase"] == "publish_cleanup"
+    assert persisted_progress["status"] == "completed"
     assert assembled["unit_count"] == 1
     assert assembled["object_count"] == 1
     assert assembled["fit_version"] == "divider_cubic_bspline_adaptive_v2"
@@ -1175,7 +1194,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         height=832,
         count=3,
         dtype="uint8",
-        crs="EPSG:4490",
+        crs="EPSG:3857",
         transform=from_origin(0, 832, 1, 1),
         compress="deflate",
     ) as destination:
@@ -1225,7 +1244,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         output_root=tmp_path / "output",
         raster={
             "path": tile,
-            "crs": "EPSG:4490",
+            "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, 832],
             "nodata": None,
         },
@@ -1526,7 +1545,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
         "run_dir": str(run_dir),
         "state_db": str(state_path),
         "raster": {
-            "crs": "EPSG:4490",
+            "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, plan["processing_window"]["y1"]],
         },
         "streams": [
@@ -1582,7 +1601,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             raw_path,
             [base],
             transform=affine,
-            crs="EPSG:4490",
+            crs="EPSG:3857",
             include_fit=False,
         )
         _write_gpkg(
@@ -1601,7 +1620,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
                 }
             ],
             transform=affine,
-            crs="EPSG:4490",
+            crs="EPSG:3857",
             include_fit=True,
         )
         diagnostics = (
@@ -1645,7 +1664,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             stream_id="model:a",
             unit_id=unit["unit_id"],
             transform=affine,
-            crs="EPSG:4490",
+            crs="EPSG:3857",
         )
         artifacts = [
             ("unit_raw", raw_path),
@@ -1741,7 +1760,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
         "run_dir": str(run_dir),
         "state_db": str(state_path),
         "raster": {
-            "crs": "EPSG:4490",
+            "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, 1],
         },
         "streams": [
@@ -1793,7 +1812,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
             raw_path,
             [base],
             transform=affine,
-            crs="EPSG:4490",
+            crs="EPSG:3857",
             include_fit=False,
         )
         _write_gpkg(
@@ -1812,7 +1831,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
                 }
             ],
             transform=affine,
-            crs="EPSG:4490",
+            crs="EPSG:3857",
             include_fit=True,
         )
         unit_report = {

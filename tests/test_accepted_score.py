@@ -113,7 +113,7 @@ def test_work_package_skips_model_for_fully_accepted_tile(tmp_path):
         scaling={
             "partition_tile_rows": 8,
             "partition_tile_cols": 8,
-            "partition_halo_px": 192,
+            "partition_halo_px": 256,
             "seam_band_px": 64,
             "max_job_retries": 2,
         },

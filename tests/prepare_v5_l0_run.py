@@ -143,8 +143,20 @@ def prepare(source_run: Path, output_root: Path, *, device: str, run_id: str | N
         )
 
     scaling = dict(effective["scaling"])
+    fragmentation = dict(effective.get("fragmentation_regularization") or {})
+    fragmentation_buffer = (
+        int(fragmentation.get("buffer_pixels", 256))
+        if bool(fragmentation.get("enabled", True))
+        else 0
+    )
     if str(scaling.get("partition_halo_px", "auto")).lower() == "auto":
-        scaling["partition_halo_px"] = max(overlap, int(scaling["seam_band_px"]))
+        scaling["partition_halo_px"] = max(
+            overlap, int(scaling["seam_band_px"]), fragmentation_buffer
+        )
+    else:
+        scaling["partition_halo_px"] = max(
+            int(scaling["partition_halo_px"]), fragmentation_buffer
+        )
     pixel_count = 512 * 512
     sample_tile_bytes = first_source.stat().st_size
     spatial_plan = plan_spatial_units(

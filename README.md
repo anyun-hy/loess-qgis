@@ -23,6 +23,15 @@ bash/install_plugin.sh --help
 bash/init_project.sh --help
 ```
 
+Tencent Ubuntu 远程命令统一通过项目入口执行：
+
+```sh
+bash/ssh_tencent.sh 'uname -a'
+```
+
+首次调用会建立 SSH 连接，后续调用复用该连接，默认闲置 15 分钟后自动关闭；
+无需预先启动交互式 `ssh Tencent`，也不安装永久后台服务。
+
 `init_project.sh` 在使用者选择的项目根目录中创建 `inference_scripts/`、
 `runtime/`、`weights/`、`input/`、`qgis/` 和 `output/`。权重、用户输入、
 运行输出和 QGIS 工程不进入本仓库，也不会由重复部署覆盖。

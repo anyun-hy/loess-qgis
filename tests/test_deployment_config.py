@@ -155,6 +155,7 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
     assert effective["scaling"]["partition_halo_px"] == "auto"
     assert effective["scaling"]["tile_io_workers"] == "auto"
     assert effective["scaling"]["assembly_validation_workers"] == "auto"
+    assert effective["scaling"]["max_concurrent_assembly"] == "auto"
     assert (
         effective["boundary_fitting"]["mode"]
         == "divider_cubic_bspline_adaptive_v2"
@@ -200,6 +201,7 @@ def test_auto_performance_fields_are_valid_schema_values(tmp_path):
     config["scaling"]["tile_io_workers"] = "auto"
     config["scaling"]["max_cpu_partition_workers"] = "auto"
     config["scaling"]["assembly_validation_workers"] = "auto"
+    config["scaling"]["max_concurrent_assembly"] = "auto"
 
     effective, issues = validate_deployment_config(
         config,
@@ -213,6 +215,7 @@ def test_auto_performance_fields_are_valid_schema_values(tmp_path):
     assert effective["scaling"]["tile_io_workers"] == "auto"
     assert effective["scaling"]["max_cpu_partition_workers"] == "auto"
     assert effective["scaling"]["assembly_validation_workers"] == "auto"
+    assert effective["scaling"]["max_concurrent_assembly"] == "auto"
 
 
 def test_legacy_single_model_config_is_rejected(tmp_path):

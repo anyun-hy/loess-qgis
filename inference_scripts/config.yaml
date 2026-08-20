@@ -15,6 +15,7 @@ scaling:
   min_free_disk_gb: 50
   tile_io_workers: auto
   max_cpu_partition_workers: auto
+  max_concurrent_assembly: auto
   assembly_validation_workers: auto
   max_open_frontier_units: 64
   max_partition_segments: 250000
@@ -69,9 +70,10 @@ boundary_fitting:
   max_segment_arc_length_px: 8.0
   diagnostic_level: changed_and_failed
 
-# Runs after Fusion assembly. It reuses committed mask/confidence partitions,
-# writes a derived review result under run_dir/postprocess, and never replaces
-# the original Fusion products.
+# Runs once on each Fusion probability Halo before spatial-unit vectorization.
+# Only the cleaned, non-overlapping Partition Core is published as the
+# authoritative class raster. The standalone postprocess script remains for
+# explicitly repairing historical completed Runs; it is not part of new Runs.
 fragmentation_regularization:
   enabled: true
   policy_id: semantic_optimized_200_v3

@@ -88,7 +88,6 @@ def _runner(module):
             "profile_id": "approved",
         },
     ]
-    runner._fragmentation_queue = None
     runner._spec = {
         "streams": list(runner._assembly_queue),
         "fragmentation_regularization": {
@@ -108,7 +107,7 @@ def _runner(module):
     return runner
 
 
-def test_assembly_queue_starts_streams_in_run_spec_order(monkeypatch):
+def test_assembly_queue_starts_streams_then_acceptance_without_postprocess(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)
     starts = []
@@ -124,38 +123,29 @@ def test_assembly_queue_starts_streams_in_run_spec_order(monkeypatch):
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
-        "assemble_stream:fusion:approved",
     ]
-    # Simulate all assemblies finished -> triggers fragmentation
+    # The hardware-governed default admits the remaining Stream after a slot
+    # becomes available.
     runner._processes.clear()
     runner._start_assembly()
-    assert runner._phase == "fragmentation"
-    # Simulate fragmentation finished -> triggers scale_acceptance
+    assert [item[0] for item in starts] == [
+        "assemble_stream:model:a",
+        "assemble_stream:model:b",
+        "assemble_stream:fusion:approved",
+    ]
+    # Simulate all assemblies finished -> goes straight to acceptance.
     runner._processes.clear()
-    runner._start_fragmentation()
+    runner._start_assembly()
     assert runner._phase == "acceptance"
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
         "assemble_stream:fusion:approved",
-        "fragmentation_v3:fusion:approved",
         "scale_acceptance",
     ]
-    fragmentation = starts[3]
-    assert fragmentation[1] == "run_fragmentation_postprocess.sh"
-    assert fragmentation[2] == [
-        "--run-spec",
-        "/tmp/run_spec.json",
-        "--stream-id",
-        "fusion:approved",
-        "--workers",
-        "4",
-        "--buffer-pixels",
-        "256",
-    ]
 
 
-def test_passed_fragmentation_manifest_becomes_fusion_review_source(
+def test_formal_gpkg_remains_review_source_even_when_postprocess_exists(
     tmp_path, monkeypatch
 ):
     module = _load_runner_module(monkeypatch)
@@ -189,26 +179,26 @@ def test_passed_fragmentation_manifest_becomes_fusion_review_source(
     (root / "fragmentation_v3_manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
-    runner._spec = {
-        "run_id": "run-1",
-        "run_dir": str(run_dir),
-        "fragmentation_regularization": {
-            "enabled": True,
-            "policy_id": "semantic_optimized_200_v3",
-            "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
-        },
-    }
-
-    value = runner._validated_fragmentation_review(
-        {
-            "stream_id": "fusion:approved",
-            "kind": "fusion",
-            "profile_id": "approved",
-        }
+    formal_root = run_dir / "fusion" / "approved"
+    formal_root.mkdir(parents=True)
+    for name in (
+        "mask_mosaic.vrt",
+        "confidence_mosaic.vrt",
+        "semantic_polygons_raw.gpkg",
+        "semantic_polygons.gpkg",
+        "boundary_fitting_report.json",
+        "fitted_edges.gpkg",
+    ):
+        (formal_root / name).write_bytes(b"formal")
+    (formal_root / "boundary_fitting_report.json").write_text(
+        '{"status":"passed","validation":{"passed":true}}', encoding="utf-8"
     )
-
-    assert value["semantic_polygons"] == str(review)
-    assert value["semantic_polygons_sha256"] == digest(review)
+    runner._spec = {"run_dir": str(run_dir), "boundary_fitting": {"enabled": True}}
+    result = runner._result_stream(
+        {"stream_id": "fusion:approved", "kind": "fusion", "profile_id": "approved"}
+    )
+    assert result["review_polygons"] == str(formal_root / "semantic_polygons.gpkg")
+    assert result["review_layer_name"] == "semantic_polygons"
 
 
 def test_active_assembly_process_blocks_second_stream(monkeypatch):

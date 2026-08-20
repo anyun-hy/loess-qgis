@@ -19,6 +19,7 @@ from affine import Affine
 from fiona.crs import CRS
 from rasterio.features import geometry_mask, shapes
 from rasterio.windows import Window
+from scipy import ndimage
 from shapely.affinity import affine_transform
 from shapely.geometry import LineString, MultiPolygon, Polygon, mapping, shape
 
@@ -38,11 +39,6 @@ from polyline_smoother import SmoothingConfig
 from deployment_config import load_json
 from runtime_metrics import peak_rss_bytes
 from rasterio_compat import quiet_deprecated_memory_driver
-from small_component_regularizer import (
-    physical_pixel_area_m2,
-    regularize_small_components,
-)
-from fragmentation_v3 import production_policy
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
 
@@ -246,16 +242,69 @@ def _unit_probabilities(
     return normalized, valid
 
 
+def _unit_authoritative_labels(
+    database: RunStateDB,
+    run_id: str,
+    stream_id: str,
+    unit: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the non-overlapping Core masks that own one spatial Unit.
+
+    Class assignment is frozen upstream in the authoritative raster stage.
+    Probability halos remain available for confidence statistics, but may not
+    change a category while fitting Core, Seam, or Junction geometry.
+    """
+
+    window = unit["pixel_window"]
+    x0, y0, x1, y1 = (int(window[key]) for key in ("x0", "y0", "x1", "y1"))
+    labels = np.full((y1 - y0, x1 - x0), -1, dtype=np.int16)
+    written = np.zeros(labels.shape, dtype=bool)
+    for partition_id in unit["dependency_ids"]:
+        partition = database.get_partition(run_id, partition_id)
+        artifact = database.artifact_for_stream_unit(
+            run_id, stream_id, partition_id, "core_mask"
+        )
+        if partition is None or artifact is None:
+            raise UnitRuntimeError(
+                "authoritative Core mask dependency is missing: "
+                f"{stream_id}/{partition_id}"
+            )
+        core = partition["core_window"]
+        cx0, cy0, cx1, cy1 = (int(core[key]) for key in ("x0", "y0", "x1", "y1"))
+        ix0, iy0 = max(x0, cx0), max(y0, cy0)
+        ix1, iy1 = min(x1, cx1), min(y1, cy1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        source_window = Window(ix0 - cx0, iy0 - cy0, ix1 - ix0, iy1 - iy0)
+        destination = np.s_[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0]
+        with rasterio.open(artifact["path"]) as source:
+            values = source.read(1, window=source_window).astype(np.int16)
+        if values.shape != labels[destination].shape:
+            raise UnitRuntimeError(
+                f"authoritative Core mask crop has unexpected shape: {partition_id}"
+            )
+        overlap = written[destination]
+        if np.any(overlap & (labels[destination] != values)):
+            raise UnitRuntimeError(
+                f"overlapping authoritative Core masks disagree: {partition_id}"
+            )
+        labels[destination] = values
+        written[destination] = True
+    valid = labels >= 0
+    if not np.all(written):
+        raise UnitRuntimeError("authoritative Core masks leave a Unit coverage gap")
+    return labels, valid
+
+
 def _polygonize(
-    probabilities: np.ndarray,
+    labels: np.ndarray,
     unit: Mapping[str, Any],
     class_codes: list[int],
     valid_mask: np.ndarray | None = None,
-    *,
-    regularize: bool = False,
-    pixel_area_m2: float = 1.0,
 ):
-    mask = probabilities.argmax(axis=0).astype(np.int16)
+    mask = np.asarray(labels, dtype=np.int16)
+    if mask.ndim != 2:
+        raise UnitRuntimeError("authoritative labels must be a two-dimensional raster")
     valid = (
         np.asarray(valid_mask, dtype=bool)
         if valid_mask is not None
@@ -263,17 +312,6 @@ def _polygonize(
     )
     if valid.shape != mask.shape:
         raise UnitRuntimeError("unit validity mask shape does not match probabilities")
-    if regularize and pixel_area_m2 > 0:
-        confidence = probabilities.max(axis=0).astype(np.float32)
-        mask, _ = regularize_small_components(
-            mask,
-            class_codes=class_codes,
-            pixel_area_m2=float(pixel_area_m2),
-            policy=production_policy(),
-            valid_mask=valid,
-            confidence=confidence,
-            probabilities=probabilities,
-        )
     window = unit["pixel_window"]
     transform = Affine.translation(int(window["x0"]), int(window["y0"]))
     records = []
@@ -285,6 +323,7 @@ def _polygonize(
             mask,
             mask=valid.astype(np.uint8),
             transform=transform,
+            connectivity=4,
         )
         for index, (geometry, value) in enumerate(polygons):
             class_index = int(value)
@@ -563,6 +602,42 @@ def _vertex_count(records: list[Mapping[str, Any]]) -> int:
     )
 
 
+def _raster_complexity(
+    labels: np.ndarray,
+    valid_mask: np.ndarray,
+    class_count: int,
+) -> tuple[int, int]:
+    """Estimate unit complexity before its sole polygonization pass."""
+
+    values = np.asarray(labels, dtype=np.int16)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if values.shape != valid.shape:
+        raise UnitRuntimeError("labels and valid mask shapes differ")
+    structure = ndimage.generate_binary_structure(2, 1)
+    feature_count = 0
+    for class_index in range(int(class_count)):
+        _components, count = ndimage.label(
+            valid & (values == class_index), structure=structure
+        )
+        feature_count += int(count)
+    padded_valid = np.pad(valid, 1, constant_values=False)
+    padded_values = np.pad(values, 1, constant_values=-1)
+    horizontal = (padded_valid[:, 1:] != padded_valid[:, :-1]) | (
+        padded_valid[:, 1:]
+        & padded_valid[:, :-1]
+        & (padded_values[:, 1:] != padded_values[:, :-1])
+    )
+    vertical = (padded_valid[1:, :] != padded_valid[:-1, :]) | (
+        padded_valid[1:, :]
+        & padded_valid[:-1, :]
+        & (padded_values[1:, :] != padded_values[:-1, :])
+    )
+    return feature_count, 2 * (
+        int(np.count_nonzero(horizontal))
+        + int(np.count_nonzero(vertical))
+    )
+
+
 def _without_smoothing(raw_records: list[Mapping[str, Any]]):
     formal_records = []
     for record in raw_records:
@@ -619,7 +694,7 @@ def _without_smoothing(raw_records: list[Mapping[str, Any]]):
 
 
 def _fit_or_subdivide(
-    probabilities: np.ndarray,
+    labels: np.ndarray,
     unit: Mapping[str, Any],
     class_codes: list[int],
     *,
@@ -630,63 +705,63 @@ def _fit_or_subdivide(
     min_core_px: int,
     force_split: bool = False,
     smoothing_enabled: bool = True,
-    regularize: bool = False,
-    pixel_area_m2: float = 1.0,
     depth: int = 0,
     output_transform: tuple[float, ...] | None = None,
 ):
     if valid_mask is None:
-        valid_mask = np.ones(probabilities.shape[1:], dtype=bool)
-    raw_records = _polygonize(
-        probabilities,
-        unit,
-        class_codes,
-        valid_mask=valid_mask,
-        regularize=regularize,
-        pixel_area_m2=pixel_area_m2,
+        valid_mask = np.ones(labels.shape, dtype=bool)
+    estimated_features, estimated_segments = _raster_complexity(
+        labels, valid_mask, len(class_codes)
     )
-    if not raw_records:
-        return [], [], {
-            "status": "passed",
-            "smoothing_enabled": bool(smoothing_enabled),
-            "fit_version": (
-                "divider_cubic_bspline_adaptive_v2"
-                if smoothing_enabled else "raw_polygonize_v1"
-            ),
-            "chain_count": 0,
-            "shared_chain_count": 0,
-            "spline_count": 0,
-            "unchanged_count": 0,
-            "skipped_invalid_count": 0,
-            "max_displacement_px": 0.0,
-            "mean_displacement_px": 0.0,
-            "dense_curve_point_count": 0,
-            "sparse_curve_point_count": 0,
-            "max_chord_error_px": 0.0,
-            "max_segment_arc_length_px": 0.0,
-            "candidate_validation": {
-                "passed": True,
-                "scope": (
-                    "per_common_divider" if smoothing_enabled else "not_applicable"
-                ),
-                "checks": (
-                    ["valid", "positive_area", "pair_total_area"]
-                    if smoothing_enabled else []
-                ),
-                "rejected_count": 0,
-            },
-            "validation": {
-                "passed": True,
-                "scope": "all_output_polygons",
-                "invalid_count": 0,
-            },
-            "diagnostics": [],
-            "subdivision_depth": depth,
-            "subdivision_count": 0,
-        }
-    segments = _vertex_count(raw_records)
-    exceeds = len(raw_records) > max_features or segments > max_segments
+    exceeds = (
+        estimated_features > max_features or estimated_segments > max_segments
+    )
     if not exceeds and not force_split:
+        raw_records = _polygonize(
+            labels,
+            unit,
+            class_codes,
+            valid_mask=valid_mask,
+        )
+        if not raw_records:
+            return [], [], {
+                "status": "passed",
+                "smoothing_enabled": bool(smoothing_enabled),
+                "fit_version": (
+                    "divider_cubic_bspline_adaptive_v2"
+                    if smoothing_enabled else "raw_polygonize_v1"
+                ),
+                "chain_count": 0,
+                "shared_chain_count": 0,
+                "spline_count": 0,
+                "unchanged_count": 0,
+                "skipped_invalid_count": 0,
+                "max_displacement_px": 0.0,
+                "mean_displacement_px": 0.0,
+                "dense_curve_point_count": 0,
+                "sparse_curve_point_count": 0,
+                "max_chord_error_px": 0.0,
+                "max_segment_arc_length_px": 0.0,
+                "candidate_validation": {
+                    "passed": True,
+                    "scope": (
+                        "per_common_divider" if smoothing_enabled else "not_applicable"
+                    ),
+                    "checks": (
+                        ["valid", "positive_area", "pair_total_area"]
+                        if smoothing_enabled else []
+                    ),
+                    "rejected_count": 0,
+                },
+                "validation": {
+                    "passed": True,
+                    "scope": "all_output_polygons",
+                    "invalid_count": 0,
+                },
+                "diagnostics": [],
+                "subdivision_depth": depth,
+                "subdivision_count": 0,
+            }
         if not smoothing_enabled:
             formal_records, report = _without_smoothing(raw_records)
             report["subdivision_depth"] = depth
@@ -733,7 +808,7 @@ def _fit_or_subdivide(
             local_y0 = y0 - int(window["y0"])
             local_y1 = y1 - int(window["y0"])
             child_raw, child_formal, child_report = _fit_or_subdivide(
-                probabilities[:, local_y0:local_y1, local_x0:local_x1],
+                labels[local_y0:local_y1, local_x0:local_x1],
                 child,
                 class_codes,
                 valid_mask=valid_mask[local_y0:local_y1, local_x0:local_x1],
@@ -743,8 +818,6 @@ def _fit_or_subdivide(
                 min_core_px=min_core_px,
                 force_split=False,
                 smoothing_enabled=smoothing_enabled,
-                regularize=regularize,
-                pixel_area_m2=pixel_area_m2,
                 depth=depth + 1,
                 output_transform=output_transform,
             )
@@ -869,9 +942,16 @@ def run_unit_fit(
             )
         smoothing_enabled = bool(boundary.get("enabled", True))
         emit("polygonize_started", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
-        probabilities, valid_mask = _unit_probabilities(
+        probabilities, probability_valid = _unit_probabilities(
             database, run_id, stream_id, unit
         )
+        labels, valid_mask = _unit_authoritative_labels(
+            database, run_id, stream_id, unit
+        )
+        if np.any(valid_mask & ~probability_valid):
+            raise UnitRuntimeError(
+                "authoritative Core mask is valid where probability coverage is absent"
+            )
         class_snapshot = load_json(Path(spec["class_mapping_snapshot"]))
         class_codes = [
             int(class_snapshot["index_to_code"][str(index)]) for index in range(14)
@@ -892,25 +972,8 @@ def run_unit_fit(
             transform.c,
             transform.f,
         )
-        frag_config = spec.get("fragmentation_regularization") or {}
-        frag_enabled = bool(frag_config.get("enabled", True))
-        target_stream_kind = str(frag_config.get("stream_kind") or "fusion")
-        is_fusion = stream_id.startswith("fusion:") or any(
-            s.get("stream_id") == stream_id and s.get("kind") == "fusion"
-            for s in spec.get("streams", [])
-        )
-        apply_regularization = frag_enabled and (
-            target_stream_kind == "all"
-            or (target_stream_kind == "fusion" and is_fusion)
-        )
-        pixel_area_m2 = physical_pixel_area_m2(
-            transform,
-            spec["raster"]["crs"],
-            height=probabilities.shape[1],
-            width=probabilities.shape[2],
-        )
         raw_records, formal_records, report = _fit_or_subdivide(
-            probabilities,
+            labels,
             unit,
             class_codes,
             valid_mask=valid_mask,
@@ -920,8 +983,6 @@ def run_unit_fit(
             min_core_px=2 * int(spec["tile_grid"]["stride"]),
             force_split=force_marker.is_file(),
             smoothing_enabled=smoothing_enabled,
-            regularize=apply_regularization,
-            pixel_area_m2=pixel_area_m2,
             output_transform=output_transform,
         )
         _attach_confidence(raw_records, probabilities, valid_mask, unit)

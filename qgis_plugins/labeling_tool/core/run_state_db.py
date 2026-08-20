@@ -175,6 +175,26 @@ class RunStateDB:
                     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS stream_runtime_progress (
+                    run_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT '',
+                    phase TEXT NOT NULL DEFAULT '',
+                    phase_name TEXT NOT NULL DEFAULT '',
+                    phase_index INTEGER NOT NULL DEFAULT 0,
+                    phase_total INTEGER NOT NULL DEFAULT 0,
+                    progress_current INTEGER NOT NULL DEFAULT 0,
+                    progress_total INTEGER NOT NULL DEFAULT 0,
+                    feature_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    message TEXT NOT NULL DEFAULT '',
+                    phase_started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, stream_id),
+                    FOREIGN KEY (run_id, stream_id)
+                        REFERENCES streams(run_id, stream_id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS work_packages (
                     run_id TEXT NOT NULL,
                     package_id TEXT NOT NULL,
@@ -387,6 +407,8 @@ class RunStateDB:
 
                 CREATE INDEX IF NOT EXISTS idx_streams_status
                     ON streams(run_id, status, stream_id);
+                CREATE INDEX IF NOT EXISTS idx_stream_progress_stage
+                    ON stream_runtime_progress(run_id, stage, status, stream_id);
                 CREATE INDEX IF NOT EXISTS idx_packages_status
                     ON work_packages(run_id, status, sequence_no);
                 CREATE INDEX IF NOT EXISTS idx_partitions_status
@@ -554,6 +576,108 @@ class RunStateDB:
                    WHERE run_id=? AND stream_id=?""",
                 (str(status), str(error), _now(), str(run_id), str(stream_id)),
             ).rowcount == 1
+
+    def upsert_stream_runtime_progress(
+        self,
+        run_id: str,
+        stream_id: str,
+        *,
+        stage: str,
+        phase: str,
+        phase_name: str,
+        phase_index: int,
+        phase_total: int,
+        current: int = 0,
+        total: int = 0,
+        feature_count: int = 0,
+        status: str = "running",
+        message: str = "",
+    ) -> None:
+        """Persist the latest bounded progress row for one result Stream.
+
+        Progress is an overwriteable control-plane snapshot, not an event log.
+        Keeping one row per Stream lets a reopened QGIS monitor recover the
+        current phase without accumulating one database row per feature.
+        """
+
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO stream_runtime_progress
+                   (run_id, stream_id, stage, phase, phase_name,
+                    phase_index, phase_total, progress_current,
+                    progress_total, feature_count, status, message,
+                    phase_started_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id, stream_id) DO UPDATE SET
+                     stage=excluded.stage,
+                     phase=excluded.phase,
+                     phase_name=excluded.phase_name,
+                     phase_index=excluded.phase_index,
+                     phase_total=excluded.phase_total,
+                     progress_current=excluded.progress_current,
+                     progress_total=excluded.progress_total,
+                     feature_count=excluded.feature_count,
+                     status=excluded.status,
+                     message=excluded.message,
+                     phase_started_at=CASE
+                       WHEN stream_runtime_progress.phase!=excluded.phase
+                         OR stream_runtime_progress.stage!=excluded.stage
+                       THEN excluded.phase_started_at
+                       ELSE stream_runtime_progress.phase_started_at
+                     END,
+                     updated_at=excluded.updated_at""",
+                (
+                    str(run_id),
+                    str(stream_id),
+                    str(stage),
+                    str(phase),
+                    str(phase_name),
+                    max(0, int(phase_index)),
+                    max(0, int(phase_total)),
+                    max(0, int(current)),
+                    max(0, int(total)),
+                    max(0, int(feature_count)),
+                    str(status),
+                    str(message),
+                    now,
+                    now,
+                ),
+            )
+
+    def stream_runtime_progress(
+        self, run_id: str, stream_id: str = ""
+    ) -> dict[str, dict[str, Any]]:
+        sql = "SELECT * FROM stream_runtime_progress WHERE run_id=?"
+        values: list[Any] = [str(run_id)]
+        if stream_id:
+            sql += " AND stream_id=?"
+            values.append(str(stream_id))
+        sql += " ORDER BY stream_id"
+        with self._connection() as connection:
+            rows = connection.execute(sql, values).fetchall()
+        return {str(row["stream_id"]): dict(row) for row in rows}
+
+    def fail_stream_runtime_progress(
+        self, run_id: str, stream_id: str, error: str
+    ) -> None:
+        progress = self.stream_runtime_progress(run_id, stream_id).get(
+            str(stream_id)
+        ) or {}
+        self.upsert_stream_runtime_progress(
+            run_id,
+            stream_id,
+            stage=str(progress.get("stage") or "assembly"),
+            phase=str(progress.get("phase") or "failed"),
+            phase_name=str(progress.get("phase_name") or "组装失败"),
+            phase_index=int(progress.get("phase_index") or 0),
+            phase_total=int(progress.get("phase_total") or 0),
+            current=int(progress.get("progress_current") or 0),
+            total=int(progress.get("progress_total") or 0),
+            feature_count=int(progress.get("feature_count") or 0),
+            status="failed",
+            message=str(error),
+        )
 
     def fail_open_streams(self, run_id: str, error: str) -> int:
         """Fail every non-ready stream after a terminal Run failure."""
@@ -1179,11 +1303,26 @@ class RunStateDB:
                 ).setdefault(str(row["unit_type"]), {})[
                     str(row["status"])
                 ] = int(row["n"])
+            # Historical schema-v2 Runs created before structured assembly
+            # monitoring do not have this additive table.  Keep them readable
+            # with coarse Stream status instead of breaking the entire panel.
+            try:
+                stream_runtime_progress = {
+                    str(row["stream_id"]): dict(row)
+                    for row in connection.execute(
+                        """SELECT * FROM stream_runtime_progress
+                           WHERE run_id=? ORDER BY stream_id""",
+                        (identifier,),
+                    ).fetchall()
+                }
+            except Exception:
+                stream_runtime_progress = {}
         return {
             "run": run,
             "job_counts": job_counts,
             "active_work_package": active_package,
             "streams": streams,
+            "stream_runtime_progress": stream_runtime_progress,
             "stream_unit_type_counts": stream_unit_type_counts,
             "stream_unit_job_type_counts": stream_unit_job_type_counts,
         }

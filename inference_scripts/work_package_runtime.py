@@ -36,6 +36,11 @@ from labeling_tool.core.run_state_db import RunStateDB
 
 from _device import resolve_device, validate_device
 from accepted_score import accepted_probabilities
+from authoritative_raster import (
+    apply_range_mask_to_core,
+    core_mask_tags,
+    regularize_partition_core,
+)
 from deployment_config import load_json
 from incremental_fusion import FusionAccumulator
 from partition_mosaic import (
@@ -43,6 +48,7 @@ from partition_mosaic import (
     derive_partition_arrays,
     write_partition_rasters,
 )
+from range_clip_runtime import RangeClipRuntimeError, extract_range_mask_geometry
 from runtime_metrics import directory_size, peak_rss_bytes
 from score_batch_cache import (
     CHECKPOINT_WRITE_OVERHEAD_BYTES,
@@ -66,6 +72,15 @@ from torchscript_runtime import load_torchscript_model
 
 class WorkPackageRuntimeError(RuntimeError):
     pass
+
+
+def _range_geometry_for_run(spec: Mapping[str, Any], crs: str):
+    """Resolve the one frozen exact boundary before a Package starts work."""
+
+    try:
+        return extract_range_mask_geometry(spec, crs)
+    except RangeClipRuntimeError as error:
+        raise WorkPackageRuntimeError(str(error)) from error
 
 
 class LeaseLostError(WorkPackageRuntimeError):
@@ -876,6 +891,7 @@ def _run_work_package_impl(
     package_root.mkdir(parents=True, exist_ok=True)
     transform = Affine(*[float(value) for value in spec["raster"]["transform"]])
     crs = spec["raster"]["crs"]
+    range_geometry = _range_geometry_for_run(spec, str(crs))
     overlap = int(spec["tile_grid"]["overlap"])
     profile = _load_profile(spec)
     active_fusion_head = fusion_head
@@ -1390,6 +1406,12 @@ def _run_work_package_impl(
                 partition: Mapping[str, Any], arrays: Mapping[str, np.ndarray]
             ) -> None:
                 partition_id = str(partition["partition_id"])
+                arrays, range_report = apply_range_mask_to_core(
+                    arrays,
+                    partition,
+                    global_transform=transform,
+                    range_geometry=range_geometry,
+                )
                 probability_path = (
                     run_dir
                     / "tmp"
@@ -1433,6 +1455,12 @@ def _run_work_package_impl(
                         output_mask=raster_root / f"{partition_id}_mask.tif",
                         output_confidence=raster_root
                         / f"{partition_id}_confidence.tif",
+                        core_mask_tags=core_mask_tags(
+                            {
+                                "authority": "partition_core_argmax_v1",
+                                **range_report,
+                            }
+                        ),
                     )
                 finally:
                     current_probability_bytes = (
@@ -1444,9 +1472,9 @@ def _run_work_package_impl(
                         current_probability_bytes - previous_probability_bytes
                     )
                 for kind, key in (
-                    ("partition_probability", "probability"),
                     ("core_mask", "mask"),
                     ("core_confidence", "confidence"),
+                    ("partition_probability", "probability"),
                 ):
                     if lease_guard is not None:
                         lease_guard()
@@ -1893,6 +1921,31 @@ def _run_work_package_impl(
                     partition,
                     weights=coverage.astype(np.float32),
                 )
+                if bool(
+                    (spec.get("fragmentation_regularization") or {}).get(
+                        "enabled", True
+                    )
+                ):
+                    arrays, regularization = regularize_partition_core(
+                        arrays,
+                        partition,
+                        global_transform=transform,
+                        crs=str(crs),
+                        range_geometry=range_geometry,
+                    )
+                else:
+                    arrays, range_report = apply_range_mask_to_core(
+                        arrays,
+                        partition,
+                        global_transform=transform,
+                        range_geometry=range_geometry,
+                    )
+                    regularization = {
+                        "authority": "partition_core_argmax_v1",
+                        "changed_pixel_count": 0,
+                        "changed_component_count": 0,
+                        **range_report,
+                    }
                 probability_path = (
                     run_dir / "tmp" / "probability_parts" / f"fusion_{fusion_id}" / f"{partition_id}.tif"
                 )
@@ -1930,6 +1983,7 @@ def _run_work_package_impl(
                         output_mask=raster_root / f"{partition_id}_mask.tif",
                         output_confidence=raster_root
                         / f"{partition_id}_confidence.tif",
+                        core_mask_tags=core_mask_tags(regularization),
                     )
                 finally:
                     current_probability_bytes = (
@@ -1940,10 +1994,14 @@ def _run_work_package_impl(
                     reservation.settle(
                         current_probability_bytes - previous_probability_bytes
                     )
+                # Publish the permanent Core products first.  The probability
+                # artifact is the unit-fit dependency gate, so publishing it
+                # last makes every Core/Seam/Junction read the authoritative
+                # V3-cleaned classes, never a transient argmax crop.
                 for kind, key in (
-                    ("partition_probability", "probability"),
                     ("core_mask", "mask"),
                     ("core_confidence", "confidence"),
+                    ("partition_probability", "probability"),
                 ):
                     if lease_guard is not None:
                         lease_guard()
@@ -1957,6 +2015,19 @@ def _run_work_package_impl(
                     )
                     if kind in {"core_mask", "core_confidence"}:
                         ready_permanent_keys.add((stream_id, partition_id, kind))
+                emit(
+                    "authoritative_raster_ready",
+                    run_id=run_id,
+                    stream_id=stream_id,
+                    partition_id=partition_id,
+                    changed_pixel_count=int(
+                        regularization.get("changed_pixel_count", 0)
+                    ),
+                    changed_component_count=int(
+                        regularization.get("changed_component_count", 0)
+                    ),
+                    authority=str(regularization["authority"]),
+                )
             removed = _remove_tree_with_count(
                 package_root / "fusion" / fusion_id
             )

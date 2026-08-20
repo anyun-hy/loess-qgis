@@ -239,10 +239,17 @@ def resolve_hardware_tuning(
         scaling_value.get("tile_io_workers", "auto"),
         min(16, max(4, physical)),
     )
+    assembly_concurrency, assembly_concurrency_auto = _configured_or_auto(
+        scaling_value.get("max_concurrent_assembly", "auto"),
+        min(2, physical),
+    )
+    assembly_concurrency = min(assembly_concurrency, physical)
+    assembly_worker_budget = max(1, physical // assembly_concurrency)
     assembly_workers, assembly_auto = _configured_or_auto(
         scaling_value.get("assembly_validation_workers", "auto"),
-        min(8, physical),
+        min(8, assembly_worker_budget),
     )
+    assembly_workers = min(assembly_workers, assembly_worker_budget)
     package_threads = min(automatic_package_threads, physical)
     geometry_with_package = max(1, geometry_workers - package_threads)
 
@@ -252,6 +259,7 @@ def resolve_hardware_tuning(
             "max_cpu_partition_workers": geometry_workers,
             "max_cpu_partition_workers_with_package": geometry_with_package,
             "tile_io_workers": tile_io_workers,
+            "max_concurrent_assembly": assembly_concurrency,
             "assembly_validation_workers": assembly_workers,
         }
     )
@@ -260,6 +268,7 @@ def resolve_hardware_tuning(
         "max_cpu_partition_workers": geometry_workers,
         "max_cpu_partition_workers_with_package": geometry_with_package,
         "tile_io_workers": tile_io_workers,
+        "max_concurrent_assembly": assembly_concurrency,
         "assembly_validation_workers": assembly_workers,
         "unit_process_threads": 1,
         "package_process_threads": package_threads,
@@ -271,6 +280,7 @@ def resolve_hardware_tuning(
             ("tile_batch_size", batch_auto),
             ("max_cpu_partition_workers", geometry_auto),
             ("tile_io_workers", io_auto),
+            ("max_concurrent_assembly", assembly_concurrency_auto),
             ("assembly_validation_workers", assembly_auto),
         )
         if enabled
