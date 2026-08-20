@@ -79,7 +79,6 @@ class V5AsyncInferenceRunner(QObject):
         "run_unit_fit.sh",
         "run_finalize_partition_rasters.sh",
         "run_assemble_stream.sh",
-        "run_fragmentation_postprocess.sh",
         "run_scale_acceptance.sh",
     )
 
@@ -104,7 +103,6 @@ class V5AsyncInferenceRunner(QObject):
         self._accelerator_crash_count = 0
         self._processes = {}
         self._assembly_queue = []
-        self._fragmentation_queue = None
         self._started_at = 0.0
         self._manual_package_reset = {}
         self._scheduler = QTimer(self)
@@ -181,7 +179,6 @@ class V5AsyncInferenceRunner(QObject):
         self._accelerator_done = False
         self._accelerator_crash_count = 0
         self._assembly_queue = []
-        self._fragmentation_queue = None
         self._started_at = time.time()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
         if resume and recovered_package_jobs:
@@ -375,7 +372,13 @@ class V5AsyncInferenceRunner(QObject):
 
     def _start_assembly(self):
         scaling = self._spec.get("scaling") or {}
-        max_concurrent = int(scaling.get("max_concurrent_assembly", 4))
+        max_concurrent = max(
+            1,
+            min(
+                int(scaling.get("max_concurrent_assembly", 2)),
+                max(1, len(self._spec.get("streams") or [])),
+            ),
+        )
         while self._assembly_queue:
             active_assemblies = [
                 entry
@@ -406,39 +409,15 @@ class V5AsyncInferenceRunner(QObject):
             if (entry.get("context") or {}).get("kind") == "assemble"
         ]
         if not active_assemblies and not self._assembly_queue:
-            QTimer.singleShot(0, self._start_fragmentation)
+            QTimer.singleShot(0, self._start_acceptance)
 
-    def _start_fragmentation(self):
-        config = self._spec.get("fragmentation_regularization") or {}
-        if self._fragmentation_queue is None:
-            self._fragmentation_queue = (
-                [
-                    stream for stream in self._spec.get("streams") or []
-                    if stream.get("kind") == "fusion"
-                ]
-                if config.get("enabled", True)
-                else []
-            )
-        if self._fragmentation_queue:
-            stream = self._fragmentation_queue.pop(0)
-            self._phase = "fragmentation"
-            self._start_process(
-                f"fragmentation_v3:{stream['stream_id']}",
-                "run_fragmentation_postprocess.sh",
-                [
-                    "--run-spec", self._spec_path,
-                    "--stream-id", stream["stream_id"],
-                    "--workers", str(int(config.get("max_workers", 4))),
-                    "--buffer-pixels", str(
-                        int(config.get("buffer_pixels", 256))
-                    ),
-                ],
-                {
-                    "kind": "fragmentation",
-                    "stream_id": stream["stream_id"],
-                },
-            )
-            return
+    def _start_acceptance(self):
+        """Continue from the one assembly pass to acceptance.
+
+        Historical completed Runs can still be repaired explicitly with the
+        standalone fragmentation script.  New v5 Runs never launch it or let
+        it replace the formal assembled GPKG.
+        """
         self._phase = "acceptance"
         self._start_process(
             "scale_acceptance",
@@ -683,8 +662,6 @@ class V5AsyncInferenceRunner(QObject):
             QTimer.singleShot(0, self._start_assembly)
         elif context.get("kind") == "assemble":
             QTimer.singleShot(0, self._start_assembly)
-        elif context.get("kind") == "fragmentation":
-            QTimer.singleShot(0, self._start_fragmentation)
         elif context.get("kind") == "scale_acceptance":
             self._finish(True, "")
 
@@ -900,75 +877,15 @@ class V5AsyncInferenceRunner(QObject):
                 key: artifact_sha256(path) for key, path in paths.items()
             },
         }
-        candidate_path = root / "semantic_candidates.gpkg"
-        if candidate_path.is_file():
-            result["review_polygons"] = str(candidate_path)
-            result["review_layer_name"] = "semantic_candidates"
-            result["output_sha256"]["review_polygons"] = sha256_file(candidate_path)
-        fragmentation = self._validated_fragmentation_review(stream)
-        if fragmentation is not None:
-            review_path = Path(fragmentation["semantic_polygons"])
-            result["review_polygons"] = str(review_path)
-            result["review_layer_name"] = str(
-                fragmentation.get("semantic_polygons_layer")
-                or "semantic_polygons"
-            )
-            result["output_sha256"]["review_polygons"] = str(
-                fragmentation["semantic_polygons_sha256"]
-            )
-            result["fragmentation_postprocess"] = {
-                "policy_id": fragmentation["policy_id"],
-                "policy_version": fragmentation["policy_version"],
-                "manifest": fragmentation["manifest_path"],
-                "report": fragmentation["report_path"],
-            }
+        # The formal assembled geometry is the review source for every new
+        # stream.  Candidate and historical postprocess layers are auxiliary
+        # diagnostics only and may not silently replace production geometry.
+        result["review_polygons"] = paths["semantic_polygons"]
+        result["review_layer_name"] = "semantic_polygons"
+        result["output_sha256"]["review_polygons"] = result["output_sha256"][
+            "semantic_polygons"
+        ]
         return result
-
-    def _validated_fragmentation_review(self, stream):
-        config = self._spec.get("fragmentation_regularization") or {}
-        if not config.get("enabled", True) or stream.get("kind") != "fusion":
-            return None
-        policy_id = str(config.get("policy_id") or "semantic_optimized_200_v3")
-        root = (
-            Path(self._spec["run_dir"])
-            / "postprocess"
-            / policy_id
-            / "fusion"
-            / str(stream["profile_id"])
-        ).resolve()
-        manifest_path = root / "fragmentation_v3_manifest.json"
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as handle:
-                manifest = json.load(handle)
-            review_path = Path(str(manifest["semantic_polygons"])).resolve()
-            report_path = Path(str(manifest["report_path"])).resolve()
-            review_path.relative_to(root)
-            report_path.relative_to(root)
-            if (
-                manifest.get("status") != "passed"
-                or manifest.get("run_id") != self._spec.get("run_id")
-                or manifest.get("stream_id") != stream.get("stream_id")
-                or manifest.get("policy_id") != policy_id
-                or manifest.get("policy_version")
-                != config.get(
-                    "policy_version",
-                    "semantic_optimized_200_v3_core_bounded_v1",
-                )
-                or not report_path.is_file()
-                or sha256_file(report_path) != manifest.get("report_sha256")
-                or not review_path.is_file()
-                or sha256_file(review_path)
-                != manifest.get("semantic_polygons_sha256")
-            ):
-                return None
-        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-        return {
-            **manifest,
-            "manifest_path": str(manifest_path),
-            "semantic_polygons": str(review_path),
-            "report_path": str(report_path),
-        }
 
     def _finish(self, success, error):
         if not self._running:

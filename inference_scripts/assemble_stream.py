@@ -13,7 +13,7 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import fiona
 from fiona.crs import CRS
@@ -34,7 +34,11 @@ from labeling_tool.core.run_spec import sha256_file
 
 from deployment_config import load_json
 from difference_runtime import apply_accepted_difference
-from range_clip_runtime import apply_adaptive_range_clip
+from range_clip_runtime import (
+    RangeClipRuntimeError,
+    apply_adaptive_range_clip,
+    extract_range_mask_geometry,
+)
 from semantic_batch import _atomic_json
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
 from work_package_runtime import _commit_artifact
@@ -42,6 +46,121 @@ from work_package_runtime import _commit_artifact
 
 class StreamAssemblyError(RuntimeError):
     pass
+
+
+ASSEMBLY_PHASES = (
+    ("validate_inputs", "校验单元产物"),
+    ("register_objects", "登记对象部件"),
+    ("link_objects", "连接跨单元对象"),
+    ("write_raw", "写入 Raw GPKG"),
+    ("write_formal", "写入正式 GPKG"),
+    ("aggregate_reports", "汇总拟合边界"),
+    ("range_clip", "精确范围裁剪"),
+    ("accepted_difference", "Accepted 差分"),
+    ("publish_cleanup", "提交产物并清理中间文件"),
+)
+ASSEMBLY_PHASE_INDEX = {
+    phase: index
+    for index, (phase, _name) in enumerate(ASSEMBLY_PHASES, start=1)
+}
+ASSEMBLY_PHASE_NAMES = dict(ASSEMBLY_PHASES)
+ASSEMBLY_PROGRESS_INTERVAL_SEC = 0.75
+
+
+class _AssemblyProgress:
+    """Emit and persist throttled, restart-visible Stream assembly progress."""
+
+    def __init__(self, database: RunStateDB, run_id: str, stream_id: str):
+        self.database = database
+        self.run_id = str(run_id)
+        self.stream_id = str(stream_id)
+        self.started_at = time.monotonic()
+        self._last_emit_at = 0.0
+        self._last_phase = ""
+
+    def emit(
+        self,
+        phase: str,
+        *,
+        current: int = 0,
+        total: int = 0,
+        feature_count: int = 0,
+        status: str = "running",
+        message: str = "",
+        force: bool = False,
+    ) -> None:
+        phase_value = str(phase)
+        if phase_value not in ASSEMBLY_PHASE_INDEX:
+            raise StreamAssemblyError(
+                f"unknown assembly progress phase: {phase_value}"
+            )
+        now = time.monotonic()
+        total_value = max(0, int(total))
+        current_value = max(0, int(current))
+        if total_value:
+            current_value = min(current_value, total_value)
+        should_emit = (
+            force
+            or phase_value != self._last_phase
+            or str(status) != "running"
+            or (total_value > 0 and current_value >= total_value)
+            or now - self._last_emit_at >= ASSEMBLY_PROGRESS_INTERVAL_SEC
+        )
+        if not should_emit:
+            return
+        event = {
+            "event": "assembly_progress",
+            "run_id": self.run_id,
+            "stream_id": self.stream_id,
+            "stage": "assembly",
+            "phase": phase_value,
+            "phase_name": ASSEMBLY_PHASE_NAMES[phase_value],
+            "phase_index": ASSEMBLY_PHASE_INDEX[phase_value],
+            "phase_total": len(ASSEMBLY_PHASES),
+            "current": current_value,
+            "total": total_value,
+            "feature_count": max(0, int(feature_count)),
+            "status": str(status),
+            "message": str(message),
+            "elapsed_sec": round(now - self.started_at, 3),
+        }
+        try:
+            self.database.upsert_stream_runtime_progress(
+                self.run_id,
+                self.stream_id,
+                stage="assembly",
+                phase=phase_value,
+                phase_name=event["phase_name"],
+                phase_index=event["phase_index"],
+                phase_total=event["phase_total"],
+                current=current_value,
+                total=total_value,
+                feature_count=event["feature_count"],
+                status=event["status"],
+                message=event["message"],
+            )
+        except Exception as error:
+            print(
+                json.dumps(
+                    {
+                        "event": "assembly_progress_persistence_warning",
+                        "run_id": self.run_id,
+                        "stream_id": self.stream_id,
+                        "phase": phase_value,
+                        "error": str(error),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+            flush=True,
+        )
+        self._last_phase = phase_value
+        self._last_emit_at = now
 
 
 ASSEMBLY_VALIDATION_MAX_IN_FLIGHT = 32
@@ -572,7 +691,7 @@ def _validate_existing_gpkg(
     schema: Mapping[str, Any],
     crs: Any,
     identity: Mapping[str, str],
-    expected_feature_count: int,
+    expected_feature_count: int | None,
 ) -> dict[str, Any]:
     if not path.is_file():
         raise StreamAssemblyError(f"resume input is missing: {path}")
@@ -633,7 +752,10 @@ def _validate_existing_gpkg(
                 f"expected={expected_crs}, actual={actual_crs}"
             )
         feature_count = len(source)
-        if feature_count != int(expected_feature_count):
+        if (
+            expected_feature_count is not None
+            and feature_count != int(expected_feature_count)
+        ):
             raise StreamAssemblyError(
                 f"resume input feature count changed: {path}::{layer}; "
                 f"expected={expected_feature_count}, actual={feature_count}"
@@ -664,6 +786,42 @@ def _validate_existing_gpkg(
         "feature_count": int(feature_count),
         **_file_fingerprint(path),
     }
+
+
+def _assert_gpkg_within_exact_range(
+    path: Path,
+    *,
+    layer: str,
+    spec: Mapping[str, Any],
+) -> None:
+    """Reject a resume formal output that was not clipped to its frozen range."""
+
+    selection = spec.get("range_selection") or {}
+    if (
+        selection.get("mode") != "vector_tile_intersection"
+        and not isinstance(spec.get("requested_extent"), Mapping)
+    ):
+        # Pre-range legacy runs have neither a vector authority nor an extent
+        # contract to validate. They remain resumable without inventing one.
+        return
+
+    try:
+        with fiona.open(path, layer=layer) as source:
+            mask = extract_range_mask_geometry(spec, source.crs_wkt or source.crs)
+            if mask is None or mask.is_empty:
+                raise StreamAssemblyError("resume formal output has no exact range mask")
+            outside = sum(
+                1
+                for feature in source
+                if feature.get("geometry")
+                and not mask.covers(shape(feature["geometry"]))
+            )
+    except RangeClipRuntimeError as error:
+        raise StreamAssemblyError(str(error)) from error
+    if outside:
+        raise StreamAssemblyError(
+            f"resume formal output contains {outside} features outside the exact range"
+        )
 
 
 def _resolved_object_state(
@@ -736,6 +894,7 @@ def _parallel_validate_summary_artifacts(
     crs: Any,
     run_id: str,
     stream_id: str,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Validate immutable report/edge shards with a bounded future window."""
     if not items:
@@ -778,6 +937,7 @@ def _parallel_validate_summary_artifacts(
 
     iterator = iter(items)
     pending = set()
+    completed_count = 0
     with ThreadPoolExecutor(
         max_workers=max(1, int(workers)),
         thread_name_prefix="assembly-validator",
@@ -792,6 +952,9 @@ def _parallel_validate_summary_artifacts(
             completed, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in completed:
                 future.result()
+                completed_count += 1
+                if progress_callback is not None:
+                    progress_callback(completed_count, len(items))
             while len(pending) < ASSEMBLY_VALIDATION_MAX_IN_FLIGHT:
                 try:
                     pending.add(executor.submit(validate, next(iterator)))
@@ -814,6 +977,7 @@ def _validated_summary_inputs(
     expected_units: int,
     report_artifacts: list[Mapping[str, Any]],
     edge_schema: Mapping[str, Any],
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summaries = database.unit_report_summaries(run_id, stream_id)
     if len(summaries) != int(expected_units):
@@ -889,6 +1053,7 @@ def _validated_summary_inputs(
         crs=spec["raster"]["crs"],
         run_id=run_id,
         stream_id=stream_id,
+        progress_callback=progress_callback,
     )
     return (
         [edges_by_unit[unit_id] for unit_id in sorted(edges_by_unit)],
@@ -981,9 +1146,11 @@ def _link_neighbor_parts(
     formal_by_unit: Mapping[str, str],
     units: list[Mapping[str, Any]],
     tolerance: float,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> int:
     linked = 0
-    for left_unit, right_unit in ownership_neighbors(units):
+    neighbors = ownership_neighbors(units)
+    for pair_index, (left_unit, right_unit) in enumerate(neighbors, start=1):
         left_features = _read_features(formal_by_unit[left_unit])
         right_features = _read_features(formal_by_unit[right_unit])
         right_geometries = [item["geometry"] for item in right_features]
@@ -1005,6 +1172,8 @@ def _link_neighbor_parts(
                     left_class,
                 ):
                     linked += 1
+        if progress_callback is not None:
+            progress_callback(pair_index, len(neighbors), linked)
     return linked
 
 
@@ -1035,11 +1204,29 @@ def _assemble_stream_impl(
         "divider_cubic_bspline_adaptive_v2"
         if smoothing_enabled else "raw_polygonize_v1"
     )
+    counts = database.stream_unit_counts(run_id, stream_id)
+    expected_units = sum(counts.values())
+    progress = _AssemblyProgress(database, run_id, stream_id)
     reused = _reuse_ready_assembly(spec, stream, database)
     if reused is not None:
-        database.set_stream_status(run_id, stream_id, "ready", error="")
+        progress.emit(
+            "publish_cleanup",
+            current=0,
+            total=1,
+            message="校验已组装产物并清理残留中间文件",
+            force=True,
+        )
         reused["unit_artifact_cleanup"] = _cleanup_stream_unit_artifacts(
             spec, database, stream_id
+        )
+        database.set_stream_status(run_id, stream_id, "ready", error="")
+        progress.emit(
+            "publish_cleanup",
+            current=1,
+            total=1,
+            status="completed",
+            message="已复用完整组装产物",
+            force=True,
         )
         return reused
     database.set_stream_status(
@@ -1048,8 +1235,6 @@ def _assemble_stream_impl(
         "assembling",
         error="",
     )
-    counts = database.stream_unit_counts(run_id, stream_id)
-    expected_units = sum(counts.values())
     if expected_units < 1 or counts != {"ready": expected_units}:
         raise StreamAssemblyError(f"stream units are not all ready: {counts}")
     units = database.spatial_units(run_id)
@@ -1133,6 +1318,13 @@ def _assemble_stream_impl(
             "arc_len": "float",
         },
     }
+    progress.emit(
+        "validate_inputs",
+        current=0,
+        total=expected_units,
+        message="校验单元报告和拟合边界分片",
+        force=True,
+    )
     edge_artifacts, summary_validation = _validated_summary_inputs(
         spec,
         database,
@@ -1141,6 +1333,19 @@ def _assemble_stream_impl(
         expected_units,
         report_artifacts,
         edge_schema,
+        progress_callback=lambda current, total: progress.emit(
+            "validate_inputs",
+            current=current,
+            total=total,
+            message="校验单元报告和拟合边界分片",
+        ),
+    )
+    progress.emit(
+        "validate_inputs",
+        current=int(summary_validation["artifact_count"]),
+        total=int(summary_validation["artifact_count"]),
+        message="单元产物校验完成",
+        force=True,
     )
     summary_aggregate = database.unit_report_summary_aggregate(
         run_id,
@@ -1159,8 +1364,16 @@ def _assemble_stream_impl(
         "invalid_count": 0,
     }
     resume_inputs: dict[str, dict[str, Any]] = {}
+    formal_feature_count = 0
 
     if resume_from_reports:
+        progress.emit(
+            "register_objects",
+            current=0,
+            total=1,
+            message="校验已有对象身份",
+            force=True,
+        )
         part_count, object_count = _resolved_object_state(
             spec["state_db"],
             run_id,
@@ -1181,7 +1394,18 @@ def _assemble_stream_impl(
             schema=formal_schema,
             crs=spec["raster"]["crs"],
             identity={"run_id": run_id, "result_stream_id": stream_id},
-            expected_feature_count=part_count,
+            # Exact clipping may discard a fully outside part or split one at
+            # the boundary, so formal feature count is intentionally not tied
+            # to pre-clip object_nodes. Raw remains count-locked above.
+            expected_feature_count=None,
+        )
+        _assert_gpkg_within_exact_range(
+            formal_path,
+            layer="semantic_polygons",
+            spec=spec,
+        )
+        formal_feature_count = int(
+            resume_inputs["formal"].get("feature_count") or 0
         )
         print(
             json.dumps(
@@ -1198,11 +1422,32 @@ def _assemble_stream_impl(
             ),
             flush=True,
         )
+        for phase, message in (
+            ("register_objects", "已有对象身份校验完成"),
+            ("link_objects", "复用已有跨单元对象连接"),
+            ("write_raw", "复用已有 Raw GPKG"),
+            ("write_formal", "复用并校验已有正式 GPKG"),
+        ):
+            progress.emit(
+                phase,
+                current=1,
+                total=1,
+                message=message,
+                force=True,
+            )
     else:
-        for artifact in formal_artifacts:
+        registered_part_count = 0
+        progress.emit(
+            "register_objects",
+            current=0,
+            total=len(formal_artifacts),
+            message="登记空间单元多边形身份",
+            force=True,
+        )
+        for artifact_index, artifact in enumerate(formal_artifacts, start=1):
             unit_id = str(artifact["unit_id"])
             for features in _feature_batches(artifact["path"]):
-                database.register_object_parts(
+                registered_part_count += database.register_object_parts(
                     run_id,
                     stream_id,
                     (
@@ -1214,8 +1459,23 @@ def _assemble_stream_impl(
                         for feature in features
                     ),
                 )
+            progress.emit(
+                "register_objects",
+                current=artifact_index,
+                total=len(formal_artifacts),
+                feature_count=registered_part_count,
+                message=f"已登记 {registered_part_count} 个多边形部件",
+            )
         pixel_tolerance = (
             max(abs(float(transform[0])), abs(float(transform[4]))) * 1e-6
+        )
+        progress.emit(
+            "link_objects",
+            current=0,
+            total=0,
+            feature_count=registered_part_count,
+            message="扫描相邻空间单元公共边界",
+            force=True,
         )
         _link_neighbor_parts(
             database,
@@ -1224,21 +1484,48 @@ def _assemble_stream_impl(
             formal_by_unit,
             units,
             pixel_tolerance,
+            progress_callback=lambda current, total, linked: progress.emit(
+                "link_objects",
+                current=current,
+                total=total,
+                feature_count=registered_part_count,
+                message=f"已建立 {linked} 条跨单元对象连接",
+            ),
         )
         link_count = database.object_link_count(run_id, stream_id)
+        progress.emit(
+            "link_objects",
+            current=0,
+            total=0,
+            feature_count=registered_part_count,
+            message=f"解析对象连接，当前连接 {link_count} 条",
+            force=True,
+        )
         object_count = database.resolve_object_components(run_id, stream_id)
+        progress.emit(
+            "link_objects",
+            current=1,
+            total=1,
+            feature_count=registered_part_count,
+            message=f"对象连接完成，共 {object_count} 个对象",
+            force=True,
+        )
         class_snapshot = load_json(Path(spec["class_mapping_snapshot"]))
         class_names = class_snapshot["class_mapping"]
 
+        raw_feature_count = 0
+
         def write_raw(destination):
             def records():
-                for unit in units:
+                nonlocal raw_feature_count
+                for unit_index, unit in enumerate(units, start=1):
                     unit_id = str(unit["unit_id"])
                     with fiona.open(
                         raw_by_unit[unit_id],
                         layer="polygons",
                     ) as source:
                         for feature in source:
+                            raw_feature_count += 1
                             yield {
                                 "geometry": feature["geometry"],
                                 "properties": {
@@ -1253,9 +1540,24 @@ def _assemble_stream_impl(
                                     ),
                                 },
                             }
+                    progress.emit(
+                        "write_raw",
+                        current=unit_index,
+                        total=len(units),
+                        feature_count=raw_feature_count,
+                        message=f"已写入 {raw_feature_count} 个 Raw 面",
+                    )
 
             destination.writerecords(records())
 
+        progress.emit(
+            "write_raw",
+            current=0,
+            total=len(units),
+            feature_count=0,
+            message="创建 Raw GPKG",
+            force=True,
+        )
         _atomic_gpkg(
             raw_path,
             "semantic_polygons_raw",
@@ -1272,7 +1574,8 @@ def _assemble_stream_impl(
 
         def write_formal(destination):
             def records():
-                for unit in units:
+                nonlocal formal_feature_count
+                for unit_index, unit in enumerate(units, start=1):
                     unit_id = str(unit["unit_id"])
                     for features in _feature_batches(formal_by_unit[unit_id]):
                         part_ids = [
@@ -1298,6 +1601,7 @@ def _assemble_stream_impl(
                             properties = feature["properties"]
                             part_id = str(properties["polygon_id"])
                             class_code = int(properties["class_code"])
+                            formal_feature_count += 1
                             yield {
                                 "geometry": feature["geometry"],
                                 "properties": {
@@ -1359,9 +1663,24 @@ def _assemble_stream_impl(
                                     "created_at": now,
                                 },
                             }
+                    progress.emit(
+                        "write_formal",
+                        current=unit_index,
+                        total=len(units),
+                        feature_count=formal_feature_count,
+                        message=f"已写入 {formal_feature_count} 个正式面",
+                    )
 
             destination.writerecords(records())
 
+        progress.emit(
+            "write_formal",
+            current=0,
+            total=len(units),
+            feature_count=0,
+            message="创建正式 GPKG",
+            force=True,
+        )
         _atomic_gpkg(
             formal_path,
             "semantic_polygons",
@@ -1435,15 +1754,18 @@ def _assemble_stream_impl(
         "max_chord_error_px": 0.0,
         "max_segment_arc_length_px": 0.0,
     }
+    edge_feature_count = 0
 
     def write_edges(destination):
         def records():
-            for artifact in edge_artifacts:
+            nonlocal edge_feature_count
+            for artifact_index, artifact in enumerate(edge_artifacts, start=1):
                 with fiona.open(
                     artifact["path"],
                     layer="fitted_edges",
                 ) as source:
                     for feature in source:
+                        edge_feature_count += 1
                         properties = dict(feature["properties"])
                         edge_metrics["dense_curve_point_count"] += int(
                             properties.get("dense_vtx") or 0
@@ -1463,6 +1785,13 @@ def _assemble_stream_impl(
                             "geometry": feature["geometry"],
                             "properties": properties,
                         }
+                progress.emit(
+                    "aggregate_reports",
+                    current=artifact_index,
+                    total=len(edge_artifacts),
+                    feature_count=edge_feature_count,
+                    message=f"已汇总 {edge_feature_count} 条拟合边界",
+                )
 
         destination.writerecords(records())
 
@@ -1479,7 +1808,16 @@ def _assemble_stream_impl(
         path.unlink(missing_ok=True)
 
     def build_report_outputs() -> bool:
+        nonlocal formal_feature_count
         try:
+            progress.emit(
+                "aggregate_reports",
+                current=0,
+                total=max(1, len(edge_artifacts)),
+                feature_count=0,
+                message="汇总拟合报告与公共边界",
+                force=True,
+            )
             print(
                 json.dumps(
                     {
@@ -1513,6 +1851,14 @@ def _assemble_stream_impl(
                     tuple(str(item["path"]) for item in edge_artifacts)
                 ),
                 operation=f"stream_fitted_edges_stage:{stream_id}",
+            )
+            progress.emit(
+                "aggregate_reports",
+                current=max(1, len(edge_artifacts)),
+                total=max(1, len(edge_artifacts)),
+                feature_count=edge_feature_count,
+                message="拟合报告与公共边界汇总完成",
+                force=True,
             )
             aggregate.update(edge_metrics)
             dense_points = int(aggregate["dense_curve_point_count"])
@@ -1580,14 +1926,44 @@ def _assemble_stream_impl(
             )
             if not fitting_passed:
                 raise StreamAssemblyError("boundary fitting contains failed units")
-            range_clip = _guarded_range_clip(
-                formal_path,
-                spec,
-                storage_guard=storage_guard,
-                storage_lock_path=storage_lock_path,
-                operation=f"stream_range_clip:{stream_id}",
+            progress.emit(
+                "range_clip",
+                current=0,
+                total=1,
+                feature_count=formal_feature_count,
+                message=(
+                    "校验已裁剪正式 GPKG"
+                    if resume_from_reports
+                    else "按冻结研究范围精确裁剪正式 GPKG"
+                ),
+                force=True,
             )
+            if resume_from_reports:
+                range_clip = {
+                    "status": "already_clipped",
+                    "reason": "resume formal output was range-validated before assembly",
+                }
+            else:
+                range_clip = _guarded_range_clip(
+                    formal_path,
+                    spec,
+                    storage_guard=storage_guard,
+                    storage_lock_path=storage_lock_path,
+                    operation=f"stream_range_clip:{stream_id}",
+                )
             aggregate["range_clip"] = range_clip
+            if "output_feature_count" in range_clip:
+                formal_feature_count = int(range_clip["output_feature_count"])
+            elif "source_feature_count" in range_clip:
+                formal_feature_count = int(range_clip["source_feature_count"])
+            progress.emit(
+                "range_clip",
+                current=1,
+                total=1,
+                feature_count=formal_feature_count,
+                message="研究范围裁剪完成",
+                force=True,
+            )
             if resume_from_reports:
                 aggregate["input_sha256"] = resume_inputs["raw"]["sha256"]
                 aggregate["output_sha256"] = resume_inputs["formal"]["sha256"]
@@ -1605,6 +1981,14 @@ def _assemble_stream_impl(
                     raise StreamAssemblyError(
                         "accepted_labels changed after run creation"
                     )
+            progress.emit(
+                "accepted_difference",
+                current=0,
+                total=1,
+                feature_count=formal_feature_count,
+                message="计算 Accepted 标签差分",
+                force=True,
+            )
             difference = _guarded_accepted_difference(
                 formal_path,
                 accepted_value,
@@ -1618,6 +2002,14 @@ def _assemble_stream_impl(
                 difference = dict(difference)
                 difference["output"] = str(candidate_path)
             aggregate["difference"] = difference
+            progress.emit(
+                "accepted_difference",
+                current=1,
+                total=1,
+                feature_count=formal_feature_count,
+                message="Accepted 标签差分完成",
+                force=True,
+            )
             _write_json(
                 staged_report_path,
                 aggregate,
@@ -1638,11 +2030,25 @@ def _assemble_stream_impl(
                 path.unlink(missing_ok=True)
 
     candidate_written = build_report_outputs()
-    for kind, path in (
+    assembled_artifacts = [
         ("semantic_polygons_raw", raw_path),
         ("semantic_polygons", formal_path),
         ("boundary_fitting_report", report_path),
         ("fitted_edges", fitted_edges_path),
+    ]
+    if candidate_written:
+        assembled_artifacts.append(("semantic_candidates", candidate_path))
+    publish_total = len(assembled_artifacts) + 1
+    progress.emit(
+        "publish_cleanup",
+        current=0,
+        total=publish_total,
+        feature_count=formal_feature_count,
+        message="提交正式组装产物",
+        force=True,
+    )
+    for artifact_index, (kind, path) in enumerate(
+        assembled_artifacts, start=1
     ):
         _commit_artifact(
             database,
@@ -1652,23 +2058,30 @@ def _assemble_stream_impl(
             stream_id=stream_id,
             unit_id="assembled",
         )
-    if candidate_written:
-        _commit_artifact(
-            database,
-            run_id,
-            path=candidate_path,
-            kind="semantic_candidates",
-            stream_id=stream_id,
-            unit_id="assembled",
+        progress.emit(
+            "publish_cleanup",
+            current=artifact_index,
+            total=publish_total,
+            feature_count=formal_feature_count,
+            message=f"已提交 {artifact_index}/{len(assembled_artifacts)} 个正式产物",
         )
+    aggregate["unit_artifact_cleanup"] = _cleanup_stream_unit_artifacts(
+        spec, database, stream_id
+    )
     database.set_stream_status(
         run_id,
         stream_id,
         "ready",
         error="",
     )
-    aggregate["unit_artifact_cleanup"] = _cleanup_stream_unit_artifacts(
-        spec, database, stream_id
+    progress.emit(
+        "publish_cleanup",
+        current=publish_total,
+        total=publish_total,
+        feature_count=formal_feature_count,
+        status="completed",
+        message="正式产物已提交，中间文件清理完成",
+        force=True,
     )
     print(json.dumps({"event": "stream_assembled", **aggregate}, separators=(",", ":")))
     return aggregate
@@ -1690,11 +2103,17 @@ def assemble_stream(
         try:
             spec = load_json(Path(run_spec_path).resolve())
             if spec.get("schema_version") == 2:
-                RunStateDB(spec["state_db"]).set_stream_status(
+                database = RunStateDB(spec["state_db"])
+                database.set_stream_status(
                     str(spec["run_id"]),
                     str(stream_id),
                     "failed",
                     error=str(error),
+                )
+                database.fail_stream_runtime_progress(
+                    str(spec["run_id"]),
+                    str(stream_id),
+                    str(error),
                 )
         except Exception:
             pass

@@ -27,6 +27,7 @@ def test_m2_max_profile_uses_all_cores_without_thread_oversubscription():
         {
             "tile_io_workers": "auto",
             "max_cpu_partition_workers": "auto",
+            "max_concurrent_assembly": "auto",
             "assembly_validation_workers": "auto",
         },
         _hardware(cores=12, memory_gib=32, kind="mps"),
@@ -36,7 +37,8 @@ def test_m2_max_profile_uses_all_cores_without_thread_oversubscription():
     assert scaling["max_cpu_partition_workers"] == 12
     assert scaling["max_cpu_partition_workers_with_package"] == 9
     assert scaling["tile_io_workers"] == 12
-    assert scaling["assembly_validation_workers"] == 8
+    assert scaling["max_concurrent_assembly"] == 2
+    assert scaling["assembly_validation_workers"] == 6
     assert evidence["resolved"]["package_process_threads"] == 3
     assert (
         scaling["max_cpu_partition_workers_with_package"]
@@ -51,6 +53,7 @@ def test_rtx3090_profile_uses_sixteen_tile_batch_and_twenty_core_budget():
         {
             "tile_io_workers": "auto",
             "max_cpu_partition_workers": "auto",
+            "max_concurrent_assembly": "auto",
             "assembly_validation_workers": "auto",
         },
         _hardware(
@@ -66,6 +69,7 @@ def test_rtx3090_profile_uses_sixteen_tile_batch_and_twenty_core_budget():
     assert scaling["max_cpu_partition_workers_with_package"] == 16
     assert scaling["tile_io_workers"] == 16
     assert scaling["assembly_validation_workers"] == 8
+    assert scaling["max_concurrent_assembly"] == 2
     assert evidence["resolved"]["package_process_threads"] == 4
     assert (
         scaling["max_cpu_partition_workers_with_package"]
@@ -80,6 +84,7 @@ def test_explicit_performance_values_are_not_replaced_by_auto_defaults():
         {
             "tile_io_workers": 5,
             "max_cpu_partition_workers": 6,
+            "max_concurrent_assembly": 2,
             "assembly_validation_workers": 3,
         },
         _hardware(
@@ -93,6 +98,7 @@ def test_explicit_performance_values_are_not_replaced_by_auto_defaults():
     assert runtime["tile_batch_size"] == 1
     assert scaling["tile_io_workers"] == 5
     assert scaling["max_cpu_partition_workers"] == 6
+    assert scaling["max_concurrent_assembly"] == 2
     assert scaling["assembly_validation_workers"] == 3
     assert evidence["automatic_fields"] == []
 

@@ -40,6 +40,7 @@ def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
     assert {
         "runs",
         "streams",
+        "stream_runtime_progress",
         "tiles",
         "partitions",
         "spatial_units",
@@ -51,6 +52,80 @@ def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
         "object_links",
         "events",
     }.issubset(tables)
+
+
+def test_stream_runtime_progress_is_bounded_restart_visible_and_phase_aware(tmp_path):
+    database = _database(tmp_path)
+    database.register_streams(
+        RUN_ID,
+        [{"stream_id": "model:test", "kind": "model", "model_id": "test"}],
+    )
+    database.upsert_stream_runtime_progress(
+        RUN_ID,
+        "model:test",
+        stage="assembly",
+        phase="write_raw",
+        phase_name="写入 Raw GPKG",
+        phase_index=4,
+        phase_total=9,
+        current=5,
+        total=10,
+        feature_count=123,
+        message="writing",
+    )
+    first = database.stream_runtime_progress(RUN_ID)["model:test"]
+    time.sleep(0.002)
+    database.upsert_stream_runtime_progress(
+        RUN_ID,
+        "model:test",
+        stage="assembly",
+        phase="write_raw",
+        phase_name="写入 Raw GPKG",
+        phase_index=4,
+        phase_total=9,
+        current=10,
+        total=10,
+        feature_count=456,
+        message="written",
+    )
+    same_phase = database.monitor_snapshot(RUN_ID)[
+        "stream_runtime_progress"
+    ]["model:test"]
+    assert same_phase["phase_started_at"] == first["phase_started_at"]
+    assert same_phase["progress_current"] == 10
+    assert same_phase["feature_count"] == 456
+
+    time.sleep(0.002)
+    database.upsert_stream_runtime_progress(
+        RUN_ID,
+        "model:test",
+        stage="assembly",
+        phase="write_formal",
+        phase_name="写入正式 GPKG",
+        phase_index=5,
+        phase_total=9,
+        current=1,
+        total=10,
+    )
+    next_phase = database.stream_runtime_progress(RUN_ID)["model:test"]
+    assert next_phase["phase_started_at"] != first["phase_started_at"]
+    assert len(database.stream_runtime_progress(RUN_ID)) == 1
+
+    database.fail_stream_runtime_progress(RUN_ID, "model:test", "disk error")
+    failed = database.stream_runtime_progress(RUN_ID)["model:test"]
+    assert failed["status"] == "failed"
+    assert failed["message"] == "disk error"
+
+
+def test_monitor_snapshot_keeps_pre_progress_schema_v2_runs_readable(tmp_path):
+    database = _database(tmp_path)
+    with database._connection() as connection:
+        connection.execute("DROP TABLE stream_runtime_progress")
+
+    snapshot = database.monitor_snapshot(RUN_ID)
+
+    assert snapshot["run"]["run_id"] == RUN_ID
+    assert snapshot["stream_runtime_progress"] == {}
 
 
 def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path):

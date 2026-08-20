@@ -258,6 +258,7 @@ def write_partition_rasters(
     output_probability: str | Path,
     output_mask: str | Path,
     output_confidence: str | Path,
+    core_mask_tags: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     halo = partition["halo_window"]
     core = partition["core_window"]
@@ -304,6 +305,7 @@ def write_partition_rasters(
         mask_path,
         arrays["core_mask"],
         {**core_profile, "dtype": "int16", "nodata": -1},
+        tags=core_mask_tags,
     )
     confidence_path = Path(output_confidence)
     _atomic_raster(

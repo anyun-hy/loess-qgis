@@ -102,6 +102,10 @@ def physical_pixel_area_m2(
         meters_per_deg_lon = (math.pi / 180.0) * 6378137.0 * math.cos(lat_rad)
         dx_m = abs(float(transform.a)) * meters_per_deg_lon
         dy_m = abs(float(transform.e)) * meters_per_deg_lat
+        if not -90.0 <= float(center_y) <= 90.0:
+            raise SmallComponentRegularizationError(
+                "geographic raster center latitude is outside [-90, 90]"
+            )
         return float(dx_m * dy_m)
     raise SmallComponentRegularizationError(
         f"physical pixel area requires a projected metre CRS, EPSG:3857, or geographic CRS, got {raster_crs}"

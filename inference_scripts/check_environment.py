@@ -1456,7 +1456,8 @@ def build_report(args):
             f"Tile batch {resolved_resources['tile_batch_size']}"
             + (f" ({model_batches})" if model_batches else "")
             + f"; Tile I/O {resolved_resources['tile_io_workers']}; "
-            f"assembly {resolved_resources['assembly_validation_workers']}"
+            f"assembly {resolved_resources['max_concurrent_assembly']}×"
+            f"{resolved_resources['assembly_validation_workers']}"
         ),
         "automatic hardware tuning and isolated resident model-set Batch probes",
         (

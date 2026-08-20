@@ -14,6 +14,25 @@ The platform implementation is intentionally unified:
 - `bash/install_plugin.sh` installs the shared plugin for the selected platform.
 - `bash/init_project.sh` initializes or updates the platform deployment project.
 
+## Test environment
+
+Run project tests in the Conda environment named `qgis`. Use
+`conda run -n qgis <test command>` or activate `qgis` before running tests; do
+not use system Python or the Conda `base` environment for project test results.
+
+## Remote Ubuntu access
+
+`Tencent` is the project's Ubuntu runtime and validation host. When a task
+requires Ubuntu, QGIS 3.44, Qt5, CUDA/RTX 3090, remote logs, or live runtime
+evidence, invoke `bash/ssh_tencent.sh <command>` directly; do not wait for the
+user to start an interactive `ssh Tencent` session.
+
+The project wrapper reuses an SSH connection for a short idle window and then
+closes it automatically. The local `loess-qgis` checkout remains the
+authoritative source. Remote writes, synchronization, deployment, and changes
+to user-controlled data still require authorization from the current task and
+must preserve the deployment-project boundary below.
+
 ## Prohibited legacy lookup by default
 
 `/Users/example/Desktop/loess-data` is a legacy/original-data workspace that

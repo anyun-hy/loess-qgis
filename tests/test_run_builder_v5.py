@@ -10,7 +10,7 @@ def _scaling():
     return {
         "partition_tile_rows": 8,
         "partition_tile_cols": 8,
-        "partition_halo_px": 192,
+        "partition_halo_px": 256,
         "seam_band_px": 64,
         "max_job_retries": 2,
     }
@@ -99,6 +99,8 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         "buffer_pixels": 256,
         "max_workers": 4,
     }
+    assert spec["range_selection"]["mode"] == "extent"
+    assert spec["range_selection"]["clip_outputs"] is True
     assert "tiles" not in spec
     assert spec_path.stat().st_size < 50_000
     expected_tile_cache = (

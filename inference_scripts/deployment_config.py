@@ -398,6 +398,7 @@ def validate_deployment_config(
     auto_integer_defaults = {
         "tile_io_workers": "auto",
         "max_cpu_partition_workers": "auto",
+        "max_concurrent_assembly": "auto",
         "assembly_validation_workers": "auto",
     }
     for key, default in auto_integer_defaults.items():

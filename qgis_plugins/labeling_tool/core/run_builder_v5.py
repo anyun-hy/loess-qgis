@@ -130,12 +130,59 @@ def create_v5_run(
         raise RunBuilderV5Error(
             "fragmentation_regularization.max_workers must be positive"
         )
+    # The caller's spatial preflight, Package plan, and storage reservation all
+    # depend on this value.  Do not silently enlarge it here: that would make
+    # the frozen plan disagree with its preflight.  GUI/CLI entry points must
+    # resolve auto halo with this requirement before calling the builder.
+    if (
+        fragmentation_value["enabled"]
+        and int(scaling_value["partition_halo_px"])
+        < int(fragmentation_value["buffer_pixels"])
+    ):
+        raise RunBuilderV5Error(
+            "partition_halo_px must be at least "
+            "fragmentation_regularization.buffer_pixels"
+        )
     range_value = dict(range_selection or {})
     range_mode = str(range_value.get("mode") or "extent")
     if range_mode not in {"extent", "vector_tile_intersection"}:
         raise RunBuilderV5Error(f"unsupported range selection mode: {range_mode}")
-    if range_mode == "vector_tile_intersection" and range_value.get("clip_outputs") is not False:
-        raise RunBuilderV5Error("vector Tile selection must not clip outputs")
+    range_value["mode"] = range_mode
+    if range_mode == "extent":
+        # Tile expansion is only a processing detail. View and hand-drawn
+        # runs are always published against their exact requested rectangle.
+        range_value["clip_outputs"] = True
+    if range_mode == "vector_tile_intersection":
+        if range_value.get("clip_outputs") is not True:
+            raise RunBuilderV5Error(
+                "vector Tile selection must clip outputs to the exact vector boundary"
+            )
+        source_value = str(
+            range_value.get("vector_source") or range_value.get("vector_path") or ""
+        )
+        snapshot_path = Path(source_value.split("|", 1)[0]).expanduser().resolve()
+        try:
+            snapshot_path.relative_to(run_dir)
+        except ValueError as error:
+            raise RunBuilderV5Error(
+                "vector range source must be a run-local frozen snapshot"
+            ) from error
+        if not snapshot_path.is_file() or snapshot_path.suffix.lower() != ".gpkg":
+            raise RunBuilderV5Error(
+                "vector range snapshot is missing or is not a GeoPackage"
+            )
+        snapshot_sha256 = sha256_file(snapshot_path)
+        supplied_sha256 = str(range_value.get("vector_sha256") or "")
+        if supplied_sha256 and supplied_sha256 != snapshot_sha256:
+            raise RunBuilderV5Error("vector range snapshot changed before run creation")
+        range_value.update(
+            {
+                "vector_source": str(snapshot_path),
+                "vector_path": str(snapshot_path),
+                "vector_sha256": snapshot_sha256,
+                "clip_outputs": True,
+            }
+        )
     grid_count = int(tile_rows) * int(tile_cols)
     selected_count = int(range_value.get("selected_tile_count", grid_count))
     excluded_count = int(range_value.get("excluded_tile_count", 0))

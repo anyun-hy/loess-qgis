@@ -1,10 +1,11 @@
-"""Resumable V3 fragmentation repair for completed and future Fusion runs.
+"""Resumable V3 fragmentation repair for historical completed Fusion runs.
 
 The stage consumes committed partition mask/confidence rasters and writes only
 below ``run_dir/postprocess``.  Original inference, fitted vectors, confidence
 rasters, and class workspaces are never overwritten.  Once every derived
 artifact passes validation, ``--activate-review`` may atomically point the Run
-manifest at the derived polygon layer.
+manifest at the derived polygon layer. New v5 Runs apply V3 to probability
+Halos before vectorization and never invoke this compatibility tool.
 """
 
 from __future__ import annotations

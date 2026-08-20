@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from pathlib import Path
 
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     Qgis,
+    QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
     QgsField,
@@ -23,7 +23,7 @@ from qgis.core import (
 
 from .layer_names import LAYER_NAMES
 from .qgis_writer import write_vector_layer
-from .run_state_db import RunStateDB
+from .run_spec import sha256_file
 from . import accepted_integrity
 
 
@@ -65,57 +65,92 @@ def pixel_area_tolerance(run_spec):
     return 0.0
 
 
-def _selected_tile_target(run_spec):
+def _selected_tile_target(run_spec, target_crs=None):
     selection = run_spec.get("range_selection") or {}
     if selection.get("mode") != "vector_tile_intersection":
         extent = run_spec["requested_extent"]
-        return QgsGeometry.fromRect(QgsRectangle(
+        geometry = QgsGeometry.fromRect(QgsRectangle(
             float(extent["xmin"]), float(extent["ymin"]),
             float(extent["xmax"]), float(extent["ymax"]),
         ))
-
-    database = RunStateDB(run_spec["state_db"])
-    rows = {}
-    offset = 0
-    while True:
-        page = database.page_tiles(
-            run_spec["run_id"], limit=500, offset=offset
+        source_crs = (run_spec.get("raster") or {}).get("crs")
+    else:
+        source_value = str(
+            selection.get("vector_source") or selection.get("vector_path") or ""
         )
-        if not page:
-            break
-        for tile in page:
-            if str(tile.get("status")) == "excluded":
-                continue
-            bounds = tile.get("bounds")
-            if not isinstance(bounds, dict):
-                bounds = json.loads(tile.get("bounds_json") or "{}")
-            rows.setdefault(int(tile["row_no"]), []).append(
-                (int(tile["col_no"]), bounds)
-            )
-        offset += len(page)
+        source_path = Path(source_value.split("|", 1)[0]).expanduser().resolve()
+        expected_sha256 = str(selection.get("vector_sha256") or "")
+        if not source_path.is_file() or not expected_sha256:
+            raise RuntimeError("cannot read frozen vector range: snapshot or SHA256 is missing")
+        run_dir_value = str(run_spec.get("run_dir") or "")
+        if run_dir_value:
+            try:
+                source_path.relative_to(Path(run_dir_value).expanduser().resolve())
+            except ValueError as error:
+                raise RuntimeError(
+                    "cannot read frozen vector range: snapshot is outside the Run directory"
+                ) from error
+        if sha256_file(source_path) != expected_sha256:
+            raise RuntimeError("cannot read frozen vector range: snapshot SHA256 changed")
+        layer = QgsVectorLayer(str(source_path), "range_target", "ogr")
+        if not layer.isValid() or not layer.crs().isValid():
+            raise RuntimeError("cannot read frozen vector range: layer or CRS is invalid")
+        geometries = [
+            QgsGeometry(feature.geometry())
+            for feature in layer.getFeatures()
+            if feature.geometry() is not None
+            and not feature.geometry().isNull()
+            and not feature.geometry().isEmpty()
+        ]
+        if not geometries:
+            raise RuntimeError("cannot read frozen vector range: no polygon geometry found")
+        geometry = QgsGeometry.unaryUnion(geometries)
+        source_crs = layer.crs()
 
-    rectangles = []
-    for values in rows.values():
-        ordered = sorted(values)
-        run = []
-        for item in ordered:
-            if run and item[0] != run[-1][0] + 1:
-                rectangles.append(run)
-                run = []
-            run.append(item)
-        if run:
-            rectangles.append(run)
-    geometries = []
-    for run in rectangles:
-        first = run[0][1]
-        last = run[-1][1]
-        geometries.append(QgsGeometry.fromRect(QgsRectangle(
-            float(first["xmin"]), float(first["ymin"]),
-            float(last["xmax"]), float(first["ymax"]),
-        )))
-    if not geometries:
-        raise RuntimeError("vector Tile selection has no non-excluded Tile")
-    return QgsGeometry.unaryUnion(geometries)
+    source = (
+        source_crs
+        if hasattr(source_crs, "isValid")
+        else QgsCoordinateReferenceSystem(str(source_crs or ""))
+    )
+    if not source.isValid():
+        raise RuntimeError("cannot transform range target: source CRS is invalid")
+    resolved_target = target_crs or source
+    if source != resolved_target:
+        transform = QgsCoordinateTransform(source, resolved_target, QgsProject.instance())
+        try:
+            geometry.transform(transform)
+        except Exception as error:
+            raise RuntimeError(f"cannot transform range target to formal CRS: {error}") from error
+
+    if selection.get("mode") == "vector_tile_intersection":
+        extent = run_spec.get("requested_extent") or {}
+        try:
+            extent_geometry = QgsGeometry.fromRect(QgsRectangle(
+                float(extent["xmin"]),
+                float(extent["ymin"]),
+                float(extent["xmax"]),
+                float(extent["ymax"]),
+            ))
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("cannot read requested raster extent") from error
+        raster_crs = QgsCoordinateReferenceSystem(
+            str((run_spec.get("raster") or {}).get("crs") or "")
+        )
+        if not raster_crs.isValid():
+            raise RuntimeError("cannot transform requested extent: raster CRS is invalid")
+        if raster_crs != resolved_target:
+            extent_transform = QgsCoordinateTransform(
+                raster_crs,
+                resolved_target,
+                QgsProject.instance(),
+            )
+            extent_geometry.transform(extent_transform)
+        geometry = geometry.intersection(extent_geometry)
+        if geometry is None or geometry.isNull() or geometry.isEmpty():
+            raise RuntimeError(
+                "frozen vector range does not overlap the requested raster extent"
+            )
+    return geometry
 
 
 def validate_topology(run_spec, final_path, accepted_layer=None):
@@ -200,7 +235,7 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
                 message="Confirmed class polygons overlap beyond one-pixel tolerance",
             )
 
-    target = _selected_tile_target(run_spec)
+    target = _selected_tile_target(run_spec, final.crs())
     if accepted_layer is not None and accepted_layer.isValid():
         accepted_tolerance = accepted_integrity.strict_overlap_tolerance(run_spec)
         accepted_integrity.audit_accepted_layer(

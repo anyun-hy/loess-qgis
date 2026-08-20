@@ -7,7 +7,7 @@ auto-scroll, save-to-file, and clipboard copy functionality.
 
 from datetime import datetime
 
-from qgis.PyQt.QtCore import QTimer
+from qgis.PyQt.QtCore import QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QFont, QTextCharFormat
 from qgis.PyQt.QtWidgets import (
     QApplication,
@@ -62,6 +62,8 @@ class LogPanel(QWidget):
         Clear all content.
     """
 
+    cleared = pyqtSignal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
@@ -112,6 +114,7 @@ class LogPanel(QWidget):
         """Clear all logged events and the text display."""
         self._events.clear()
         self.log_edit.clear()
+        self.cleared.emit()
 
     # ── UI construction ────────────────────────────────────────────────
 
