@@ -2027,6 +2027,21 @@ def _run_work_package_impl(
                         regularization.get("changed_component_count", 0)
                     ),
                     authority=str(regularization["authority"]),
+                    owned_pixel_count=int(
+                        (regularization.get("coverage_validation") or {}).get(
+                            "owned_pixel_count", 0
+                        )
+                    ),
+                    gap_pixel_count=int(
+                        (regularization.get("coverage_validation") or {}).get(
+                            "gap_pixel_count", 0
+                        )
+                    ),
+                    outside_pixel_count=int(
+                        (regularization.get("coverage_validation") or {}).get(
+                            "outside_pixel_count", 0
+                        )
+                    ),
                 )
             removed = _remove_tree_with_count(
                 package_root / "fusion" / fusion_id

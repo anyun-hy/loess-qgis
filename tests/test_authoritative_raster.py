@@ -1,8 +1,13 @@
 import numpy as np
+import pytest
 import rasterio
 from affine import Affine
 
-from authoritative_raster import core_mask_tags, regularize_partition_core
+from authoritative_raster import (
+    AuthoritativeRasterError,
+    core_mask_tags,
+    regularize_partition_core,
+)
 from partition_mosaic import write_partition_rasters
 
 
@@ -112,3 +117,61 @@ def test_geographic_pixel_area_uses_partition_location():
     )
 
     assert 0.8 < report["pixel_area_m2"] < 1.1
+
+
+def test_authoritative_core_rejects_unassigned_pixel_inside_owned_range():
+    probabilities = np.zeros((14, 6, 6), dtype=np.float32)
+    probabilities[2, :, :] = 1.0
+    weights = np.ones((6, 6), dtype=np.float32)
+    weights[3, 3] = 0.0
+    partition = {
+        "partition_id": "partition_00000_00000",
+        "halo_window": {"x0": 0, "y0": 0, "x1": 6, "y1": 6},
+        "core_window": {"x0": 1, "y0": 1, "x1": 5, "y1": 5},
+    }
+
+    with pytest.raises(
+        AuthoritativeRasterError,
+        match="unassigned pixel inside the owned research range",
+    ):
+        regularize_partition_core(
+            {
+                "halo_probabilities": probabilities,
+                "halo_weights": weights,
+                "core_mask": np.full((4, 4), 2, dtype=np.int16),
+                "core_confidence": np.ones((4, 4), dtype=np.float32),
+            },
+            partition,
+            global_transform=Affine(1, 0, 0, 0, -1, 6),
+            crs="EPSG:3857",
+        )
+
+
+def test_authoritative_core_reports_zero_gap_coverage_contract():
+    probabilities = np.zeros((14, 4, 4), dtype=np.float32)
+    probabilities[2, :, :] = 1.0
+    partition = {
+        "partition_id": "partition_00000_00000",
+        "halo_window": {"x0": 0, "y0": 0, "x1": 4, "y1": 4},
+        "core_window": {"x0": 0, "y0": 0, "x1": 4, "y1": 4},
+    }
+
+    _cleaned, report = regularize_partition_core(
+        {
+            "halo_probabilities": probabilities,
+            "halo_weights": np.ones((4, 4), dtype=np.float32),
+            "core_mask": np.full((4, 4), 2, dtype=np.int16),
+            "core_confidence": np.ones((4, 4), dtype=np.float32),
+        },
+        partition,
+        global_transform=Affine(1, 0, 0, 0, -1, 4),
+        crs="EPSG:3857",
+    )
+
+    assert report["coverage_validation"] == {
+        "status": "passed",
+        "owned_pixel_count": 16,
+        "gap_pixel_count": 0,
+        "invalid_confidence_pixel_count": 0,
+        "outside_pixel_count": 0,
+    }

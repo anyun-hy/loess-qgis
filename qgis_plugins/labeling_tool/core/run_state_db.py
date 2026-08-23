@@ -1317,12 +1317,38 @@ class RunStateDB:
                 }
             except Exception:
                 stream_runtime_progress = {}
+            try:
+                stream_coverage_validation = {}
+                coverage_rows = connection.execute(
+                    """SELECT e.stream_id, e.payload_json
+                       FROM events e
+                       WHERE e.run_id=?
+                         AND e.event_type='stream_coverage_validation'
+                         AND e.event_id=(
+                           SELECT MAX(latest.event_id) FROM events latest
+                           WHERE latest.run_id=e.run_id
+                             AND latest.stream_id=e.stream_id
+                             AND latest.event_type=e.event_type
+                         )
+                       ORDER BY e.stream_id""",
+                    (identifier,),
+                ).fetchall()
+                for row in coverage_rows:
+                    try:
+                        payload = json.loads(str(row["payload_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if isinstance(payload, dict):
+                        stream_coverage_validation[str(row["stream_id"])] = payload
+            except Exception:
+                stream_coverage_validation = {}
         return {
             "run": run,
             "job_counts": job_counts,
             "active_work_package": active_package,
             "streams": streams,
             "stream_runtime_progress": stream_runtime_progress,
+            "stream_coverage_validation": stream_coverage_validation,
             "stream_unit_type_counts": stream_unit_type_counts,
             "stream_unit_job_type_counts": stream_unit_job_type_counts,
         }
