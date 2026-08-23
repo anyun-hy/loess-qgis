@@ -14,7 +14,7 @@
 - `inference_scripts/`：推理、组装、边界拟合及运行入口。
 - `bash/`：项目初始化和插件安装脚本。
 - `tests/`：自动化契约、故障注入和流水线测试。
-- `docs/`：项目意图、唯一实施计划和验证证据。
+- `docs/`：当前架构、状态、操作手册、决策和历史证据入口。
 
 插件安装与项目初始化是两个独立操作：
 
@@ -36,6 +36,8 @@ bash/ssh_tencent.sh 'uname -a'
 `runtime/`、`weights/`、`input/`、`qgis/` 和 `output/`。权重、用户输入、
 运行输出和 QGIS 工程不进入本仓库，也不会由重复部署覆盖。
 
-设计、实施和验收以 `docs/plugin_plan_v3.md` 为唯一准则；实际验证结果记录在
-`docs/IMPLEMENTATION_STATUS.md`。初始 Tencent Ubuntu 拉取基线永久保存在
-Git 标签 `ubuntu-baseline-2026-07-29` 中。
+项目文档统一从 [`docs/README.md`](docs/README.md) 进入。当前架构与数据合同
+见 `docs/ARCHITECTURE.md`，真实状态与未完成证据见
+`docs/CURRENT_STATUS.md`。历史巨型计划和时间线只保存在 `docs/archive/`，不再
+作为当前实现入口。初始 Tencent Ubuntu 拉取基线永久保存在 Git 标签
+`ubuntu-baseline-2026-07-29` 中。

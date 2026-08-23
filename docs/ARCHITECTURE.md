@@ -1,0 +1,109 @@
+# 当前架构与数据合同
+
+## 1. 文档地位
+
+本文只描述当前仍有效的架构和不可破坏合同。实际完成程度与部署状态见
+[CURRENT_STATUS.md](CURRENT_STATUS.md)。历史完整方案保存在
+[archive/PLUGIN_PLAN_V3_LEGACY.md](archive/PLUGIN_PLAN_V3_LEGACY.md)，不得用
+其中旧状态覆盖当前代码、配置、测试和本文件。
+
+## 2. 权威源码与平台
+
+`/Users/example/Desktop/loess-qgis` 是 macOS 与 Ubuntu 的唯一权威源码：
+
+- Ubuntu：QGIS 3.44、Qt5/PyQt5、独立 `qgis` Conda、CUDA/RTX 3090；
+- macOS：QGIS 4.2、Qt6/PyQt6、独立 `qgis` Conda、MPS；
+- 两个平台安装相同插件、推理运行时和 Bash 部署入口；
+- `loess-project` 是生成的部署项目，不是源码仓库；
+- 权重、输入、QGIS 工程、人工标签和输出由用户控制，不随源码部署覆盖。
+
+## 3. 代码边界
+
+| 区域 | 职责 |
+|---|---|
+| `qgis_plugins/labeling_tool/` | QGIS UI、地图交互、运行编排、监控、人工修整 |
+| `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3、组装和验收 |
+| `bash/` | 插件安装、部署项目初始化、Tencent SSH 入口 |
+| `tests/` | 契约、恢复、故障、规模和平台兼容测试 |
+| `docs/` | 当前架构、状态、操作和长期决策 |
+
+QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和其他推理
+任务只使用当前平台的 `qgis` Conda 子进程，禁止混用两边 `site-packages`。
+
+## 4. 正式运行数据流
+
+```text
+影像 + 完整研究范围
+  -> Run Spec + PostgreSQL 状态图
+  -> 共享 Tile 物化
+  -> 各模型独立概率推理
+  -> Partition Halo cosine 概率拼接
+  -> 各模型与 Fusion 独立 Core mask/confidence
+  -> Fragmentation V3 权威 Core
+  -> 分区矢量化与公共分界拟合
+  -> Stream 组装
+  -> 完整范围 gap/overlap/outside 硬验收
+  -> QGIS 结果层与人工修整
+  -> final/topology/accepted_labels
+```
+
+## 5. 空间和规模合同
+
+- `512 x 512` 是模型 Tile 尺寸，不代表地面分辨率；
+- 物理面积和距离必须由当前影像 Affine 与 CRS 计算；
+- Halo 只提供上下文，互不重叠的 Core 拥有正式像元；
+- 大图使用有界 Work Package 和 Partition，不分配整幅概率或整幅线网；
+- Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
+- Run JSON 只保存冻结配置和摘要，不保存几十万 Tile 明细；
+- 临时 Tile/probability Artifact 只有在依赖提交后才按引用关系清理。
+
+## 6. 模型与 Fusion 合同
+
+- 每个实际执行模型保留独立结果身份；
+- approved Fusion 是独立结果流，不覆盖模型结果；
+- Fusion 按冻结 profile 对 14 类概率执行算法融合，不做矢量几何叠加；
+- 当前正式 profile 引用 Swin-B、SETR 和 MambaOut-B 三个模型；
+- 模型、profile、输入和关键输出必须记录 SHA-256；
+- 单个 Run 的可恢复性不能依赖另一个 Run 的临时缓存。
+
+## 7. 权威栅格与碎片治理
+
+- Fragmentation V3 是当前生产碎片治理方案；
+- V3 在概率拼接后、矢量化前生成唯一权威 Core；
+- V3 必须保持单标签，不得产生 gap、overlap 或范围外发布；
+- Generate 只作研究参考，不是生产入口；
+- 失败 RAG 与空间联合解码已归档，不得从 archive 导入生产；
+- V3.1 尚未开始；未来候选必须独立实现和同域验收，不能直接覆盖 V3。
+
+## 8. 矢量与边界合同
+
+- 相邻 Polygon 的公共分界只拟合一次，两侧复用同一坐标；
+- 只允许误差受限的公共分界处理，禁止逐 Polygon 独立平滑；
+- 不在最后执行整幅 dissolve；跨单元同类对象通过连接关系取得统一身份；
+- 正式组装必须验证完整范围、无效几何、gap、overlap 和 outside coverage；
+- coverage 验收失败的 Stream 不得标记为 ready。
+
+## 9. 人工修整和长期标签
+
+- 正式 Fusion 是只读基准；
+- 用户按 14 类工作层比较、编辑和确认；
+- SAM3 只提供当前对象的临时候选边界，不负责类别判断；
+- 未经用户决定不得覆盖正式几何；
+- 所有类别确认后才生成 final、topology issues 和 accepted labels；
+- accepted labels、对象来源和 revision 必须可追溯。
+
+## 10. 状态、恢复与部署
+
+- 新正式 Run 使用 PostgreSQL 状态库；历史 SQLite Run 只保留兼容读取；
+- Job 领取、Artifact 引用、失败重试和清理必须事务化；
+- live PID 不代表 Run 成功，必须以 Job、Stream、Artifact 和 hard gate 收口；
+- `bash/install_plugin.sh` 安装共享插件；
+- `bash/init_project.sh` 初始化或更新部署项目；
+- Tencent 操作统一通过 `bash/ssh_tencent.sh`；
+- 部署成功、自动测试通过和 QGIS 实机验收是三个不同结论。
+
+## 11. 变更原则
+
+任何新实现都必须先说明它影响的数据合同、状态图、空间所有权、永久 Artifact
+和跨平台行为。研究候选不得直接接入正式入口；通过自动测试但没有真实资产或
+QGIS 证据时，不得标记为生产完成。

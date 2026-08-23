@@ -1,6 +1,9 @@
 # 项目思想：为什么建设这套标注工作台
 
-> **文档职责：WHY。** 本文只说明项目要解决的问题、价值、原则和范围，不定义实现细节，也不作为验收依据。唯一的设计、实施与验收依据是 [`plugin_plan_v3.md`](plugin_plan_v3.md)。
+> **文档职责：WHY。** 本文只说明项目要解决的问题、价值、原则和范围，不
+> 定义实现细节，也不作为验收依据。当前设计合同见
+> [`ARCHITECTURE.md`](ARCHITECTURE.md)，真实状态见
+> [`CURRENT_STATUS.md`](CURRENT_STATUS.md)。
 
 ## 要解决的问题
 
@@ -33,11 +36,14 @@
 
 因此：
 
-- 本文不规定字段、模块、算法、状态机、文件树、资产清单或测试步骤；这些内容只由 `plugin_plan_v3.md` 定义。
-- 本文不记录“已经完成什么”；真实进度、证据和阻塞状态只写入 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)。
+- 本文不规定字段、模块、算法、状态机、文件树、资产清单或测试步骤；这些
+  内容由 `ARCHITECTURE.md` 和实际代码合同定义。
+- 本文不记录“已经完成什么”；真实进度、证据和阻塞状态只写入
+  [`CURRENT_STATUS.md`](CURRENT_STATUS.md)。
 
 ## 项目成功的含义
 
 最终成功不是“模型能输出一张 mask”，而是用户能在 QGIS 中稳定完成以下工作：比较不同语义来源，按类别修整和编辑，检查拓扑，确认来源，并把可追溯的最终结果安全写入长期标签库。
 
-具体完成条件始终以 `plugin_plan_v3.md` 的当前版本为准。
+具体完成条件以 `ARCHITECTURE.md`、`CURRENT_STATUS.md` 和对应自动/实机验收
+合同为准。
