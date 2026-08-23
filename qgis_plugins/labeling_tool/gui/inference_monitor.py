@@ -235,6 +235,7 @@ class InferenceMonitorDialog(QDialog):
         self._stage_started_at = time.monotonic()
         self._runner_message = ""
         self._runtime_progress = {}
+        self._coverage_state = {}
         self._log_error_count = 0
         self._log_warning_count = 0
         self._detail_signature = None
@@ -272,11 +273,13 @@ class InferenceMonitorDialog(QDialog):
         self._package_overview = QLabel("Work Package：等待计划")
         self._unit_overview = QLabel("空间单元拟合：等待计划")
         self._assembly_overview = QLabel("结果流组装：等待上游计算")
+        self._coverage_overview = QLabel("空白/重叠验收：等待组装")
         for overview in (
             self._run_overview,
             self._package_overview,
             self._unit_overview,
             self._assembly_overview,
+            self._coverage_overview,
         ):
             overview.setWordWrap(True)
             left_layout.addWidget(overview)
@@ -444,6 +447,40 @@ class InferenceMonitorDialog(QDialog):
             action + (" · " + "/".join(counts) if counts else "")
         )
 
+    def _update_coverage_overview(self):
+        values = [
+            dict(value)
+            for value in self._coverage_state.values()
+            if isinstance(value, dict)
+        ]
+        if not values:
+            self._coverage_overview.setText("空白/重叠验收：等待组装")
+            return
+        gap_area_m2 = sum(
+            float(value.get("gap_area_m2") or 0.0) for value in values
+        )
+        overlap_area_m2 = sum(
+            float(value.get("overlap_area_m2") or 0.0) for value in values
+        )
+        outside_area_m2 = sum(
+            float(value.get("outside_area_m2") or 0.0) for value in values
+        )
+        passed = sum(1 for value in values if value.get("status") == "passed")
+        failed = sum(1 for value in values if value.get("status") == "failed")
+        skipped = len(values) - passed - failed
+        if failed:
+            state = f"失败 {failed} 个流"
+        elif skipped:
+            state = f"通过 {passed}，未验证 {skipped}"
+        else:
+            state = "通过"
+        self._coverage_overview.setText(
+            f"空白/重叠验收：{state} {passed}/{len(values)} | "
+            f"空白 {gap_area_m2:.6g} m² | "
+            f"重叠 {overlap_area_m2:.6g} m² | "
+            f"范围外 {outside_area_m2:.6g} m²"
+        )
+
     def _update_stage_rail(self, active_key):
         order = [key for key, _name in PIPELINE_STAGES]
         active = str(active_key or "compute")
@@ -482,6 +519,7 @@ class InferenceMonitorDialog(QDialog):
         self._package_activity.clear()
         self._runner_message = ""
         self._runtime_progress.clear()
+        self._coverage_state.clear()
         self._detail_signature = None
         self._stage_key = ""
         self._stage_started_at = time.monotonic()
@@ -490,6 +528,7 @@ class InferenceMonitorDialog(QDialog):
         self._package_overview.setText("Work Package：等待计划")
         self._unit_overview.setText("空间单元拟合：等待计划")
         self._assembly_overview.setText("结果流组装：等待上游计算")
+        self._coverage_overview.setText("空白/重叠验收：等待组装")
         self._update_stage_rail("compute")
         self._tile_detail_title.setText("选中结果流：未选择 | 空间单元详情")
         self._summary.setText("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
@@ -691,6 +730,22 @@ class InferenceMonitorDialog(QDialog):
                 failures=int(
                     self._stream_state.get(stream_id, {}).get("failures", 0)
                 ) + (1 if progress_status == "failed" else 0),
+            )
+            return
+        if event == "stream_coverage_validation":
+            self._coverage_state[stream_id] = dict(info)
+            self._update_coverage_overview()
+            coverage_status = str(info.get("status") or "")
+            passed = coverage_status == "passed"
+            failed = coverage_status == "failed"
+            self._set_stream(
+                stream_id,
+                stage="空白/重叠验收",
+                stage_progress="1/1",
+                status="成功" if passed else "失败" if failed else "未验证",
+                failures=int(
+                    self._stream_state.get(stream_id, {}).get("failures", 0)
+                ) + (1 if failed else 0),
             )
             return
         status = "失败" if event.endswith("failed") else "运行中"
@@ -1089,6 +1144,15 @@ class InferenceMonitorDialog(QDialog):
                 str(key): dict(value)
                 for key, value in all_runtime_progress.items()
             }
+            persisted_coverage = snapshot.get("stream_coverage_validation") or {}
+            if persisted_coverage:
+                self._coverage_state = {
+                    str(key): dict(value)
+                    for key, value in persisted_coverage.items()
+                }
+            coverage_updater = getattr(self, "_update_coverage_overview", None)
+            if callable(coverage_updater):
+                coverage_updater()
             all_type_counts = snapshot.get("stream_unit_type_counts") or {}
             all_job_type_counts = (
                 snapshot.get("stream_unit_job_type_counts") or {}

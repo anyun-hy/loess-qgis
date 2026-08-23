@@ -47,30 +47,55 @@ def apply_range_mask_to_core(
     """
 
     result = dict(arrays)
-    if range_geometry is None:
-        return result, {"range_mask_applied": False, "range_masked_pixel_count": 0}
-    if range_geometry.is_empty:
-        raise AuthoritativeRasterError("range geometry is empty")
     core = _window(partition["core_window"])
     core_shape = (core[3] - core[1], core[2] - core[0])
     if np.asarray(result["core_mask"]).shape != core_shape:
         raise AuthoritativeRasterError("Core mask shape does not match Partition")
-    core_transform = global_transform * Affine.translation(core[0], core[1])
-    inside = geometry_mask(
-        [mapping(range_geometry)],
-        out_shape=core_shape,
-        transform=core_transform,
-        invert=True,
-    )
     mask = np.asarray(result["core_mask"], dtype=np.int16).copy()
     confidence = np.asarray(result["core_confidence"], dtype=np.float32).copy()
+    if confidence.shape != core_shape:
+        raise AuthoritativeRasterError("Core confidence shape does not match Partition")
+    if range_geometry is None:
+        inside = np.ones(core_shape, dtype=bool)
+    else:
+        if range_geometry.is_empty:
+            raise AuthoritativeRasterError("range geometry is empty")
+        core_transform = global_transform * Affine.translation(core[0], core[1])
+        inside = geometry_mask(
+            [mapping(range_geometry)],
+            out_shape=core_shape,
+            transform=core_transform,
+            invert=True,
+        )
+
+    gap = inside & (mask < 0)
+    invalid_confidence = inside & (
+        ~np.isfinite(confidence) | (confidence < 0.0)
+    )
+    gap_count = int(np.count_nonzero(gap))
+    invalid_confidence_count = int(np.count_nonzero(invalid_confidence))
+    if gap_count or invalid_confidence_count:
+        raise AuthoritativeRasterError(
+            "authoritative Core has an unassigned pixel inside the owned "
+            "research range: "
+            f"gaps={gap_count}, invalid_confidence={invalid_confidence_count}"
+        )
+
     mask[~inside] = -1
     confidence[~inside] = -1.0
     result["core_mask"] = mask
     result["core_confidence"] = confidence
+    outside_count = int(np.count_nonzero(~inside))
     return result, {
-        "range_mask_applied": True,
-        "range_masked_pixel_count": int(np.count_nonzero(~inside)),
+        "range_mask_applied": range_geometry is not None,
+        "range_masked_pixel_count": outside_count,
+        "coverage_validation": {
+            "status": "passed",
+            "owned_pixel_count": int(np.count_nonzero(inside)),
+            "gap_pixel_count": 0,
+            "invalid_confidence_pixel_count": 0,
+            "outside_pixel_count": outside_count,
+        },
     }
 
 
@@ -158,6 +183,7 @@ def core_mask_tags(report: Mapping[str, Any]) -> dict[str, str]:
     policy = dict(report.get("policy") or {})
     halo = dict(report.get("halo_window") or {})
     core = dict(report.get("core_window") or {})
+    coverage = dict(report.get("coverage_validation") or {})
     margins = (
         int(core.get("x0", 0)) - int(halo.get("x0", 0)),
         int(core.get("y0", 0)) - int(halo.get("y0", 0)),
@@ -173,5 +199,13 @@ def core_mask_tags(report: Mapping[str, Any]) -> dict[str, str]:
         "fragmentation_halo_buffer_px": str(max(0, min(margins))),
         "fragmentation_changed_pixel_count": str(
             int(report.get("changed_pixel_count", 0))
+        ),
+        "coverage_validation_status": str(coverage.get("status") or "unknown"),
+        "coverage_owned_pixel_count": str(
+            int(coverage.get("owned_pixel_count", 0))
+        ),
+        "coverage_gap_pixel_count": str(int(coverage.get("gap_pixel_count", 0))),
+        "coverage_outside_pixel_count": str(
+            int(coverage.get("outside_pixel_count", 0))
         ),
     }

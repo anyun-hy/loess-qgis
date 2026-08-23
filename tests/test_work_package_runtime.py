@@ -1156,6 +1156,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         "write_formal",
         "aggregate_reports",
         "range_clip",
+        "coverage_validation",
         "accepted_difference",
         "publish_cleanup",
     }
@@ -1165,6 +1166,12 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     ]["fusion:fixture_fusion"]
     assert persisted_progress["phase"] == "publish_cleanup"
     assert persisted_progress["status"] == "completed"
+    coverage = database.monitor_snapshot(spec["run_id"])[
+        "stream_coverage_validation"
+    ]["fusion:fixture_fusion"]
+    assert coverage["status"] == "passed"
+    assert coverage["hard_gate_applied"] is True
+    assert coverage["gap_area_m2"] == pytest.approx(0.0)
     assert assembled["unit_count"] == 1
     assert assembled["object_count"] == 1
     assert assembled["fit_version"] == "divider_cubic_bspline_adaptive_v2"

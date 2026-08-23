@@ -260,6 +260,10 @@ def create_v5_run(
         "fusion": fusion_value,
         "boundary_fitting": boundary_value,
         "fragmentation_regularization": fragmentation_value,
+        "coverage_validation": {
+            "policy_id": "exact_range_zero_gap_v1",
+            "area_tolerance_pixels": 0.01,
+        },
         "range_selection": range_value,
         "config_fingerprint": str(config_fingerprint),
     }
@@ -359,6 +363,10 @@ def create_v5_run(
         "scaling": scaling_value,
         "boundary_fitting": boundary_value,
         "fragmentation_regularization": fragmentation_value,
+        "coverage_validation": {
+            "policy_id": "exact_range_zero_gap_v1",
+            "area_tolerance_pixels": 0.01,
+        },
         "storage_preflight": dict(storage_report),
         "models": model_values,
         "fusion": fusion_value,

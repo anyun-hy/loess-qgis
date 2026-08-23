@@ -123,6 +123,8 @@ def test_left_monitor_uses_run_package_and_unit_layers():
     ):
         assert label in build_ui
     assert "self._assembly_overview = QLabel(" in build_ui
+    assert "self._coverage_overview = QLabel(" in build_ui
+    assert "空白/重叠验收" in build_ui
 
 
 def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
@@ -495,6 +497,16 @@ def test_persisted_assembly_progress_replaces_completed_unit_counts():
     assert rows["model:test"]["stage_progress"] == "4/12"
     assert rows["model:test"]["feature_count"] == 999
     assert rows["model:test"]["activity"] == "—"
+
+
+def test_monitor_reads_persisted_coverage_validation_summary():
+    poll = _method_source("_poll_database")
+    coverage = _method_source("_update_coverage_overview")
+
+    assert 'snapshot.get("stream_coverage_validation")' in poll
+    assert "gap_area_m2" in coverage
+    assert "overlap_area_m2" in coverage
+    assert "outside_area_m2" in coverage
 
 
 def test_log_panel_is_retained_but_collapsed_by_default():
