@@ -28,6 +28,30 @@ Use an available background wait or monitoring mechanism; otherwise return
 control to the user with the current state and the exact condition for
 resuming, then continue only after notification or a new request.
 
+## Session handoff documents
+
+Do not create or update session-handoff documents for routine code changes.
+Handoff records are allowed only when the user explicitly requests a new
+conversation or handoff, work is actually being transferred to another
+session, or the current context can no longer safely carry the unfinished
+task. Otherwise rely on the live code, `git diff`, `git status`, and test
+evidence. Update formal implementation-status documents only when their own
+project rules require it, not as a substitute for a session handoff.
+
+## Documentation discipline
+
+`docs/README.md` is the only documentation entrypoint. Keep current contracts
+in `docs/ARCHITECTURE.md`, current verified state in `docs/CURRENT_STATUS.md`,
+formal operating methods in `docs/operations/`, and durable choices in
+`docs/decisions/`. Files under `docs/archive/` are read-only historical context
+and must not be updated as current guidance.
+
+Routine code changes do not require documentation edits. Do not append dated
+work logs, test transcripts, or session summaries to current documents. Update
+current docs only when an architecture contract, verified capability,
+deployment state, blocker, operating method, or durable project decision has
+materially changed.
+
 ## Remote Ubuntu access
 
 `Tencent` is the project's Ubuntu runtime and validation host. When a task
@@ -57,4 +81,3 @@ Managed plugin and inference files must originate from `loess-qgis` through the
 Bash deployment entry points. Preserve user-controlled weights, inputs, QGIS
 projects, accepted labels, and outputs unless the user explicitly requests a
 specific change.
-
