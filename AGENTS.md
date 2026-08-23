@@ -20,6 +20,14 @@ Run project tests in the Conda environment named `qgis`. Use
 `conda run -n qgis <test command>` or activate `qgis` before running tests; do
 not use system Python or the Conda `base` environment for project test results.
 
+## Waiting tasks
+
+When a task is waiting only for time or an external process, do not keep the
+active conversation open with repeated polling or unchanged status messages.
+Use an available background wait or monitoring mechanism; otherwise return
+control to the user with the current state and the exact condition for
+resuming, then continue only after notification or a new request.
+
 ## Remote Ubuntu access
 
 `Tencent` is the project's Ubuntu runtime and validation host. When a task
