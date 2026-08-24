@@ -12,6 +12,8 @@
    碎片治理方法；
 5. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
    V3、Generate、失败 RAG 和未来 V3.1 的方法决策。
+6. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
+   请求的新对话 V3.1 启动交接。
 
 ## 文档职责
 
@@ -23,6 +25,7 @@
 | `operations/` | 正式运行方法和操作合同 | 未验收研究候选 |
 | `decisions/` | 长期有效的方法选择及理由 | 每次代码修改记录 |
 | `diagrams/` | 当前机制图 | 无来源截图和临时导出 |
+| `handoffs/` | 用户明确请求的跨会话任务交接 | 普通代码修改和测试流水账 |
 | `archive/` | 只读历史证据 | 当前指导性结论 |
 
 ## 更新规则
