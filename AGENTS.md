@@ -28,6 +28,28 @@ Use an available background wait or monitoring mechanism; otherwise return
 control to the user with the current state and the exact condition for
 resuming, then continue only after notification or a new request.
 
+## Subagent model selection
+
+When subagents are authorized, choose each subagent's model and reasoning
+effort from the task's complexity, ambiguity, risk, and verification burden;
+do not use one fixed setting for every task.
+
+- Use `gpt-5.6-luna` with low or medium reasoning for bounded, low-risk work
+  such as file discovery, evidence collection, mechanical checks, and simple
+  test execution.
+- Use `gpt-5.6-terra` with medium or high reasoning as the normal baseline for
+  scoped implementation, tests, and reviews with clear acceptance criteria.
+- Use `gpt-5.6-sol` with high or xhigh reasoning for difficult root-cause
+  analysis, cross-platform architecture, concurrency or data-integrity work,
+  security-sensitive review, and other high-risk or highly ambiguous tasks.
+
+Use the least expensive tier that can reliably complete the work. Increase
+capability or reasoning when evidence shows the initial tier is insufficient;
+do not lower it merely to save tokens when correctness risk remains. Record
+the selected model, reasoning effort, task boundary, and expected evidence in
+the subagent task card. If a named model is unavailable, use the closest
+available model in the same capability tier.
+
 ## Session handoff documents
 
 Do not create or update session-handoff documents for routine code changes.
