@@ -22,7 +22,7 @@
 | 区域 | 职责 |
 |---|---|
 | `qgis_plugins/labeling_tool/` | QGIS UI、地图交互、运行编排、监控、人工修整 |
-| `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3、组装和验收 |
+| `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3/V3.3、组装和验收 |
 | `bash/` | 插件安装、部署项目初始化、Tencent SSH 入口 |
 | `tests/` | 契约、恢复、故障、规模和平台兼容测试 |
 | `docs/` | 当前架构、状态、操作和长期决策 |
@@ -39,7 +39,8 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
   -> 各模型独立概率推理
   -> Partition Halo cosine 概率拼接
   -> 各模型与 Fusion 独立 Core mask/confidence
-  -> Fragmentation V3 权威 Core
+  -> Fragmentation V3 冻结基线
+  -> Fragmentation V3.3 权威 Core
   -> 分区矢量化与公共分界拟合
   -> Stream 组装
   -> 完整范围 gap/overlap/outside 硬验收
@@ -68,18 +69,22 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 
 ## 7. 权威栅格与碎片治理
 
-- Fragmentation V3 是当前生产碎片治理方案；
-- V3 在概率拼接后、矢量化前生成唯一权威 Core；
-- V3 必须保持单标签，不得产生 gap、overlap 或范围外发布；
+- Fragmentation V3.3 是当前生产碎片治理方案；
+- V3 先从 Fusion 概率生成冻结基线和上下文，V3.3 再统一裁决所有 Core，
+  V3.3 输出才是矢量化使用的唯一权威 Core；
+- V3.3 必须保持单标签，不得产生 gap、overlap 或范围外发布；
+- V3.3 任务只有在全部 Work Package 的 V3 基线、上下文和概率都 ready 后才能
+  领取；同一 Fusion 的空间单元必须等 V3.3 整体 ready 后才可执行；
+- V3 保留为新 Run 的明确回滚选项，但同一个 Run 内不允许 V3.3 失败后静默退回
+  V3；
 - Generate 只作研究参考，不是生产入口；
 - 失败 RAG 与空间联合解码已归档，不得从 archive 导入生产；
 - V3.1—V3.4 的同域实验最终选择 V3.3；
 - V3.3 规则存放在可查询、严格校验的版本化配置中，执行器不得使用隐藏默认值
   覆盖类别权限、面积阈值、关系优先级或冲突顺序；
-- V3.3 当前仍是隔离候选，不被正式入口导入，也不修改生产 V3；
 - V3.1、V3.2、V3.4 的源码和测试只保存在实验分支历史，不属于主干当前文件。
 
-### V3.3 迁移到 approved Fusion 的唯一性硬门
+### V3.3 approved Fusion 唯一性硬门
 
 单模型概率实验中保持 zero-gap、zero-overlap、zero-outside，不能自动证明
 approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立验证：
@@ -89,8 +94,9 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 - hard label 使用冻结 `CLASS_ORDER` 的稳定 argmax，每个有效像元只发布一个
   类别；最高概率并列及 near-tie 必须单独计数和审计，但并列概率本身不允许
   变成多标签或跨类别 overlap；
-- Partition Core 对完整范围精确覆盖一次，Halo 不发布；跨 Core proposal 只能
-  由一个冻结 owner 发布，不能重复改写同一像元；
+- Partition Core 对完整范围精确覆盖一次，Halo 不发布；proposal 只能由一个
+  冻结 owner 发布，不能重复改写同一像元；任何 owner 都无法完整裁决的跨 Core
+  footprint 不执行 V3.3 改写；
 - V3.3 后的权威 Core mosaic 必须逐像元验证 single-label、gap=0、overlap=0、
   outside=0、invalid 保持和完整范围 coverage；
 - 矢量化及全流组装后必须再次执行 gap、overlap、outside 硬验收，不能用栅格
