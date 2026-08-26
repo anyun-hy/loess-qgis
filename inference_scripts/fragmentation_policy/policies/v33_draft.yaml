@@ -1,0 +1,393 @@
+# V3.3 is a draft policy document only.  It cannot alter V3, V3.1-B, or V3.2.
+# All shares below are the screenshot's frozen V3.1 "优化前占比", not a live census.
+schema_version: fragmentation-policy/v1
+policy:
+  id: fragmentation_v33_configurable_absorption_draft
+  version: v33_draft_20260826
+  status: draft
+  baseline: frozen_v3
+  connectivity: 4
+  single_pass: true
+  cascade_generation: false
+
+# source_absorption = may this class disappear when it is the small fragment?
+# target_growth = may this class receive that small fragment?
+# same_class_bridge = may a small separating footprint connect this class's components?
+classes:
+  "12": {code: 12, name: 水浇地, source_absorption: deny, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 50, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "13": {code: 13, name: 旱地, source_absorption: allow, target_growth: allow, same_class_bridge: deny, fragment_max_m2: 150, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "21": {code: 21, name: 果园, source_absorption: allow, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 80, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "31": {code: 31, name: 有林地, source_absorption: allow, target_growth: allow, same_class_bridge: deny, fragment_max_m2: 100, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "32": {code: 32, name: 灌木林地, source_absorption: allow, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 100, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "33": {code: 33, name: 其他林地, source_absorption: deny, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 60, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "43": {code: 43, name: 其他草地, source_absorption: allow, target_growth: allow, same_class_bridge: deny, fragment_max_m2: 100, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "51": {code: 51, name: 城镇建设用地, source_absorption: allow, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 80, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "52": {code: 52, name: 农村建设用地, source_absorption: deny, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 60, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "53": {code: 53, name: 人为扰动用地, source_absorption: allow, target_growth: allow, same_class_bridge: deny, fragment_max_m2: 50, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "54": {code: 54, name: 其他建设用地, source_absorption: allow, target_growth: allow, same_class_bridge: deny, fragment_max_m2: 50, relation_profile: policy_rules, post_cleanup_obligation: none}
+  "61": {code: 61, name: 农村道路, source_absorption: allow, target_growth: deny, same_class_bridge: deny, fragment_max_m2: 30, relation_profile: policy_rules, post_cleanup_obligation: manual_transport_vector_overlay}
+  "62": {code: 62, name: 其他交通用地, source_absorption: allow, target_growth: deny, same_class_bridge: deny, fragment_max_m2: 50, relation_profile: policy_rules, post_cleanup_obligation: manual_transport_vector_overlay}
+  "71": {code: 71, name: 河湖库塘, source_absorption: deny, target_growth: allow, same_class_bridge: allow, fragment_max_m2: 50, relation_profile: policy_rules, post_cleanup_obligation: none}
+
+scenarios:
+  unique_enclosure:
+    match: one_surrounding_class
+    source_scope: complete_source_component_only
+    target_selection: unique_surrounding_class
+    evidence_gates: {semantic: policy_relation_only, probability: audit_only, confidence: audit_only}
+  multi_neighbour:
+    match: two_or_more_surrounding_classes_without_eligible_bridge
+    source_scope: complete_source_component_only
+    target_selection: [raw_v31_share_ascending, target_probability_descending, class_code_ascending]
+    rarity_source: statistics.raw_v31_optimization_before_share
+    contact_measurement: audit_only
+    evidence_gates: {semantic: policy_relation_only, probability: audit_only, confidence: audit_only}
+  same_class_bridge:
+    match: two_or_more_surrounding_classes_and_two_or_more_components_of_selected_target
+    source_scope: complete_source_component_only
+    target_selection: same_class_only
+    evidence_gates: {semantic: policy_relation_only, probability: audit_only, confidence: audit_only}
+  invalid_or_ambiguous:
+    match: external_contact_or_invalid_pixel_or_incomplete_routing_evidence
+    decision: deny
+
+decision_engine:
+  default_decision: deny
+  precedence: [hard_deny, scenario_routing, source_permission, target_permission, relation_permission, area_budget_topology, target_selection]
+  conflict_resolution: [class_permission_hard_deny, higher_specificity, higher_priority, equal_rank_deny_overrides, default_deny]
+  scenario_routing:
+    order: [invalid_or_ambiguous, unique_enclosure, same_class_bridge, multi_neighbour]
+    unique_enclosure_rule: one_distinct_surrounding_class_regardless_of_target_component_count
+    bridge_rule: multi_class_boundary_with_at_least_two_components_of_one_selected_target
+    multi_neighbour_rule: complete_bridge_check_found_no_eligible_bridge
+  # ABAC-like, queryable relation rules.  Class permissions are hard denies.
+  # Normal rules select specificity, then priority; a deny wins at equal rank.
+  relation_rules:
+    - {id: deny_protected_source_12, effect: deny, source: "12", target: "*", scenario: "*", priority: 1000, specificity: 1}
+    - {id: deny_protected_source_33, effect: deny, source: "33", target: "*", scenario: "*", priority: 1000, specificity: 1}
+    - {id: deny_protected_source_52, effect: deny, source: "52", target: "*", scenario: "*", priority: 1000, specificity: 1}
+    - {id: deny_protected_source_71, effect: deny, source: "71", target: "*", scenario: "*", priority: 1000, specificity: 1}
+    - {id: allow_dryland_to_any_surrounding, effect: allow, source: "13", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_orchard_to_any_surrounding, effect: allow, source: "21", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_arbor_to_any_surrounding, effect: allow, source: "31", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_shrub_to_any_surrounding, effect: allow, source: "32", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_grass_to_any_surrounding, effect: allow, source: "43", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_urban_to_any_surrounding, effect: allow, source: "51", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_disturbed_to_any_surrounding, effect: allow, source: "53", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_other_built_to_any_surrounding, effect: allow, source: "54", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_rural_road_to_any_surrounding, effect: allow, source: "61", target: "*", scenario: "*", priority: 300, specificity: 1}
+    - {id: allow_other_transport_to_any_surrounding, effect: allow, source: "62", target: "*", scenario: "*", priority: 300, specificity: 1}
+  proposal_adjudication:
+    conflict_set: all_scenarios_single_incremental_pass
+    canonical_deduplication: required
+    proposal_id_collision: reject
+    footprint_conflict: reject
+    core_owner: required
+    dependency_mode: v31b_incremental
+    proposal_rank:
+      - {field: dynamic_fragment_reduction, order: descending, value_source: proposal}
+      - {field: component_reduction, order: descending, value_source: proposal}
+      - {field: target_rarity_share, order: ascending, value_source: decision_engine.statistics.raw_v31_optimization_before_share}
+      - {field: target_probability, order: descending, value_source: proposal}
+      - {field: changed_area_m2, order: ascending, value_source: proposal}
+      - {field: target_class_code, order: ascending, value_source: proposal}
+    exact_tie_break: [proposal_digest_ascending, proposal_id_ascending]
+  statistics:
+    source: "Screenshot: V3.1 optimization-before area and share (2026-08-26 user-provided table)"
+    raw_v31_optimization_before_share:
+      "12": 0.0013
+      "13": 0.3958
+      "21": 0.0225
+      "31": 0.2196
+      "32": 0.0929
+      "33": 0.0017
+      "43": 0.2002
+      "51": 0.0047
+      "52": 0.0199
+      "53": 0.0009
+      "54": 0.0008
+      "61": 0.0000
+      "62": 0.0142
+      "71": 0.0254
+    raw_v31_optimization_before_area_km2:
+      "12": 1.21
+      "13": 371.91
+      "21": 21.18
+      "31": 206.38
+      "32": 87.24
+      "33": 1.57
+      "43": 188.13
+      "51": 4.38
+      "52": 18.74
+      "53": 0.84
+      "54": 0.78
+      "61": 0.02
+      "62": 13.34
+      "71": 23.86
+
+constraints:
+  hard_gates: [valid_single_label, no_gap_overlap_outside, core_owner_only, proposal_footprint_conflict_reject, canonical_proposal_dedup_required, single_incremental_adjudication, source_connectivity_preserved, target_attachment_preserved, per_class_components_nonincreasing, global_components_nonincreasing, dynamic_fragments_nonincreasing, dynamic_fragment_area_nonincreasing, total_boundary_edges_nonincreasing, internal_boundary_edges_nonincreasing, total_boundary_meters_nonincreasing, internal_boundary_meters_nonincreasing, full_audit_required, lineage_required]
+  budgets:
+    source_loss_fraction: 0.02
+    target_gain_fraction: 0.02
+    protected_source_loss_fraction: 0.0
+    protected_bridge_gain_fraction: 0.01
+    protected_source_codes: [12, 33, 52, 71]
+    bridge_limits:
+      "12": {allow: allow, max_edge_distance_m: 6, max_new_footprint_m2: 50}
+      "13": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "21": {allow: allow, max_edge_distance_m: 12, max_new_footprint_m2: 160}
+      "31": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "32": {allow: allow, max_edge_distance_m: 12, max_new_footprint_m2: 200}
+      "33": {allow: allow, max_edge_distance_m: 6, max_new_footprint_m2: 60}
+      "43": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "51": {allow: allow, max_edge_distance_m: 8, max_new_footprint_m2: 160}
+      "52": {allow: allow, max_edge_distance_m: 10, max_new_footprint_m2: 120}
+      "53": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "54": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "61": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "62": {allow: deny, max_edge_distance_m: 0, max_new_footprint_m2: 0}
+      "71": {allow: allow, max_edge_distance_m: 6, max_new_footprint_m2: 50}
+  transport_overlay:
+    required: true
+    artifact_sha256: required_at_runtime
+    artifact_version: required_at_runtime
+    precedence: manual_transport_vector_over_fragmentation
+    post_overlay_budget_audit: true
+    budget_treatment: authoritative_overlay_exempt_from_fragmentation_target_gain_report_separately
+  execution_contract:
+    bridge_edge_distance: euclidean_cell_polygon_edge_distance_m
+    bridge_path_length: four_neighbour_path_length_m
+    budget_denominator: class_budget_mask_and_valid_frozen_baseline
+    canonical_proposal_identity: kind_target_index_target_code_sorted_footprint_source_indices_source_codes_source_component_ids_baseline_target_component_ids
+    duplicate_representative: proposal_id_then_occurrence_edge_distance_then_occurrence_path_length_none_last
+    canonical_distance_evidence: minimum_present_edge_distance_and_path_length
+    inconsistent_duplicate_rank_or_evidence: reject
+  evaluation:
+    comparison_baseline: frozen_v32
+    required_partition_count: 140
+    effect_metric: dynamic_fragment_count_reduction_fraction
+    effect_fraction: 0.005
+    lineage_gates: [same_v31a_parent, same_snapshot, same_v3_policy, same_partition_ids_and_raw_v3_valid_sha256]
+    coverage_gates: [part_count_140, core_overlap_zero, geometric_gap_zero, candidate_invalid_inside_zero, candidate_outside_valid_zero]
+  post_cleanup_acceptance: [manual_transport_vector_overlay_if_obligated, rerun_all_hard_gates, rerun_fragmentation_budget_audit, audit_authoritative_overlay_separately]
+
+# This ledger is the explicit answer to "which V3.2B rules did not enter V3.3".
+# It cites implementation facts; status records V3.3 treatment, not an assertion
+# that the old candidate has been changed.
+migration:
+  legacy_policy: V3.1-B/V3.2 implementation evidence
+  evidence_files:
+    - inference_scripts/fragmentation_v31_candidate/candidate.py
+    - inference_scripts/fragmentation_v31_candidate/v32.py
+    - scratch/v32_full_140_20260825/run_v32_from_v3.py
+    - scratch/v32_full_140_20260825/evaluate_v32_against_b.py
+    - tests/test_fragmentation_v32_candidate.py
+  # Queryable legacy values.  They are evidence only where the V3.3 rule ledger
+  # marks them superseded/not_moved; the executor must not silently reactivate them.
+  legacy_reference:
+    v31b_dynamic_fragmentation_m2: {"12": 50.0, "13": 150.0, "21": 80.0, "31": 100.0, "32": 100.0, "33": 60.0, "43": 100.0, "51": 80.0, "52": 60.0, "53": 50.0, "54": 50.0, "61": 30.0, "62": 50.0, "71": 50.0}
+    v31b_enclosed_island_max_m2: {"12": 0.0, "13": 150.0, "21": 80.0, "31": 100.0, "32": 100.0, "33": 0.0, "43": 100.0, "51": 80.0, "52": 60.0, "53": 50.0, "54": 50.0, "61": 0.0, "62": 0.0, "71": 0.0}
+    v31b_ordinary_protected: {"12": true, "13": false, "21": false, "31": false, "32": false, "33": true, "43": false, "51": false, "52": false, "53": false, "54": false, "61": true, "62": true, "71": true}
+    v31b_protected_source_codes: [12, 33, 61, 62, 71]
+    v31b_probability_thresholds:
+      "12": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.05, minimum_target_probability_p10: 0.25}
+      "13": {minimum_target_probability_mean: 0.30, maximum_current_minus_target_probability_mean: 0.10, minimum_target_probability_p10: 0.20}
+      "21": {minimum_target_probability_mean: 0.30, maximum_current_minus_target_probability_mean: 0.10, minimum_target_probability_p10: 0.20}
+      "31": {minimum_target_probability_mean: 0.30, maximum_current_minus_target_probability_mean: 0.10, minimum_target_probability_p10: 0.20}
+      "32": {minimum_target_probability_mean: 0.30, maximum_current_minus_target_probability_mean: 0.10, minimum_target_probability_p10: 0.20}
+      "33": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.05, minimum_target_probability_p10: 0.25}
+      "43": {minimum_target_probability_mean: 0.30, maximum_current_minus_target_probability_mean: 0.10, minimum_target_probability_p10: 0.20}
+      "51": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.08, minimum_target_probability_p10: 0.20}
+      "52": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.08, minimum_target_probability_p10: 0.20}
+      "53": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.08, minimum_target_probability_p10: 0.20}
+      "54": {minimum_target_probability_mean: 0.35, maximum_current_minus_target_probability_mean: 0.08, minimum_target_probability_p10: 0.20}
+      "61": {minimum_target_probability_mean: 0.40, maximum_current_minus_target_probability_mean: 0.05, minimum_target_probability_p10: 0.25}
+      "62": {minimum_target_probability_mean: 0.40, maximum_current_minus_target_probability_mean: 0.05, minimum_target_probability_p10: 0.25}
+      "71": {minimum_target_probability_mean: 0.40, maximum_current_minus_target_probability_mean: 0.05, minimum_target_probability_p10: 0.25}
+    v31b_source_confidence_max: 0.65
+    v31b_bridge_limits:
+      "12": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 6, bridge_max_new_footprint_m2: 50}
+      "13": {allow_same_class_bridge: false, bridge_max_edge_distance_m: 0, bridge_max_new_footprint_m2: 0}
+      "21": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 12, bridge_max_new_footprint_m2: 160}
+      "31": {allow_same_class_bridge: false, bridge_max_edge_distance_m: 0, bridge_max_new_footprint_m2: 0}
+      "32": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 12, bridge_max_new_footprint_m2: 200}
+      "33": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 6, bridge_max_new_footprint_m2: 60}
+      "43": {allow_same_class_bridge: false, bridge_max_edge_distance_m: 0, bridge_max_new_footprint_m2: 0}
+      "51": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 8, bridge_max_new_footprint_m2: 160}
+      "52": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 10, bridge_max_new_footprint_m2: 120}
+      "53": {allow_same_class_bridge: false, bridge_max_edge_distance_m: 0, bridge_max_new_footprint_m2: 0}
+      "54": {allow_same_class_bridge: false, bridge_max_edge_distance_m: 0, bridge_max_new_footprint_m2: 0}
+      "61": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 4, bridge_max_new_footprint_m2: 30}
+      "62": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 6, bridge_max_new_footprint_m2: 50}
+      "71": {allow_same_class_bridge: true, bridge_max_edge_distance_m: 6, bridge_max_new_footprint_m2: 50}
+    v31b_semantic_compatible_targets:
+      "12": []
+      "13": ["21", "31", "32", "43"]
+      "21": ["13"]
+      "31": ["13", "32", "43"]
+      "32": ["31", "43"]
+      "33": []
+      "43": ["13", "31", "32"]
+      "51": ["52", "53", "54"]
+      "52": ["51", "53", "54"]
+      "53": ["51", "52", "54"]
+      "54": ["51", "52", "53"]
+      "61": []
+      "62": []
+      "71": []
+    v31b_budgets: {source_loss_fraction: 0.02, target_gain_fraction: 0.02, protected_bridge_gain_fraction: 0.01}
+    v31b_audit_proposal_limit: 256
+    v31b_adjudication_mode: dependency_incremental_v1
+    v31b_algorithm_contract:
+      topology_connectivity: 4
+      dynamic_fragment_area_test: "0 < area_m2 < class_mmu_m2"
+      enclosed_island_area_test: "0 < area_m2 <= island_cap_m2 and dynamic_fragment"
+      probability_p10_method: empirical_nearest_rank_ceil
+      probability_support: minimum_gate_margin
+      single_pass_from_frozen_baseline: true
+      cascade_generation: false
+      exact_cross_target_tie: reject_ambiguous_group
+      bridge_edge_distance: euclidean_cell_polygon_edge_distance_m
+      bridge_path_length: four_neighbour_path_length_m
+      budget_denominator: class_budget_mask_and_valid_frozen_baseline
+      adjudication: incremental_source_connectivity_target_attachment_and_component_gate
+      incremental_metric_gate: per_class_components_nonincreasing_global_components_and_dynamic_nonincreasing
+    v31b_global_acceptance:
+      - valid_single_label_and_invalid_pixel_preservation
+      - no_gap_overlap_outside
+      - protected_source_retention
+      - source_connectivity_preserved
+      - target_attachment_preserved
+      - per_class_components_nonincreasing
+      - global_components_nonincreasing
+      - dynamic_fragments_nonincreasing
+      - final_topology_rollback_if_any_gate_fails
+    v32_selector_and_contact:
+      additional_proposal: closed_multi_neighbor_rarity
+      source_eligibility: dynamic_nonprotected_nonexternal_closed_source_touching_at_least_two_classes
+      target_gates: existing_B_semantic_protected_target_probability_and_budget_adjudication_gates
+      target_selection: full_owner_core_strict_valid_v3_frozen_total_ascending_then_mean_target_probability_descending_then_class_code_ascending
+      contact_measurement: audit_only_not_filter_or_sort
+      adjudication: one_B_incremental_adjudication_over_B_original_and_V32_new_proposals
+  rules:
+    per_class_small_fragment_thresholds:
+      legacy_behavior: V3.1-B dynamic_fragmentation_m2 per class
+      status: moved
+      v33_location: classes.*.fragment_max_m2
+      reason: Same 14 thresholds are explicit and queryable.
+    enclosed_island_area_caps:
+      legacy_behavior: V3.1-B enclosed_island_max_m2 per class, including zero caps for protected sources
+      status: superseded
+      v33_location: classes.*.source_absorption and classes.*.fragment_max_m2
+      reason: Protected-source eligibility is now a separate permission; permitted complete small components use the class fragment limit.
+    four_connected_frozen_single_pass:
+      legacy_behavior: 4-connected one frozen baseline with cascade disabled
+      status: moved
+      v33_location: policy.connectivity and policy.single_pass
+      reason: Retained as a non-negotiable execution contract.
+    source_protection:
+      legacy_behavior: ordinary_protected and protected_source_codes 12,33,61,62,71
+      status: superseded
+      v33_location: classes.*.source_absorption and constraints.budgets.protected_source_codes
+      reason: Split source loss from target growth; 61/62 are released for this run and 52 becomes source protected.
+    target_protection:
+      legacy_behavior: ordinary_protected also denied every protected target
+      status: superseded
+      v33_location: classes.*.target_growth and decision_engine.relation_rules
+      reason: Target growth is independent; 13 may become any surrounding class including protected targets, and 52 may grow.
+    semantic_compatibility_table:
+      legacy_behavior: source-to-target semantic_compatible_targets table
+      status: superseded
+      v33_location: decision_engine.relation_rules
+      reason: All permitted small-fragment sources now use any-surrounding relation rules; the old semantic table remains audit evidence only.
+    enclosed_single_neighbour:
+      legacy_behavior: enclosed island proposal used class island cap plus confidence and probability gates
+      status: superseded
+      v33_location: scenarios.unique_enclosure
+      reason: One surrounding class directly absorbs an eligible small fragment; probability and confidence are audit only.
+    multi_neighbour_rarity:
+      legacy_behavior: V3.2 chose legal targets by live frozen pixel total, target probability, then code
+      status: superseded
+      v33_location: scenarios.multi_neighbour and decision_engine.statistics
+      reason: User froze rarity to raw V3.1 optimization-before shares; target probability then code break ties.
+    contact_length:
+      legacy_behavior: V3.2 recorded contact edges and physical length but did not select by them
+      status: moved
+      v33_location: scenarios.multi_neighbour.contact_measurement
+      reason: Retained as audit-only evidence.
+    class_source_and_target_budgets:
+      legacy_behavior: 2 percent source and target limits with 0 protected source loss
+      status: moved
+      v33_location: constraints.budgets and constraints.execution_contract.budget_denominator
+      reason: Retained, with the new protected-source set.
+    global_acceptance_gates:
+      legacy_behavior: V3.1-B/V3.2 final topology rollback and single-label, gap, attachment, connectivity, component, and dynamic-fragment gates
+      status: moved
+      v33_location: constraints.hard_gates and constraints.post_cleanup_acceptance
+      reason: Retained both before publication and after mandatory transport-vector overlay.
+    protected_bridge_one_percent_budget:
+      legacy_behavior: protected same-class bridges had a separate 1 percent gain limit
+      status: moved
+      v33_location: constraints.budgets.protected_bridge_gain_fraction
+      reason: Retained at 1 percent so the new 52 bridge permission remains bounded.
+    bridge_distance_and_footprint_caps:
+      legacy_behavior: per-class bridge distance and new-footprint caps
+      status: moved
+      v33_location: constraints.budgets.bridge_limits and constraints.execution_contract
+      reason: Existing numeric caps are actively inherited so the new 52 bridge permission remains bounded.
+    exact_cross_target_tie_rejection:
+      legacy_behavior: V3.1-B rejected an exact cross-target proposal tie
+      status: superseded
+      v33_location: decision_engine.precedence and scenarios.multi_neighbour.target_selection
+      reason: Deterministic class-code tie break is now explicit for multi-neighbour selection.
+    manual_transport_vector_overlay:
+      legacy_behavior: not represented in V3.1-B/V3.2 candidate policy
+      status: moved
+      v33_location: classes.61/classes.62 and constraints.post_cleanup_acceptance
+      reason: 61/62 may disappear only with a mandatory later manual transport-vector overlay and re-audit.
+    probability_thresholds:
+      legacy_behavior: Per-target probability mean, current-minus-target mean, and P10 proposal gates
+      status: superseded
+      v33_location: scenarios.*.evidence_gates
+      reason: Stored as live-audited legacy evidence and no longer rejects V3.3 absorption.
+    source_confidence_cap:
+      legacy_behavior: V3.1-B island mean source confidence cap of 0.65
+      status: superseded
+      v33_location: scenarios.*.evidence_gates
+      reason: Retained as audit evidence only.
+    audit_proposal_limit:
+      legacy_behavior: Candidate audit_proposal_limit of 256 when full audit is disabled
+      status: superseded
+      v33_location: constraints.hard_gates.full_audit_required
+      reason: V3.3 requires full audit, so the 256-row truncation cap is recorded as legacy evidence but is no longer active.
+    proposal_rank:
+      legacy_behavior: V3.1-B stable proposal rank key and V3.2 frozen-total selector
+      status: superseded
+      v33_location: decision_engine.proposal_adjudication.proposal_rank
+      reason: Approved V3.3 order is dynamic-fragment reduction, component reduction, frozen raw-V3.1 target rarity, target probability, changed area, and class code; digest and proposal ID only make exact ties reproducible.
+    dedup_and_id_collision:
+      legacy_behavior: Canonical proposal IDs, duplicate occurrence audit, and collision closure
+      status: moved
+      v33_location: decision_engine.proposal_adjudication, constraints.execution_contract, and constraints.hard_gates.full_audit_required
+      reason: V3.3 executor contract must retain deterministic IDs and complete duplicate ledger.
+    footprint_conflict_and_core_owner:
+      legacy_behavior: Reject overlapping proposal footprints and non-owner-Core footprints
+      status: moved
+      v33_location: constraints.hard_gates
+      reason: Preserved as a hard execution gate.
+    b_incremental_adjudication:
+      legacy_behavior: B dependency-incremental source/attachment/component adjudication
+      status: moved
+      v33_location: constraints.hard_gates
+      reason: Preserved as the topology-safe adjudication contract.
+    b_plus_v32_same_adjudication:
+      legacy_behavior: V3.2 submits B and multi-neighbour proposals to one B incremental adjudication
+      status: moved
+      v33_location: constraints.hard_gates
+      reason: V3.3 must adjudicate all scenario proposals in one conflict set.
+    lineage_140_coverage_effect_fraction:
+      legacy_behavior: 140-Core exact coverage and lineage gate with evaluator EFFECT_FRACTION 0.005
+      status: moved
+      v33_location: constraints.hard_gates and constraints.evaluation
+      reason: Explicitly retained for end-to-end publication acceptance.
