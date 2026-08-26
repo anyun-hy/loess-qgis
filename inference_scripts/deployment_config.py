@@ -687,13 +687,21 @@ def validate_deployment_config(
         issues.append(ValidationIssue(
             "/fragmentation_regularization/enabled", "must be boolean"
         ))
-    policy_id = str(
-        fragmentation.get("policy_id") or "semantic_optimized_200_v3"
-    )
-    if policy_id != "semantic_optimized_200_v3":
+    v3_policy_id = "semantic_optimized_200_v3"
+    v33_policy_id = "fragmentation_v33_configurable_absorption_v1"
+    policy_id = str(fragmentation.get("policy_id") or v3_policy_id)
+    if policy_id not in {v3_policy_id, v33_policy_id}:
         issues.append(ValidationIssue(
             "/fragmentation_regularization/policy_id",
-            "must equal semantic_optimized_200_v3",
+            f"must equal {v33_policy_id} or {v3_policy_id}",
+        ))
+    baseline_policy_id = str(
+        fragmentation.get("baseline_policy_id") or v3_policy_id
+    )
+    if baseline_policy_id != v3_policy_id:
+        issues.append(ValidationIssue(
+            "/fragmentation_regularization/baseline_policy_id",
+            f"must equal {v3_policy_id}",
         ))
     try:
         buffer_pixels = int(fragmentation.get("buffer_pixels", 256))
@@ -719,15 +727,37 @@ def validate_deployment_config(
                 "/fragmentation_regularization/max_workers",
                 "must be auto or between 1 and the available CPU count",
             ))
-    effective["fragmentation_regularization"] = {
+    effective_fragmentation = {
         "enabled": raw_enabled is True,
         "policy_id": policy_id,
-        "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "policy_version": (
+            "v33_production_20260826"
+            if policy_id == v33_policy_id
+            else "semantic_optimized_200_v3_core_bounded_v1"
+        ),
+        "baseline_policy_id": baseline_policy_id,
+        "baseline_policy_version": "semantic_optimized_200_v3_core_bounded_v1",
         "buffer_pixels": buffer_pixels,
         "requested_max_workers": requested_workers,
         "max_workers": max(1, max_workers),
         "stream_kind": "fusion",
     }
+    if policy_id == v33_policy_id:
+        if raw_enabled is not True:
+            issues.append(ValidationIssue(
+                "/fragmentation_regularization/enabled",
+                "must be true when V3.3 is selected",
+            ))
+        from fragmentation_v33_candidate import (
+            executor_snapshot_sha256,
+            policy_snapshot_sha256,
+        )
+        effective_fragmentation.update({
+            "publication": "authoritative_fusion_core",
+            "policy_sha256": policy_snapshot_sha256(),
+            "executor_sha256": executor_snapshot_sha256(),
+        })
+    effective["fragmentation_regularization"] = effective_fragmentation
 
     classes = _mapping(config.get("classes"), "/classes", issues)
     raw_index = _mapping(classes.get("index_to_code"), "/classes/index_to_code", issues)

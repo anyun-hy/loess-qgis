@@ -1,10 +1,10 @@
-# Selected V3.3 candidate policy. It remains isolated from the production V3 entry.
+# Selected V3.3 production policy. V3 remains the frozen first-stage baseline.
 # All shares below are the screenshot's frozen V3.1 "优化前占比", not a live census.
 schema_version: fragmentation-policy/v1
 policy:
-  id: fragmentation_v33_configurable_absorption_candidate
-  version: v33_candidate_20260826
-  status: candidate
+  id: fragmentation_v33_configurable_absorption
+  version: v33_production_20260826
+  status: approved
   baseline: frozen_v3
   connectivity: 4
   single_pass: true

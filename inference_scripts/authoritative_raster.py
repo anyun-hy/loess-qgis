@@ -155,7 +155,15 @@ def regularize_partition_core(
         class_budget_mask=budget,
     )
     result = dict(arrays)
-    result["core_mask"] = cleaned[y0:y1, x0:x1].astype(np.int16, copy=False)
+    # Keep the owner-Core V3 result before the exact research-range mask is
+    # applied.  An isolated V3.3 comparison stage needs this decoder-valid
+    # context from neighbouring owners so a fragment crossing a Partition
+    # boundary is seen exactly once.  The regular authoritative ``core_mask``
+    # below remains the only production publication.
+    result["v3_context_core"] = cleaned[y0:y1, x0:x1].astype(
+        np.int16, copy=True
+    )
+    result["core_mask"] = result["v3_context_core"].copy()
     result["core_confidence"] = confidence[y0:y1, x0:x1].astype(
         np.float32, copy=False
     )

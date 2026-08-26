@@ -43,6 +43,7 @@ def process_thread_environment_values(spec, context):
     if (
         context.get("kind") == "accelerator_worker"
         or job.get("job_type") == "work_package"
+        or job.get("job_type") == "fragmentation_v33"
     ):
         threads = _resource_value(spec, "package_process_threads", 2)
     elif job.get("job_type") == "unit_fit":
@@ -76,6 +77,7 @@ class V5AsyncInferenceRunner(QObject):
 
     REQUIRED_SCRIPTS = (
         "run_work_package.sh",
+        "run_fragmentation_v33_work_package.sh",
         "run_unit_fit.sh",
         "run_finalize_partition_rasters.sh",
         "run_assemble_stream.sh",
@@ -272,6 +274,10 @@ class V5AsyncInferenceRunner(QObject):
             if entry["context"].get("kind") == "job"
         ]
         unit_active = sum(1 for job in active_jobs if job and job["job_type"] == "unit_fit")
+        candidate_active = any(
+            job and job["job_type"] == "fragmentation_v33"
+            for job in active_jobs
+        )
         started = False
 
         package_pending = any(
@@ -286,6 +292,42 @@ class V5AsyncInferenceRunner(QObject):
             else:
                 self._accelerator_done = True
 
+        fragmentation = dict(self._spec.get("fragmentation_regularization") or {})
+        production_v33 = bool(
+            fragmentation.get("enabled") is True
+            and fragmentation.get("policy_id")
+            == "fragmentation_v33_configurable_absorption_v1"
+            and fragmentation.get("publication") == "authoritative_fusion_core"
+        )
+        replay_v33 = bool(
+            (fragmentation.get("comparison") or {}).get("enabled", False)
+        )
+        v33_enabled = production_v33 or replay_v33
+        if v33_enabled and not package_pending:
+            candidate_counts = self._database.job_counts(
+                self._spec["run_id"], job_type="fragmentation_v33"
+            )
+            if int(candidate_counts.get("failed", 0)):
+                self._finish(
+                    False,
+                    "V3.3 exhausted retries: "
+                    + str(candidate_counts),
+                )
+                return
+            if not candidate_active and not candidate_counts.get("ready", 0):
+                job = self._database.lease_next_fragmentation_v33(
+                    self._spec["run_id"],
+                    self._worker_id + "-fragmentation-v33",
+                    lease_seconds=300,
+                )
+                if job:
+                    self._start_job(job)
+                    started = True
+
+        # The state DB refuses same-Fusion-stream unit jobs until its V3.3 job
+        # is ready, while model streams remain leasable.  Keep dispatch here
+        # after the V3.3 attempt so an all-Package-ready Run starts the gate
+        # without waiting for unrelated model geometry work.
         cpu_limit = cpu_worker_limit(
             self._spec,
             package_active=accelerator_active,
@@ -328,6 +370,20 @@ class V5AsyncInferenceRunner(QObject):
             )
 
     def _start_job(self, job):
+        if job["job_type"] == "fragmentation_v33":
+            self._start_process(
+                "fragmentation_v33_candidate",
+                "run_fragmentation_v33_work_package.sh",
+                [
+                    "--run-spec", self._spec_path,
+                    "--worker-id", self._worker_id + "-fragmentation-v33",
+                    "--job-id", str(job["job_id"]),
+                    "--lease-token", job["lease_token"],
+                    "--lease-seconds", "300",
+                ],
+                {"kind": "job", "job": job},
+            )
+            return
         if job["job_type"] != "unit_fit":
             raise RuntimeError(
                 "QGIS may only launch unit_fit jobs directly; "
@@ -629,6 +685,11 @@ class V5AsyncInferenceRunner(QObject):
             job = context["job"]
             current = self._database.get_job(job["job_id"])
             if current and current["status"] == "running":
+                if job.get("job_type") == "fragmentation_v33" and success:
+                    success = False
+                    error = (
+                        "V3.3 worker exited without its atomic output commit"
+                    )
                 self._database.finish_job(
                     job["job_id"],
                     job["lease_token"],
@@ -758,7 +819,7 @@ class V5AsyncInferenceRunner(QObject):
         candidates = self._database.cleanup_candidates(
             self._spec["run_id"],
             limit=1000,
-            kinds=("partition_probability",),
+            kinds=("partition_probability", "v3_context_core", "v3_baseline_core"),
         )
         for candidate in candidates:
             claimed = self._database.claim_artifact_cleanup(candidate["artifact_id"])

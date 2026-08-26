@@ -338,6 +338,71 @@ def test_scheduler_starts_one_persistent_accelerator_and_unit_jobs(monkeypatch):
     assert calls == ["accelerator", ("unit", 10)]
 
 
+def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_running(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = True
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 2,
+            "max_cpu_partition_workers_with_package": 1,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "comparison": {"enabled": True},
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    candidate = {
+        "job_id": 20,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33_candidate",
+        "lease_token": "candidate-token",
+    }
+    model_unit = {
+        "job_id": 21,
+        "job_type": "unit_fit",
+        "stream_id": "model:a",
+        "unit_id": "core_00001",
+        "lease_token": "model-token",
+    }
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"queued": 1}
+            raise AssertionError(job_type)
+
+        def lease_next_job(self, *_args, **_kwargs):
+            if not hasattr(self, "leased_model"):
+                self.leased_model = True
+                return model_unit
+            return None
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            return candidate
+
+    runner._database = Database()
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert starts == [candidate, model_unit]
+
+
 def test_active_accelerator_process_prevents_a_second_worker(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = _runner(module)
@@ -469,6 +534,56 @@ def test_qprocess_start_error_is_forced_through_terminal_handler(monkeypatch):
         "assemble:model:a process error: executable not found"
     )
     assert finished == [("failed-start", -1, None)]
+
+
+def test_v33_process_cannot_bypass_atomic_completion_gate(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._spec = {"run_id": "run-1"}
+    job = {
+        "job_id": 33,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33",
+        "lease_token": "lease-33",
+    }
+    runner._processes = {
+        "v33": {
+            "process": _FinishedProcess(),
+            "context": {"kind": "job", "label": "fragmentation_v33", "job": job},
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+            "timeout_count": 0,
+        }
+    }
+    finished = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._emit_progress = lambda *_args: None
+    runner._schedule = lambda: None
+    runner.step_finished = _Signal()
+    runner._database = types.SimpleNamespace(
+        get_job=lambda _job_id: {**job, "status": "running"},
+        finish_job=lambda job_id, token, **kwargs: finished.append(
+            (job_id, token, kwargs)
+        ) or True,
+        requeue_failed_job=lambda _job_id: False,
+    )
+
+    runner._process_finished("v33", 0, None)
+
+    assert finished == [
+        (
+            33,
+            "lease-33",
+            {
+                "status": "failed",
+                "error": "V3.3 worker exited without its atomic output commit",
+            },
+        )
+    ]
 
 
 def test_failed_finish_kills_and_interrupts_other_active_children(

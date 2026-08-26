@@ -1,4 +1,4 @@
-"""Isolated V3.3 raster executor for the approved configurable policy.
+"""V3.3 raster executor for the approved configurable production policy.
 
 The executor consumes one frozen V3-cleaned label/probability window and never
 imports or mutates production V3.  A proposal always consumes one complete,
@@ -21,6 +21,7 @@ import hashlib
 import heapq
 import json
 import math
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -31,8 +32,8 @@ from fragmentation_policy.loader import policy_snapshot as config_snapshot
 from . import engine as _b
 
 
-V33_POLICY_ID = "fragmentation_v33_configurable_absorption_candidate_v1"
-V33_POLICY_VERSION = "v33_20260826"
+V33_POLICY_ID = "fragmentation_v33_configurable_absorption_v1"
+V33_POLICY_VERSION = "v33_production_20260826"
 V33_ADJUDICATION_MODE = "approved_fragment_reduction_rarity_incremental_v1"
 
 
@@ -115,6 +116,31 @@ def policy_snapshot(document: Mapping[str, Any] | None = None) -> dict[str, Any]
 
 def policy_snapshot_sha256(document: Mapping[str, Any] | None = None) -> str:
     return _sha_json(policy_snapshot(document))
+
+
+def executor_snapshot_sha256() -> str:
+    """Hash every repository file that defines V3.3 decisions."""
+
+    scripts_root = Path(__file__).resolve().parents[1]
+    paths = {
+        Path(__file__).resolve(),
+        Path(__file__).with_name("engine.py"),
+        scripts_root / "fragmentation_v33_work_package.py",
+        scripts_root / "authoritative_raster.py",
+        scripts_root / "partition_mosaic.py",
+    }
+    policy_root = scripts_root / "fragmentation_policy"
+    paths.update(policy_root.rglob("*.py"))
+    paths.update(policy_root.rglob("*.yaml"))
+    records = []
+    for path in sorted(paths):
+        records.append(
+            {
+                "path": str(path.relative_to(scripts_root)),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    return _sha_json({"files": records})
 
 
 def _probability_evidence(

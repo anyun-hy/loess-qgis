@@ -58,6 +58,19 @@ def finalize_partition_rasters(run_spec_path: str | Path) -> dict[str, Any]:
     total_packages = sum(package_counts.values())
     if total_packages < 1 or package_counts != {"ready": total_packages}:
         raise RasterFinalizeError(f"Work Packages are not all ready: {package_counts}")
+    fragmentation = dict(spec.get("fragmentation_regularization") or {})
+    production_v33 = bool(
+        fragmentation.get("enabled") is True
+        and fragmentation.get("policy_id")
+        == "fragmentation_v33_configurable_absorption_v1"
+        and fragmentation.get("publication") == "authoritative_fusion_core"
+    )
+    if production_v33:
+        v33_counts = database.job_counts(run_id, job_type="fragmentation_v33")
+        if v33_counts != {"ready": 1}:
+            raise RasterFinalizeError(
+                f"V3.3 authoritative raster is not ready: {v33_counts}"
+            )
     partition_count = int(spec["spatial_plan_summary"]["partition_count"])
     outputs = []
     for stream in spec["streams"]:

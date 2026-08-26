@@ -1055,6 +1055,28 @@ class RunStateDB:
             result.append(item)
         return result
 
+    def spatial_units_for_stream(
+        self, run_id: str, stream_id: str
+    ) -> list[dict[str, Any]]:
+        """Return only geometry units registered for one result stream."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT u.* FROM spatial_units u
+                   JOIN stream_units su
+                     ON su.run_id=u.run_id AND su.unit_id=u.unit_id
+                   WHERE u.run_id=? AND su.stream_id=?
+                   ORDER BY u.unit_type, u.unit_id""",
+                (str(run_id), str(stream_id)),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["pixel_window"] = json.loads(item.pop("pixel_window_json"))
+            item["dependency_ids"] = json.loads(item.pop("dependency_ids_json"))
+            result.append(item)
+        return result
+
     def set_spatial_unit_status(
         self, run_id: str, unit_id: str, status: str
     ) -> bool:
@@ -1593,7 +1615,11 @@ class RunStateDB:
             " AND failed_package.job_type='work_package'"
             " AND failed_package.status='failed'))) "
             "AND (job_type!='unit_fit' OR "
-            "((SELECT COUNT(*) FROM artifact_dependencies ad"
+            "(NOT EXISTS (SELECT 1 FROM jobs v33"
+            "  WHERE v33.run_id=jobs.run_id AND v33.stream_id=jobs.stream_id"
+            "    AND v33.job_type='fragmentation_v33'"
+            "    AND v33.status!='ready')"
+            " AND (SELECT COUNT(*) FROM artifact_dependencies ad"
             " WHERE ad.job_id=jobs.job_id)="
             " (SELECT COUNT(*) FROM unit_dependencies ud"
             " WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)"
@@ -1672,6 +1698,95 @@ class RunStateDB:
             job_types=("work_package",),
             lease_seconds=lease_seconds,
         )
+
+    def lease_next_fragmentation_v33(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 120.0,
+    ) -> dict[str, Any] | None:
+        """Lease one V3.3 candidate only after every owner input is ready.
+
+        A candidate dependency is complete only when it owns the frozen V3
+        owner-Core context, preserved V3 baseline Core, and matching probability
+        Halo for every Partition listed in ``unit_dependencies``.  The owner
+        Work Packages must also be atomically ready, so a candidate never
+        observes a half-committed first stage.
+        """
+
+        token = uuid.uuid4().hex
+        expires = time.time() + max(1.0, float(lease_seconds))
+        now = _now()
+        with self.transaction() as connection:
+            lock_clause = " FOR UPDATE SKIP LOCKED" if self.is_postgresql else ""
+            row = connection.execute(
+                """SELECT j.* FROM jobs j
+                   WHERE j.run_id=? AND j.job_type='fragmentation_v33'
+                     AND j.status IN ('queued','interrupted')
+                     AND j.attempt < j.max_attempts
+                     AND EXISTS (
+                       SELECT 1 FROM runs r WHERE r.run_id=j.run_id
+                         AND r.status IN (
+                           'preflight','planned','running','raster_ready'
+                         )
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM unit_dependencies d
+                       LEFT JOIN partitions p
+                         ON p.run_id=d.run_id
+                        AND p.partition_id=d.partition_id
+                       LEFT JOIN work_packages wp
+                         ON wp.run_id=p.run_id
+                        AND wp.package_id=p.package_id
+                       WHERE d.run_id=j.run_id AND d.unit_id=j.unit_id
+                         AND COALESCE(wp.status,'')!='ready'
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM unit_dependencies d
+                       WHERE d.run_id=j.run_id AND d.unit_id=j.unit_id
+                         AND (
+                           NOT EXISTS (
+                             SELECT 1 FROM artifact_dependencies ad
+                             JOIN artifacts a ON a.artifact_id=ad.artifact_id
+                             WHERE ad.job_id=j.job_id
+                               AND a.run_id=j.run_id
+                               AND a.stream_id=j.stream_id
+                               AND a.unit_id=d.partition_id
+                               AND a.kind='partition_probability'
+                               AND a.status='ready'
+                           )
+                           OR NOT EXISTS (
+                             SELECT 1 FROM artifact_dependencies ad
+                             JOIN artifacts a ON a.artifact_id=ad.artifact_id
+                             WHERE ad.job_id=j.job_id
+                               AND a.run_id=j.run_id
+                               AND a.stream_id=j.stream_id
+                               AND a.unit_id=d.partition_id
+                               AND a.kind='v3_context_core'
+                               AND a.status='ready'
+                           )
+                           OR NOT EXISTS (
+                             SELECT 1 FROM artifact_dependencies ad
+                             JOIN artifacts a ON a.artifact_id=ad.artifact_id
+                             WHERE ad.job_id=j.job_id
+                               AND a.run_id=j.run_id
+                               AND a.stream_id=j.stream_id
+                               AND a.unit_id=d.partition_id
+                               AND a.kind='v3_baseline_core'
+                               AND a.status='ready'
+                           )
+                         )
+                     )
+                   ORDER BY j.priority DESC, j.job_id LIMIT 1"""
+                + lock_clause,
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._lease_selected_job(
+                connection, row, worker_id, token, expires, now
+            )
 
     def lease_job(
         self,
@@ -1789,6 +1904,107 @@ class RunStateDB:
                     fence_time,
                 ),
             ).rowcount == 1
+
+    def complete_fragmentation_v33_job(
+        self,
+        job_id: int,
+        lease_token: str,
+    ) -> bool:
+        """Atomically complete V3.3 and release all retained owner inputs."""
+
+        now = _now()
+        fence_time = time.time()
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT * FROM jobs WHERE job_id=?
+                   AND job_type='fragmentation_v33' AND status='running'
+                   AND lease_token=? AND lease_expires IS NOT NULL
+                   AND lease_expires>=?""",
+                (int(job_id), str(lease_token), fence_time),
+            ).fetchone()
+            if job is None:
+                return False
+            production = str(job["unit_id"]) == "fragmentation_v33"
+            mask_kind, audit_kind, report_kind = (
+                (
+                    "core_mask",
+                    "fragmentation_v33_audit",
+                    "fragmentation_v33_report",
+                )
+                if production
+                else (
+                    "v33_candidate_mask",
+                    "v33_candidate_audit",
+                    "v33_candidate_report",
+                )
+            )
+            expected = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM unit_dependencies
+                       WHERE run_id=? AND unit_id=?""",
+                    (str(job["run_id"]), str(job["unit_id"])),
+                ).fetchone()[0]
+            )
+            if expected < 1:
+                raise RunStateError("V3.3 has no owner dependencies")
+            for kind in (mask_kind, audit_kind):
+                ready_row = connection.execute(
+                        """SELECT COUNT(*) AS artifact_count,
+                                  COUNT(DISTINCT a.unit_id) AS owner_count
+                           FROM artifacts a
+                           JOIN unit_dependencies d
+                             ON d.run_id=a.run_id AND d.partition_id=a.unit_id
+                           WHERE a.run_id=? AND a.stream_id=?
+                             AND d.unit_id=? AND a.kind=? AND a.status='ready'""",
+                        (
+                            str(job["run_id"]),
+                            str(job["stream_id"]),
+                            str(job["unit_id"]),
+                            kind,
+                        ),
+                    ).fetchone()
+                ready = int(ready_row["artifact_count"])
+                owners = int(ready_row["owner_count"])
+                if ready != expected or owners != expected:
+                    raise RunStateError(
+                        f"V3.3 {kind} incomplete or duplicated: "
+                        f"artifacts={ready}, owners={owners}, expected={expected}"
+                    )
+            report_ready = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM artifacts WHERE run_id=?
+                       AND stream_id=? AND unit_id=? AND kind=? AND status='ready'""",
+                    (
+                        str(job["run_id"]),
+                        str(job["stream_id"]),
+                        str(job["unit_id"]),
+                        report_kind,
+                    ),
+                ).fetchone()[0]
+            )
+            if report_ready != 1:
+                raise RunStateError("V3.3 acceptance report is not ready")
+            changed = connection.execute(
+                """UPDATE jobs SET status='ready', error='', worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   WHERE job_id=? AND job_type='fragmentation_v33'
+                     AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    now,
+                    now,
+                    int(job_id),
+                    str(lease_token),
+                    fence_time,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            connection.execute(
+                "DELETE FROM artifact_dependencies WHERE job_id=?",
+                (int(job_id),),
+            )
+            return True
 
     def work_package_job_holds_lease(
         self,
@@ -2802,7 +3018,295 @@ class RunStateDB:
                      AND j.status IN ('queued','interrupted','running')""",
                 (artifact_id, now, identifier, stream, partition),
             )
+            # V3.3 candidate jobs are planned before the first Work Package
+            # starts.  Link them in this same ready-publication transaction so
+            # the zero-ref cleanup worker can never observe an unreferenced
+            # probability between publication and candidate registration.
+            connection.execute(
+                """INSERT OR IGNORE INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, ?, ? FROM jobs j
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   WHERE j.run_id=? AND j.stream_id=?
+                     AND j.job_type='fragmentation_v33'
+                     AND d.partition_id=?
+                     AND j.status IN ('queued','interrupted','running')""",
+                (artifact_id, now, identifier, stream, partition),
+            )
             return artifact_id
+
+    def _publish_fragmentation_v33_input(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        path: str | Path,
+        *,
+        byte_count: int,
+        sha256: str,
+        kind: str,
+        label: str,
+    ) -> int:
+        """Publish one frozen V3.3 input and link its candidate atomically."""
+
+        if kind not in {"v3_context_core", "v3_baseline_core"}:
+            raise ValueError(f"unsupported V3.3 input kind: {kind}")
+
+        size = int(byte_count)
+        if size < 0:
+            raise ValueError("artifact byte_count cannot be negative")
+        digest = str(sha256).lower()
+        if len(digest) != 64:
+            raise ValueError("artifact sha256 must contain 64 hexadecimal characters")
+        try:
+            int(digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                "artifact sha256 must contain 64 hexadecimal characters"
+            ) from error
+
+        identifier = str(run_id)
+        stream = str(stream_id)
+        partition = str(partition_id)
+        resolved_path = str(Path(path).expanduser().resolve())
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO artifacts
+                   (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
+                (identifier, stream, partition, kind, resolved_path, now, now),
+            )
+            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
+            artifact = connection.execute(
+                """SELECT * FROM artifacts
+                   WHERE run_id=? AND stream_id=? AND unit_id=?
+                     AND kind=? AND path=?"""
+                + artifact_lock,
+                (identifier, stream, partition, kind, resolved_path),
+            ).fetchone()
+            if artifact is None:
+                raise RunStateError(f"{label} registration did not create a row")
+            artifact_id = int(artifact["artifact_id"])
+            status = str(artifact["status"])
+            if status == "ready":
+                if (
+                    int(artifact["byte_count"]) != size
+                    or str(artifact["sha256"]) != digest
+                ):
+                    raise RunStateError(
+                        f"ready {label} changed on disk: {resolved_path}"
+                    )
+            elif status == "cleaned":
+                started = connection.execute(
+                    """SELECT COUNT(*) FROM jobs j
+                       JOIN unit_dependencies d
+                         ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                       WHERE j.run_id=? AND j.stream_id=?
+                         AND j.job_type='fragmentation_v33'
+                         AND d.partition_id=?
+                         AND j.status NOT IN ('queued','interrupted')""",
+                    (identifier, stream, partition),
+                ).fetchone()[0]
+                if int(artifact["ref_count"]) != 0 or int(started) != 0:
+                    raise RunStateError(
+                        f"cleaned {label} requires a full candidate reset"
+                    )
+                changed = connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
+                       updated_at=? WHERE artifact_id=? AND status='cleaned'
+                       AND ref_count=0""",
+                    (size, digest, now, artifact_id),
+                ).rowcount
+                if changed != 1:
+                    raise RunStateError(
+                        f"cannot republish {label}: {resolved_path}"
+                    )
+            elif status in {"writing", "failed"}:
+                changed = connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
+                       updated_at=? WHERE artifact_id=?
+                       AND status IN ('writing','failed')""",
+                    (size, digest, now, artifact_id),
+                ).rowcount
+                if changed != 1:
+                    raise RunStateError(
+                        f"cannot publish {label}: {resolved_path}"
+                    )
+            else:
+                raise RunStateError(
+                    f"{label} is unavailable for publish ({status}): "
+                    + resolved_path
+                )
+            connection.execute(
+                """INSERT OR IGNORE INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, ?, ? FROM jobs j
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   WHERE j.run_id=? AND j.stream_id=?
+                     AND j.job_type='fragmentation_v33'
+                     AND d.partition_id=?
+                     AND j.status IN ('queued','interrupted','running')""",
+                (artifact_id, now, identifier, stream, partition),
+            )
+            return artifact_id
+
+    def publish_fragmentation_v33_context(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        path: str | Path,
+        *,
+        byte_count: int,
+        sha256: str,
+    ) -> int:
+        """Publish one V3 owner-Core context and link V3.3 atomically."""
+
+        return self._publish_fragmentation_v33_input(
+            run_id,
+            stream_id,
+            partition_id,
+            path,
+            byte_count=byte_count,
+            sha256=sha256,
+            kind="v3_context_core",
+            label="V3 context",
+        )
+
+    def publish_fragmentation_v33_baseline_core(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        path: str | Path,
+        *,
+        byte_count: int,
+        sha256: str,
+    ) -> int:
+        """Publish one immutable V3 baseline Core and link V3.3 atomically."""
+
+        return self._publish_fragmentation_v33_input(
+            run_id,
+            stream_id,
+            partition_id,
+            path,
+            byte_count=byte_count,
+            sha256=sha256,
+            kind="v3_baseline_core",
+            label="V3 baseline Core",
+        )
+
+    def publish_fragmentation_v33_output_pair(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        *,
+        mask_path: str | Path,
+        mask_byte_count: int,
+        mask_sha256: str,
+        audit_path: str | Path,
+        audit_byte_count: int,
+        audit_sha256: str,
+        production: bool,
+    ) -> tuple[int, int]:
+        """Publish one V3.3 mask/audit pair atomically.
+
+        Files are written before this transaction. A crash before commit leaves
+        no ready Artifact; a crash after commit leaves both, so resume never
+        observes a half-published authority pair.
+        """
+
+        identifier = str(run_id)
+        stream = str(stream_id)
+        partition = str(partition_id)
+        kinds = (
+            ("core_mask", "fragmentation_v33_audit")
+            if production
+            else ("v33_candidate_mask", "v33_candidate_audit")
+        )
+        records = (
+            (
+                kinds[0],
+                str(Path(mask_path).expanduser().resolve()),
+                int(mask_byte_count),
+                str(mask_sha256).lower(),
+            ),
+            (
+                kinds[1],
+                str(Path(audit_path).expanduser().resolve()),
+                int(audit_byte_count),
+                str(audit_sha256).lower(),
+            ),
+        )
+        for _kind, _path, size, digest in records:
+            if size < 0:
+                raise ValueError("artifact byte_count cannot be negative")
+            if len(digest) != 64:
+                raise ValueError("artifact sha256 must contain 64 hexadecimal characters")
+            try:
+                int(digest, 16)
+            except ValueError as error:
+                raise ValueError(
+                    "artifact sha256 must contain 64 hexadecimal characters"
+                ) from error
+        now = _now()
+        artifact_ids: list[int] = []
+        with self.transaction() as connection:
+            for kind, resolved_path, size, digest in records:
+                other = connection.execute(
+                    """SELECT path FROM artifacts
+                       WHERE run_id=? AND stream_id=? AND unit_id=? AND kind=?
+                         AND path!=? AND status='ready'""",
+                    (identifier, stream, partition, kind, resolved_path),
+                ).fetchone()
+                if other is not None:
+                    raise RunStateError(
+                        f"V3.3 {kind} already has another ready path: {other['path']}"
+                    )
+                connection.execute(
+                    """INSERT INTO artifacts
+                       (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
+                    (identifier, stream, partition, kind, resolved_path, now, now),
+                )
+                artifact = connection.execute(
+                    """SELECT * FROM artifacts
+                       WHERE run_id=? AND stream_id=? AND unit_id=?
+                         AND kind=? AND path=?""",
+                    (identifier, stream, partition, kind, resolved_path),
+                ).fetchone()
+                if artifact is None:
+                    raise RunStateError("V3.3 output registration did not create a row")
+                artifact_id = int(artifact["artifact_id"])
+                if str(artifact["status"]) == "ready":
+                    if (
+                        int(artifact["byte_count"]) != size
+                        or str(artifact["sha256"]) != digest
+                    ):
+                        raise RunStateError(
+                            f"ready V3.3 {kind} changed on disk: {resolved_path}"
+                        )
+                elif str(artifact["status"]) in {"writing", "failed"}:
+                    changed = connection.execute(
+                        """UPDATE artifacts SET status='ready', byte_count=?,
+                           sha256=?, updated_at=? WHERE artifact_id=?
+                           AND status IN ('writing','failed')""",
+                        (size, digest, now, artifact_id),
+                    ).rowcount
+                    if changed != 1:
+                        raise RunStateError(f"cannot publish V3.3 {kind}")
+                else:
+                    raise RunStateError(
+                        f"V3.3 {kind} is unavailable for publish: {artifact['status']}"
+                    )
+                artifact_ids.append(artifact_id)
+        return artifact_ids[0], artifact_ids[1]
 
     def mark_artifact_failed(self, artifact_id: int) -> bool:
         with self.transaction() as connection:
@@ -2832,6 +3336,46 @@ class RunStateDB:
                 (int(job_id), int(artifact_id), _now()),
             )
             return cursor.rowcount == 1
+
+    def link_fragmentation_v33_input(
+        self,
+        run_id: str,
+        stream_id: str,
+        partition_id: str,
+        artifact_id: int,
+    ) -> int:
+        """Attach one ready owner input to every waiting V3.3 candidate."""
+
+        identifier = str(run_id)
+        stream = str(stream_id)
+        partition = str(partition_id)
+        now = _now()
+        with self.transaction() as connection:
+            artifact = connection.execute(
+                """SELECT kind FROM artifacts
+                   WHERE artifact_id=? AND run_id=? AND stream_id=?
+                     AND unit_id=? AND status='ready'
+                     AND kind IN ('partition_probability','v3_context_core',
+                                  'v3_baseline_core')""",
+                (int(artifact_id), identifier, stream, partition),
+            ).fetchone()
+            if artifact is None:
+                raise RunStateError(
+                    "V3.3 dependency Artifact is not ready or mismatched"
+                )
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, ?, ? FROM jobs j
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   WHERE j.run_id=? AND j.stream_id=?
+                     AND j.job_type='fragmentation_v33'
+                     AND d.partition_id=?
+                     AND j.status IN ('queued','interrupted','running')""",
+                (int(artifact_id), now, identifier, stream, partition),
+            )
+            return cursor.rowcount
 
     def link_partition_artifact(
         self,

@@ -554,6 +554,24 @@ def _commit_artifact(
             byte_count=path.stat().st_size,
             sha256=sha256_file(path),
         )
+    if kind == "v3_context_core":
+        return database.publish_fragmentation_v33_context(
+            run_id,
+            stream_id,
+            unit_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=sha256_file(path),
+        )
+    if kind == "v3_baseline_core":
+        return database.publish_fragmentation_v33_baseline_core(
+            run_id,
+            stream_id,
+            unit_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=sha256_file(path),
+        )
     artifact_id = database.register_artifact(
         run_id,
         kind,
@@ -994,11 +1012,12 @@ def _run_work_package_impl(
         storage_report.get("working_cache_budget_bytes")
         or storage_report.get("resolved_score_cache_budget_bytes")
         or 0
-    )
+    ) + int(storage_report.get("v33_retained_input_budget_bytes") or 0)
     managed_roots = (
         package_root,
         tile_cache_dir,
         run_dir / "tmp" / "probability_parts",
+        run_dir / "tmp" / "fragmentation_v33_inputs",
     )
     storage_guard = StorageGuard(
         run_dir,
@@ -1906,6 +1925,12 @@ def _run_work_package_impl(
 
         if profile:
             stream_id = f"fusion:{fusion_id}"
+            fragmentation = dict(spec.get("fragmentation_regularization") or {})
+            v33_enabled = bool(
+                fragmentation.get("enabled", True)
+                and fragmentation.get("policy_id")
+                == "fragmentation_v33_configurable_absorption_v1"
+            )
             database.set_stream_status(run_id, stream_id, "running")
             for partition in partitions:
                 partition_id = partition["partition_id"]
@@ -1949,10 +1974,34 @@ def _run_work_package_impl(
                 probability_path = (
                     run_dir / "tmp" / "probability_parts" / f"fusion_{fusion_id}" / f"{partition_id}.tif"
                 )
+                v3_context_path = (
+                    run_dir
+                    / "tmp"
+                    / "fragmentation_v33_inputs"
+                    / f"fusion_{fusion_id}"
+                    / f"{partition_id}_v3_context.tif"
+                )
+                v3_baseline_path = (
+                    run_dir
+                    / "tmp"
+                    / "fragmentation_v33_inputs"
+                    / f"fusion_{fusion_id}"
+                    / f"{partition_id}_v3_baseline.tif"
+                )
                 raster_root = run_dir / "fusion" / fusion_id / "raster_parts"
                 previous_probability_bytes = (
                     probability_path.stat().st_size
                     if probability_path.is_file()
+                    else 0
+                )
+                previous_v3_context_bytes = (
+                    v3_context_path.stat().st_size
+                    if v33_enabled and v3_context_path.is_file()
+                    else 0
+                )
+                previous_v3_baseline_bytes = (
+                    v3_baseline_path.stat().st_size
+                    if v33_enabled and v3_baseline_path.is_file()
                     else 0
                 )
                 probability_write_bytes = int(probabilities.size * 2)
@@ -1960,17 +2009,29 @@ def _run_work_package_impl(
                     np.asarray(arrays["core_mask"]).nbytes
                     + np.asarray(arrays["core_confidence"]).nbytes
                 )
-                raster_write_overhead_bytes = 3 * 64 * 1024
+                candidate_context_bytes = int(
+                    np.asarray(arrays.get("v3_context_core", ())).nbytes
+                    if v33_enabled
+                    else 0
+                )
+                raster_write_overhead_bytes = (
+                    (5 if v33_enabled else 3) * 64 * 1024
+                )
                 reservation = reserve_write(
                     f"partition_rasters:{stream_id}:{partition_id}",
                     probability_write_bytes
                     + permanent_write_bytes
+                    + candidate_context_bytes
                     + raster_write_overhead_bytes,
                     managed_growth_bytes=max(
                         0,
                         probability_write_bytes
+                        + candidate_context_bytes
+                        + (np.asarray(arrays["core_mask"]).nbytes if v33_enabled else 0)
                         + 64 * 1024
-                        - previous_probability_bytes,
+                        - previous_probability_bytes
+                        - previous_v3_context_bytes
+                        - previous_v3_baseline_bytes,
                     ),
                 )
                 try:
@@ -1980,9 +2041,16 @@ def _run_work_package_impl(
                         global_transform=transform,
                         crs=crs,
                         output_probability=probability_path,
-                        output_mask=raster_root / f"{partition_id}_mask.tif",
+                        output_mask=(
+                            v3_baseline_path
+                            if v33_enabled
+                            else raster_root / f"{partition_id}_mask.tif"
+                        ),
                         output_confidence=raster_root
                         / f"{partition_id}_confidence.tif",
+                        output_v3_context=(
+                            v3_context_path if v33_enabled else None
+                        ),
                         core_mask_tags=core_mask_tags(regularization),
                     )
                 finally:
@@ -1991,21 +2059,44 @@ def _run_work_package_impl(
                         if probability_path.is_file()
                         else 0
                     )
+                    current_v3_context_bytes = (
+                        v3_context_path.stat().st_size
+                        if v33_enabled and v3_context_path.is_file()
+                        else 0
+                    )
+                    current_v3_baseline_bytes = (
+                        v3_baseline_path.stat().st_size
+                        if v33_enabled and v3_baseline_path.is_file()
+                        else 0
+                    )
                     reservation.settle(
                         current_probability_bytes - previous_probability_bytes
+                        + current_v3_context_bytes
+                        - previous_v3_context_bytes
+                        + current_v3_baseline_bytes
+                        - previous_v3_baseline_bytes
                     )
-                # Publish the permanent Core products first.  The probability
-                # artifact is the unit-fit dependency gate, so publishing it
-                # last makes every Core/Seam/Junction read the authoritative
-                # V3-cleaned classes, never a transient argmax crop.
-                for kind, key in (
-                    ("core_mask", "mask"),
-                    ("core_confidence", "confidence"),
-                    ("partition_probability", "probability"),
-                ):
+                # With V3.3 selected the V3 Core remains a temporary, frozen
+                # baseline. The second-stage job publishes the only production
+                # core_mask before any Fusion Core/Seam/Junction job may run.
+                raster_artifacts = (
+                    (
+                        ("v3_baseline_core", "mask"),
+                        ("core_confidence", "confidence"),
+                        ("v3_context_core", "v3_context"),
+                        ("partition_probability", "probability"),
+                    )
+                    if v33_enabled
+                    else (
+                        ("core_mask", "mask"),
+                        ("core_confidence", "confidence"),
+                        ("partition_probability", "probability"),
+                    )
+                )
+                for kind, key in raster_artifacts:
                     if lease_guard is not None:
                         lease_guard()
-                    _commit_artifact(
+                    artifact_id = _commit_artifact(
                         database,
                         run_id,
                         path=Path(paths[key]),

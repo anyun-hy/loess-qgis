@@ -258,6 +258,7 @@ def write_partition_rasters(
     output_probability: str | Path,
     output_mask: str | Path,
     output_confidence: str | Path,
+    output_v3_context: str | Path | None = None,
     core_mask_tags: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     halo = partition["halo_window"]
@@ -313,11 +314,35 @@ def write_partition_rasters(
         arrays["core_confidence"],
         {**core_profile, "dtype": "float32", "nodata": -1.0},
     )
-    return {
+    result = {
         "probability": str(probability_path.resolve()),
         "mask": str(mask_path.resolve()),
         "confidence": str(confidence_path.resolve()),
     }
+    if output_v3_context is not None:
+        if "v3_context_core" not in arrays:
+            raise PartitionMosaicError(
+                "V3 context output requested but v3_context_core is missing"
+            )
+        context = np.asarray(arrays["v3_context_core"], dtype=np.int16)
+        expected_shape = (cy1 - cy0, cx1 - cx0)
+        if context.shape != expected_shape:
+            raise PartitionMosaicError(
+                "V3 context Core shape does not match Partition"
+            )
+        context_path = Path(output_v3_context)
+        _atomic_raster(
+            context_path,
+            context,
+            {**core_profile, "dtype": "int16", "nodata": -1},
+            tags={
+                **dict(core_mask_tags or {}),
+                "classification_authority": "partition_owner_v3_context_v1",
+                "publication_scope": "v33_comparison_input_only",
+            },
+        )
+        result["v3_context"] = str(context_path.resolve())
+    return result
 
 
 def build_vrt(output_path: str | Path, part_paths: Iterable[str | Path]) -> str:

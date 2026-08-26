@@ -70,13 +70,14 @@ boundary_fitting:
   max_segment_arc_length_px: 8.0
   diagnostic_level: changed_and_failed
 
-# Runs once on each Fusion probability Halo before spatial-unit vectorization.
-# Only the cleaned, non-overlapping Partition Core is published as the
-# authoritative class raster. The standalone postprocess script remains for
-# explicitly repairing historical completed Runs; it is not part of new Runs.
+# V3 runs first as the frozen, resumable baseline. V3.3 then adjudicates all
+# owner Cores before spatial-unit vectorization and publishes the authoritative
+# Fusion class raster. Setting policy_id back to semantic_optimized_200_v3 is
+# the explicit rollback switch for a newly created Run.
 fragmentation_regularization:
   enabled: true
-  policy_id: semantic_optimized_200_v3
+  policy_id: fragmentation_v33_configurable_absorption_v1
+  baseline_policy_id: semantic_optimized_200_v3
   buffer_pixels: 256
   max_workers: auto
 

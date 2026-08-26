@@ -882,6 +882,294 @@ def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path):
     assert restored["ref_count"] == 6
 
 
+def _fragmentation_v33_state(tmp_path):
+    database = _database(tmp_path)
+    stream_id = "fusion:test"
+    partition_id = "partition_00000_00000"
+    database.register_streams(
+        RUN_ID,
+        [{"stream_id": stream_id, "kind": "fusion", "profile_id": "test"}],
+    )
+    database.insert_work_packages(
+        RUN_ID,
+        [{"package_id": "package_00000", "sequence_no": 0, "status": "ready"}],
+    )
+    database.insert_partitions(
+        RUN_ID,
+        [
+            {
+                "partition_id": partition_id,
+                "row": 0,
+                "col": 0,
+                "core_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "halo_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "package_id": "package_00000",
+                "status": "ready",
+            }
+        ],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "fragmentation_v33",
+                "unit_type": "FragmentationV33",
+                "owner_key": "all_partition_owner_cores",
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [partition_id],
+            }
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "fragmentation_v33",
+                "stream_id": stream_id,
+                "unit_id": "fragmentation_v33",
+            }
+        ],
+    )
+    return database, stream_id, partition_id
+
+
+def _publish_v33_outputs(database, tmp_path, stream_id, partition_id):
+    mask = tmp_path / f"{partition_id}_v33_mask.tif"
+    audit = tmp_path / f"{partition_id}_v33_audit.json"
+    report = tmp_path / "fragmentation_v33_report.json"
+    mask.write_bytes(b"v33-mask")
+    audit.write_bytes(b"v33-audit")
+    report.write_bytes(b"v33-report")
+    database.publish_fragmentation_v33_output_pair(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        mask_path=mask,
+        mask_byte_count=mask.stat().st_size,
+        mask_sha256=hashlib.sha256(mask.read_bytes()).hexdigest(),
+        audit_path=audit,
+        audit_byte_count=audit.stat().st_size,
+        audit_sha256=hashlib.sha256(audit.read_bytes()).hexdigest(),
+        production=True,
+    )
+    report_id = database.register_artifact(
+        RUN_ID,
+        "fragmentation_v33_report",
+        report,
+        stream_id=stream_id,
+        unit_id="fragmentation_v33",
+    )
+    assert database.mark_artifact_ready(
+        report_id,
+        byte_count=report.stat().st_size,
+        sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+    )
+
+
+def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
+    database, stream_id, partition_id = _fragmentation_v33_state(tmp_path)
+    context = tmp_path / "context.tif"
+    context.write_bytes(b"context")
+    digest = hashlib.sha256(context.read_bytes()).hexdigest()
+
+    artifact_id = database.publish_fragmentation_v33_context(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        context,
+        byte_count=context.stat().st_size,
+        sha256=digest,
+    )
+
+    assert database.get_artifact(artifact_id)["ref_count"] == 1
+    assert database.cleanup_candidates(
+        RUN_ID, kinds=("v3_context_core",)
+    ) == []
+    probability = tmp_path / "probability.tif"
+    probability.write_bytes(b"probability")
+    database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        probability,
+        byte_count=probability.stat().st_size,
+        sha256=hashlib.sha256(probability.read_bytes()).hexdigest(),
+    )
+    assert database.lease_next_fragmentation_v33(
+        RUN_ID, "v33-worker", lease_seconds=120
+    ) is None
+    baseline = tmp_path / "baseline.tif"
+    baseline.write_bytes(b"baseline")
+    baseline_id = database.publish_fragmentation_v33_baseline_core(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        baseline,
+        byte_count=baseline.stat().st_size,
+        sha256=hashlib.sha256(baseline.read_bytes()).hexdigest(),
+    )
+    assert database.get_artifact(baseline_id)["ref_count"] == 1
+    leased = database.lease_next_fragmentation_v33(
+        RUN_ID, "v33-worker", lease_seconds=120
+    )
+    assert leased is not None
+    with pytest.raises(RunStateError, match="core_mask incomplete"):
+        database.complete_fragmentation_v33_job(
+            leased["job_id"], leased["lease_token"]
+        )
+    _publish_v33_outputs(database, tmp_path, stream_id, partition_id)
+    assert database.complete_fragmentation_v33_job(
+        leased["job_id"], leased["lease_token"]
+    )
+    assert database.get_job(leased["job_id"])["status"] == "ready"
+    assert database.get_artifact(artifact_id)["ref_count"] == 0
+    assert database.get_artifact(baseline_id)["ref_count"] == 0
+    assert [
+        item["artifact_id"]
+        for item in database.cleanup_candidates(
+            RUN_ID,
+            kinds=(
+                "partition_probability",
+                "v3_context_core",
+                "v3_baseline_core",
+            ),
+        )
+    ] == sorted([artifact_id, baseline_id, database.artifact_for_stream_unit(
+        RUN_ID, stream_id, partition_id, "partition_probability"
+    )["artifact_id"]])
+
+
+def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
+    database, stream_id, partition_id = _fragmentation_v33_state(tmp_path)
+    context = tmp_path / "context.tif"
+    context.write_bytes(b"context")
+    artifact_id = database.publish_fragmentation_v33_context(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        context,
+        byte_count=context.stat().st_size,
+        sha256=hashlib.sha256(context.read_bytes()).hexdigest(),
+    )
+    baseline = tmp_path / "baseline.tif"
+    baseline.write_bytes(b"baseline")
+    baseline_id = database.publish_fragmentation_v33_baseline_core(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        baseline,
+        byte_count=baseline.stat().st_size,
+        sha256=hashlib.sha256(baseline.read_bytes()).hexdigest(),
+    )
+    probability = tmp_path / "probability.tif"
+    probability.write_bytes(b"probability")
+    database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        probability,
+        byte_count=probability.stat().st_size,
+        sha256=hashlib.sha256(probability.read_bytes()).hexdigest(),
+    )
+    leased = database.lease_next_fragmentation_v33(
+        RUN_ID, "v33-worker", lease_seconds=120
+    )
+    assert leased is not None
+    _publish_v33_outputs(database, tmp_path, stream_id, partition_id)
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_v33_dependency_release
+               BEFORE DELETE ON artifact_dependencies
+               BEGIN SELECT RAISE(ABORT, 'injected release failure'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected release failure"):
+        database.complete_fragmentation_v33_job(
+            leased["job_id"], leased["lease_token"]
+        )
+
+    assert database.get_job(leased["job_id"])["status"] == "running"
+    assert database.get_artifact(artifact_id)["ref_count"] == 1
+    assert database.get_artifact(baseline_id)["ref_count"] == 1
+
+
+def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path):
+    database, fusion_stream, partition_id = _fragmentation_v33_state(tmp_path)
+    model_stream = "model:test"
+    database.register_streams(
+        RUN_ID,
+        [{"stream_id": model_stream, "kind": "model", "model_id": "test"}],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": "core_for_v33_gate",
+                "unit_type": "Core",
+                "owner_key": partition_id,
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [partition_id],
+            }
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "unit_fit",
+                "stream_id": fusion_stream,
+                "unit_id": "core_for_v33_gate",
+                "priority": 100,
+            },
+            {
+                "job_type": "unit_fit",
+                "stream_id": model_stream,
+                "unit_id": "core_for_v33_gate",
+                "priority": 1,
+            },
+        ],
+    )
+    for name, publisher, stream_id in (
+        ("context", database.publish_fragmentation_v33_context, fusion_stream),
+        ("baseline", database.publish_fragmentation_v33_baseline_core, fusion_stream),
+    ):
+        path = tmp_path / f"{name}.tif"
+        path.write_bytes(name.encode())
+        publisher(
+            RUN_ID,
+            stream_id,
+            partition_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+    for stream_id in (fusion_stream, model_stream):
+        path = tmp_path / f"{stream_id.replace(':', '_')}.tif"
+        path.write_bytes(stream_id.encode())
+        database.publish_partition_artifact(
+            RUN_ID,
+            stream_id,
+            partition_id,
+            path,
+            byte_count=path.stat().st_size,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+
+    first = database.lease_next_job(RUN_ID, "unit-worker", job_types=("unit_fit",))
+    assert first is not None
+    assert first["stream_id"] == model_stream
+
+    candidate = database.lease_next_fragmentation_v33(RUN_ID, "v33-worker")
+    assert candidate is not None
+    _publish_v33_outputs(database, tmp_path, fusion_stream, partition_id)
+    assert database.complete_fragmentation_v33_job(
+        candidate["job_id"], candidate["lease_token"]
+    )
+    second = database.lease_next_job(RUN_ID, "fusion-worker", job_types=("unit_fit",))
+    assert second is not None
+    assert second["stream_id"] == fusion_stream
+
+
 def test_fail_open_streams_preserves_ready_streams(tmp_path):
     database = _database(tmp_path)
     database.register_streams(
