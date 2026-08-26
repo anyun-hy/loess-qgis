@@ -96,6 +96,8 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         "enabled": True,
         "policy_id": "semantic_optimized_200_v3",
         "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "baseline_policy_id": "semantic_optimized_200_v3",
+        "baseline_policy_version": "semantic_optimized_200_v3_core_bounded_v1",
         "buffer_pixels": 256,
         "max_workers": 4,
     }
@@ -152,3 +154,92 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         assert first_tile[1] == ""
     assert len(RunStateDB(database_path).package_tiles(spec["run_id"], first_package)) <= 600
     assert json.loads(spec_path.read_text())["state_db"] == str(database_path)
+
+
+def test_v33_plans_one_authoritative_fusion_job(tmp_path):
+    raster = tmp_path / "source.tif"
+    raster.write_bytes(b"fixture")
+    models = []
+    for model_id in ("a", "b"):
+        artifact = tmp_path / f"{model_id}.pt"
+        artifact.write_bytes(model_id.encode())
+        models.append(
+            {
+                "model_id": model_id,
+                "artifact_path": str(artifact),
+                "sha256": "e" * 64,
+                "version": "fixture",
+            }
+        )
+    profile = {
+        "profile_id": "approved",
+        "status": "approved",
+        "approval": {"passed": True},
+        "strategy": "equal_probability_average",
+        "models": [{"model_id": "a"}, {"model_id": "b"}],
+        "weights": [[0.5, 0.5] for _ in range(14)],
+    }
+    spec, _spec_path, database_path = create_v5_run(
+        state_database=tmp_path / "state.sqlite",
+        output_root=tmp_path / "output",
+        raster={
+            "path": raster,
+            "crs": "EPSG:3857",
+            "transform": [1, 0, 0, 0, -1, 512],
+            "nodata": None,
+        },
+        requested_extent={"xmin": 0, "ymin": 0, "xmax": 512, "ymax": 512},
+        processing_extent={"xmin": 0, "ymin": 0, "xmax": 512, "ymax": 512},
+        tile_rows=1,
+        tile_cols=1,
+        tiles=_tiles(1, 1, raster),
+        models=models,
+        effective_device="cpu",
+        overlap=192,
+        scaling=_scaling(),
+        boundary_fitting=_boundary(),
+        storage_report={
+            "package_tile_limit": 4,
+            "working_bytes_per_tile": 4096,
+            "status": "passed",
+        },
+        fragmentation_regularization={
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "policy_version": "v33_production_20260826",
+            "baseline_policy_id": "semantic_optimized_200_v3",
+            "baseline_policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+            "buffer_pixels": 256,
+            "max_workers": 4,
+            "publication": "authoritative_fusion_core",
+            "policy_sha256": "a" * 64,
+            "executor_sha256": "b" * 64,
+        },
+        fusion={"profile_id": "approved", "profile": profile},
+        run_id="20260826_120000_v33builder",
+    )
+
+    assert spec["fragmentation_regularization"]["publication"] == (
+        "authoritative_fusion_core"
+    )
+    with sqlite3.connect(database_path) as connection:
+        job = connection.execute(
+            "SELECT job_type, stream_id, unit_id, status FROM jobs "
+            "WHERE job_type='fragmentation_v33'"
+        ).fetchall()
+        dependencies = connection.execute(
+            "SELECT partition_id FROM unit_dependencies "
+            "WHERE unit_id='fragmentation_v33'"
+        ).fetchall()
+        partition_count = connection.execute(
+            "SELECT COUNT(*) FROM partitions"
+        ).fetchone()[0]
+    assert job == [
+        (
+            "fragmentation_v33",
+            "fusion:approved",
+            "fragmentation_v33",
+            "queued",
+        )
+    ]
+    assert len(dependencies) == partition_count

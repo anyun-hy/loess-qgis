@@ -25,6 +25,8 @@ from .work_package_planner import plan_work_packages
 
 
 RUN_SPEC_SCHEMA_VERSION = 2
+V3_POLICY_ID = "semantic_optimized_200_v3"
+V33_POLICY_ID = "fragmentation_v33_configurable_absorption_v1"
 logger = logging.getLogger("labeling_tool.run_builder_v5")
 
 
@@ -46,6 +48,28 @@ def _json_sha(value: Mapping[str, Any]) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _fragmentation_v33_unit(
+    partitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Plan one resumable second-stage job over all owner Cores."""
+
+    if not partitions:
+        raise RunBuilderV5Error("V3.3 production stage requires Partitions")
+    global_window = {
+        "x0": min(int(item["core_window"]["x0"]) for item in partitions),
+        "y0": min(int(item["core_window"]["y0"]) for item in partitions),
+        "x1": max(int(item["core_window"]["x1"]) for item in partitions),
+        "y1": max(int(item["core_window"]["y1"]) for item in partitions),
+    }
+    return {
+        "unit_id": "fragmentation_v33",
+        "unit_type": "FragmentationV33",
+        "owner_key": "all_partition_owner_cores",
+        "pixel_window": global_window,
+        "dependency_ids": [str(item["partition_id"]) for item in partitions],
+    }
 
 
 def create_v5_run(
@@ -107,9 +131,18 @@ def create_v5_run(
         )
     fragmentation_value = dict(fragmentation_regularization or {})
     fragmentation_value.setdefault("enabled", True)
-    fragmentation_value.setdefault("policy_id", "semantic_optimized_200_v3")
+    fragmentation_value.setdefault("policy_id", V3_POLICY_ID)
     fragmentation_value.setdefault(
-        "policy_version", "semantic_optimized_200_v3_core_bounded_v1"
+        "policy_version",
+        (
+            "v33_production_20260826"
+            if fragmentation_value["policy_id"] == V33_POLICY_ID
+            else "semantic_optimized_200_v3_core_bounded_v1"
+        ),
+    )
+    fragmentation_value.setdefault("baseline_policy_id", V3_POLICY_ID)
+    fragmentation_value.setdefault(
+        "baseline_policy_version", "semantic_optimized_200_v3_core_bounded_v1"
     )
     fragmentation_value.setdefault("buffer_pixels", 256)
     fragmentation_value.setdefault("max_workers", 4)
@@ -117,10 +150,14 @@ def create_v5_run(
         raise RunBuilderV5Error(
             "fragmentation_regularization.enabled must be true or false"
         )
-    if fragmentation_value.get("policy_id") != "semantic_optimized_200_v3":
+    if fragmentation_value.get("policy_id") not in {V3_POLICY_ID, V33_POLICY_ID}:
         raise RunBuilderV5Error(
-            "fragmentation_regularization.policy_id must equal "
-            "semantic_optimized_200_v3"
+            "fragmentation_regularization.policy_id is unsupported"
+        )
+    if fragmentation_value.get("baseline_policy_id") != V3_POLICY_ID:
+        raise RunBuilderV5Error(
+            "fragmentation_regularization.baseline_policy_id must equal "
+            + V3_POLICY_ID
         )
     if int(fragmentation_value.get("buffer_pixels") or 0) != 256:
         raise RunBuilderV5Error(
@@ -130,6 +167,28 @@ def create_v5_run(
         raise RunBuilderV5Error(
             "fragmentation_regularization.max_workers must be positive"
         )
+    v33_enabled = bool(
+        fragmentation_value["enabled"]
+        and fragmentation_value["policy_id"] == V33_POLICY_ID
+    )
+    if v33_enabled:
+        if fragmentation_value.get("publication") != "authoritative_fusion_core":
+            raise RunBuilderV5Error(
+                "V3.3 publication must equal authoritative_fusion_core"
+            )
+        for key in ("policy_sha256", "executor_sha256"):
+            digest = str(fragmentation_value.get(key) or "").lower()
+            if len(digest) != 64:
+                raise RunBuilderV5Error(
+                    f"fragmentation_regularization.{key} is required for V3.3"
+                )
+            try:
+                int(digest, 16)
+            except ValueError as error:
+                raise RunBuilderV5Error(
+                    f"fragmentation_regularization.{key} is invalid"
+                ) from error
+            fragmentation_value[key] = digest
     # The caller's spatial preflight, Package plan, and storage reservation all
     # depend on this value.  Do not silently enlarge it here: that would make
     # the frozen plan disagree with its preflight.  GUI/CLI entry points must
@@ -213,6 +272,37 @@ def create_v5_run(
         }
         for partition in spatial_plan["partitions"]
     ]
+    storage_value = dict(storage_report)
+    if v33_enabled:
+        retained_input_bytes = sum(
+            (
+                (int(partition["halo_window"]["x1"]) - int(partition["halo_window"]["x0"]))
+                * (int(partition["halo_window"]["y1"]) - int(partition["halo_window"]["y0"]))
+                * len(CLASS_ORDER)
+                * 2
+                + (int(partition["core_window"]["x1"]) - int(partition["core_window"]["x0"]))
+                * (int(partition["core_window"]["y1"]) - int(partition["core_window"]["y0"]))
+                * 4
+                + 3 * 64 * 1024
+            )
+            for partition in partitions
+        )
+        storage_value["v33_retained_input_budget_bytes"] = retained_input_bytes
+        storage_value["v33_retained_input_estimate"] = (
+            "all_probability_halos_uint16_plus_v3_context_and_baseline_cores_int16"
+        )
+        if int(storage_value.get("storage_tuning_schema_version") or 0) >= 2:
+            safe_headroom = int(storage_value.get("safe_headroom_bytes") or 0)
+            working_budget = int(
+                storage_value.get("working_cache_budget_bytes") or 0
+            )
+            if working_budget + retained_input_bytes > safe_headroom:
+                raise RunBuilderV5Error(
+                    "V3.3 retained inputs exceed frozen storage headroom"
+                )
+            storage_value["estimated_required_bytes"] = int(
+                storage_value.get("estimated_required_bytes") or 0
+            ) + retained_input_bytes
 
     class_snapshot = {
         "class_mapping": {str(code): CLASS_NAMES[code] for code in CLASS_ORDER},
@@ -226,6 +316,10 @@ def create_v5_run(
     if len(set(model_ids)) != len(model_ids):
         raise RunBuilderV5Error("semantic model IDs must be unique")
     fusion_value = dict(fusion) if fusion else None
+    if v33_enabled and fusion_value is None:
+        raise RunBuilderV5Error(
+            "V3.3 production requires an approved Fusion stream"
+        )
     if fusion_value:
         profile = fusion_value.get("profile")
         if not isinstance(profile, Mapping):
@@ -367,7 +461,7 @@ def create_v5_run(
             "policy_id": "exact_range_zero_gap_v1",
             "area_tolerance_pixels": 0.01,
         },
-        "storage_preflight": dict(storage_report),
+        "storage_preflight": storage_value,
         "models": model_values,
         "fusion": fusion_value,
         "streams": stream_values,
@@ -472,6 +566,19 @@ def create_v5_run(
             for package in package_plan["packages"]
         ),
     )
+    if v33_enabled:
+        v33_unit = _fragmentation_v33_unit(partitions)
+        database.insert_spatial_units(identifier, (v33_unit,))
+        database.insert_jobs(
+            identifier,
+            ({
+                "job_type": "fragmentation_v33",
+                "stream_id": str(stream_values[-1]["stream_id"]),
+                "unit_id": str(v33_unit["unit_id"]),
+                "priority": 50,
+                "max_attempts": int(scaling_value["max_job_retries"]) + 1,
+            },),
+        )
     database.insert_jobs(
         identifier,
         (

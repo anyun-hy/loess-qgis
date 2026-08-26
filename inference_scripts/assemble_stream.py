@@ -1476,7 +1476,7 @@ def _assemble_stream_impl(
     )
     if expected_units < 1 or counts != {"ready": expected_units}:
         raise StreamAssemblyError(f"stream units are not all ready: {counts}")
-    units = database.spatial_units(run_id)
+    units = database.spatial_units_for_stream(run_id, stream_id)
     formal_artifacts = database.artifacts_for_stream(
         run_id, stream_id, kind="unit_formal"
     )

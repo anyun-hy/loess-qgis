@@ -30,6 +30,11 @@ from boundary_fitting.unit_runtime import (
 )
 from assemble_stream import StreamAssemblyError, assemble_stream
 from finalize_partition_rasters import finalize_partition_rasters
+from fragmentation_v33_candidate import (
+    executor_snapshot_sha256,
+    policy_snapshot_sha256,
+)
+from fragmentation_v33_work_package import run_worker as run_v33_worker
 from scale_acceptance import build_scale_acceptance_report
 from work_package_runtime import (
     BatchCapacityError,
@@ -136,6 +141,7 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         storage_report={
             "package_tile_limit": 4,
             "working_bytes_per_tile": 4096,
+            "working_cache_budget_bytes": 64 * 1024 * 1024,
             "status": "passed",
         },
         fusion={"profile_id": "fixture_fusion", "profile": profile},
@@ -956,7 +962,20 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         storage_report={
             "package_tile_limit": 4,
             "working_bytes_per_tile": 4096,
+            "working_cache_budget_bytes": 64 * 1024 * 1024,
             "status": "passed",
+        },
+        fragmentation_regularization={
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "policy_version": "v33_production_20260826",
+            "baseline_policy_id": "semantic_optimized_200_v3",
+            "baseline_policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+            "buffer_pixels": 256,
+            "max_workers": 4,
+            "publication": "authoritative_fusion_core",
+            "policy_sha256": policy_snapshot_sha256(),
+            "executor_sha256": executor_snapshot_sha256(),
         },
         fusion={"profile_id": "fixture_fusion", "profile": profile},
         run_id="20260717_220000_fixture",
@@ -1045,12 +1064,27 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     for relative in (
         "models/a/raster_parts/partition_00000_00000_mask.tif",
         "models/b/raster_parts/partition_00000_00000_mask.tif",
-        "fusion/fixture_fusion/raster_parts/partition_00000_00000_mask.tif",
     ):
         assert (run_dir / relative).is_file()
     fusion_mask = run_dir / "fusion/fixture_fusion/raster_parts/partition_00000_00000_mask.tif"
+    assert not fusion_mask.exists()
+    assert (
+        run_dir
+        / "tmp/fragmentation_v33_inputs/fusion_fixture_fusion"
+        / "partition_00000_00000_v3_baseline.tif"
+    ).is_file()
+    v33_report = run_v33_worker(
+        spec_path,
+        worker_id="integration-v33",
+        lease_seconds=120,
+    )
+    assert v33_report["validation_status"] == "passed"
+    assert v33_report["production_replacement"] is True
     with rasterio.open(fusion_mask) as source:
         assert np.all(source.read(1) == 0)
+        assert source.tags()["classification_authority"] == (
+            "fragmentation_v33_authoritative_fusion_core_v1"
+        )
     assert not list((run_dir / "tmp/work_packages" / package_id / "scores").rglob("*.npz"))
     assert not list((run_dir / "tmp/work_packages" / package_id / "scores").rglob("*.json"))
     assert not (run_dir / "tmp/work_packages" / package_id / "score_batches").exists()
@@ -1071,7 +1105,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         assert connection.execute(
             "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
         ).fetchone()[0] == "ready"
-        assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 9
+        assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 13
         unit_job_id = connection.execute(
             """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
                AND job_type='unit_fit'"""
