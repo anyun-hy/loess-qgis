@@ -1,0 +1,96 @@
+"""Isolated V3.1-A, V3.1-B, and V3.1-C topology candidates.
+
+This package deliberately has no production entry-point imports.  Callers must
+opt in, pass the complete class probability cube, and retain the returned audit
+alongside an A/B result before considering production integration.
+"""
+
+from .candidate import (
+    CandidateError,
+    CandidatePolicy,
+    ClassPolicy,
+    apply_v31a,
+    apply_v31a_candidate,
+    apply_v31b,
+    apply_v31b_candidate,
+    policy_v31a,
+    policy_v31b,
+    policy_snapshot,
+    policy_snapshot_sha256,
+    v31a_policy,
+    v31b_policy,
+)
+from .v31c import (
+    CrossCoreDiscovery,
+    GlobalAction,
+    PlannedAction,
+    V31CCoordinationError,
+    V31C_COORDINATION_MODE,
+    V31C_POLICY_ID,
+    V31C_POLICY_VERSION,
+    action_conflicts,
+    canonicalize_global_discoveries,
+    collect_cross_core_discoveries,
+    global_action_to_dict,
+    select_global_actions,
+)
+from .v31d import (
+    V31D_ADJUDICATION_MODE,
+    V31D_POLICY_ID,
+    V31D_POLICY_VERSION,
+    apply_v31d,
+    apply_v31d_candidate,
+    v31d_policy,
+)
+from .v32 import (
+    V32_ADJUDICATION_MODE,
+    V32_POLICY_ID,
+    V32_POLICY_VERSION,
+    apply_v32,
+    apply_v32_candidate,
+    policy_snapshot as v32_policy_snapshot,
+    policy_snapshot_sha256 as v32_policy_snapshot_sha256,
+    v32_policy,
+)
+
+__all__ = [
+    "CandidateError",
+    "CandidatePolicy",
+    "ClassPolicy",
+    "apply_v31a",
+    "apply_v31a_candidate",
+    "apply_v31b",
+    "apply_v31b_candidate",
+    "policy_v31a",
+    "policy_v31b",
+    "policy_snapshot",
+    "policy_snapshot_sha256",
+    "v31a_policy",
+    "v31b_policy",
+    "CrossCoreDiscovery",
+    "GlobalAction",
+    "PlannedAction",
+    "V31CCoordinationError",
+    "V31C_COORDINATION_MODE",
+    "V31C_POLICY_ID",
+    "V31C_POLICY_VERSION",
+    "action_conflicts",
+    "canonicalize_global_discoveries",
+    "collect_cross_core_discoveries",
+    "global_action_to_dict",
+    "select_global_actions",
+    "V31D_ADJUDICATION_MODE",
+    "V31D_POLICY_ID",
+    "V31D_POLICY_VERSION",
+    "apply_v31d",
+    "apply_v31d_candidate",
+    "v31d_policy",
+    "V32_ADJUDICATION_MODE",
+    "V32_POLICY_ID",
+    "V32_POLICY_VERSION",
+    "apply_v32",
+    "apply_v32_candidate",
+    "v32_policy_snapshot",
+    "v32_policy_snapshot_sha256",
+    "v32_policy",
+]
