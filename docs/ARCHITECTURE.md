@@ -73,7 +73,28 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - V3 必须保持单标签，不得产生 gap、overlap 或范围外发布；
 - Generate 只作研究参考，不是生产入口；
 - 失败 RAG 与空间联合解码已归档，不得从 archive 导入生产；
-- V3.1 尚未开始；未来候选必须独立实现和同域验收，不能直接覆盖 V3。
+- V3.1—V3.4 的同域实验最终选择 V3.3；
+- V3.3 规则存放在可查询、严格校验的版本化配置中，执行器不得使用隐藏默认值
+  覆盖类别权限、面积阈值、关系优先级或冲突顺序；
+- V3.3 当前仍是隔离候选，不被正式入口导入，也不修改生产 V3；
+- V3.1、V3.2、V3.4 的源码和测试只保存在实验分支历史，不属于主干当前文件。
+
+### V3.3 迁移到 approved Fusion 的唯一性硬门
+
+单模型概率实验中保持 zero-gap、zero-overlap、zero-outside，不能自动证明
+approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立验证：
+
+- strict-valid 范围内每个像元都有有限、非负且和为 1 的 14 类 Fusion 概率，
+  Fusion coverage weight 不得为 0；
+- hard label 使用冻结 `CLASS_ORDER` 的稳定 argmax，每个有效像元只发布一个
+  类别；最高概率并列及 near-tie 必须单独计数和审计，但并列概率本身不允许
+  变成多标签或跨类别 overlap；
+- Partition Core 对完整范围精确覆盖一次，Halo 不发布；跨 Core proposal 只能
+  由一个冻结 owner 发布，不能重复改写同一像元；
+- V3.3 后的权威 Core mosaic 必须逐像元验证 single-label、gap=0、overlap=0、
+  outside=0、invalid 保持和完整范围 coverage；
+- 矢量化及全流组装后必须再次执行 gap、overlap、outside 硬验收，不能用栅格
+  阶段通过替代矢量阶段通过。
 
 ## 8. 矢量与边界合同
 
