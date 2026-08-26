@@ -1986,11 +1986,14 @@ class RunStateDB:
                 raise RunStateError("V3.3 acceptance report is not ready")
             changed = connection.execute(
                 """UPDATE jobs SET status='ready', error='', worker_id='',
-                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   progress_current=?, progress_total=?, lease_token='',
+                   lease_expires=NULL, heartbeat_at=?, updated_at=?
                    WHERE job_id=? AND job_type='fragmentation_v33'
                      AND status='running' AND lease_token=?
                      AND lease_expires IS NOT NULL AND lease_expires>=?""",
                 (
+                    expected,
+                    expected,
                     now,
                     now,
                     int(job_id),
