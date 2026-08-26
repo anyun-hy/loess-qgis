@@ -1,27 +1,28 @@
-# Fragmentation V3 production stage
+# Fragmentation V3.3 production stage
 
-V3 is the bounded, class-aware authoritative-raster stage for new Fusion Runs.
-Each Work Package applies the frozen policy to a Fusion probability Halo and
-publishes only its non-overlapping cleaned Core mask. Core, Seam, and Junction
-units read those masks as their sole class source before the one vectorization
-and common-boundary fitting pass.
+V3.3 is the class-aware authoritative-raster stage for new Fusion Runs. Each
+Work Package first applies frozen V3 to its Fusion probability Halo and stores
+the V3 baseline Core, context, and probability. After every Work Package is
+ready, one V3.3 job adjudicates the frozen owner Cores and publishes the final
+non-overlapping Core masks. Core, Seam, and Junction units read only those
+V3.3 masks before the one vectorization and common-boundary fitting pass.
 
 ## Data contract
 
 - Fusion Halo probabilities are read-only and remain the source for confidence
   statistics.
-- `fusion/<profile>/raster_parts/*_mask.tif` is the cleaned authoritative Core
-  classification; its GeoTIFF tags record the policy, version, actual context,
-  and changed-pixel count.
+- `fusion/<profile>/raster_parts/*_mask.tif` is the V3.3 authoritative Core
+  classification; its GeoTIFF tags record the policy, version, production
+  replacement state, actual context, and changed-pixel count.
 - Spatial units do not run `argmax` or fragmentation repair.
 - `semantic_polygons.gpkg` is assembled once and becomes `review_polygons`.
 - The v5 runner does not invoke the historical postprocess script.
 
-The frozen policy is `semantic_optimized_200_v3_core_bounded_v1`: a 200 m2
-ceiling for eligible non-protected classes, 256-pixel context, semantic target
-compatibility, a 0.65 confidence guard, 8% source/target class budgets, minimum
-remaining class area, and elongated-feature preservation. Classes 12, 33, 61,
-62, and 71 are protected from source reassignment.
+The production policy is `fragmentation_v33_configurable_absorption_v1`; its
+complete class permissions, area ceilings, enclosure routing, rarity order,
+bridge rules, budgets, conflict order, and hard gates are frozen in
+`fragmentation_policy/policies/v33.yaml`. The first-stage baseline remains
+`semantic_optimized_200_v3_core_bounded_v1`.
 
 ## Historical completed-Run repair
 
@@ -44,12 +45,17 @@ report, and final GeoPackage still match their recorded fingerprints.
 
 ## New Runs
 
-`fragmentation_regularization` in `inference_scripts/config.yaml` freezes the
-same policy into new `run_spec.json` files. The configured Partition Halo must
-be at least the policy buffer. Work Packages publish cleaned Core masks before
-publishing the probability Artifact that releases dependent spatial units.
-After one vectorization/fitting/assembly pass, the runner records the formal
-GeoPackage as the review source and continues directly to scale acceptance.
+`fragmentation_regularization` in `inference_scripts/config.yaml` selects V3.3
+and records V3 as its baseline in each new `run_spec.json`. The configured
+Partition Halo must be at least the policy buffer. Work Packages publish the
+frozen inputs; the singleton V3.3 job then atomically publishes one mask and
+one audit per Core plus the global report. Dependent Fusion spatial units stay
+blocked until that report is ready. After one vectorization/fitting/assembly
+pass, the runner records the formal GeoPackage as the review source and
+continues directly to scale acceptance.
+
+To roll back a newly created Run, explicitly set `policy_id` to
+`semantic_optimized_200_v3`. A running V3.3 Run never falls back silently.
 
 If an older `classes/` workspace exists, the plugin never replaces it silently.
 It offers a V3 rebuild only when all 14 class records are unmodified and
