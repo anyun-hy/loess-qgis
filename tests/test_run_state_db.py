@@ -1021,7 +1021,10 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
     assert database.complete_fragmentation_v33_job(
         leased["job_id"], leased["lease_token"]
     )
-    assert database.get_job(leased["job_id"])["status"] == "ready"
+    completed = database.get_job(leased["job_id"])
+    assert completed["status"] == "ready"
+    assert completed["progress_current"] == 1
+    assert completed["progress_total"] == 1
     assert database.get_artifact(artifact_id)["ref_count"] == 0
     assert database.get_artifact(baseline_id)["ref_count"] == 0
     assert [
