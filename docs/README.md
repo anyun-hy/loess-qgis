@@ -11,8 +11,10 @@
 4. [operations/FRAGMENTATION_V3.md](operations/FRAGMENTATION_V3.md)：当前生产
    碎片治理方法；
 5. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
-   V3、Generate、失败 RAG 和未来 V3.1 的方法决策。
-6. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
+   V3、Generate、失败 RAG 和 V3.1 启动前的方法决策；
+6. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
+   V3.1—V3.4 全量比较与 V3.3 选择决定；
+7. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
    请求的新对话 V3.1 启动交接。
 
 ## 文档职责
@@ -45,3 +47,5 @@
   `scratch/archive/rag_failed_20260823/`，不会进入 Git；
 - Generate 研究说明位于
   `scratch/archive/generate_reference_20260823/`，不是生产文档。
+- V3.1—V3.4 实验源码、测试和运行脚本保存在
+  `research/fragmentation-v31-v34` 的 Git 历史，主干当前文件只保留 V3.3。
