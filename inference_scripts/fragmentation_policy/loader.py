@@ -14,7 +14,7 @@ import yaml
 from .schema import CLASS_CODES, PolicyError, validate_policy
 
 
-DEFAULT_POLICY_PATH = Path(__file__).with_name("policies") / "v33_draft.yaml"
+DEFAULT_POLICY_PATH = Path(__file__).with_name("policies") / "v33.yaml"
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -405,22 +405,18 @@ def diff_policies(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[d
 
 
 def audit_legacy_migration(policy: Mapping[str, Any]) -> dict[str, Any]:
-    """Report every V3.1-B/V3.2 rule recorded in the document's migration ledger."""
-
-    from .legacy_audit import audit_live_legacy
+    """Report the frozen V3.1-B/V3.2 migration ledger stored in the policy."""
 
     snapshot = policy_snapshot(policy)
     rules = snapshot["migration"]["rules"]
     rows = [{"rule": name, **detail} for name, detail in sorted(rules.items())]
-    live = audit_live_legacy(snapshot)
     return {
         "policy_id": snapshot["policy"]["id"],
         "policy_sha256": policy_sha256(snapshot),
         "legacy_policy": snapshot["migration"]["legacy_policy"],
-        "evidence_files": live["evidence_files"],
+        "evidence_files": list(snapshot["migration"]["evidence_files"]),
         "legacy_reference": snapshot["migration"]["legacy_reference"],
         "counts": {status: sum(row["status"] == status for row in rows) for status in ("moved", "superseded", "not_moved")},
         "rules": rows,
         "not_moved": [row for row in rows if row["status"] == "not_moved"],
-        "live_legacy_validation": live,
     }

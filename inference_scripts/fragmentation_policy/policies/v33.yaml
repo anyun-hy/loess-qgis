@@ -1,10 +1,10 @@
-# V3.3 is a draft policy document only.  It cannot alter V3, V3.1-B, or V3.2.
+# Selected V3.3 candidate policy. It remains isolated from the production V3 entry.
 # All shares below are the screenshot's frozen V3.1 "优化前占比", not a live census.
 schema_version: fragmentation-policy/v1
 policy:
-  id: fragmentation_v33_configurable_absorption_draft
-  version: v33_draft_20260826
-  status: draft
+  id: fragmentation_v33_configurable_absorption_candidate
+  version: v33_candidate_20260826
+  status: candidate
   baseline: frozen_v3
   connectivity: 4
   single_pass: true
@@ -178,11 +178,11 @@ constraints:
 migration:
   legacy_policy: V3.1-B/V3.2 implementation evidence
   evidence_files:
-    - inference_scripts/fragmentation_v31_candidate/candidate.py
-    - inference_scripts/fragmentation_v31_candidate/v32.py
-    - scratch/v32_full_140_20260825/run_v32_from_v3.py
-    - scratch/v32_full_140_20260825/evaluate_v32_against_b.py
-    - tests/test_fragmentation_v32_candidate.py
+    - git:f6d7c00:inference_scripts/fragmentation_v31_candidate/candidate.py
+    - git:f6d7c00:inference_scripts/fragmentation_v31_candidate/v32.py
+    - git:f6d7c00:scratch/v32_full_140_20260825/run_v32_from_v3.py
+    - git:f6d7c00:scratch/v32_full_140_20260825/evaluate_v32_against_b.py
+    - git:f6d7c00:tests/test_fragmentation_v32_candidate.py
   # Queryable legacy values.  They are evidence only where the V3.3 rule ledger
   # marks them superseded/not_moved; the executor must not silently reactivate them.
   legacy_reference:

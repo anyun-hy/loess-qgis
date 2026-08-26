@@ -28,7 +28,7 @@ import numpy as np
 
 from fragmentation_policy import load_policy, policy_sha256 as config_sha256
 from fragmentation_policy.loader import policy_snapshot as config_snapshot
-from fragmentation_v31_candidate import candidate as _b
+from . import engine as _b
 
 
 V33_POLICY_ID = "fragmentation_v33_configurable_absorption_candidate_v1"

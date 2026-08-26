@@ -1,10 +1,8 @@
-"""Single-round, probability-gated V3.1-A topology proposals.
+"""Topology primitives used by the selected V3.3 fragmentation candidate.
 
-The module is intentionally independent of V3.  It never writes files,
-changes a production default, or relies on vector buffering.  All proposals
-are computed from one frozen hard-label baseline, then adjudicated once.  This
-is an in-memory reference implementation for tests and isolated panels, not a
-production-scale Partition/Core runner.
+The engine is independent of production V3. It never writes files, changes a
+production default, or relies on vector buffering. Proposals are computed from
+one frozen hard-label baseline and adjudicated once.
 
 Labels are class *indices* into ``class_codes`` and probabilities have shape
 ``[len(class_codes), height, width]``.  Distances and areas are supplied in

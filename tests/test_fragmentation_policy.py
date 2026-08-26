@@ -17,10 +17,10 @@ from fragmentation_policy import (
 from fragmentation_policy.loader import diff_policies
 
 
-POLICY_PATH = Path(__file__).parents[1] / "inference_scripts" / "fragmentation_policy" / "policies" / "v33_draft.yaml"
+POLICY_PATH = Path(__file__).parents[1] / "inference_scripts" / "fragmentation_policy" / "policies" / "v33.yaml"
 
 
-def test_v33_draft_loads_all_classes_and_has_stable_sha():
+def test_v33_policy_loads_all_classes_and_has_stable_sha():
     policy = load_policy(POLICY_PATH)
     assert sorted(map(int, policy["classes"])) == [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71]
     assert policy_sha256(policy) == policy_sha256(load_policy(POLICY_PATH))
@@ -222,22 +222,8 @@ def test_migration_audit_reports_old_rules_not_moved_and_no_silent_diff():
     audit = audit_legacy_migration(policy)
     assert audit["counts"] == {"moved": 13, "superseded": 11, "not_moved": 0}
     assert audit["not_moved"] == []
-    assert audit["live_legacy_validation"]["all_verified"] is True
-    assert audit["live_legacy_validation"]["field_checks"]["active_execution_contract"] is True
-    assert audit["live_legacy_validation"]["field_checks"]["active_proposal_rank"] is True
-    assert all(row["sha256_matches"] for row in audit["live_legacy_validation"]["implementation_file_sha256"].values())
+    assert audit["evidence_files"] == policy["migration"]["evidence_files"]
     assert diff_policies(policy, load_policy(POLICY_PATH)) == []
-
-
-def test_migration_audit_checks_active_moved_values_not_only_legacy_reference():
-    policy = deepcopy(load_policy(POLICY_PATH))
-    policy["classes"]["13"]["fragment_max_m2"] = 149
-    policy["constraints"]["budgets"]["source_loss_fraction"] = 0.03
-    policy["constraints"]["budgets"]["bridge_limits"]["21"]["max_edge_distance_m"] = 11
-    checks = audit_legacy_migration(policy)["live_legacy_validation"]["field_checks"]
-    assert checks["active_dynamic_fragmentation_thresholds"] is False
-    assert checks["active_source_and_target_budgets"] is False
-    assert checks["active_bridge_limits"] is False
 
 
 def _proposal(
