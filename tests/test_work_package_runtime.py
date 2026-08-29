@@ -1240,6 +1240,50 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert finalized["status"] == "raster_ready"
     assert len(finalized["streams"]) == 3
     assert all(Path(item["mask_vrt"]).is_file() for item in finalized["streams"])
+    assert database.recover_ready_work_package_jobs(spec["run_id"]) == 1
+
+    # Complete the two model Stream unit jobs and assemblies so the final
+    # acceptance gate exercises the production V3.3 job graph end to end.
+    for stream_id in ("model:a", "model:b"):
+        job = database.lease_next_job(
+            spec["run_id"],
+            f"{stream_id}-unit-test",
+            job_types=("unit_fit",),
+            lease_seconds=120,
+        )
+        assert job is not None
+        assert job["stream_id"] == stream_id
+        report = run_unit_fit(
+            spec_path,
+            stream_id,
+            job["unit_id"],
+            job_id=job["job_id"],
+            lease_token=job["lease_token"],
+        )
+        assert report["status"] == "passed"
+        assert assemble_stream(spec_path, stream_id)["status"] == "passed"
+    # This older fixture assembled Fusion before VRT finalization; production
+    # does the reverse. Restore the already-validated Stream terminal state.
+    assert database.set_stream_status(
+        spec["run_id"], "fusion:fixture_fusion", "ready"
+    )
+
+    scale_report = build_scale_acceptance_report(spec_path)
+    assert scale_report["status"] == "passed"
+    assert scale_report["hard_gate_passed"] is True
+    assert scale_report["hard_gates"]["all_v33_jobs_ready"] is True
+    assert scale_report["hard_gates"]["all_unit_jobs_ready"] is True
+    assert scale_report["expected_job_counts"] == {
+        "work_package": 1,
+        "fragmentation_v33": 2,
+        "unit_fit": 3,
+        "total": 6,
+    }
+    assert scale_report["job_type_counts"] == {
+        "fragmentation_v33": {"ready": 2},
+        "unit_fit": {"ready": 3},
+        "work_package": {"ready": 1},
+    }
 
 
 def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp_path):
