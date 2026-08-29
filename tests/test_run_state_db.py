@@ -332,7 +332,20 @@ def test_monitor_aggregates_unit_types_and_active_package(tmp_path):
     snapshot = database.monitor_snapshot(RUN_ID)
     assert snapshot["run"]["run_id"] == RUN_ID
     assert snapshot["job_counts"]["work_package"] == {"running": 1}
+    assert snapshot["job_counts"]["fragmentation_v33"] == {}
     assert snapshot["job_counts"]["unit_fit"] == {"interrupted": 1, "ready": 1}
+    assert snapshot["job_progress"]["work_package"] == {
+        "completed": 0.0,
+        "total": 1,
+    }
+    assert snapshot["job_progress"]["fragmentation_v33"] == {
+        "completed": 0.0,
+        "total": 0,
+    }
+    assert snapshot["job_progress"]["unit_fit"] == {
+        "completed": 1.0,
+        "total": 2,
+    }
     assert snapshot["active_work_package"]["package_id"] == "package_00000"
     assert snapshot["stream_unit_type_counts"]["model:test"] == {
         "core": {"ready": 1},
