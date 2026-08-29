@@ -926,6 +926,30 @@ def test_manual_retry_selects_package_reset_instead_of_job_requeue(monkeypatch):
     ]
 
 
+def test_scheduler_exception_is_logged_and_finishes_the_run(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    messages = []
+    finishes = []
+    runner.log_line = types.SimpleNamespace(
+        emit=lambda level, message: messages.append((level, message))
+    )
+    runner._schedule = lambda: (_ for _ in ()).throw(
+        TypeError("unexpected keyword argument 'run_id'")
+    )
+    runner._finish = lambda success, error: finishes.append((success, error))
+
+    runner._schedule_safely()
+
+    assert messages == [
+        (
+            "stderr",
+            "[scheduler-error] TypeError: unexpected keyword argument 'run_id'",
+        )
+    ]
+    assert finishes == [(False, messages[0][1])]
+
+
 def test_resume_contract_failure_precedes_database_mutation(monkeypatch):
     module = _load_runner_module(monkeypatch)
     runner = module.V5AsyncInferenceRunner.__new__(

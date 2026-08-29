@@ -36,6 +36,23 @@ def _method(name: str) -> ast.FunctionDef:
     raise AssertionError(f"InferenceMonitorDialog.{name} is missing")
 
 
+def _module_function(name: str) -> ast.FunctionDef:
+    for node in TREE.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"module function {name} is missing")
+
+
+def _execute_module_function(name: str, *args):
+    function = copy.deepcopy(_module_function(name))
+    module = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+    namespace = {}
+    exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
+    return namespace[name](*args)
+
+
 def _method_source(name: str) -> str:
     node = _method(name)
     return ast.get_source_segment(SOURCE, node) or ""
@@ -516,6 +533,26 @@ def test_log_panel_is_retained_but_collapsed_by_default():
     assert "self._log_panel.setVisible(False)" in build_ui
     assert "[720, 460] if shown else [1180, 0]" in toggle
     assert "self._log_panel.setVisible(shown)" in toggle
+
+
+def test_log_count_ignores_failure_field_names_and_keeps_real_errors_visible():
+    resource_tuning = (
+        '[resource-tuning] {"first_failed_batch":null,"status":"completed"}'
+    )
+    assert _execute_module_function(
+        "_log_indicators", "system", resource_tuning
+    ) == (False, False)
+    assert _execute_module_function(
+        "_log_indicators",
+        "stderr",
+        "TypeError: unexpected keyword argument 'run_id'",
+    ) == (False, True)
+    assert _execute_module_function(
+        "_log_indicators",
+        "stdout",
+        '{"event":"stream_assembly_failed"}',
+    ) == (False, True)
+    assert "_log_indicators(level, message)" in _method_source("_on_log")
 
 
 def test_tile_and_spatial_unit_details_remain_bounded_and_paged():
