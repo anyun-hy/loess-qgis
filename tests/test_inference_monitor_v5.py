@@ -147,6 +147,24 @@ def test_left_monitor_uses_run_package_and_unit_layers():
     assert "空白/重叠验收" in build_ui
 
 
+def test_result_stream_table_is_compact_and_scrollable():
+    build_ui = _method_source("_build_ui")
+
+    assert "STREAM_TABLE_VISIBLE_ROWS = 5" in SOURCE
+    assert (
+        "self._streams.setHorizontalScrollBarPolicy(SCROLLBAR_AS_NEEDED)"
+        in build_ui
+    )
+    assert (
+        "self._streams.setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)"
+        in build_ui
+    )
+    assert "* STREAM_TABLE_VISIBLE_ROWS" in build_ui
+    assert "self._streams.setFixedHeight(stream_table_height)" in build_ui
+    assert "left_layout.addWidget(self._streams)" in build_ui
+    assert "left_layout.addWidget(self._streams, stretch=2)" not in build_ui
+
+
 def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
     method = _method("bind_state_database")
     positional = [argument.arg for argument in method.args.args]
