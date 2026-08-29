@@ -82,6 +82,7 @@ def _runner(module):
     runner._assembly_queue = [
         {"stream_id": "model:a"},
         {"stream_id": "model:b"},
+        {"stream_id": "model:c"},
         {
             "stream_id": "fusion:approved",
             "kind": "fusion",
@@ -123,14 +124,7 @@ def test_assembly_queue_starts_streams_then_acceptance_without_postprocess(monke
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
-    ]
-    # The hardware-governed default admits the remaining Stream after a slot
-    # becomes available.
-    runner._processes.clear()
-    runner._start_assembly()
-    assert [item[0] for item in starts] == [
-        "assemble_stream:model:a",
-        "assemble_stream:model:b",
+        "assemble_stream:model:c",
         "assemble_stream:fusion:approved",
     ]
     # Simulate all assemblies finished -> goes straight to acceptance.
@@ -140,6 +134,7 @@ def test_assembly_queue_starts_streams_then_acceptance_without_postprocess(monke
     assert [item[0] for item in starts] == [
         "assemble_stream:model:a",
         "assemble_stream:model:b",
+        "assemble_stream:model:c",
         "assemble_stream:fusion:approved",
         "scale_acceptance",
     ]
@@ -232,6 +227,7 @@ def test_active_assembly_process_blocks_second_stream(monkeypatch):
     assert [item["stream_id"] for item in runner._assembly_queue] == [
         "model:a",
         "model:b",
+        "model:c",
         "fusion:approved",
     ]
 
@@ -356,7 +352,9 @@ def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_runn
         "boundary_fitting": {"enabled": True},
         "fragmentation_regularization": {
             "enabled": True,
-            "comparison": {"enabled": True},
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
         },
     }
     runner._cleanup_released_artifacts = lambda: None
@@ -392,7 +390,10 @@ def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_runn
             return None
 
         def lease_next_fragmentation_v33(self, *_args, **_kwargs):
-            return candidate
+            if not hasattr(self, "leased_candidate"):
+                self.leased_candidate = True
+                return candidate
+            return None
 
     runner._database = Database()
     starts = []
@@ -545,7 +546,7 @@ def test_v33_process_cannot_bypass_atomic_completion_gate(monkeypatch):
         "job_id": 33,
         "job_type": "fragmentation_v33",
         "stream_id": "fusion:approved",
-        "unit_id": "fragmentation_v33",
+        "unit_id": "fragmentation_v33_partition:partition_00000_00000",
         "lease_token": "lease-33",
     }
     runner._processes = {
@@ -673,6 +674,7 @@ def test_failed_stream_stops_queue_before_fusion_and_acceptance(monkeypatch):
     assert [item["stream_id"] for item in runner._assembly_queue] == [
         "model:a",
         "model:b",
+        "model:c",
         "fusion:approved",
     ]
 

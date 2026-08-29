@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -117,8 +120,8 @@ def test_vector_guard_subtracts_exact_edge_core_bytes(remaining, tmp_path):
     assert remaining(spec, _UnequalReadyCoreArtifacts()) == 61
 
 
-def test_unit_gpkg_low_disk_fails_before_temp_and_preserves_target(tmp_path):
-    target = tmp_path / "unit_raw.gpkg"
+def test_unit_geoparquet_low_disk_fails_before_temp_and_preserves_target(tmp_path):
+    target = tmp_path / "unit_raw.parquet"
     target.write_bytes(b"existing-formal-output")
     guard = StorageGuard(
         tmp_path,
@@ -136,7 +139,7 @@ def test_unit_gpkg_low_disk_fails_before_temp_and_preserves_target(tmp_path):
     ]
 
     with pytest.raises(StorageReserveError):
-        unit_runtime._write_gpkg(
+        unit_runtime._write_geoparquet(
             target,
             records,
             transform=Affine.identity(),
@@ -148,12 +151,12 @@ def test_unit_gpkg_low_disk_fails_before_temp_and_preserves_target(tmp_path):
         )
 
     assert target.read_bytes() == b"existing-formal-output"
-    assert list(tmp_path.glob("*.tmp.gpkg")) == []
+    assert not list(tmp_path.glob(".*.tmp"))
     assert guard.pending_write_bytes == 0
 
 
-def test_unit_fitted_edges_low_disk_preserves_target(tmp_path):
-    target = tmp_path / "unit_fitted_edges.gpkg"
+def test_unit_fitted_edges_geoparquet_low_disk_preserves_target(tmp_path):
+    target = tmp_path / "unit_fitted_edges.parquet"
     target.write_bytes(b"existing-edge-output")
     guard = StorageGuard(
         tmp_path,
@@ -172,7 +175,7 @@ def test_unit_fitted_edges_low_disk_preserves_target(tmp_path):
     }
 
     with pytest.raises(StorageReserveError):
-        unit_runtime._write_diagnostic_gpkg(
+        unit_runtime._write_diagnostic_geoparquet(
             target,
             report,
             run_id="run-storage",
@@ -185,7 +188,7 @@ def test_unit_fitted_edges_low_disk_preserves_target(tmp_path):
         )
 
     assert target.read_bytes() == b"existing-edge-output"
-    assert list(tmp_path.glob("*.tmp.gpkg")) == []
+    assert not list(tmp_path.glob(".*.tmp"))
     assert guard.pending_write_bytes == 0
 
 
@@ -289,6 +292,45 @@ def test_stream_report_low_disk_preserves_target(tmp_path):
     assert target.read_text(encoding="utf-8") == '{"old":true}\n'
     assert list(tmp_path.glob("*.tmp")) == []
     assert guard.pending_write_bytes == 0
+
+
+def test_vector_write_lock_only_reserves_and_allows_independent_writes_to_overlap(
+    tmp_path,
+):
+    lock_path = tmp_path / "storage.lock"
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+    guards = [
+        StorageGuard(tmp_path, min_free_bytes=0, disk_usage=_disk_usage(1_000_000))
+        for _ in range(2)
+    ]
+
+    def writer(index):
+        with assemble_stream._reserved_vector_write(
+            guards[index], lock_path, f"stream-{index}", 1_024
+        ):
+            entered[index].set()
+            assert release.wait(5)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(writer, 0)
+        assert entered[0].wait(2)
+        second = executor.submit(writer, 1)
+        try:
+            assert entered[1].wait(2), "second file writer was serialized"
+            state = json.loads(
+                lock_path.with_name(f"{lock_path.name}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert len(state["reservations"]) == 2
+        finally:
+            release.set()
+        first.result()
+        second.result()
+
+    assert guards[0].pending_write_bytes == 0
+    assert guards[1].pending_write_bytes == 0
 
 
 def test_missing_accepted_layer_does_not_reserve_candidate_write(tmp_path):

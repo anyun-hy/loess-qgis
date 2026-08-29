@@ -113,6 +113,11 @@ def _config(model_sha):
             "max_segment_arc_length_px": 8.0,
             "diagnostic_level": "changed_and_failed",
         },
+        "vector_data_plane": {
+            "enabled": True,
+            "mode": "columnar",
+            "dependency_policy": "error",
+        },
         "classes": {
             "background_index": -1,
             "index_to_code": {index: code for index, code in enumerate(CLASS_ORDER)},
@@ -216,6 +221,25 @@ def test_auto_performance_fields_are_valid_schema_values(tmp_path):
     assert effective["scaling"]["max_cpu_partition_workers"] == "auto"
     assert effective["scaling"]["assembly_validation_workers"] == "auto"
     assert effective["scaling"]["max_concurrent_assembly"] == "auto"
+
+
+def test_v33_worker_count_above_four_is_rejected_during_config_validation(
+    tmp_path,
+):
+    scripts, config, _ = _workspace(tmp_path)
+    config["fragmentation_regularization"] = {"max_workers": 5}
+
+    _effective, issues = validate_deployment_config(
+        config,
+        scripts_dir=scripts,
+        verify_files=True,
+        verify_hashes=True,
+    )
+
+    assert any(
+        issue.path == "/fragmentation_regularization/max_workers"
+        for issue in issues
+    )
 
 
 def test_legacy_single_model_config_is_rejected(tmp_path):

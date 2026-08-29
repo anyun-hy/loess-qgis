@@ -93,7 +93,7 @@ def test_100_reverse_report_summaries_are_validated_in_unit_id_order(
             *,
             kind=None,
         ):
-            if kind == "unit_fitted_edges":
+            if kind == "unit_fitted_edges_geoparquet":
                 return []
             raise AssertionError(kind)
 
@@ -175,61 +175,6 @@ def test_parallel_validation_keeps_12635_artifacts_bounded(
         <= stats["peak_in_flight"]
         <= assemble_stream.ASSEMBLY_VALIDATION_MAX_IN_FLIGHT
     )
-
-
-def test_resolved_object_state_rejects_missing_and_unresolved_rows(tmp_path):
-    database_path = tmp_path / "state.sqlite"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """CREATE TABLE object_nodes (
-                   run_id TEXT,
-                   stream_id TEXT,
-                   part_id TEXT,
-                   object_id TEXT,
-                   parent_id TEXT
-               )"""
-        )
-
-    with pytest.raises(
-        assemble_stream.StreamAssemblyError,
-        match="resume requires existing resolved object IDs",
-    ):
-        assemble_stream._resolved_object_state(
-            database_path,
-            "run-1",
-            "model:a",
-        )
-
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """INSERT INTO object_nodes
-               (run_id, stream_id, part_id, object_id, parent_id)
-               VALUES (?, ?, ?, ?, ?)""",
-            ("run-1", "model:a", "part-1", "", "part-1"),
-        )
-
-    with pytest.raises(
-        assemble_stream.StreamAssemblyError,
-        match="unresolved=1",
-    ):
-        assemble_stream._resolved_object_state(
-            database_path,
-            "run-1",
-            "model:a",
-        )
-
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """UPDATE object_nodes SET object_id=?
-               WHERE run_id=? AND stream_id=?""",
-            ("object-1", "run-1", "model:a"),
-        )
-
-    assert assemble_stream._resolved_object_state(
-        database_path,
-        "run-1",
-        "model:a",
-    ) == (1, 1)
 
 
 def test_resume_input_fingerprint_change_is_rejected(tmp_path):

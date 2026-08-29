@@ -24,10 +24,11 @@ from labeling_tool.core.run_spec import atomic_write_json
 from labeling_tool.core.spatial_planner import plan_spatial_units
 from boundary_fitting.unit_runtime import (
     _polygonize,
-    _write_diagnostic_gpkg,
-    _write_gpkg,
+    _write_diagnostic_geoparquet,
+    _write_geoparquet,
     run_unit_fit,
 )
+from vector_data_plane import unit_boundary_signatures, write_boundary_signatures
 from assemble_stream import StreamAssemblyError, assemble_stream
 from finalize_partition_rasters import finalize_partition_rasters
 from fragmentation_v33_candidate import (
@@ -1073,9 +1074,16 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         / "tmp/fragmentation_v33_inputs/fusion_fixture_fusion"
         / "partition_00000_00000_v3_baseline.tif"
     ).is_file()
-    v33_report = run_v33_worker(
+    v33_partition = run_v33_worker(
         spec_path,
         worker_id="integration-v33",
+        lease_seconds=120,
+    )
+    assert v33_partition["status"] == "ready"
+    assert v33_partition["stage"] == "partition"
+    v33_report = run_v33_worker(
+        spec_path,
+        worker_id="integration-v33-finalize",
         lease_seconds=120,
     )
     assert v33_report["validation_status"] == "passed"
@@ -1105,7 +1113,15 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         assert connection.execute(
             "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
         ).fetchone()[0] == "ready"
-        assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 13
+        # Partition workers retain two cleaned staging rows for auditability;
+        # finalize adds the same three authoritative rows as the former
+        # single-job implementation.
+        assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 15
+        assert connection.execute(
+            """SELECT COUNT(*) FROM artifacts
+               WHERE kind IN ('v33_staged_mask','v33_staged_audit')
+                 AND status='cleaned'"""
+        ).fetchone()[0] == 2
         unit_job_id = connection.execute(
             """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
                AND job_type='unit_fit'"""
@@ -1154,8 +1170,9 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert assembled["report_processed_count"] == 1
     assert assembled["report_peak_loaded_count"] == 0
     assert assembled["report_json_parse_count"] == 0
-    assert assembled["gpkg_write_mode"] == "gdal_batch_writerecords"
-    assert assembled["object_id_lookup_batch_size"] == 512
+    assert assembled["gpkg_write_mode"] == "pyogrio_arrow_single_publish"
+    assert assembled["object_id_resolution"] == "boundary_signature_components_v1"
+    assert database.object_link_count(spec["run_id"], "fusion:fixture_fusion") == 0
     events = [
         json.loads(line)
         for line in capsys.readouterr().out.splitlines()
@@ -1635,17 +1652,17 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             "confidence_mean": 1.0,
             "confidence_std": 0.0,
         }
-        raw_path = output_root / f"{unit['unit_id']}_raw.gpkg"
-        formal_path = output_root / f"{unit['unit_id']}_formal.gpkg"
+        raw_path = output_root / f"{unit['unit_id']}_raw.parquet"
+        formal_path = output_root / f"{unit['unit_id']}_formal.parquet"
         report_path = output_root / f"{unit['unit_id']}_report.json"
-        _write_gpkg(
+        _write_geoparquet(
             raw_path,
             [base],
             transform=affine,
             crs="EPSG:3857",
             include_fit=False,
         )
-        _write_gpkg(
+        _write_geoparquet(
             formal_path,
             [
                 {
@@ -1697,8 +1714,8 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             },
         }
         report_path.write_text(json.dumps(unit_report), encoding="utf-8")
-        fitted_edges_path = output_root / f"{unit['unit_id']}_fitted_edges.gpkg"
-        fitted_edge_count = _write_diagnostic_gpkg(
+        fitted_edges_path = output_root / f"{unit['unit_id']}_fitted_edges.parquet"
+        fitted_edge_count = _write_diagnostic_geoparquet(
             fitted_edges_path,
             unit_report,
             run_id=run_id,
@@ -1707,13 +1724,38 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
             transform=affine,
             crs="EPSG:3857",
         )
+        signature_path = output_root / f"{unit['unit_id']}_boundary_signatures.json"
+        write_boundary_signatures(
+            signature_path,
+            unit_boundary_signatures(
+                [
+                    {
+                        **base,
+                        "fit_method": "unchanged",
+                        "fit_status": "unchanged",
+                        "fit_version": "divider_cubic_bspline_adaptive_v2",
+                        "vertex_count_before": 5,
+                        "vertex_count_after": 5,
+                        "max_shift_px": 0.0,
+                        "mean_shift_px": 0.0,
+                        "area_change_ratio": 0.0,
+                    }
+                ],
+                stream_id="model:a",
+                unit_id=unit["unit_id"],
+                pixel_window=unit["pixel_window"],
+            ),
+            stream_id="model:a",
+            unit_id=unit["unit_id"],
+        )
         artifacts = [
-            ("unit_raw", raw_path),
-            ("unit_formal", formal_path),
+            ("unit_raw_geoparquet", raw_path),
+            ("unit_formal_geoparquet", formal_path),
             ("unit_boundary_report", report_path),
+            ("unit_boundary_signatures", signature_path),
         ]
         if fitted_edge_count:
-            artifacts.append(("unit_fitted_edges", fitted_edges_path))
+            artifacts.append(("unit_fitted_edges_geoparquet", fitted_edges_path))
         for kind, path in artifacts:
             _commit_artifact(
                 database,
@@ -1846,17 +1888,17 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
             "confidence_mean": 1.0,
             "confidence_std": 0.0,
         }
-        raw_path = output_root / f"{unit['unit_id']}_raw.gpkg"
-        formal_path = output_root / f"{unit['unit_id']}_formal.gpkg"
+        raw_path = output_root / f"{unit['unit_id']}_raw.parquet"
+        formal_path = output_root / f"{unit['unit_id']}_formal.parquet"
         report_path = output_root / f"{unit['unit_id']}_report.json"
-        _write_gpkg(
+        _write_geoparquet(
             raw_path,
             [base],
             transform=affine,
             crs="EPSG:3857",
             include_fit=False,
         )
-        _write_gpkg(
+        _write_geoparquet(
             formal_path,
             [
                 {
@@ -1891,10 +1933,35 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
             },
         }
         report_path.write_text(json.dumps(unit_report), encoding="utf-8")
+        signature_path = output_root / f"{unit['unit_id']}_boundary_signatures.json"
+        write_boundary_signatures(
+            signature_path,
+            unit_boundary_signatures(
+                [
+                    {
+                        **base,
+                        "fit_method": "unchanged",
+                        "fit_status": "unchanged",
+                        "fit_version": "divider_cubic_bspline_adaptive_v2",
+                        "vertex_count_before": 5,
+                        "vertex_count_after": 5,
+                        "max_shift_px": 0.0,
+                        "mean_shift_px": 0.0,
+                        "area_change_ratio": 0.0,
+                    }
+                ],
+                stream_id="model:a",
+                unit_id=unit["unit_id"],
+                pixel_window=unit["pixel_window"],
+            ),
+            stream_id="model:a",
+            unit_id=unit["unit_id"],
+        )
         for kind, path in (
-            ("unit_raw", raw_path),
-            ("unit_formal", formal_path),
+            ("unit_raw_geoparquet", raw_path),
+            ("unit_formal_geoparquet", formal_path),
             ("unit_boundary_report", report_path),
+            ("unit_boundary_signatures", signature_path),
         ):
             _commit_artifact(
                 database,
