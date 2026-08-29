@@ -1,10 +1,9 @@
 """Run V3.3 as a resumable second-stage Work Package.
 
 The production mode waits for every V3 baseline Core, neighbouring V3 context,
-and matching Fusion probability Artifact. It validates and publishes V3.3 as
-the authoritative Fusion ``core_mask`` before geometry jobs may run. The same
-worker retains an explicit isolated replay mode for historical equivalence
-tests; replay outputs never become production Artifacts.
+and matching Fusion probability Artifact. It stages owner outputs, validates
+the stitched global domain, then atomically publishes authoritative Fusion
+``core_mask`` artifacts before geometry jobs may run.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
 import threading
 import time
@@ -31,7 +31,7 @@ for plugin_root in (ROOT / "qgis_plugins", ROOT / "runtime"):
         sys.path.insert(0, str(plugin_root))
 
 from labeling_tool.core.run_spec import sha256_file
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 
 from deployment_config import CLASS_ORDER, load_json
 from fragmentation_v33_candidate import (
@@ -41,15 +41,16 @@ from fragmentation_v33_candidate import (
     policy_snapshot_sha256,
     runtime_policy,
 )
+from fragmentation_global_connectivity import (
+    GlobalConnectivityError,
+    audit_partitioned_connectivity,
+    connectivity_hard_gate,
+)
 from partition_mosaic import _atomic_raster
 from small_component_regularizer import physical_pixel_area_m2
 
 
 CANDIDATE_JOB_TYPE = "fragmentation_v33"
-PRODUCTION_UNIT_ID = "fragmentation_v33"
-REPLAY_UNIT_ID = "fragmentation_v33_candidate"
-
-
 class FragmentationV33WorkPackageError(RuntimeError):
     pass
 
@@ -63,26 +64,12 @@ def _execution_contract(spec: Mapping[str, Any]) -> dict[str, Any]:
     ):
         return {
             "production": True,
-            "unit_id": PRODUCTION_UNIT_ID,
             "buffer_pixels": int(fragmentation.get("buffer_pixels", 256)),
             "policy_sha256": str(fragmentation.get("policy_sha256") or ""),
             "executor_sha256": str(fragmentation.get("executor_sha256") or ""),
         }
-    comparison = dict(fragmentation.get("comparison") or {})
-    if comparison.get("enabled") is True:
-        return {
-            "production": False,
-            "unit_id": REPLAY_UNIT_ID,
-            "buffer_pixels": int(comparison.get("buffer_pixels", 256)),
-            "policy_sha256": str(
-                comparison.get("candidate_policy_sha256") or ""
-            ),
-            "executor_sha256": str(
-                comparison.get("candidate_executor_sha256") or ""
-            ),
-        }
     raise FragmentationV33WorkPackageError(
-        "run spec does not select V3.3 production or isolated replay"
+        "run spec does not select V3.3 authoritative production"
     )
 
 
@@ -399,6 +386,7 @@ def _run_partition(
     executor_sha256: str,
     staging_key: str,
     production: bool,
+    stage_only: bool = False,
 ) -> dict[str, Any]:
     run_id = str(spec["run_id"])
     run_dir = Path(str(spec["run_dir"]))
@@ -560,7 +548,18 @@ def _run_partition(
         audit = _empty_budget_audit()
     candidate_core = np.asarray(result[core_slice], dtype=np.int16).copy()
     candidate_core[~strict_valid] = -1
-    if production:
+    if production and stage_only:
+        if not stream_id.startswith("fusion:"):
+            raise FragmentationV33WorkPackageError(
+                "V3.3 production requires a Fusion stream"
+            )
+        output_root = (
+            run_dir / "fusion" / stream_id.split(":", 1)[1]
+            / "fragmentation_v33_staging"
+        )
+        mask_path = output_root / "raster_parts" / f"{target_id}_mask.tif"
+        audit_path = output_root / "audits" / f"{target_id}.json"
+    elif production:
         if not stream_id.startswith("fusion:"):
             raise FragmentationV33WorkPackageError(
                 "V3.3 production requires a Fusion stream"
@@ -597,7 +596,11 @@ def _run_partition(
         profile,
         tags={
             "classification_authority": (
-                "fragmentation_v33_authoritative_fusion_core_v1"
+                (
+                    "fragmentation_v33_staged_fusion_core_v1"
+                    if stage_only
+                    else "fragmentation_v33_authoritative_fusion_core_v1"
+                )
                 if production
                 else "isolated_fragmentation_v33_replay_v1"
             ),
@@ -605,7 +608,7 @@ def _run_partition(
             "fragmentation_policy_sha256": policy_snapshot_sha256(),
             "fragmentation_executor_sha256": executor_sha256,
             "baseline": "authoritative_v3_owner_core",
-            "production_replacement": str(bool(production)).lower(),
+            "production_replacement": str(bool(production and not stage_only)).lower(),
         },
     )
     lease_guard()
@@ -674,9 +677,11 @@ def _run_partition(
         "candidate": audit,
         "acceptance": acceptance,
         "publication": (
-            "authoritative_fusion_core" if production else "isolated_replay"
+            "staged_fusion_core"
+            if stage_only
+            else ("authoritative_fusion_core" if production else "isolated_replay")
         ),
-        "production_replacement": bool(production),
+        "production_replacement": bool(production and not stage_only),
         "candidate_policy_sha256": policy_sha256,
         "candidate_executor_sha256": executor_sha256,
         "output_mask_sha256": sha256_file(mask_path),
@@ -704,7 +709,7 @@ def _run_partition(
         audit_path=audit_path,
         audit_byte_count=audit_path.stat().st_size,
         audit_sha256=sha256_file(audit_path),
-        production=production,
+        production=None if stage_only else production,
     )
     return {
         "partition_id": target_id,
@@ -775,59 +780,140 @@ class _Heartbeat:
         self.thread.join(timeout=20)
 
 
-def run_worker(
-    run_spec_path: str | Path,
+def _copy_atomic(
+    source: Path,
+    destination: Path,
+    staging_key: str,
     *,
-    worker_id: str,
-    lease_seconds: int = 120,
-    job_id: int | None = None,
-    lease_token: str = "",
+    raster_tags: Mapping[str, str] | None = None,
+) -> None:
+    """Publish a frozen staged file without exposing a partial destination."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{staging_key}.tmp")
+    try:
+        with source.open("rb") as input_handle, temporary.open("wb") as output_handle:
+            shutil.copyfileobj(input_handle, output_handle)
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        if raster_tags is not None:
+            with rasterio.open(temporary, "r+") as raster:
+                raster.update_tags(**dict(raster_tags))
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _finish_or_requeue_v33(
+    database: RunStateDB, job: Mapping[str, Any], error: Exception
+) -> None:
+    if database.finish_job(
+        int(job["job_id"]), str(job["lease_token"]), status="failed", error=str(error)
+    ):
+        database.requeue_failed_job(int(job["job_id"]))
+
+
+def _release_staged_outputs(
+    database: RunStateDB,
+    artifacts: Mapping[tuple[str, str], Mapping[str, Any]],
+    partition_ids: list[str],
+) -> dict[str, int]:
+    """Best-effort release after the authority barrier is already committed."""
+
+    released = 0
+    released_bytes = 0
+    for partition_id in partition_ids:
+        for kind in ("v33_staged_mask", "v33_staged_audit"):
+            artifact = artifacts.get((partition_id, kind))
+            if artifact is None:
+                continue
+            claimed = database.claim_artifact_cleanup(int(artifact["artifact_id"]))
+            if claimed is None:
+                continue
+            path = Path(str(claimed.get("path") or ""))
+            success = False
+            try:
+                path.unlink(missing_ok=True)
+                success = not path.exists()
+            finally:
+                database.finish_artifact_cleanup(
+                    int(claimed["artifact_id"]), success=success
+                )
+            if success:
+                released += 1
+                released_bytes += int(claimed.get("byte_count") or 0)
+    return {"artifact_count": released, "byte_count": released_bytes}
+
+
+def _run_durable_partition_job(
+    spec: Mapping[str, Any],
+    database: RunStateDB,
+    job: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    lease_seconds: int,
 ) -> dict[str, Any]:
-    spec = load_json(Path(run_spec_path).resolve())
-    contract = _execution_contract(spec)
-    production = bool(contract["production"])
-    current_policy_sha256 = policy_snapshot_sha256()
-    current_executor_sha256 = executor_snapshot_sha256()
-    if contract["policy_sha256"] != current_policy_sha256:
-        raise FragmentationV33WorkPackageError(
-            "V3.3 policy differs from the frozen Run contract"
-        )
-    if contract["executor_sha256"] != current_executor_sha256:
-        raise FragmentationV33WorkPackageError(
-            "V3.3 executor differs from the frozen Run contract"
-        )
-    database = RunStateDB(spec["state_db"])
+    """Execute exactly one owner Core; publication remains staged."""
+
     run_id = str(spec["run_id"])
-    if job_id is not None or lease_token:
-        if job_id is None or not lease_token:
-            raise FragmentationV33WorkPackageError(
-                "external lease requires job_id and lease_token"
-            )
-        job = database.get_job(int(job_id))
-        if (
-            job is None
-            or str(job.get("run_id")) != run_id
-            or str(job.get("job_type")) != CANDIDATE_JOB_TYPE
-            or str(job.get("status")) != "running"
-            or str(job.get("lease_token")) != str(lease_token)
-        ):
-            raise FragmentationV33WorkPackageError(
-                "external V3.3 lease is not owned by this worker"
-            )
-    else:
-        job = database.lease_next_fragmentation_v33(
-            run_id,
-            str(worker_id),
-            lease_seconds=max(30, int(lease_seconds)),
+    unit = database.get_spatial_unit(run_id, str(job["unit_id"]))
+    if unit is None or str(unit.get("unit_type")) != "FragmentationV33Partition":
+        raise FragmentationV33WorkPackageError("unexpected durable V3.3 partition unit")
+    target = database.get_partition(run_id, str(unit["owner_key"]))
+    if target is None:
+        raise FragmentationV33WorkPackageError("V3.3 owner Partition is unavailable")
+    partitions = database.partitions_for_run(run_id)
+    artifacts = _artifact_map(database, run_id, str(job["stream_id"]))
+    heartbeat = _Heartbeat(database, job, lease_seconds=lease_seconds)
+    heartbeat.start(1)
+    try:
+        summary = _run_partition(
+            spec,
+            database,
+            target,
+            partitions,
+            artifacts,
+            stream_id=str(job["stream_id"]),
+            buffer_pixels=int(contract["buffer_pixels"]),
+            verified=set(),
+            lease_guard=heartbeat.fence,
+            policy_sha256=str(contract["policy_sha256"]),
+            executor_sha256=str(contract["executor_sha256"]),
+            staging_key=f"job{int(job['job_id'])}.{str(job['lease_token'])[:16]}",
+            production=True,
+            stage_only=True,
         )
-    if job is None:
-        counts = database.job_counts(run_id, job_type=CANDIDATE_JOB_TYPE)
-        return {"status": "ready" if counts.get("ready") else "not_ready", "job_counts": counts}
-    if str(job["unit_id"]) != str(contract["unit_id"]):
-        raise FragmentationV33WorkPackageError("unexpected V3.3 unit")
+        heartbeat.progress(1)
+        heartbeat.fence()
+        if not database.complete_fragmentation_v33_job(
+            int(job["job_id"]), str(job["lease_token"])
+        ):
+            raise FragmentationV33WorkPackageError("V3.3 partition lease expired before commit")
+        return {
+            "status": "ready",
+            "stage": "partition",
+            "partition_id": str(target["partition_id"]),
+            "summary": summary,
+        }
+    except Exception as error:
+        _finish_or_requeue_v33(database, job, error)
+        raise
+    finally:
+        heartbeat.close()
+
+
+def _run_durable_finalize_job(
+    spec: Mapping[str, Any], database: RunStateDB, job: Mapping[str, Any], *, lease_seconds: int
+) -> dict[str, Any]:
+    """Audit the stitched domain, then cross the single publication barrier."""
+
+    run_id = str(spec["run_id"])
+    unit = database.get_spatial_unit(run_id, str(job["unit_id"]))
+    if unit is None or str(unit.get("unit_type")) != "FragmentationV33Finalize":
+        raise FragmentationV33WorkPackageError("unexpected V3.3 finalize unit")
     partitions = database.partitions_for_run(run_id)
     if not partitions:
-        raise FragmentationV33WorkPackageError("V3.3 has no Partition owners")
+        raise FragmentationV33WorkPackageError("V3.3 finalize has no Partition owners")
     global_window = {
         "x0": min(int(item["core_window"]["x0"]) for item in partitions),
         "y0": min(int(item["core_window"]["y0"]) for item in partitions),
@@ -856,123 +942,146 @@ def run_worker(
         )
     artifacts = _artifact_map(database, run_id, str(job["stream_id"]))
     heartbeat = _Heartbeat(database, job, lease_seconds=lease_seconds)
-    heartbeat.start(len(partitions))
+    heartbeat.start(len(partitions) * 3)
+    run_dir = Path(str(spec["run_dir"]))
+    stream_name = str(job["stream_id"]).split(":", 1)[1]
+    canonical_root = run_dir / "fusion" / stream_name
     summaries: list[dict[str, Any]] = []
-    verified: set[tuple[str, int, str]] = set()
-    mask_kind = "core_mask" if production else "v33_candidate_mask"
-    audit_kind = (
-        "fragmentation_v33_audit" if production else "v33_candidate_audit"
-    )
+    authoritative_outputs: list[dict[str, Any]] = []
     try:
+        staged_records: list[dict[str, Any]] = []
         for index, partition in enumerate(partitions, start=1):
-            heartbeat.progress(index - 1)
-            existing = artifacts.get(
-                (str(partition["partition_id"]), mask_kind)
+            partition_id = str(partition["partition_id"])
+            staged_mask = _verified_path(
+                artifacts.get((partition_id, "v33_staged_mask")),
+                kind="v33_staged_mask", partition_id=partition_id,
             )
-            existing_audit = artifacts.get(
-                (str(partition["partition_id"]), audit_kind)
+            staged_audit = _verified_path(
+                artifacts.get((partition_id, "v33_staged_audit")),
+                kind="v33_staged_audit", partition_id=partition_id,
             )
-            if (existing is None) != (existing_audit is None):
+            audit = load_json(staged_audit)
+            acceptance = dict(audit.get("acceptance") or {})
+            if any(int(acceptance.get(key, -1)) != 0 for key in (
+                "gap_pixels", "overlap_pixels", "outside_pixels", "invalid_pixels",
+                "protected_source_loss_pixel_count", "probability_nonfinite_pixels",
+                "probability_negative_pixels", "probability_zero_sum_pixels",
+                "probability_bad_sum_pixels",
+            )):
                 raise FragmentationV33WorkPackageError(
-                    f"{partition['partition_id']}: partial V3.3 publication requires reset"
+                    f"{partition_id}: staged V3.3 Core did not pass acceptance"
                 )
-            if existing is not None and existing_audit is not None:
-                _verified_path(
-                    existing,
-                    kind=mask_kind,
-                    partition_id=str(partition["partition_id"]),
-                    verified=verified,
-                )
-                _verified_path(
-                    existing_audit,
-                    kind=audit_kind,
-                    partition_id=str(partition["partition_id"]),
-                    verified=verified,
-                )
-                existing_report = load_json(Path(str(existing_audit["path"])))
-                if (
-                    existing_report.get("candidate_policy_sha256")
-                    != current_policy_sha256
-                    or existing_report.get("candidate_executor_sha256")
-                    != current_executor_sha256
-                ):
-                    raise FragmentationV33WorkPackageError(
-                        "resumed V3.3 candidate uses a different frozen contract"
-                    )
-                acceptance = dict(existing_report.get("acceptance") or {})
-                if any(
-                    int(acceptance.get(key, -1)) != 0
-                    for key in (
-                        "gap_pixels",
-                        "overlap_pixels",
-                        "outside_pixels",
-                        "invalid_pixels",
-                        "protected_source_loss_pixel_count",
-                        "probability_nonfinite_pixels",
-                        "probability_negative_pixels",
-                        "probability_zero_sum_pixels",
-                        "probability_bad_sum_pixels",
-                    )
-                ):
-                    raise FragmentationV33WorkPackageError(
-                        "resumed V3.3 output did not pass acceptance"
-                    )
-                candidate = dict(existing_report.get("candidate") or {})
-                summaries.append(
-                    {
-                        "partition_id": str(partition["partition_id"]),
-                        "output_mask_sha256": str(existing["sha256"]),
-                        "changed_pixel_count": int(
-                            candidate.get("changed_pixel_count", 0)
-                        ),
-                        "baseline_dynamic_fragments": int(
-                            (candidate.get("baseline") or {}).get(
-                                "dynamic_fragments_4_connected", 0
-                            )
-                        ),
-                        "candidate_dynamic_fragments": int(
-                            (candidate.get("result") or {}).get(
-                                "dynamic_fragments_4_connected", 0
-                            )
-                        ),
-                        "acceptance": acceptance,
-                    }
-                )
-                continue
+            baseline_path = _verified_path(
+                artifacts.get((partition_id, "v3_baseline_core")),
+                kind="v3_baseline_core",
+                partition_id=partition_id,
+            )
+            core = _window(partition["core_window"])
+            staged_records.append(
+                {
+                    "partition": partition,
+                    "partition_id": partition_id,
+                    "staged_mask": staged_mask,
+                    "staged_audit": staged_audit,
+                    "baseline_path": baseline_path,
+                    "audit": audit,
+                    "acceptance": acceptance,
+                    "pixel_area_m2": _physical_metrics(
+                        Affine(*[float(value) for value in spec["raster"]["transform"]]),
+                        str(spec["raster"]["crs"]),
+                        core,
+                    )["pixel_area_m2"],
+                }
+            )
+            candidate = dict(audit.get("candidate") or {})
             summaries.append(
-                _run_partition(
-                    spec,
-                    database,
-                    partition,
-                    partitions,
-                    artifacts,
-                    stream_id=str(job["stream_id"]),
-                    buffer_pixels=int(contract["buffer_pixels"]),
-                    verified=verified,
-                    lease_guard=heartbeat.fence,
-                    policy_sha256=current_policy_sha256,
-                    executor_sha256=current_executor_sha256,
-                    staging_key=(
-                        f"job{int(job['job_id'])}.{str(job['lease_token'])[:16]}"
+                {
+                    "partition_id": partition_id,
+                    "output_mask_sha256": "",
+                    "changed_pixel_count": int(candidate.get("changed_pixel_count", 0)),
+                    "baseline_dynamic_fragments": int(
+                        (candidate.get("baseline") or {}).get(
+                            "dynamic_fragments_4_connected", 0
+                        )
                     ),
-                    production=production,
-                )
+                    "candidate_dynamic_fragments": int(
+                        (candidate.get("result") or {}).get(
+                            "dynamic_fragments_4_connected", 0
+                        )
+                    ),
+                    "acceptance": acceptance,
+                }
             )
             heartbeat.progress(index)
-        heartbeat.close()
+            heartbeat.fence()
+
+        transform = Affine(*[float(value) for value in spec["raster"]["transform"]])
+        crs = str(spec["raster"]["crs"])
+        selected_policy = runtime_policy()
+        dynamic_thresholds = {
+            int(code): float(
+                selected_policy.class_policies[int(code)].dynamic_fragmentation_m2
+            )
+            for code in CLASS_ORDER
+        }
+
+        def audit_records(path_key: str, *, encoding_from_suffix: bool, offset: int):
+            records = [
+                {
+                    "partition_id": item["partition_id"],
+                    "core_window": item["partition"]["core_window"],
+                    "path": item[path_key],
+                    "encoding": (
+                        "class_codes"
+                        if encoding_from_suffix
+                        and Path(item[path_key]).suffix.lower() == ".npy"
+                        else "indices"
+                    ),
+                    "pixel_area_m2": item["pixel_area_m2"],
+                }
+                for item in staged_records
+            ]
+
+            def progress(current: int) -> None:
+                heartbeat.progress(offset + current)
+                heartbeat.fence()
+
+            return audit_partitioned_connectivity(
+                records,
+                class_codes=CLASS_ORDER,
+                dynamic_thresholds_m2=dynamic_thresholds,
+                expected_crs=crs,
+                global_transform=transform,
+                progress=progress,
+            )
+
+        try:
+            baseline_connectivity = audit_records(
+                "baseline_path", encoding_from_suffix=True, offset=len(partitions)
+            )
+            candidate_connectivity = audit_records(
+                "staged_mask", encoding_from_suffix=False, offset=len(partitions) * 2
+            )
+        except GlobalConnectivityError as error:
+            raise FragmentationV33WorkPackageError(
+                f"V3.3 global 4-connected audit failed: {error}"
+            ) from error
+        connectivity_gate = connectivity_hard_gate(
+            baseline_connectivity, candidate_connectivity
+        )
+        if not connectivity_gate["passed"]:
+            raise FragmentationV33WorkPackageError(
+                "V3.3 global 4-connected component/fragment hard gate failed"
+            )
+
         acceptance_keys = (
-            "gap_pixels",
-            "overlap_pixels",
-            "outside_pixels",
-            "invalid_pixels",
-            "protected_source_loss_pixel_count",
-            "probability_nonfinite_pixels",
-            "probability_negative_pixels",
-            "probability_zero_sum_pixels",
+            "gap_pixels", "overlap_pixels", "outside_pixels", "invalid_pixels",
+            "protected_source_loss_pixel_count", "probability_nonfinite_pixels",
+            "probability_negative_pixels", "probability_zero_sum_pixels",
             "probability_bad_sum_pixels",
         )
         acceptance_totals = {
-            key: sum(int(item["acceptance"][key]) for item in summaries)
+            key: sum(int(item["acceptance"].get(key, 0)) for item in summaries)
             for key in acceptance_keys
         }
         acceptance_totals.update(
@@ -981,21 +1090,33 @@ def run_worker(
                 "global_core_area": int(global_area),
                 "core_overlap_pair_count": int(overlap_pairs),
                 "argmax_tie_pixels": sum(
-                    int(item["acceptance"]["argmax_tie_pixels"])
+                    int(item["acceptance"].get("argmax_tie_pixels", 0))
                     for item in summaries
                 ),
                 "near_tie_pixels": sum(
-                    int(item["acceptance"]["near_tie_pixels"])
+                    int(item["acceptance"].get("near_tie_pixels", 0))
                     for item in summaries
                 ),
                 "changed_pixel_count": sum(
                     int(item["changed_pixel_count"]) for item in summaries
                 ),
-                "baseline_dynamic_fragments": sum(
+                "partition_local_baseline_dynamic_fragments": sum(
                     int(item["baseline_dynamic_fragments"]) for item in summaries
                 ),
-                "result_dynamic_fragments": sum(
+                "partition_local_result_dynamic_fragments": sum(
                     int(item["candidate_dynamic_fragments"]) for item in summaries
+                ),
+                "baseline_components_4_connected": int(
+                    baseline_connectivity["components_4_connected"]
+                ),
+                "result_components_4_connected": int(
+                    candidate_connectivity["components_4_connected"]
+                ),
+                "baseline_dynamic_fragments": int(
+                    baseline_connectivity["dynamic_fragments_4_connected"]
+                ),
+                "result_dynamic_fragments": int(
+                    candidate_connectivity["dynamic_fragments_4_connected"]
                 ),
             }
         )
@@ -1003,90 +1124,186 @@ def run_worker(
             raise FragmentationV33WorkPackageError(
                 "V3.3 global raster acceptance failed"
             )
-        if acceptance_totals["result_dynamic_fragments"] > acceptance_totals[
-            "baseline_dynamic_fragments"
-        ]:
-            raise FragmentationV33WorkPackageError(
-                "V3.3 global dynamic fragmentation increased"
+
+        # Nothing reaches the canonical raster directory until the exact
+        # stitched-domain connectivity gate above has passed.
+        for summary, item in zip(summaries, staged_records):
+            partition_id = str(item["partition_id"])
+            mask_path = canonical_root / "raster_parts" / f"{partition_id}_mask.tif"
+            audit_path = canonical_root / "fragmentation_v33_audits" / f"{partition_id}.json"
+            _copy_atomic(
+                Path(item["staged_mask"]),
+                mask_path,
+                str(job["lease_token"])[:16],
+                raster_tags={
+                    "classification_authority": "fragmentation_v33_authoritative_fusion_core_v1",
+                    "production_replacement": "true",
+                },
             )
+            canonical_audit = dict(item["audit"])
+            canonical_audit.update(
+                {
+                    "publication": "authoritative_fusion_core",
+                    "production_replacement": True,
+                    "output_mask_sha256": sha256_file(mask_path),
+                }
+            )
+            canonical_audit.pop("audit_sha256", None)
+            canonical_audit["audit_sha256"] = hashlib.sha256(
+                json.dumps(
+                    canonical_audit,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest()
+            _atomic_json(audit_path, canonical_audit)
+            mask_sha256 = sha256_file(mask_path)
+            audit_sha256 = sha256_file(audit_path)
+            summary["output_mask_sha256"] = mask_sha256
+            authoritative_outputs.append(
+                {
+                    "partition_id": partition_id,
+                    "mask_path": mask_path,
+                    "mask_byte_count": mask_path.stat().st_size,
+                    "mask_sha256": mask_sha256,
+                    "audit_path": audit_path,
+                    "audit_byte_count": audit_path.stat().st_size,
+                    "audit_sha256": audit_sha256,
+                }
+            )
+            heartbeat.fence()
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "ready",
             "validation_status": "passed",
-            "publication": (
-                "authoritative_fusion_core" if production else "isolated_replay"
+            "publication": "authoritative_fusion_core",
+            "publication_barrier": (
+                "all_v33_partition_jobs_ready_and_global_4_connected_gate_passed"
             ),
-            "production_replacement": production,
+            "production_replacement": True,
             "run_id": run_id,
             "stream_id": str(job["stream_id"]),
-            "partition_count": len(partitions),
+            "partition_count": len(summaries),
             "acceptance": acceptance_totals,
+            "global_connectivity_4_connected": {
+                "baseline": baseline_connectivity,
+                "candidate": candidate_connectivity,
+                "hard_gate": connectivity_gate,
+            },
             "partitions": summaries,
         }
-        if production:
-            report_path = (
-                Path(str(spec["run_dir"]))
-                / "fusion"
-                / str(job["stream_id"]).split(":", 1)[1]
-                / "fragmentation_v33_report.json"
-            )
-        else:
-            report_path = (
-                Path(str(spec["run_dir"]))
-                / "candidates"
-                / "fragmentation_v33"
-                / "work_package_report.json"
-            )
-        report_kind = (
-            "fragmentation_v33_report" if production else "v33_candidate_report"
-        )
-        existing_report_artifact = artifacts.get(
-            (str(contract["unit_id"]), report_kind)
-        )
-        if existing_report_artifact is not None:
-            existing_report_path = _verified_path(
-                existing_report_artifact,
-                kind=report_kind,
-                partition_id=str(contract["unit_id"]),
-                verified=verified,
-            )
-            if load_json(existing_report_path) != report:
-                raise FragmentationV33WorkPackageError(
-                    "ready V3.3 acceptance report differs on resume"
-                )
-        else:
-            _atomic_json(report_path, report)
-            _commit_output_artifact(
-                database,
-                run_id,
-                str(job["stream_id"]),
-                str(contract["unit_id"]),
-                kind=report_kind,
-                path=report_path,
-            )
-        if not database.complete_fragmentation_v33_job(
+        report_path = canonical_root / "fragmentation_v33_report.json"
+        _atomic_json(report_path, report)
+        heartbeat.fence()
+        if not database.complete_fragmentation_v33_finalize(
             int(job["job_id"]),
             str(job["lease_token"]),
+            authoritative_outputs,
+            report_path=report_path,
+            report_byte_count=report_path.stat().st_size,
+            report_sha256=sha256_file(report_path),
         ):
-            raise FragmentationV33WorkPackageError(
-                "V3.3 lease expired before final commit"
-            )
+            raise FragmentationV33WorkPackageError("V3.3 finalize lease expired before publish")
+        _release_staged_outputs(
+            database,
+            artifacts,
+            [str(item["partition_id"]) for item in summaries],
+        )
         return report
     except Exception as error:
-        heartbeat.close()
-        if database.finish_job(
-            int(job["job_id"]),
-            str(job["lease_token"]),
-            status="failed",
-            error=str(error),
-        ):
-            database.requeue_failed_job(int(job["job_id"]))
+        _finish_or_requeue_v33(database, job, error)
         raise
+    finally:
+        heartbeat.close()
+
+
+def run_worker(
+    run_spec_path: str | Path,
+    *,
+    worker_id: str,
+    lease_seconds: int = 120,
+    job_id: int | None = None,
+    lease_token: str = "",
+) -> dict[str, Any]:
+    spec = load_json(Path(run_spec_path).resolve())
+    contract = _execution_contract(spec)
+    production = bool(contract["production"])
+    current_policy_sha256 = policy_snapshot_sha256()
+    current_executor_sha256 = executor_snapshot_sha256()
+    if contract["policy_sha256"] != current_policy_sha256:
+        raise FragmentationV33WorkPackageError(
+            "V3.3 policy differs from the frozen Run contract"
+        )
+    if contract["executor_sha256"] != current_executor_sha256:
+        raise FragmentationV33WorkPackageError(
+            "V3.3 executor differs from the frozen Run contract"
+        )
+    database = run_state_from_spec(spec)
+    run_id = str(spec["run_id"])
+    if job_id is not None or lease_token:
+        if job_id is None or not lease_token:
+            raise FragmentationV33WorkPackageError(
+                "external lease requires job_id and lease_token"
+            )
+        job = database.get_job(int(job_id))
+        if (
+            job is None
+            or str(job.get("run_id")) != run_id
+            or str(job.get("job_type")) != CANDIDATE_JOB_TYPE
+            or str(job.get("status")) != "running"
+            or str(job.get("lease_token")) != str(lease_token)
+        ):
+            raise FragmentationV33WorkPackageError(
+                "external V3.3 lease is not owned by this worker"
+            )
+    else:
+        job = database.lease_next_fragmentation_v33(
+            run_id,
+            str(worker_id),
+            lease_seconds=max(30, int(lease_seconds)),
+            max_running=max(
+                1,
+                min(
+                    4,
+                    int(
+                        (spec.get("fragmentation_regularization") or {}).get(
+                            "max_workers", 4
+                        )
+                    ),
+                ),
+            ),
+        )
+    if job is None:
+        counts = database.job_counts(run_id, job_type=CANDIDATE_JOB_TYPE)
+        return {"status": "ready" if counts.get("ready") else "not_ready", "job_counts": counts}
+    durable_unit = database.get_spatial_unit(run_id, str(job["unit_id"]))
+    if durable_unit is not None:
+        durable_type = str(durable_unit.get("unit_type") or "")
+        if durable_type == "FragmentationV33Partition":
+            if not production:
+                raise FragmentationV33WorkPackageError(
+                    "durable V3.3 partition jobs require production policy"
+                )
+            return _run_durable_partition_job(
+                spec, database, job, contract, lease_seconds=lease_seconds
+            )
+        if durable_type == "FragmentationV33Finalize":
+            if not production:
+                raise FragmentationV33WorkPackageError(
+                    "durable V3.3 finalize requires production policy"
+                )
+            return _run_durable_finalize_job(
+                spec, database, job, lease_seconds=lease_seconds
+            )
+    raise FragmentationV33WorkPackageError(
+        "V3.3 production requires a durable partition or finalize unit"
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the V3.3 production or isolated replay Work Package"
+        description="Run the V3.3 partitioned production Work Package"
     )
     parser.add_argument("--run-spec", required=True)
     parser.add_argument("--worker-id", default=f"v33-{os.getpid()}")

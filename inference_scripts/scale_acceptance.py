@@ -286,14 +286,15 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         row
         for row in metrics["artifact_rows"]
         if str(row.get("kind") or "") in {
-            "unit_raw",
-            "unit_formal",
+            "unit_raw_geoparquet",
+            "unit_formal_geoparquet",
             "unit_boundary_report",
-            "unit_fitted_edges",
+            "unit_fitted_edges_geoparquet",
+            "unit_boundary_signatures",
         }
     ]
     expected_unit_artifacts = (
-        expected_unit_reports * 3
+        expected_unit_reports * 4
         + sum(
             1
             for summary in unit_summaries

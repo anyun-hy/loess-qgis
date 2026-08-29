@@ -245,6 +245,9 @@ class V5AsyncInferenceRunner(QObject):
             return
         if self._phase != "jobs":
             return
+        recover_expired = getattr(self._database, "interrupt_expired_jobs", None)
+        if callable(recover_expired):
+            recover_expired(run_id=self._spec["run_id"])
         package_counts = self._database.job_counts(
             self._spec["run_id"],
             job_type="work_package",
@@ -274,9 +277,9 @@ class V5AsyncInferenceRunner(QObject):
             if entry["context"].get("kind") == "job"
         ]
         unit_active = sum(1 for job in active_jobs if job and job["job_type"] == "unit_fit")
-        candidate_active = any(
-            job and job["job_type"] == "fragmentation_v33"
-            for job in active_jobs
+        candidate_active = sum(
+            1 for job in active_jobs
+            if job and job["job_type"] == "fragmentation_v33"
         )
         started = False
 
@@ -299,10 +302,7 @@ class V5AsyncInferenceRunner(QObject):
             == "fragmentation_v33_configurable_absorption_v1"
             and fragmentation.get("publication") == "authoritative_fusion_core"
         )
-        replay_v33 = bool(
-            (fragmentation.get("comparison") or {}).get("enabled", False)
-        )
-        v33_enabled = production_v33 or replay_v33
+        v33_enabled = production_v33
         if v33_enabled and not package_pending:
             candidate_counts = self._database.job_counts(
                 self._spec["run_id"], job_type="fragmentation_v33"
@@ -314,15 +314,26 @@ class V5AsyncInferenceRunner(QObject):
                     + str(candidate_counts),
                 )
                 return
-            if not candidate_active and not candidate_counts.get("ready", 0):
+            candidate_limit = min(
+                4,
+                max(1, int(fragmentation.get("max_workers", 4))),
+            )
+            leased_candidate_ids = set()
+            while candidate_active < candidate_limit:
                 job = self._database.lease_next_fragmentation_v33(
                     self._spec["run_id"],
-                    self._worker_id + "-fragmentation-v33",
+                    self._worker_id + f"-fragmentation-v33-{candidate_active}",
                     lease_seconds=300,
+                    max_running=candidate_limit,
                 )
-                if job:
-                    self._start_job(job)
-                    started = True
+                if not job:
+                    break
+                if int(job["job_id"]) in leased_candidate_ids:
+                    raise RuntimeError("state backend leased one V3.3 job twice")
+                leased_candidate_ids.add(int(job["job_id"]))
+                self._start_job(job)
+                candidate_active += 1
+                started = True
 
         # The state DB refuses same-Fusion-stream unit jobs until its V3.3 job
         # is ready, while model streams remain leasable.  Keep dispatch here
@@ -372,7 +383,7 @@ class V5AsyncInferenceRunner(QObject):
     def _start_job(self, job):
         if job["job_type"] == "fragmentation_v33":
             self._start_process(
-                "fragmentation_v33_candidate",
+                f"fragmentation_v33:{job['unit_id']}",
                 "run_fragmentation_v33_work_package.sh",
                 [
                     "--run-spec", self._spec_path,
@@ -431,7 +442,7 @@ class V5AsyncInferenceRunner(QObject):
         max_concurrent = max(
             1,
             min(
-                int(scaling.get("max_concurrent_assembly", 2)),
+                int(scaling.get("max_concurrent_assembly", 4)),
                 max(1, len(self._spec.get("streams") or [])),
             ),
         )
@@ -819,7 +830,10 @@ class V5AsyncInferenceRunner(QObject):
         candidates = self._database.cleanup_candidates(
             self._spec["run_id"],
             limit=1000,
-            kinds=("partition_probability", "v3_context_core", "v3_baseline_core"),
+            kinds=(
+                "partition_probability", "v3_context_core", "v3_baseline_core",
+                "v33_staged_mask", "v33_staged_audit",
+            ),
         )
         for candidate in candidates:
             claimed = self._database.claim_artifact_cleanup(candidate["artifact_id"])

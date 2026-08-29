@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -12,11 +12,9 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-import fiona
 import numpy as np
 import rasterio
 from affine import Affine
-from fiona.crs import CRS
 from rasterio.features import geometry_mask, shapes
 from rasterio.windows import Window
 from scipy import ndimage
@@ -37,9 +35,15 @@ from labeling_tool.core.run_state_db import RunStateDB
 from common_boundary_smoother import smooth_common_boundaries
 from polyline_smoother import SmoothingConfig
 from deployment_config import load_json
+from concurrent_storage_reservation import concurrent_storage_reservation
 from runtime_metrics import peak_rss_bytes
 from rasterio_compat import quiet_deprecated_memory_driver
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
+from vector_data_plane import (
+    unit_boundary_signatures,
+    write_boundary_signatures,
+    write_geoparquet,
+)
 from work_package_runtime import _commit_artifact
 
 
@@ -87,35 +91,10 @@ def _reserved_vector_write(
     operation: str,
     write_bytes: int,
 ):
-    """Reserve one atomic vector write across all unit-fit processes.
-
-    The lock is held only for the file transaction.  Geometry calculation stays
-    parallel, while two processes cannot both pass a stale free-space check.
-    """
-
-    if storage_guard is None:
+    with concurrent_storage_reservation(
+        storage_guard, lock_path, operation, write_bytes
+    ):
         yield
-        return
-    shared_lock = lock_path or (
-        storage_guard.root / "tmp" / ".vector-storage-reserve.lock"
-    )
-    shared_lock.parent.mkdir(parents=True, exist_ok=True)
-    with shared_lock.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        reserved_write = 0
-        try:
-            reservation = storage_guard.check(
-                operation,
-                write_bytes=max(0, int(write_bytes)),
-                managed_growth_bytes=0,
-                reserve_managed_growth=True,
-            )
-            reserved_write = int(reservation["reserved_write_bytes"])
-            yield
-        finally:
-            if reserved_write:
-                storage_guard.adjust(0, settled_write_bytes=reserved_write)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _estimate_record_gpkg_bytes(
@@ -377,7 +356,7 @@ def _multipolygon(geometry):
     raise UnitRuntimeError(f"output geometry is not polygonal: {geometry.geom_type}")
 
 
-def _write_gpkg(
+def _write_geoparquet(
     path: Path,
     records: list[Mapping[str, Any]],
     *,
@@ -386,35 +365,12 @@ def _write_gpkg(
     include_fit: bool,
     storage_guard: StorageGuard | None = None,
     storage_lock_path: Path | None = None,
-    operation: str = "unit_gpkg",
+    operation: str = "unit_geoparquet",
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
-    properties = {
-        "polygon_id": "str:96",
-        "class_code": "int",
-        "conf_mean": "float",
-        "conf_std": "float",
-    }
-    if include_fit:
-        properties.update(
-            {
-                "fit_method": "str:64",
-                "fit_status": "str:32",
-                "fit_version": "str:40",
-                "vtx_before": "int",
-                "vtx_after": "int",
-                "max_shift": "float",
-                "mean_shift": "float",
-                "area_ratio": "float",
-            }
-        )
-    schema = {"geometry": "MultiPolygon", "properties": properties}
-
     def feature_records():
         for record in records:
             values = {
-                "polygon_id": str(record["polygon_id"]),
+                "part_id": str(record["polygon_id"]),
                 "class_code": int(record["class_code"]),
                 "conf_mean": float(record.get("confidence_mean", 0.0)),
                 "conf_std": float(record.get("confidence_std", 0.0)),
@@ -433,11 +389,9 @@ def _write_gpkg(
                     }
                 )
             map_geometry = _to_map_geometry(record["geometry"], transform)
-            yield {
-                "geometry": mapping(_multipolygon(map_geometry)),
-                "properties": values,
-            }
+            yield {**values, "geometry": _multipolygon(map_geometry)}
 
+    values = list(feature_records())
     estimated_write_bytes = _estimate_record_gpkg_bytes(
         records,
         attribute_bytes=768 if include_fit else 384,
@@ -448,20 +402,14 @@ def _write_gpkg(
         operation,
         estimated_write_bytes,
     ):
-        temporary.unlink(missing_ok=True)
-        try:
-            with fiona.open(
-                temporary,
-                "w",
-                driver="GPKG",
-                layer="polygons",
-                schema=schema,
-                crs=CRS.from_user_input(crs),
-            ) as destination:
-                destination.writerecords(feature_records())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        write_geoparquet(
+            path,
+            values,
+            crs=crs,
+            source_sha256=hashlib.sha256(
+                "|".join(str(value["part_id"]) for value in values).encode()
+            ).hexdigest(),
+        )
 
 
 def _diagnostic_feature_records(
@@ -505,7 +453,7 @@ def _diagnostic_feature_records(
         }
 
 
-def _write_diagnostic_gpkg(
+def _write_diagnostic_geoparquet(
     path: Path,
     report: Mapping[str, Any],
     *,
@@ -516,7 +464,7 @@ def _write_diagnostic_gpkg(
     crs: str,
     storage_guard: StorageGuard | None = None,
     storage_lock_path: Path | None = None,
-    operation: str = "unit_fitted_edges",
+    operation: str = "unit_fitted_edges_geoparquet",
 ) -> int:
     edge_count = sum(
         1
@@ -530,53 +478,26 @@ def _write_diagnostic_gpkg(
     )
     if edge_count == 0:
         return 0
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.stem}.{os.getpid()}.tmp.gpkg"
-    schema = {
-        "geometry": "LineString",
-        "properties": {
-            "run_id": "str:48",
-            "stream_id": "str:96",
-            "unit_id": "str:96",
-            "chain_id": "str:96",
-            "method": "str:24",
-            "status": "str:32",
-            "max_shift": "float",
-            "dense_vtx": "int",
-            "sparse_vtx": "int",
-            "chord_err": "float",
-            "arc_len": "float",
-        },
-    }
+    records = []
+    for index, feature in enumerate(_diagnostic_feature_records(
+        report, run_id=run_id, stream_id=stream_id, unit_id=unit_id, transform=transform
+    )):
+        properties = dict(feature["properties"])
+        properties["part_id"] = f"{unit_id}:edge:{index:08d}"
+        records.append({**properties, "geometry": shape(feature["geometry"])})
     with _reserved_vector_write(
         storage_guard,
         storage_lock_path,
         operation,
         _estimate_diagnostic_gpkg_bytes(report),
     ):
-        temporary.unlink(missing_ok=True)
-        try:
-            with fiona.open(
-                temporary,
-                "w",
-                driver="GPKG",
-                layer="fitted_edges",
-                schema=schema,
-                crs=CRS.from_user_input(crs),
-            ) as destination:
-                destination.writerecords(
-                    _diagnostic_feature_records(
-                        report,
-                        run_id=run_id,
-                        stream_id=stream_id,
-                        unit_id=unit_id,
-                        transform=transform,
-                    )
-                )
-            os.replace(temporary, path)
-            return edge_count
-        finally:
-            temporary.unlink(missing_ok=True)
+        write_geoparquet(
+            path, records, crs=crs,
+            source_sha256=hashlib.sha256(
+                "|".join(str(item["part_id"]) for item in records).encode()
+            ).hexdigest(),
+        )
+        return edge_count
 
 
 def _smoothing_config(value: Mapping[str, Any]) -> SmoothingConfig:
@@ -1011,13 +932,14 @@ def run_unit_fit(
             total=report["chain_count"],
         )
         output_root = run_dir / "tmp" / "unit_outputs" / stream_id.replace(":", "_")
-        raw_path = output_root / f"{unit_id}_raw.gpkg"
-        formal_path = output_root / f"{unit_id}_formal.gpkg"
+        raw_path = output_root / f"{unit_id}_raw.parquet"
+        formal_path = output_root / f"{unit_id}_formal.parquet"
         report_path = output_root / f"{unit_id}_report.json"
-        fitted_edges_path = output_root / f"{unit_id}_fitted_edges.gpkg"
+        fitted_edges_path = output_root / f"{unit_id}_fitted_edges.parquet"
+        boundary_signatures_path = output_root / f"{unit_id}_boundary_signatures.json"
         storage_guard = _run_storage_guard(spec, database)
         storage_lock_path = run_dir / "tmp" / ".vector-storage-reserve.lock"
-        _write_gpkg(
+        _write_geoparquet(
             raw_path,
             raw_records,
             transform=transform,
@@ -1025,10 +947,10 @@ def run_unit_fit(
             include_fit=False,
             storage_guard=storage_guard,
             storage_lock_path=storage_lock_path,
-            operation=f"unit_raw:{stream_id}:{unit_id}",
+            operation=f"unit_raw_geoparquet:{stream_id}:{unit_id}",
         )
         emit("rebuild_started", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
-        _write_gpkg(
+        _write_geoparquet(
             formal_path,
             formal_records,
             transform=transform,
@@ -1036,7 +958,7 @@ def run_unit_fit(
             include_fit=True,
             storage_guard=storage_guard,
             storage_lock_path=storage_lock_path,
-            operation=f"unit_formal:{stream_id}:{unit_id}",
+            operation=f"unit_formal_geoparquet:{stream_id}:{unit_id}",
         )
         report.update(
             {
@@ -1050,7 +972,7 @@ def run_unit_fit(
                 "elapsed_sec": round(time.monotonic() - started_at, 3),
             }
         )
-        fitted_edge_count = _write_diagnostic_gpkg(
+        fitted_edge_count = _write_diagnostic_geoparquet(
             fitted_edges_path,
             report,
             run_id=run_id,
@@ -1060,8 +982,26 @@ def run_unit_fit(
             crs=spec["raster"]["crs"],
             storage_guard=storage_guard,
             storage_lock_path=storage_lock_path,
-            operation=f"unit_fitted_edges:{stream_id}:{unit_id}",
+            operation=f"unit_fitted_edges_geoparquet:{stream_id}:{unit_id}",
         )
+        signature_records = unit_boundary_signatures(
+            formal_records,
+            stream_id=stream_id,
+            unit_id=unit_id,
+            pixel_window=unit["pixel_window"],
+        )
+        with _reserved_vector_write(
+            storage_guard,
+            storage_lock_path,
+            f"unit_boundary_signatures:{stream_id}:{unit_id}",
+            _estimate_json_bytes({"records": signature_records}),
+        ):
+            write_boundary_signatures(
+                boundary_signatures_path,
+                signature_records,
+                stream_id=stream_id,
+                unit_id=unit_id,
+            )
         report["fitted_edge_count"] = fitted_edge_count
         persisted_report = {
             key: value
@@ -1070,7 +1010,7 @@ def run_unit_fit(
         }
         persisted_report["diagnostic_storage"] = {
             "mode": (
-                "fitted_edges_gpkg"
+                "fitted_edges_geoparquet"
                 if fitted_edge_count
                 else "none"
             ),
@@ -1087,12 +1027,13 @@ def run_unit_fit(
         )
         emit("rebuild_finished", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
         artifacts = [
-            ("unit_raw", raw_path),
-            ("unit_formal", formal_path),
+            ("unit_raw_geoparquet", raw_path),
+            ("unit_formal_geoparquet", formal_path),
             ("unit_boundary_report", report_path),
+            ("unit_boundary_signatures", boundary_signatures_path),
         ]
         if fitted_edge_count:
-            artifacts.append(("unit_fitted_edges", fitted_edges_path))
+            artifacts.append(("unit_fitted_edges_geoparquet", fitted_edges_path))
         for kind, path in artifacts:
             _commit_artifact(
                 database,

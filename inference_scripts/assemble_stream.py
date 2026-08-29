@@ -6,6 +6,7 @@ import argparse
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -19,9 +20,9 @@ from typing import Any, Callable, Iterator, Mapping
 import fiona
 from fiona.crs import CRS
 from rasterio.crs import CRS as RasterCRS
-from shapely.geometry import shape
+from shapely.geometry import MultiPolygon, mapping, shape
 from shapely.ops import unary_union
-from shapely.strtree import STRtree
+from shapely.wkb import loads as load_wkb
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "qgis_plugins"
@@ -32,10 +33,11 @@ if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
 from labeling_tool.core.ownership_neighbors import ownership_neighbors
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 from labeling_tool.core.run_spec import sha256_file
 
 from deployment_config import load_json
+from concurrent_storage_reservation import concurrent_storage_reservation
 from difference_runtime import apply_accepted_difference
 from range_clip_runtime import (
     RangeClipRuntimeError,
@@ -44,6 +46,11 @@ from range_clip_runtime import (
 )
 from semantic_batch import _atomic_json
 from storage_guard import StorageGuard, exact_remaining_permanent_bytes
+from vector_data_plane import (
+    read_boundary_signatures,
+    read_geoparquet,
+    signature_links,
+)
 from work_package_runtime import _commit_artifact
 
 
@@ -172,16 +179,18 @@ OBJECT_ID_BATCH_SIZE = 512
 GPKG_ATOMIC_OVERHEAD_BYTES = 4 * 1024**2
 JSON_ATOMIC_OVERHEAD_BYTES = 64 * 1024
 UNIT_INTERMEDIATE_KINDS = (
-    "unit_raw",
-    "unit_formal",
+    "unit_raw_geoparquet",
+    "unit_formal_geoparquet",
     "unit_boundary_report",
-    "unit_fitted_edges",
+    "unit_fitted_edges_geoparquet",
+    "unit_boundary_signatures",
 )
 UNIT_INTERMEDIATE_SUFFIXES = {
-    "unit_raw": "_raw.gpkg",
-    "unit_formal": "_formal.gpkg",
+    "unit_raw_geoparquet": "_raw.parquet",
+    "unit_formal_geoparquet": "_formal.parquet",
     "unit_boundary_report": "_report.json",
-    "unit_fitted_edges": "_fitted_edges.gpkg",
+    "unit_fitted_edges_geoparquet": "_fitted_edges.parquet",
+    "unit_boundary_signatures": "_boundary_signatures.json",
 }
 
 
@@ -369,6 +378,15 @@ def _cleanup_stream_unit_artifacts_locked(
             )
         artifact_id = int(artifact["artifact_id"])
         tombstone = _cleanup_tombstone(path, artifact_id)
+        manifest = (
+            path.with_name(f"{path.name}.manifest.json")
+            if kind.endswith("_geoparquet")
+            else None
+        )
+        if manifest is not None and manifest.is_symlink():
+            raise StreamAssemblyError(
+                f"refusing symlinked GeoParquet manifest during cleanup: {manifest}"
+            )
         original_present = path.is_symlink() or path.exists()
         tombstone_present = tombstone.is_symlink() or tombstone.exists()
         if original_present and tombstone_present:
@@ -383,6 +401,10 @@ def _cleanup_stream_unit_artifacts_locked(
                     f"unclaimed cleanup tombstone already exists: {tombstone}"
                 )
             _assert_regular_cleanup_file(path, artifact, stage="pre-claim validation")
+            if manifest is not None and not manifest.is_file():
+                raise StreamAssemblyError(
+                    f"GeoParquet manifest is missing during cleanup: {manifest}"
+                )
         elif status == "cleaned":
             if original_present:
                 raise StreamAssemblyError(
@@ -390,6 +412,8 @@ def _cleanup_stream_unit_artifacts_locked(
                     f"{path}"
                 )
             if not tombstone_present:
+                if manifest is not None and manifest.exists():
+                    validated.append((artifact, path, tombstone))
                 continue
             _assert_regular_cleanup_file(
                 tombstone, artifact, stage="post-commit tombstone recovery"
@@ -408,6 +432,7 @@ def _cleanup_stream_unit_artifacts_locked(
     kind_counts: dict[str, int] = {}
     cleaned_bytes = 0
     for artifact, path, tombstone in validated:
+        kind = str(artifact["kind"])
         artifact_id = int(artifact["artifact_id"])
         claimed = artifact
         if str(artifact["status"]) == "ready":
@@ -453,13 +478,25 @@ def _cleanup_stream_unit_artifacts_locked(
             raise StreamAssemblyError(
                 f"unit intermediate cleanup state changed: {path}"
             )
+        if kind.endswith("_geoparquet"):
+            manifest = path.with_name(f"{path.name}.manifest.json")
+            if manifest.is_symlink():
+                raise StreamAssemblyError(
+                    f"refusing symlinked GeoParquet manifest during cleanup: {manifest}"
+                )
+            if manifest.exists():
+                if not manifest.is_file():
+                    raise StreamAssemblyError(
+                        f"GeoParquet manifest is unsafe during cleanup: {manifest}"
+                    )
+                manifest.unlink()
+                _fsync_directory(unit_root)
         if tombstone.exists():
             _assert_regular_cleanup_file(
                 tombstone, claimed, stage="pre-unlink validation"
             )
             _unlink_cleanup_tombstone(tombstone)
             _fsync_directory(unit_root)
-        kind = str(artifact["kind"])
         kind_counts[kind] = kind_counts.get(kind, 0) + 1
         cleaned_bytes += int(artifact["byte_count"])
     try:
@@ -491,29 +528,10 @@ def _reserved_vector_write(
     operation: str,
     write_bytes: int,
 ):
-    if storage_guard is None:
+    with concurrent_storage_reservation(
+        storage_guard, lock_path, operation, write_bytes
+    ):
         yield
-        return
-    shared_lock = lock_path or (
-        storage_guard.root / "tmp" / ".vector-storage-reserve.lock"
-    )
-    shared_lock.parent.mkdir(parents=True, exist_ok=True)
-    with shared_lock.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        reserved_write = 0
-        try:
-            reservation = storage_guard.check(
-                operation,
-                write_bytes=max(0, int(write_bytes)),
-                managed_growth_bytes=0,
-                reserve_managed_growth=True,
-            )
-            reserved_write = int(reservation["reserved_write_bytes"])
-            yield
-        finally:
-            if reserved_write:
-                storage_guard.adjust(0, settled_write_bytes=reserved_write)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _estimate_source_gpkg_bytes(
@@ -609,15 +627,15 @@ def _stream_root(spec: Mapping[str, Any], stream: Mapping[str, Any]) -> Path:
 
 
 def _read_features(path: str | Path) -> list[dict[str, Any]]:
+    """Materialise an Arrow shard only where final writing needs its rows."""
+
+    _manifest, table = read_geoparquet(path)
     result = []
-    with fiona.open(path, layer="polygons") as source:
-        for feature in source:
-            result.append(
-                {
-                    "geometry": shape(feature["geometry"]),
-                    "properties": dict(feature["properties"]),
-                }
-            )
+    for row in table.to_pylist():
+        properties = dict(row)
+        geometry = load_wkb(bytes(properties.pop("geometry")))
+        properties.pop("source_sha256", None)
+        result.append({"geometry": geometry, "properties": properties})
     return result
 
 
@@ -643,15 +661,65 @@ def _atomic_gpkg(
     ):
         temporary.unlink(missing_ok=True)
         try:
-            with fiona.open(
-                temporary,
-                "w",
-                driver="GPKG",
+            import pyarrow as pa
+            import pyogrio
+
+            class _ArrowDestination:
+                def __init__(self):
+                    self.rows: list[dict[str, Any]] = []
+
+                def writerecords(self, records):
+                    for record in records:
+                        values = dict(record["properties"])
+                        geometry = record.get("geometry")
+                        if geometry is None:
+                            raise StreamAssemblyError("final GPKG record has no geometry")
+                        normalized = shape(geometry)
+                        if (
+                            str(schema.get("geometry")) == "MultiPolygon"
+                            and normalized.geom_type == "Polygon"
+                        ):
+                            normalized = MultiPolygon([normalized])
+                        if normalized.geom_type != str(schema.get("geometry")):
+                            raise StreamAssemblyError(
+                                "final GPKG geometry differs from its declared schema: "
+                                f"expected={schema.get('geometry')}, "
+                                f"actual={normalized.geom_type}"
+                            )
+                        values["geometry"] = bytes(normalized.wkb)
+                        self.rows.append(values)
+
+            destination = _ArrowDestination()
+            writer(destination)
+            fields = schema.get("properties") or {}
+            columns = {}
+            for name, declared in fields.items():
+                values = [row.get(name) for row in destination.rows]
+                kind = str(declared).split(":", 1)[0].lower()
+                if kind == "int":
+                    columns[name] = pa.array(values, type=pa.int64())
+                elif kind == "float":
+                    columns[name] = pa.array(values, type=pa.float64())
+                else:
+                    columns[name] = pa.array(values, type=pa.string())
+            columns["geometry"] = pa.array(
+                [row["geometry"] for row in destination.rows], type=pa.binary()
+            )
+            table = pa.table(columns)
+            # Pyogrio accepts Arrow geometry WKB plus the GeoParquet metadata.
+            metadata = dict(table.schema.metadata or {})
+            metadata[b"geo"] = json.dumps({
+                "version": "1.1.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "crs": str(crs)}},
+            }).encode("utf-8")
+            pyogrio.write_arrow(
+                table.replace_schema_metadata(metadata), temporary,
                 layer=layer,
-                schema=schema,
-                crs=CRS.from_user_input(crs),
-            ) as destination:
-                writer(destination)
+                driver="GPKG",
+                geometry_name="geometry",
+                geometry_type=str(schema["geometry"]),
+                crs=str(crs),
+            )
             with sqlite3.connect(temporary) as connection:
                 if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise StreamAssemblyError(
@@ -1042,33 +1110,6 @@ def _publish_coverage_validation(
     )
 
 
-def _resolved_object_state(
-    state_db: str | Path,
-    run_id: str,
-    stream_id: str,
-) -> tuple[int, int]:
-    database = RunStateDB(state_db)
-    with database._connection() as connection:
-        row = connection.execute(
-            """SELECT COUNT(*) AS part_count,
-                      COALESCE(SUM(CASE WHEN object_id IS NULL OR object_id=''
-                                        THEN 1 ELSE 0 END), 0) AS unresolved_count,
-                      COALESCE(SUM(CASE WHEN parent_id=part_id THEN 1 ELSE 0 END), 0)
-                        AS object_count
-               FROM object_nodes WHERE run_id=? AND stream_id=?""",
-            (str(run_id), str(stream_id)),
-        ).fetchone()
-    part_count = int(row[0])
-    unresolved_count = int(row[1])
-    object_count = int(row[2])
-    if part_count < 1 or object_count < 1 or unresolved_count:
-        raise StreamAssemblyError(
-            "resume requires existing resolved object IDs; "
-            f"parts={part_count}, objects={object_count}, unresolved={unresolved_count}"
-        )
-    return part_count, object_count
-
-
 def _assert_fingerprint_unchanged(
     path: Path,
     expected: Mapping[str, Any],
@@ -1083,12 +1124,15 @@ def _assert_fingerprint_unchanged(
 
 def _feature_batches(path: str | Path, *, size: int = OBJECT_ID_BATCH_SIZE):
     batch = []
-    with fiona.open(path, layer="polygons") as source:
-        for feature in source:
-            batch.append(feature)
-            if len(batch) >= int(size):
-                yield batch
-                batch = []
+    _manifest, table = read_geoparquet(path)
+    for row in table.to_pylist():
+        properties = dict(row)
+        geometry = load_wkb(bytes(properties.pop("geometry")))
+        properties.pop("source_sha256", None)
+        batch.append({"geometry": mapping(geometry), "properties": properties})
+        if len(batch) >= int(size):
+            yield batch
+            batch = []
     if batch:
         yield batch
 
@@ -1129,18 +1173,12 @@ def _parallel_validate_summary_artifacts(
         artifact = item["artifact"]
         path = Path(str(artifact["path"]))
         if str(item["kind"]) == "edge":
-            fingerprint = _validate_existing_gpkg(
-                path,
-                layer="fitted_edges",
-                schema=edge_schema,
-                crs=crs,
-                identity={
-                    "run_id": run_id,
-                    "stream_id": stream_id,
-                    "unit_id": str(artifact["unit_id"]),
-                },
-                expected_feature_count=int(item["expected_feature_count"]),
-            )
+            manifest, table = read_geoparquet(path)
+            if int(manifest["feature_count"]) != int(item["expected_feature_count"]):
+                raise StreamAssemblyError(f"unit fitted-edge count changed: {path}")
+            if not set(edge_schema["properties"]).issubset(set(table.column_names)):
+                raise StreamAssemblyError(f"unit fitted-edge fields changed: {path}")
+            fingerprint = _file_fingerprint(path)
         else:
             if not path.is_file():
                 raise StreamAssemblyError(f"unit report Artifact is missing: {path}")
@@ -1235,7 +1273,7 @@ def _validated_summary_inputs(
     edge_artifacts = database.artifacts_for_stream(
         run_id,
         stream_id,
-        kind="unit_fitted_edges",
+        kind="unit_fitted_edges_geoparquet",
     )
     edges_by_unit = {
         str(artifact["unit_id"]): dict(artifact)
@@ -1367,7 +1405,7 @@ def _reuse_ready_assembly(
     report.setdefault("report_peak_loaded_count", 0)
     report.setdefault("report_summary_source", "run_state_database")
     report.setdefault("report_json_parse_count", 0)
-    report["object_link_count"] = database.object_link_count(run_id, stream_id)
+    report.setdefault("object_link_count", 0)
     report["recovered_stream_status"] = stream_status
     print(
         json.dumps(
@@ -1378,42 +1416,68 @@ def _reuse_ready_assembly(
     return report
 
 
-def _link_neighbor_parts(
-    database: RunStateDB,
-    run_id: str,
-    stream_id: str,
+def _signature_object_ids(
+    signature_by_unit: Mapping[str, str],
     formal_by_unit: Mapping[str, str],
     units: list[Mapping[str, Any]],
+    run_id: str,
+    stream_id: str,
     tolerance: float,
     progress_callback: Callable[[int, int, int], None] | None = None,
-) -> int:
-    linked = 0
+) -> tuple[dict[str, str], int]:
+    """Resolve the existing deterministic object IDs from signature links."""
+
+    parents: dict[str, str] = {}
+    ranks: dict[str, int] = {}
+    for path in formal_by_unit.values():
+        for feature in _read_features(path):
+            part_id = str(feature["properties"]["part_id"])
+            parents[part_id] = part_id
+            ranks[part_id] = 0
+
+    def find(value: str) -> str:
+        while parents[value] != value:
+            parents[value] = parents[parents[value]]
+            value = parents[value]
+        return value
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        left_rank, right_rank = ranks[left_root], ranks[right_root]
+        if left_rank < right_rank or (
+            left_rank == right_rank and left_root > right_root
+        ):
+            left_root, right_root = right_root, left_root
+            left_rank, right_rank = right_rank, left_rank
+        parents[right_root] = left_root
+        if left_rank == right_rank:
+            ranks[left_root] = left_rank + 1
+
+    links: set[tuple[str, str, int]] = set()
     neighbors = ownership_neighbors(units)
     for pair_index, (left_unit, right_unit) in enumerate(neighbors, start=1):
-        left_features = _read_features(formal_by_unit[left_unit])
-        right_features = _read_features(formal_by_unit[right_unit])
-        right_geometries = [item["geometry"] for item in right_features]
-        tree = STRtree(right_geometries)
-        for left in left_features:
-            left_class = int(left["properties"]["class_code"])
-            for index in tree.query(left["geometry"]):
-                right = right_features[int(index)]
-                if int(right["properties"]["class_code"]) != left_class:
-                    continue
-                shared = left["geometry"].boundary.intersection(right["geometry"].boundary)
-                if shared.length <= tolerance:
-                    continue
-                if database.add_object_link(
-                    run_id,
-                    stream_id,
-                    str(left["properties"]["polygon_id"]),
-                    str(right["properties"]["polygon_id"]),
-                    left_class,
-                ):
-                    linked += 1
+        left = read_boundary_signatures(
+            signature_by_unit[left_unit], stream_id=str(stream_id), unit_id=left_unit
+        )
+        right = read_boundary_signatures(
+            signature_by_unit[right_unit], stream_id=str(stream_id), unit_id=right_unit
+        )
+        for link in signature_links(left, right, tolerance=tolerance):
+            links.add(link)
         if progress_callback is not None:
-            progress_callback(pair_index, len(neighbors), linked)
-    return linked
+            progress_callback(pair_index, len(neighbors), len(links))
+    for left_part_id, right_part_id, _class_code in sorted(links):
+        union(left_part_id, right_part_id)
+    object_ids = {
+        part_id: "obj_"
+        + hashlib.sha1(
+            f"{run_id}|{stream_id}|{find(part_id)}".encode("utf-8")
+        ).hexdigest()[:24]
+        for part_id in sorted(parents)
+    }
+    return object_ids, len(links)
 
 
 def _assemble_stream_impl(
@@ -1426,7 +1490,7 @@ def _assemble_stream_impl(
     if spec.get("schema_version") != 2:
         raise StreamAssemblyError("stream assembly requires run_spec schema 2")
     run_id = str(spec["run_id"])
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     streams = [item for item in spec["streams"] if item["stream_id"] == stream_id]
     if len(streams) != 1:
         raise StreamAssemblyError(f"unknown result stream: {stream_id}")
@@ -1478,18 +1542,25 @@ def _assemble_stream_impl(
         raise StreamAssemblyError(f"stream units are not all ready: {counts}")
     units = database.spatial_units_for_stream(run_id, stream_id)
     formal_artifacts = database.artifacts_for_stream(
-        run_id, stream_id, kind="unit_formal"
+        run_id, stream_id, kind="unit_formal_geoparquet"
     )
-    raw_artifacts = database.artifacts_for_stream(run_id, stream_id, kind="unit_raw")
+    raw_artifacts = database.artifacts_for_stream(run_id, stream_id, kind="unit_raw_geoparquet")
+    signature_artifacts = database.artifacts_for_stream(
+        run_id, stream_id, kind="unit_boundary_signatures"
+    )
     report_artifacts = database.artifacts_for_stream(
         run_id, stream_id, kind="unit_boundary_report"
     )
     if not (
-        len(formal_artifacts) == len(raw_artifacts) == len(report_artifacts) == expected_units
+        len(formal_artifacts) == len(raw_artifacts) == len(report_artifacts)
+        == len(signature_artifacts) == expected_units
     ):
         raise StreamAssemblyError("unit Artifact count does not match ready unit count")
     formal_by_unit = {str(item["unit_id"]): str(item["path"]) for item in formal_artifacts}
     raw_by_unit = {str(item["unit_id"]): str(item["path"]) for item in raw_artifacts}
+    signature_by_unit = {
+        str(item["unit_id"]): str(item["path"]) for item in signature_artifacts
+    }
 
     transform = spec["raster"]["transform"]
     root = _stream_root(spec, stream)
@@ -1613,12 +1684,11 @@ def _assemble_stream_impl(
             message="校验已有对象身份",
             force=True,
         )
-        part_count, object_count = _resolved_object_state(
-            spec["state_db"],
-            run_id,
-            stream_id,
+        object_ids, link_count = _signature_object_ids(
+            signature_by_unit, formal_by_unit, units, run_id, stream_id, 1e-9
         )
-        link_count = database.object_link_count(run_id, stream_id)
+        part_count = len(object_ids)
+        object_count = len(set(object_ids.values()))
         resume_inputs["raw"] = _validate_existing_gpkg(
             raw_path,
             layer="semantic_polygons_raw",
@@ -1635,7 +1705,7 @@ def _assemble_stream_impl(
             identity={"run_id": run_id, "result_stream_id": stream_id},
             # Exact clipping may discard a fully outside part or split one at
             # the boundary, so formal feature count is intentionally not tied
-            # to pre-clip object_nodes. Raw remains count-locked above.
+            # to the pre-clip columnar parts. Raw remains count-locked above.
             expected_feature_count=None,
         )
         _assert_gpkg_within_exact_range(
@@ -1675,39 +1745,26 @@ def _assemble_stream_impl(
                 force=True,
             )
     else:
-        registered_part_count = 0
+        registered_part_count = sum(
+            int(read_geoparquet(artifact["path"])[0]["feature_count"])
+            for artifact in formal_artifacts
+        )
         progress.emit(
             "register_objects",
             current=0,
             total=len(formal_artifacts),
-            message="登记空间单元多边形身份",
+            message="载入列式多边形部件身份",
             force=True,
         )
         for artifact_index, artifact in enumerate(formal_artifacts, start=1):
-            unit_id = str(artifact["unit_id"])
-            for features in _feature_batches(artifact["path"]):
-                registered_part_count += database.register_object_parts(
-                    run_id,
-                    stream_id,
-                    (
-                        {
-                            "part_id": str(feature["properties"]["polygon_id"]),
-                            "class_code": int(feature["properties"]["class_code"]),
-                            "unit_id": unit_id,
-                        }
-                        for feature in features
-                    ),
-                )
             progress.emit(
                 "register_objects",
                 current=artifact_index,
                 total=len(formal_artifacts),
                 feature_count=registered_part_count,
-                message=f"已登记 {registered_part_count} 个多边形部件",
+                message=f"已读取 {registered_part_count} 个列式多边形部件",
             )
-        pixel_tolerance = (
-            max(abs(float(transform[0])), abs(float(transform[4]))) * 1e-6
-        )
+        pixel_tolerance = 1e-9
         progress.emit(
             "link_objects",
             current=0,
@@ -1716,12 +1773,12 @@ def _assemble_stream_impl(
             message="扫描相邻空间单元公共边界",
             force=True,
         )
-        _link_neighbor_parts(
-            database,
-            run_id,
-            stream_id,
+        object_ids, link_count = _signature_object_ids(
+            signature_by_unit,
             formal_by_unit,
             units,
+            run_id,
+            stream_id,
             pixel_tolerance,
             progress_callback=lambda current, total, linked: progress.emit(
                 "link_objects",
@@ -1731,7 +1788,6 @@ def _assemble_stream_impl(
                 message=f"已建立 {linked} 条跨单元对象连接",
             ),
         )
-        link_count = database.object_link_count(run_id, stream_id)
         progress.emit(
             "link_objects",
             current=0,
@@ -1740,7 +1796,7 @@ def _assemble_stream_impl(
             message=f"解析对象连接，当前连接 {link_count} 条",
             force=True,
         )
-        object_count = database.resolve_object_components(run_id, stream_id)
+        object_count = len(set(object_ids.values()))
         progress.emit(
             "link_objects",
             current=1,
@@ -1759,26 +1815,18 @@ def _assemble_stream_impl(
                 nonlocal raw_feature_count
                 for unit_index, unit in enumerate(units, start=1):
                     unit_id = str(unit["unit_id"])
-                    with fiona.open(
-                        raw_by_unit[unit_id],
-                        layer="polygons",
-                    ) as source:
-                        for feature in source:
-                            raw_feature_count += 1
-                            yield {
-                                "geometry": feature["geometry"],
-                                "properties": {
-                                    "run_id": run_id,
-                                    "stream_id": stream_id,
-                                    "unit_id": unit_id,
-                                    "polygon_id": str(
-                                        feature["properties"]["polygon_id"]
-                                    ),
-                                    "class_code": int(
-                                        feature["properties"]["class_code"]
-                                    ),
-                                },
-                            }
+                    for feature in _read_features(raw_by_unit[unit_id]):
+                        raw_feature_count += 1
+                        yield {
+                            "geometry": mapping(feature["geometry"]),
+                            "properties": {
+                                "run_id": run_id,
+                                "stream_id": stream_id,
+                                "unit_id": unit_id,
+                                "polygon_id": str(feature["properties"]["part_id"]),
+                                "class_code": int(feature["properties"]["class_code"]),
+                            },
+                        }
                     progress.emit(
                         "write_raw",
                         current=unit_index,
@@ -1817,15 +1865,6 @@ def _assemble_stream_impl(
                 for unit_index, unit in enumerate(units, start=1):
                     unit_id = str(unit["unit_id"])
                     for features in _feature_batches(formal_by_unit[unit_id]):
-                        part_ids = [
-                            str(feature["properties"]["polygon_id"])
-                            for feature in features
-                        ]
-                        object_ids = database.object_ids_for_parts(
-                            run_id,
-                            stream_id,
-                            part_ids,
-                        )
                         for feature in features:
                             geometry = shape(feature["geometry"])
                             if (
@@ -1838,7 +1877,7 @@ def _assemble_stream_impl(
                                     f"{unit_id}"
                                 )
                             properties = feature["properties"]
-                            part_id = str(properties["polygon_id"])
+                            part_id = str(properties["part_id"])
                             class_code = int(properties["class_code"])
                             formal_feature_count += 1
                             yield {
@@ -1952,8 +1991,8 @@ def _assemble_stream_impl(
             "artifact_count"
         ],
         "summary_validation_elapsed_sec": summary_validation["elapsed_sec"],
-        "gpkg_write_mode": "gdal_batch_writerecords",
-        "object_id_lookup_batch_size": OBJECT_ID_BATCH_SIZE,
+        "gpkg_write_mode": "pyogrio_arrow_single_publish",
+        "object_id_resolution": "boundary_signature_components_v1",
         "fitted_edge_shard_count": len(edge_artifacts),
         "status": "passed",
         "smoothing_enabled": smoothing_enabled,
@@ -1999,31 +2038,15 @@ def _assemble_stream_impl(
         def records():
             nonlocal edge_feature_count
             for artifact_index, artifact in enumerate(edge_artifacts, start=1):
-                with fiona.open(
-                    artifact["path"],
-                    layer="fitted_edges",
-                ) as source:
-                    for feature in source:
-                        edge_feature_count += 1
-                        properties = dict(feature["properties"])
-                        edge_metrics["dense_curve_point_count"] += int(
-                            properties.get("dense_vtx") or 0
-                        )
-                        edge_metrics["sparse_curve_point_count"] += int(
-                            properties.get("sparse_vtx") or 0
-                        )
-                        edge_metrics["max_chord_error_px"] = max(
-                            edge_metrics["max_chord_error_px"],
-                            float(properties.get("chord_err") or 0.0),
-                        )
-                        edge_metrics["max_segment_arc_length_px"] = max(
-                            edge_metrics["max_segment_arc_length_px"],
-                            float(properties.get("arc_len") or 0.0),
-                        )
-                        yield {
-                            "geometry": feature["geometry"],
-                            "properties": properties,
-                        }
+                for feature in _read_features(artifact["path"]):
+                    edge_feature_count += 1
+                    properties = dict(feature["properties"])
+                    properties.pop("part_id", None)
+                    edge_metrics["dense_curve_point_count"] += int(properties.get("dense_vtx") or 0)
+                    edge_metrics["sparse_curve_point_count"] += int(properties.get("sparse_vtx") or 0)
+                    edge_metrics["max_chord_error_px"] = max(edge_metrics["max_chord_error_px"], float(properties.get("chord_err") or 0.0))
+                    edge_metrics["max_segment_arc_length_px"] = max(edge_metrics["max_segment_arc_length_px"], float(properties.get("arc_len") or 0.0))
+                    yield {"geometry": mapping(feature["geometry"]), "properties": properties}
                 progress.emit(
                     "aggregate_reports",
                     current=artifact_index,
@@ -2394,7 +2417,7 @@ def assemble_stream(
         try:
             spec = load_json(Path(run_spec_path).resolve())
             if spec.get("schema_version") == 2:
-                database = RunStateDB(spec["state_db"])
+                database = run_state_from_spec(spec)
                 database.set_stream_status(
                     str(spec["run_id"]),
                     str(stream_id),

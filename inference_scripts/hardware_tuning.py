@@ -241,7 +241,7 @@ def resolve_hardware_tuning(
     )
     assembly_concurrency, assembly_concurrency_auto = _configured_or_auto(
         scaling_value.get("max_concurrent_assembly", "auto"),
-        min(2, physical),
+        min(4, physical),
     )
     assembly_concurrency = min(assembly_concurrency, physical)
     assembly_worker_budget = max(1, physical // assembly_concurrency)

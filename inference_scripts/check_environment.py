@@ -1005,6 +1005,8 @@ def build_report(args):
         "yaml",
         "skimage",
         "psycopg2",
+        "pyarrow",
+        "pyogrio",
     ):
         module, version, error = import_dependency(name)
         dependencies[name] = module
@@ -1017,6 +1019,20 @@ def build_report(args):
             error,
             f"install {name} in Conda environment {args.conda_env}",
         )
+
+    vector_backend_ok = (
+        dependencies.get("pyarrow") is not None
+        and dependencies.get("pyogrio") is not None
+    )
+    add_check(
+        checks,
+        "required_columnar_vector_backend",
+        "ready" if vector_backend_ok else "error",
+        "pyarrow+pyogrio" if vector_backend_ok else "missing",
+        "columnar vector data plane",
+        "unit GeoParquet and final Arrow GeoPackage output require both dependencies",
+        f"install pyarrow and pyogrio in Conda environment {args.conda_env}",
+    )
 
     runtime_platform = "macos" if sys.platform == "darwin" else "ubuntu"
     torch_module = dependencies.get("torch")
