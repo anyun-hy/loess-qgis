@@ -85,6 +85,17 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
             (run_id,),
         ).fetchall()
         job_counts = {str(row["status"]): int(row["n"]) for row in job_rows}
+        job_type_rows = connection.execute(
+            """SELECT job_type, status, COUNT(*) AS n FROM jobs
+               WHERE run_id=? GROUP BY job_type, status
+               ORDER BY job_type, status""",
+            (run_id,),
+        ).fetchall()
+        job_type_counts: dict[str, dict[str, int]] = {}
+        for row in job_type_rows:
+            job_type_counts.setdefault(str(row["job_type"]), {})[
+                str(row["status"])
+            ] = int(row["n"])
         retry_count = int(
             connection.execute(
                 """SELECT COALESCE(SUM(
@@ -141,6 +152,7 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
     return {
         "counts": counts,
         "job_counts": job_counts,
+        "job_type_counts": job_type_counts,
         "retry_count": retry_count,
         "package_counts": package_counts,
         "streams": stream_rows,
@@ -279,9 +291,31 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
                     }
                 )
     expected_packages = int(metrics["counts"]["work_packages"])
-    expected_units = int(metrics["counts"]["spatial_units"])
     expected_streams = len(spec.get("streams") or [])
+    frozen_unit_counts = dict(
+        (spec.get("spatial_plan_summary") or {}).get("unit_counts") or {}
+    )
+    expected_units = sum(int(value) for value in frozen_unit_counts.values())
+    if expected_units < 1 or expected_streams < 1:
+        raise ScaleAcceptanceError(
+            "Run Spec does not declare its frozen spatial-unit task graph"
+        )
     expected_unit_reports = expected_units * expected_streams
+    fragmentation = dict(spec.get("fragmentation_regularization") or {})
+    expected_v33_jobs = (
+        int(metrics["counts"]["partitions"]) + 1
+        if (
+            fragmentation.get("enabled") is True
+            and fragmentation.get("policy_id")
+            == "fragmentation_v33_configurable_absorption_v1"
+            and fragmentation.get("publication") == "authoritative_fusion_core"
+        )
+        else 0
+    )
+    job_type_counts = metrics["job_type_counts"]
+    expected_job_total = (
+        expected_packages + expected_unit_reports + expected_v33_jobs
+    )
     unit_artifact_rows = [
         row
         for row in metrics["artifact_rows"]
@@ -322,8 +356,17 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "all_work_packages_ready": metrics["package_counts"] == {
             "ready": expected_packages
         },
+        "all_work_package_jobs_ready": job_type_counts.get(
+            "work_package", {}
+        ) == {"ready": expected_packages},
+        "all_v33_jobs_ready": job_type_counts.get(
+            "fragmentation_v33", {}
+        ) == ({"ready": expected_v33_jobs} if expected_v33_jobs else {}),
+        "all_unit_jobs_ready": job_type_counts.get("unit_fit", {}) == {
+            "ready": expected_unit_reports
+        },
         "all_jobs_ready": metrics["job_counts"] == {
-            "ready": expected_packages + expected_unit_reports
+            "ready": expected_job_total
         },
         "all_streams_ready": (
             len(metrics["streams"]) == expected_streams
@@ -385,6 +428,13 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
             "status_counts": dict(sorted(unit_artifact_status_counts.items())),
         },
         "job_counts": metrics["job_counts"],
+        "job_type_counts": job_type_counts,
+        "expected_job_counts": {
+            "work_package": expected_packages,
+            "fragmentation_v33": expected_v33_jobs,
+            "unit_fit": expected_unit_reports,
+            "total": expected_job_total,
+        },
         "failed_count": int(metrics["job_counts"].get("failed", 0)),
         "retry_count": int(metrics["retry_count"]),
         "model_load_counts": dict(sorted(model_load_counts.items())),
