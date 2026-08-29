@@ -156,7 +156,7 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
     assert json.loads(spec_path.read_text())["state_db"] == str(database_path)
 
 
-def test_v33_plans_one_authoritative_fusion_job(tmp_path):
+def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):
     raster = tmp_path / "source.tif"
     raster.write_bytes(b"fixture")
     models = []
@@ -227,19 +227,40 @@ def test_v33_plans_one_authoritative_fusion_job(tmp_path):
             "SELECT job_type, stream_id, unit_id, status FROM jobs "
             "WHERE job_type='fragmentation_v33'"
         ).fetchall()
+        units = connection.execute(
+            "SELECT unit_id, unit_type, owner_key FROM spatial_units "
+            "WHERE unit_type LIKE 'FragmentationV33%' ORDER BY unit_id"
+        ).fetchall()
         dependencies = connection.execute(
-            "SELECT partition_id FROM unit_dependencies "
-            "WHERE unit_id='fragmentation_v33'"
+            "SELECT unit_id, partition_id FROM unit_dependencies "
+            "WHERE unit_id LIKE 'fragmentation_v33_%' ORDER BY unit_id, partition_id"
         ).fetchall()
         partition_count = connection.execute(
             "SELECT COUNT(*) FROM partitions"
         ).fetchone()[0]
-    assert job == [
-        (
-            "fragmentation_v33",
-            "fusion:approved",
-            "fragmentation_v33",
-            "queued",
-        )
+    partition_jobs = [row for row in job if ":partition_" in row[2]]
+    finalize_jobs = [row for row in job if row[2] == "fragmentation_v33_finalize"]
+    assert len(partition_jobs) == partition_count
+    assert finalize_jobs == [
+        ("fragmentation_v33", "fusion:approved", "fragmentation_v33_finalize", "queued")
     ]
-    assert len(dependencies) == partition_count
+    assert all(row[:2] == ("fragmentation_v33", "fusion:approved") for row in job)
+    assert units == [
+        (
+            "fragmentation_v33_finalize",
+            "FragmentationV33Finalize",
+            "all_partition_owner_cores",
+        ),
+        (
+            "fragmentation_v33_partition:partition_00000_00000",
+            "FragmentationV33Partition",
+            "partition_00000_00000",
+        ),
+    ]
+    assert dependencies == [
+        ("fragmentation_v33_finalize", "partition_00000_00000"),
+        (
+            "fragmentation_v33_partition:partition_00000_00000",
+            "partition_00000_00000",
+        ),
+    ]

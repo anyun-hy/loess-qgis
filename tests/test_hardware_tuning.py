@@ -37,8 +37,8 @@ def test_m2_max_profile_uses_all_cores_without_thread_oversubscription():
     assert scaling["max_cpu_partition_workers"] == 12
     assert scaling["max_cpu_partition_workers_with_package"] == 9
     assert scaling["tile_io_workers"] == 12
-    assert scaling["max_concurrent_assembly"] == 2
-    assert scaling["assembly_validation_workers"] == 6
+    assert scaling["max_concurrent_assembly"] == 4
+    assert scaling["assembly_validation_workers"] == 3
     assert evidence["resolved"]["package_process_threads"] == 3
     assert (
         scaling["max_cpu_partition_workers_with_package"]
@@ -68,8 +68,8 @@ def test_rtx3090_profile_uses_sixteen_tile_batch_and_twenty_core_budget():
     assert scaling["max_cpu_partition_workers"] == 20
     assert scaling["max_cpu_partition_workers_with_package"] == 16
     assert scaling["tile_io_workers"] == 16
-    assert scaling["assembly_validation_workers"] == 8
-    assert scaling["max_concurrent_assembly"] == 2
+    assert scaling["assembly_validation_workers"] == 5
+    assert scaling["max_concurrent_assembly"] == 4
     assert evidence["resolved"]["package_process_threads"] == 4
     assert (
         scaling["max_cpu_partition_workers_with_package"]

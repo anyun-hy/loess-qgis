@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from labeling_tool.core.run_builder_v5 import create_v5_run
+from labeling_tool.core.run_builder_v5 import _fragmentation_v33_units
 from labeling_tool.core.run_state_db import RunStateDB
 
 
@@ -290,5 +291,139 @@ def test_new_v5_run_builds_its_complete_control_graph_in_postgres(
             status="ready",
         )
         assert database.release_job_artifacts(int(unit["job_id"])) == 1
+    finally:
+        _drop_schema(POSTGRES_DSN, schema)
+
+
+def test_postgres_v33_partition_leases_enforce_four_worker_limit_and_recover(
+    tmp_path,
+):
+    schema = f"loess_test_{secrets.token_hex(6)}"
+    run_id = "20260829_000002_v33pg"
+    stream_id = "fusion:fixture"
+    database = RunStateDB(POSTGRES_DSN, postgres_schema=schema)
+    try:
+        database.initialize()
+        database.create_run(run_id, "b" * 64, status="running")
+        database.register_streams(
+            run_id,
+            [{"stream_id": stream_id, "kind": "fusion", "profile_id": "fixture"}],
+        )
+        packages = [
+            {
+                "package_id": f"package_{index:05d}",
+                "sequence_no": index,
+                "status": "ready",
+            }
+            for index in range(6)
+        ]
+        database.insert_work_packages(run_id, packages)
+        partitions = [
+            {
+                "partition_id": f"partition_{index:05d}_00000",
+                "row": index,
+                "col": 0,
+                "core_window": {"x0": 0, "y0": index, "x1": 1, "y1": index + 1},
+                "halo_window": {"x0": 0, "y0": index, "x1": 1, "y1": index + 1},
+                "package_id": packages[index]["package_id"],
+                "status": "ready",
+            }
+            for index in range(6)
+        ]
+        database.insert_partitions(run_id, partitions)
+        units = _fragmentation_v33_units(partitions)
+        database.insert_spatial_units(run_id, units)
+        database.insert_jobs(
+            run_id,
+            (
+                {
+                    "job_type": "fragmentation_v33",
+                    "stream_id": stream_id,
+                    "unit_id": unit["unit_id"],
+                    "priority": 50 if unit["unit_type"] == "FragmentationV33Partition" else 40,
+                    "max_attempts": 3,
+                }
+                for unit in units
+            ),
+        )
+        for index, partition in enumerate(partitions):
+            partition_id = partition["partition_id"]
+            probability = tmp_path / f"{partition_id}_probability.tif"
+            context = tmp_path / f"{partition_id}_context.tif"
+            baseline = tmp_path / f"{partition_id}_baseline.tif"
+            probability.write_bytes(b"probability")
+            context.write_bytes(b"context")
+            baseline.write_bytes(b"baseline")
+            database.publish_partition_artifact(
+                run_id,
+                stream_id,
+                partition_id,
+                probability,
+                byte_count=probability.stat().st_size,
+                sha256=f"{index + 1:x}" * 64,
+            )
+            database.publish_fragmentation_v33_context(
+                run_id,
+                stream_id,
+                partition_id,
+                context,
+                byte_count=context.stat().st_size,
+                sha256=f"{index + 7:x}" * 64,
+            )
+            database.publish_fragmentation_v33_baseline_core(
+                run_id,
+                stream_id,
+                partition_id,
+                baseline,
+                byte_count=baseline.stat().st_size,
+                sha256=f"{index + 13:x}"[-1] * 64,
+            )
+
+        def lease(worker_no: int):
+            return database.lease_next_fragmentation_v33(
+                run_id,
+                f"v33-pg-{worker_no}",
+                lease_seconds=120,
+                max_running=4,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            leases = [item for item in executor.map(lease, range(8)) if item]
+        assert len(leases) == 4
+        assert len({int(item["job_id"]) for item in leases}) == 4
+        assert database.job_counts(run_id, job_type="fragmentation_v33")["running"] == 4
+
+        interrupted = leases[0]
+        assert database.interrupt_job(
+            int(interrupted["job_id"]), str(interrupted["lease_token"])
+        )
+        recovered = lease(99)
+        assert recovered is not None
+        assert database.job_counts(run_id, job_type="fragmentation_v33")["running"] == 4
+        owner_unit = database.get_spatial_unit(run_id, str(recovered["unit_id"]))
+        owner_id = str(owner_unit["owner_key"])
+        staged_mask = tmp_path / f"{owner_id}_staged_mask.tif"
+        staged_audit = tmp_path / f"{owner_id}_staged_audit.json"
+        staged_mask.write_bytes(b"staged-mask")
+        staged_audit.write_bytes(b"staged-audit")
+        staged_ids = database.publish_fragmentation_v33_output_pair(
+            run_id,
+            stream_id,
+            owner_id,
+            mask_path=staged_mask,
+            mask_byte_count=staged_mask.stat().st_size,
+            mask_sha256="a" * 64,
+            audit_path=staged_audit,
+            audit_byte_count=staged_audit.stat().st_size,
+            audit_sha256="b" * 64,
+            production=None,
+        )
+        assert [database.get_artifact(item)["ref_count"] for item in staged_ids] == [1, 1]
+        assert database.cleanup_candidates(
+            run_id, kinds=("v33_staged_mask", "v33_staged_audit")
+        ) == []
+        assert database.complete_fragmentation_v33_job(
+            int(recovered["job_id"]), str(recovered["lease_token"])
+        )
     finally:
         _drop_schema(POSTGRES_DSN, schema)

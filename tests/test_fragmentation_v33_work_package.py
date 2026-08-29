@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -67,7 +68,7 @@ def _ready_artifact(
     return artifact_id
 
 
-def test_second_stage_uses_neighbor_context_and_publishes_authoritative_v33(tmp_path):
+def test_partition_workers_use_neighbor_context_then_finalize_authoritatively(tmp_path):
     database = RunStateDB(tmp_path / "state.sqlite")
     database.initialize()
     database.create_run(RUN_ID, "a" * 64, status="running")
@@ -110,8 +111,18 @@ def test_second_stage_uses_neighbor_context_and_publishes_authoritative_v33(tmp_
         RUN_ID,
         [
             {
-                    "unit_id": "fragmentation_v33",
-                    "unit_type": "FragmentationV33",
+                "unit_id": f"fragmentation_v33_partition:{partition['partition_id']}",
+                "unit_type": "FragmentationV33Partition",
+                "owner_key": partition["partition_id"],
+                "pixel_window": partition["core_window"],
+                "dependency_ids": [item["partition_id"] for item in partitions],
+            }
+            for partition in partitions
+        ]
+        + [
+            {
+                "unit_id": "fragmentation_v33_finalize",
+                "unit_type": "FragmentationV33Finalize",
                 "owner_key": "all_partition_owner_cores",
                 "pixel_window": {"x0": 0, "y0": 0, "x1": 40, "y1": 20},
                 "dependency_ids": [item["partition_id"] for item in partitions],
@@ -124,7 +135,16 @@ def test_second_stage_uses_neighbor_context_and_publishes_authoritative_v33(tmp_
             {
                 "job_type": "fragmentation_v33",
                 "stream_id": STREAM_ID,
-                    "unit_id": "fragmentation_v33",
+                "unit_id": f"fragmentation_v33_partition:{partition['partition_id']}",
+                "max_attempts": 2,
+            }
+            for partition in partitions
+        ]
+        + [
+            {
+                "job_type": "fragmentation_v33",
+                "stream_id": STREAM_ID,
+                "unit_id": "fragmentation_v33_finalize",
                 "max_attempts": 2,
             }
         ],
@@ -229,14 +249,64 @@ def test_second_stage_uses_neighbor_context_and_publishes_authoritative_v33(tmp_
         encoding="utf-8",
     )
 
+    # Keep two frozen control-plane snapshots. They retain the same immutable
+    # V3/probability inputs, but publish into independent run directories.
+    snapshots = {}
+    for worker_limit in (1, 2):
+        root = tmp_path / f"workers-{worker_limit}"
+        root.mkdir()
+        state_copy = root / "state.sqlite"
+        shutil.copy2(database.path, state_copy)
+        run_copy = root / "run"
+        payload = json.loads(spec_path.read_text(encoding="utf-8"))
+        payload["state_db"] = str(state_copy)
+        payload["run_dir"] = str(run_copy)
+        run_copy.mkdir()
+        copied_spec = run_copy / "run_spec.json"
+        copied_spec.write_text(json.dumps(payload), encoding="utf-8")
+        snapshots[worker_limit] = (RunStateDB(state_copy), copied_spec)
+
+    def execute_v33_graph(active_database, active_spec, worker_limit):
+        partition_reports = []
+        while True:
+            leases = []
+            for index in range(worker_limit):
+                leased = active_database.lease_next_fragmentation_v33(
+                    RUN_ID,
+                    f"test-v33-{worker_limit}-{index}",
+                    lease_seconds=60,
+                    max_running=worker_limit,
+                )
+                if leased is not None:
+                    leases.append(leased)
+            if not leases:
+                break
+            for leased in leases:
+                report = run_worker(
+                    active_spec,
+                    worker_id=f"test-v33-{worker_limit}",
+                    lease_seconds=60,
+                    job_id=leased["job_id"],
+                    lease_token=leased["lease_token"],
+                )
+                if report.get("stage") == "partition":
+                    partition_reports.append(report)
+                else:
+                    return partition_reports, report
+        raise AssertionError("V3.3 graph did not reach its finalize barrier")
+
     with pytest.raises(RasterFinalizeError, match="V3.3 authoritative raster"):
         finalize_partition_rasters(spec_path)
 
-    report = run_worker(spec_path, worker_id="test-v33", lease_seconds=60)
+    # The durable graph has one staged owner job per partition, then one
+    # global barrier job. External leases mirror runner dispatch and prove that
+    # the worker cannot silently choose the old serial/replay route.
+    partition_reports, report = execute_v33_graph(database, spec_path, 4)
+    assert {item["stage"] for item in partition_reports} == {"partition"}
 
     assert report["status"] == "ready"
     assert report["partition_count"] == 2
-    assert database.job_counts(RUN_ID, job_type="fragmentation_v33") == {"ready": 1}
+    assert database.job_counts(RUN_ID, job_type="fragmentation_v33") == {"ready": 3}
     for partition in partitions:
         mask_path = tmp_path / partition["partition_id"] / "v3_mask.tif"
         assert hashlib.sha256(mask_path.read_bytes()).hexdigest() == v3_hashes[
@@ -266,3 +336,23 @@ def test_second_stage_uses_neighbor_context_and_publishes_authoritative_v33(tmp_
         RUN_ID,
         kinds=("partition_probability", "v3_context_core", "v3_baseline_core"),
     )
+
+    mask_hashes = {
+        4: {
+            item["unit_id"]: item["sha256"]
+            for item in database.artifacts_for_stream(RUN_ID, STREAM_ID, kind="core_mask")
+        }
+    }
+    for worker_limit, (snapshot_database, snapshot_spec) in snapshots.items():
+        staged, snapshot_report = execute_v33_graph(
+            snapshot_database, snapshot_spec, worker_limit
+        )
+        assert len(staged) == len(partitions)
+        assert snapshot_report["global_connectivity_4_connected"]["hard_gate"]["passed"]
+        mask_hashes[worker_limit] = {
+            item["unit_id"]: item["sha256"]
+            for item in snapshot_database.artifacts_for_stream(
+                RUN_ID, STREAM_ID, kind="core_mask"
+            )
+        }
+    assert mask_hashes[1] == mask_hashes[2] == mask_hashes[4]

@@ -15,7 +15,7 @@ def _ready_unit_artifact(
     tmp_path: Path,
     *,
     unit_id: str = "core_00000",
-    kind: str = "unit_raw",
+    kind: str = "unit_raw_geoparquet",
 ):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -28,6 +28,9 @@ def _ready_unit_artifact(
     path = unit_root / f"{unit_id}{suffix}"
     payload = b"verified unit intermediate\n"
     path.write_bytes(payload)
+    path.with_name(f"{path.name}.manifest.json").write_text(
+        '{"status":"committed"}\n', encoding="utf-8"
+    )
     artifact_id = database.register_artifact(
         RUN_ID,
         kind,
@@ -157,6 +160,27 @@ def test_cleanup_recovers_every_transaction_crash_window(
     assert database.get_artifact(artifact_id)["status"] == "cleaned"
     assert not path.exists()
     assert not tombstone.exists()
+
+
+def test_cleanup_recovers_legacy_crash_after_data_unlink_before_manifest_unlink(
+    tmp_path,
+):
+    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path)
+    manifest = path.with_name(f"{path.name}.manifest.json")
+    tombstone = assemble_stream._cleanup_tombstone(path, artifact_id)
+    assert database.claim_artifact_cleanup(artifact_id)
+    assemble_stream._rename_cleanup_file(path, tombstone)
+    assert database.finish_artifact_cleanup(artifact_id, success=True)
+    assemble_stream._unlink_cleanup_tombstone(tombstone)
+    assert manifest.is_file()
+
+    report = assemble_stream._cleanup_stream_unit_artifacts(
+        spec, database, STREAM_ID
+    )
+
+    assert report["artifact_count"] == 1
+    assert not manifest.exists()
+    assert database.get_artifact(artifact_id)["status"] == "cleaned"
 
 
 def test_cleanup_rejects_traversal_unit_id_without_deleting_target(tmp_path):

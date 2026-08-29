@@ -912,12 +912,19 @@ def _fragmentation_v33_state(tmp_path):
         RUN_ID,
         [
             {
-                "unit_id": "fragmentation_v33",
-                "unit_type": "FragmentationV33",
+                "unit_id": f"fragmentation_v33_partition:{partition_id}",
+                "unit_type": "FragmentationV33Partition",
+                "owner_key": partition_id,
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [partition_id],
+            },
+            {
+                "unit_id": "fragmentation_v33_finalize",
+                "unit_type": "FragmentationV33Finalize",
                 "owner_key": "all_partition_owner_cores",
                 "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
                 "dependency_ids": [partition_id],
-            }
+            },
         ],
     )
     database.insert_jobs(
@@ -926,8 +933,13 @@ def _fragmentation_v33_state(tmp_path):
             {
                 "job_type": "fragmentation_v33",
                 "stream_id": stream_id,
-                "unit_id": "fragmentation_v33",
-            }
+                "unit_id": f"fragmentation_v33_partition:{partition_id}",
+            },
+            {
+                "job_type": "fragmentation_v33",
+                "stream_id": stream_id,
+                "unit_id": "fragmentation_v33_finalize",
+            },
         ],
     )
     return database, stream_id, partition_id
@@ -936,11 +948,9 @@ def _fragmentation_v33_state(tmp_path):
 def _publish_v33_outputs(database, tmp_path, stream_id, partition_id):
     mask = tmp_path / f"{partition_id}_v33_mask.tif"
     audit = tmp_path / f"{partition_id}_v33_audit.json"
-    report = tmp_path / "fragmentation_v33_report.json"
     mask.write_bytes(b"v33-mask")
     audit.write_bytes(b"v33-audit")
-    report.write_bytes(b"v33-report")
-    database.publish_fragmentation_v33_output_pair(
+    return database.publish_fragmentation_v33_output_pair(
         RUN_ID,
         stream_id,
         partition_id,
@@ -950,19 +960,7 @@ def _publish_v33_outputs(database, tmp_path, stream_id, partition_id):
         audit_path=audit,
         audit_byte_count=audit.stat().st_size,
         audit_sha256=hashlib.sha256(audit.read_bytes()).hexdigest(),
-        production=True,
-    )
-    report_id = database.register_artifact(
-        RUN_ID,
-        "fragmentation_v33_report",
-        report,
-        stream_id=stream_id,
-        unit_id="fragmentation_v33",
-    )
-    assert database.mark_artifact_ready(
-        report_id,
-        byte_count=report.stat().st_size,
-        sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+        production=None,
     )
 
 
@@ -981,7 +979,7 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
         sha256=digest,
     )
 
-    assert database.get_artifact(artifact_id)["ref_count"] == 1
+    assert database.get_artifact(artifact_id)["ref_count"] == 2
     assert database.cleanup_candidates(
         RUN_ID, kinds=("v3_context_core",)
     ) == []
@@ -1008,16 +1006,20 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
         byte_count=baseline.stat().st_size,
         sha256=hashlib.sha256(baseline.read_bytes()).hexdigest(),
     )
-    assert database.get_artifact(baseline_id)["ref_count"] == 1
+    assert database.get_artifact(baseline_id)["ref_count"] == 2
     leased = database.lease_next_fragmentation_v33(
         RUN_ID, "v33-worker", lease_seconds=120
     )
     assert leased is not None
-    with pytest.raises(RunStateError, match="core_mask incomplete"):
+    with pytest.raises(RunStateError, match="v33_staged_mask incomplete"):
         database.complete_fragmentation_v33_job(
             leased["job_id"], leased["lease_token"]
         )
-    _publish_v33_outputs(database, tmp_path, stream_id, partition_id)
+    staged_ids = _publish_v33_outputs(database, tmp_path, stream_id, partition_id)
+    assert [database.get_artifact(item)["ref_count"] for item in staged_ids] == [1, 1]
+    assert database.cleanup_candidates(
+        RUN_ID, kinds=("v33_staged_mask", "v33_staged_audit")
+    ) == []
     assert database.complete_fragmentation_v33_job(
         leased["job_id"], leased["lease_token"]
     )
@@ -1025,21 +1027,13 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
     assert completed["status"] == "ready"
     assert completed["progress_current"] == 1
     assert completed["progress_total"] == 1
-    assert database.get_artifact(artifact_id)["ref_count"] == 0
-    assert database.get_artifact(baseline_id)["ref_count"] == 0
-    assert [
-        item["artifact_id"]
-        for item in database.cleanup_candidates(
-            RUN_ID,
-            kinds=(
-                "partition_probability",
-                "v3_context_core",
-                "v3_baseline_core",
-            ),
-        )
-    ] == sorted([artifact_id, baseline_id, database.artifact_for_stream_unit(
-        RUN_ID, stream_id, partition_id, "partition_probability"
-    )["artifact_id"]])
+    # The finalize barrier retains the same inputs after an owner-stage commit.
+    assert database.get_artifact(artifact_id)["ref_count"] == 1
+    assert database.get_artifact(baseline_id)["ref_count"] == 1
+    assert database.cleanup_candidates(
+        RUN_ID,
+        kinds=("partition_probability", "v3_context_core", "v3_baseline_core"),
+    ) == []
 
 
 def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
@@ -1092,8 +1086,8 @@ def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
         )
 
     assert database.get_job(leased["job_id"])["status"] == "running"
-    assert database.get_artifact(artifact_id)["ref_count"] == 1
-    assert database.get_artifact(baseline_id)["ref_count"] == 1
+    assert database.get_artifact(artifact_id)["ref_count"] == 2
+    assert database.get_artifact(baseline_id)["ref_count"] == 2
 
 
 def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path):
@@ -1168,9 +1162,143 @@ def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path):
     assert database.complete_fragmentation_v33_job(
         candidate["job_id"], candidate["lease_token"]
     )
+
+    # Owner staging does not expose an authoritative Core or unblock Fusion
+    # geometry. Only the global finalize job can cross that publication barrier.
+    assert database.lease_next_job(
+        RUN_ID, "still-blocked", job_types=("unit_fit",)
+    ) is None
+    finalize = database.lease_next_fragmentation_v33(RUN_ID, "v33-finalize")
+    assert finalize is not None
+    assert finalize["unit_id"] == "fragmentation_v33_finalize"
+    final_mask = tmp_path / "authoritative_mask.tif"
+    final_audit = tmp_path / "authoritative_audit.json"
+    final_report = tmp_path / "fragmentation_v33_report.json"
+    final_mask.write_bytes(b"authoritative-mask")
+    final_audit.write_bytes(b"authoritative-audit")
+    final_report.write_bytes(b"authoritative-report")
+    assert database.complete_fragmentation_v33_finalize(
+        finalize["job_id"],
+        finalize["lease_token"],
+        [
+            {
+                "partition_id": partition_id,
+                "mask_path": final_mask,
+                "mask_byte_count": final_mask.stat().st_size,
+                "mask_sha256": hashlib.sha256(final_mask.read_bytes()).hexdigest(),
+                "audit_path": final_audit,
+                "audit_byte_count": final_audit.stat().st_size,
+                "audit_sha256": hashlib.sha256(final_audit.read_bytes()).hexdigest(),
+            }
+        ],
+        report_path=final_report,
+        report_byte_count=final_report.stat().st_size,
+        report_sha256=hashlib.sha256(final_report.read_bytes()).hexdigest(),
+    )
+    assert len(database.cleanup_candidates(
+        RUN_ID, kinds=("v33_staged_mask", "v33_staged_audit")
+    )) == 2
+    assert database.artifact_for_stream_unit(
+        RUN_ID, fusion_stream, partition_id, "core_mask"
+    )["path"] == str(final_mask.resolve())
     second = database.lease_next_job(RUN_ID, "fusion-worker", job_types=("unit_fit",))
     assert second is not None
     assert second["stream_id"] == fusion_stream
+
+
+def test_v33_partition_leases_cap_at_four_and_failed_owner_recovers(tmp_path):
+    """The PostgreSQL/SKIP-LOCKED path shares this four-lease SQL contract."""
+
+    database = _database(tmp_path)
+    stream_id = "fusion:lease-cap"
+    partition_ids = [f"partition_{index:05d}" for index in range(5)]
+    database.register_streams(
+        RUN_ID, [{"stream_id": stream_id, "kind": "fusion", "profile_id": "test"}]
+    )
+    database.insert_work_packages(
+        RUN_ID,
+        [
+            {"package_id": f"package_{index:05d}", "sequence_no": index, "status": "ready"}
+            for index in range(len(partition_ids))
+        ],
+    )
+    database.insert_partitions(
+        RUN_ID,
+        [
+            {
+                "partition_id": partition_id,
+                "row": 0,
+                "col": index,
+                "core_window": {"x0": index, "y0": 0, "x1": index + 1, "y1": 1},
+                "halo_window": {"x0": index, "y0": 0, "x1": index + 1, "y1": 1},
+                "package_id": f"package_{index:05d}",
+                "status": "ready",
+            }
+            for index, partition_id in enumerate(partition_ids)
+        ],
+    )
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": f"fragmentation_v33_partition:{partition_id}",
+                "unit_type": "FragmentationV33Partition",
+                "owner_key": partition_id,
+                "pixel_window": {"x0": index, "y0": 0, "x1": index + 1, "y1": 1},
+                "dependency_ids": [partition_id],
+            }
+            for index, partition_id in enumerate(partition_ids)
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "fragmentation_v33",
+                "stream_id": stream_id,
+                "unit_id": f"fragmentation_v33_partition:{partition_id}",
+                "max_attempts": 2,
+            }
+            for partition_id in partition_ids
+        ],
+    )
+    for partition_id in partition_ids:
+        for kind, publisher in (
+            ("probability", database.publish_partition_artifact),
+            ("context", database.publish_fragmentation_v33_context),
+            ("baseline", database.publish_fragmentation_v33_baseline_core),
+        ):
+            path = tmp_path / f"{partition_id}_{kind}.bin"
+            path.write_bytes(f"{partition_id}:{kind}".encode())
+            publisher(
+                RUN_ID,
+                stream_id,
+                partition_id,
+                path,
+                byte_count=path.stat().st_size,
+                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
+    leases = [
+        database.lease_next_fragmentation_v33(
+            RUN_ID, f"worker-{index}", max_running=99
+        )
+        for index in range(5)
+    ]
+    active = [item for item in leases if item is not None]
+    assert len(active) == 4
+    assert len({item["job_id"] for item in active}) == 4
+    failed = active[0]
+    assert database.finish_job(
+        failed["job_id"], failed["lease_token"], status="failed", error="fixture failure"
+    )
+    assert database.requeue_failed_job(failed["job_id"])
+    recovered = database.lease_next_fragmentation_v33(
+        RUN_ID, "recovery-worker", max_running=99
+    )
+    assert recovered is not None
+    assert recovered["job_id"] == failed["job_id"]
+    assert recovered["lease_token"] != failed["lease_token"]
 
 
 def test_fail_open_streams_preserves_ready_streams(tmp_path):
