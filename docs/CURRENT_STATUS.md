@@ -1,6 +1,6 @@
 # 当前实施状态
 
-更新日期：2026-08-26。
+更新日期：2026-08-29。
 
 ## 当前结论
 
@@ -25,8 +25,9 @@
   包围、同类桥接、关系优先级和 proposal 冲突顺序；
 - `inference_scripts/config.yaml` 默认选择 V3.3；V3 仍生成冻结基线，但不再直接
   发布为生产 Fusion 权威 Core；
-- 全部 Work Package ready 后才运行一个 V3.3 全局任务；其完成前，同一 Fusion
-  的矢量空间单元不能领取。
+- 全部 Work Package ready 后，V3.3 以每 Partition 一个可恢复任务、最多四个并行
+  执行，随后由唯一全局 Finalize 统一验收和发布；其完成前，同一 Fusion 的矢量
+  空间单元不能领取。
 
 ## 全域实验结果
 
@@ -61,21 +62,31 @@ Tencent 使用冻结的 140-Core V3 基线和完整概率输入，执行正式 W
 
 ## 本地验证
 
-V3.3 规则、生产任务、V3 基线、状态库依赖、组装队列和权威栅格定向回归：
+当前主干的生产任务、V3/V3.3、PostgreSQL、GeoParquet、边界签名、四流组装、
+范围转换、恢复和监控回归：
 
 ```text
-100 passed in 34.91s
+511 passed, 5 skipped
 ```
 
-全仓测试：
+独立真实 PostgreSQL 集成测试：
 
 ```text
-497 passed, 4 skipped, 1 failed in 88.97s
+3 passed
 ```
 
-唯一失败是既有目录卫生检查发现工作区中的 ignored `scratch/`。该目录包含
-用户研究材料，本次没有删除，也没有把其中的 `.npy`、栅格、日志或缓存提交到
-Git。
+Tencent 当前部署项目和 QGIS 插件来自同一 `cd76892` 源码与发布包。自动测试、
+部署一致性和用户在 QGIS 中完成完整真实输入验收仍是三个不同结论。
+
+## 当前发现的收口阻塞
+
+代码核对发现，`scale_acceptance.py` 的 `all_jobs_ready` 会读取全部 Job 状态，但
+计算预期 Job 总数时只包含 Work Package 和四流 `unit_fit`，没有包含 V3.3 的
+Partition Job 与全局 Finalize Job。V3.3 全部成功时，实际 ready Job 数因此会大于
+当前预期数，最终整体验收存在误判失败风险。
+
+该问题目前只完成只读定位，尚未修改代码。修复前不能把当前性能路径标记为“已
+完成原始影像到最终验收的全链现场通过”。
 
 ## 尚未取得的证据
 
