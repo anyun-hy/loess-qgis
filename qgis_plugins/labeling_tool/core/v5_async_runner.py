@@ -109,7 +109,7 @@ class V5AsyncInferenceRunner(QObject):
         self._manual_package_reset = {}
         self._scheduler = QTimer(self)
         self._scheduler.setInterval(500)
-        self._scheduler.timeout.connect(self._schedule)
+        self._scheduler.timeout.connect(self._schedule_safely)
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(15000)
         self._watchdog.timeout.connect(self._heartbeat_and_watchdog)
@@ -198,7 +198,7 @@ class V5AsyncInferenceRunner(QObject):
             )
         self._scheduler.start()
         self._watchdog.start()
-        QTimer.singleShot(0, self._schedule)
+        QTimer.singleShot(0, self._schedule_safely)
 
     def resume(self, run_spec_path: str, *, accepted_layer=None):
         self.run_from_spec(run_spec_path, accepted_layer=accepted_layer, resume=True)
@@ -239,6 +239,16 @@ class V5AsyncInferenceRunner(QObject):
 
     def cleanup(self):
         self.stop()
+
+    def _schedule_safely(self):
+        """Make scheduler failures visible and terminate the Run coherently."""
+
+        try:
+            self._schedule()
+        except Exception as error:
+            message = f"[scheduler-error] {type(error).__name__}: {error}"
+            self.log_line.emit("stderr", message)
+            self._finish(False, message)
 
     def _schedule(self):
         if not self._running or self._stopped:
@@ -689,7 +699,7 @@ class V5AsyncInferenceRunner(QObject):
                 # report exhausted failures instead of respawning the worker.
                 self._accelerator_done = True
             self._emit_progress(label)
-            QTimer.singleShot(0, self._schedule)
+            QTimer.singleShot(0, self._schedule_safely)
             return
 
         if context.get("kind") == "job":
@@ -722,7 +732,7 @@ class V5AsyncInferenceRunner(QObject):
                 },
             )
             self._emit_progress(label)
-            QTimer.singleShot(0, self._schedule)
+            QTimer.singleShot(0, self._schedule_safely)
             return
 
         self.step_finished.emit(label, int(exit_code), {"success": success, "error": error})

@@ -34,6 +34,29 @@ from ..qt_compat import (
 )
 
 from .log_panel import LogPanel
+
+
+def _log_indicators(level, message):
+    """Classify real failures without treating JSON field names as errors."""
+
+    lowered = str(message).lower()
+    failure = str(level) == "stderr" or any(
+        marker in lowered
+        for marker in (
+            '"event":"stream_assembly_failed"',
+            '"status":"failed"',
+            '"status": "failed"',
+            '"success":false',
+            '"success": false',
+            " failed (rc=",
+            "[scheduler-error]",
+            "[accelerator-restart]",
+        )
+    )
+    warning = not failure and any(
+        token in lowered for token in ("warning", "warn", "警告")
+    )
+    return warning, failure
 from ..core.run_state_db import RunStateDB
 
 
@@ -638,12 +661,7 @@ class InferenceMonitorDialog(QDialog):
             self._streams.setItem(row, column, item)
 
     def _on_log(self, level, message):
-        lowered = str(message).lower()
-        warning = any(token in lowered for token in ("warning", "warn", "警告"))
-        failure = any(
-            token in lowered
-            for token in ('"event":"stream_assembly_failed"', " error", "failed")
-        )
+        warning, failure = _log_indicators(level, message)
         if level == "stdout":
             self._log_panel.append_stdout(message)
         elif level == "stderr":

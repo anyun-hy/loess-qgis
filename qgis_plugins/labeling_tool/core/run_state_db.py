@@ -2666,13 +2666,43 @@ class RunStateDB:
                 (_now(), int(job_id)),
             ).rowcount == 1
 
-    def interrupt_expired_jobs(self, *, now_epoch: float | None = None) -> int:
+    def interrupt_expired_jobs(
+        self,
+        *,
+        run_id: str | None = None,
+        now_epoch: float | None = None,
+    ) -> int:
+        """Recover expired leases, optionally limited to one Run."""
+
         now_value = time.time() if now_epoch is None else float(now_epoch)
         now = _now()
+        identifier = str(run_id) if run_id is not None else None
         with self.transaction() as connection:
+            if identifier is None:
+                connection.execute(
+                    """UPDATE work_packages SET status='interrupted', updated_at=?
+                       WHERE status='running' AND EXISTS (
+                         SELECT 1 FROM jobs
+                         WHERE jobs.run_id=work_packages.run_id
+                           AND jobs.package_id=work_packages.package_id
+                           AND jobs.job_type='work_package'
+                           AND jobs.status='running'
+                           AND jobs.lease_expires IS NOT NULL
+                           AND jobs.lease_expires < ?
+                       )""",
+                    (now, now_value),
+                )
+                return connection.execute(
+                    """UPDATE jobs SET status='interrupted', worker_id='',
+                       lease_token='', lease_expires=NULL, updated_at=?,
+                       attempt=MAX(0, attempt-1)
+                       WHERE status='running' AND lease_expires IS NOT NULL
+                       AND lease_expires < ?""",
+                    (now, now_value),
+                ).rowcount
             connection.execute(
                 """UPDATE work_packages SET status='interrupted', updated_at=?
-                   WHERE status='running' AND EXISTS (
+                   WHERE run_id=? AND status='running' AND EXISTS (
                      SELECT 1 FROM jobs
                      WHERE jobs.run_id=work_packages.run_id
                        AND jobs.package_id=work_packages.package_id
@@ -2681,15 +2711,15 @@ class RunStateDB:
                        AND jobs.lease_expires IS NOT NULL
                        AND jobs.lease_expires < ?
                    )""",
-                (now, now_value),
+                (now, identifier, now_value),
             )
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='',
                    lease_token='', lease_expires=NULL, updated_at=?,
                    attempt=MAX(0, attempt-1)
-                   WHERE status='running' AND lease_expires IS NOT NULL
-                   AND lease_expires < ?""",
-                (now, now_value),
+                   WHERE run_id=? AND status='running'
+                   AND lease_expires IS NOT NULL AND lease_expires < ?""",
+                (now, identifier, now_value),
             ).rowcount
 
     def interrupt_run_jobs(self, run_id: str) -> int:
