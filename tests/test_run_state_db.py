@@ -392,6 +392,23 @@ def test_job_lease_heartbeat_completion_and_recovery(tmp_path):
     assert database.job_counts(RUN_ID) == {"ready": 1, "running": 1}
 
 
+def test_expired_job_recovery_can_be_limited_to_one_run(tmp_path):
+    database = _database(tmp_path)
+    other_run = "20260717_200001_other"
+    database.create_run(other_run, "b" * 64)
+    for run_id in (RUN_ID, other_run):
+        database.insert_jobs(run_id, [{"job_type": "unit_fit", "unit_id": "core"}])
+    selected = database.lease_next_job(RUN_ID, "selected", lease_seconds=1)
+    untouched = database.lease_next_job(other_run, "untouched", lease_seconds=1)
+
+    assert database.interrupt_expired_jobs(
+        run_id=RUN_ID, now_epoch=time.time() + 2
+    ) == 1
+
+    assert database.get_job(selected["job_id"])["status"] == "interrupted"
+    assert database.get_job(untouched["job_id"])["status"] == "running"
+
+
 def test_work_package_lease_and_crash_cleanup_are_atomic(tmp_path):
     database = _database(tmp_path)
     database.insert_work_packages(
