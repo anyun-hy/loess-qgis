@@ -40,6 +40,8 @@ def _log_indicators(level, message):
     """Classify real failures without treating JSON field names as errors."""
 
     lowered = str(message).lower()
+    if lowered.startswith("[resource-tuning] "):
+        return False, False
     failure = str(level) == "stderr" or any(
         marker in lowered
         for marker in (

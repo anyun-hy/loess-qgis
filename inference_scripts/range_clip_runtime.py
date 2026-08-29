@@ -71,7 +71,6 @@ def _requested_extent_geometry(
                     extent_crs,
                     resolved_target,
                     mapping(geometry),
-                    antimeridian_cutting=False,
                 )
             )
     return geometry
@@ -178,7 +177,6 @@ def extract_range_mask_geometry(
                         source_crs,
                         target_crs,
                         mapping(union_geom),
-                        antimeridian_cutting=False,
                     )
                     union_geom = shape(transformed)
                 if mode == "vector_tile_intersection":
