@@ -1271,16 +1271,43 @@ class RunStateDB:
                     "SELECT * FROM runs WHERE run_id=?", (identifier,)
                 ).fetchone()
             )
-            job_counts = {"work_package": {}, "unit_fit": {}}
+            monitored_job_types = (
+                "work_package", "fragmentation_v33", "unit_fit"
+            )
+            job_counts = {job_type: {} for job_type in monitored_job_types}
             for row in connection.execute(
                 """SELECT job_type, status, COUNT(*) AS n FROM jobs
-                   WHERE run_id=? AND job_type IN ('work_package','unit_fit')
+                   WHERE run_id=? AND job_type IN (
+                     'work_package','fragmentation_v33','unit_fit'
+                   )
                    GROUP BY job_type, status""",
                 (identifier,),
             ).fetchall():
                 job_counts[str(row["job_type"])][str(row["status"])] = int(
                     row["n"]
                 )
+            job_progress = {
+                job_type: {"completed": 0.0, "total": 0}
+                for job_type in monitored_job_types
+            }
+            for row in connection.execute(
+                """SELECT job_type, COUNT(*) AS total,
+                          SUM(CASE
+                            WHEN status='ready' THEN 1.0
+                            WHEN status='running' AND progress_total>0 THEN
+                              CASE WHEN progress_current>=progress_total THEN 1.0
+                                   ELSE CAST(progress_current AS REAL)
+                                        / CAST(progress_total AS REAL) END
+                            ELSE 0.0 END) AS completed
+                   FROM jobs WHERE run_id=? AND job_type IN (
+                     'work_package','fragmentation_v33','unit_fit'
+                   ) GROUP BY job_type""",
+                (identifier,),
+            ).fetchall():
+                job_progress[str(row["job_type"])] = {
+                    "completed": float(row["completed"] or 0.0),
+                    "total": int(row["total"] or 0),
+                }
             active_package = _row_dict(
                 connection.execute(
                     """SELECT j.*, wp.sequence_no,
@@ -1377,6 +1404,7 @@ class RunStateDB:
         return {
             "run": run,
             "job_counts": job_counts,
+            "job_progress": job_progress,
             "active_work_package": active_package,
             "streams": streams,
             "stream_runtime_progress": stream_runtime_progress,
