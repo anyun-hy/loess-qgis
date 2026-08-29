@@ -70,6 +70,13 @@ boundary_fitting:
   max_segment_arc_length_px: 8.0
   diagnostic_level: changed_and_failed
 
+# Production uses one mandatory columnar vector path; there is no shadow or
+# compatibility fallback to Fiona/STRtree assembly.
+vector_data_plane:
+  enabled: true
+  mode: columnar
+  dependency_policy: error
+
 # V3 runs first as the frozen, resumable baseline. V3.3 then adjudicates all
 # owner Cores before spatial-unit vectorization and publishes the authoritative
 # Fusion class raster. Setting policy_id back to semantic_optimized_200_v3 is

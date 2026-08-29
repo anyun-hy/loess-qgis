@@ -334,6 +334,7 @@ def validate_deployment_config(
         "fusion_profiles": [],
         "sam3": {},
         "boundary_fitting": {},
+        "vector_data_plane": {},
         "fragmentation_regularization": {},
         "classes": {},
     }
@@ -677,6 +678,25 @@ def validate_deployment_config(
         ))
     effective["boundary_fitting"] = normalized_boundary
 
+    vector_data_plane = _mapping(
+        config.get("vector_data_plane"), "/vector_data_plane", issues
+    )
+    if vector_data_plane.get("enabled") is not True:
+        issues.append(ValidationIssue(
+            "/vector_data_plane/enabled", "must be true for the production columnar path"
+        ))
+    if vector_data_plane.get("mode") != "columnar":
+        issues.append(ValidationIssue(
+            "/vector_data_plane/mode", "must equal columnar"
+        ))
+    if vector_data_plane.get("dependency_policy") != "error":
+        issues.append(ValidationIssue(
+            "/vector_data_plane/dependency_policy", "must equal error"
+        ))
+    effective["vector_data_plane"] = {
+        "enabled": True, "mode": "columnar", "dependency_policy": "error"
+    }
+
     fragmentation = _mapping(
         config.get("fragmentation_regularization", {}),
         "/fragmentation_regularization",
@@ -722,10 +742,10 @@ def validate_deployment_config(
         except (TypeError, ValueError):
             requested_workers = 0
         max_workers = int(requested_workers)
-        if max_workers < 1 or max_workers > (os.cpu_count() or 1):
+        if max_workers < 1 or max_workers > min(4, os.cpu_count() or 1):
             issues.append(ValidationIssue(
                 "/fragmentation_regularization/max_workers",
-                "must be auto or between 1 and the available CPU count",
+                "must be auto or between 1 and min(4, available CPU count)",
             ))
     effective_fragmentation = {
         "enabled": raw_enabled is True,

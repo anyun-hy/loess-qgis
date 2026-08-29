@@ -57,6 +57,16 @@ def production_state_schema() -> str:
     )
 
 
+def run_state_from_spec(spec: Mapping[str, Any]) -> "RunStateDB":
+    """Open the state backend frozen into a Run Spec without changing it."""
+
+    location = str(spec.get("state_db") or "").strip()
+    if not location:
+        raise RunStateError("Run Spec does not declare a state database")
+    schema = str(spec.get("state_schema") or "").strip() or None
+    return RunStateDB(location, postgres_schema=schema)
+
+
 class RunStateDB:
     """Run-state API backed by PostgreSQL for production and SQLite for legacy.
 
@@ -1705,6 +1715,7 @@ class RunStateDB:
         worker_id: str,
         *,
         lease_seconds: float = 120.0,
+        max_running: int = 4,
     ) -> dict[str, Any] | None:
         """Lease one V3.3 candidate only after every owner input is ready.
 
@@ -1719,9 +1730,27 @@ class RunStateDB:
         expires = time.time() + max(1.0, float(lease_seconds))
         now = _now()
         with self.transaction() as connection:
+            if self.is_postgresql:
+                locked_run = connection.execute(
+                    "SELECT run_id FROM runs WHERE run_id=? FOR UPDATE",
+                    (str(run_id),),
+                ).fetchone()
+                if locked_run is None:
+                    return None
+            running = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM jobs WHERE run_id=?
+                       AND job_type='fragmentation_v33' AND status='running'""",
+                    (str(run_id),),
+                ).fetchone()[0]
+            )
+            if running >= min(4, max(1, int(max_running))):
+                return None
             lock_clause = " FOR UPDATE SKIP LOCKED" if self.is_postgresql else ""
             row = connection.execute(
                 """SELECT j.* FROM jobs j
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
                    WHERE j.run_id=? AND j.job_type='fragmentation_v33'
                      AND j.status IN ('queued','interrupted')
                      AND j.attempt < j.max_attempts
@@ -1731,7 +1760,7 @@ class RunStateDB:
                            'preflight','planned','running','raster_ready'
                          )
                      )
-                     AND NOT EXISTS (
+                     AND (u.unit_type='FragmentationV33Finalize' OR NOT EXISTS (
                        SELECT 1 FROM unit_dependencies d
                        LEFT JOIN partitions p
                          ON p.run_id=d.run_id
@@ -1741,8 +1770,8 @@ class RunStateDB:
                         AND wp.package_id=p.package_id
                        WHERE d.run_id=j.run_id AND d.unit_id=j.unit_id
                          AND COALESCE(wp.status,'')!='ready'
-                     )
-                     AND NOT EXISTS (
+                     ))
+                     AND (u.unit_type='FragmentationV33Finalize' OR NOT EXISTS (
                        SELECT 1 FROM unit_dependencies d
                        WHERE d.run_id=j.run_id AND d.unit_id=j.unit_id
                          AND (
@@ -1777,7 +1806,35 @@ class RunStateDB:
                                AND a.status='ready'
                            )
                          )
-                     )
+                     ))
+                     AND (u.unit_type!='FragmentationV33Finalize' OR (
+                       NOT EXISTS (
+                         SELECT 1 FROM jobs owner_job
+                         JOIN spatial_units owner_unit
+                           ON owner_unit.run_id=owner_job.run_id
+                          AND owner_unit.unit_id=owner_job.unit_id
+                         WHERE owner_job.run_id=j.run_id
+                           AND owner_job.stream_id=j.stream_id
+                           AND owner_job.job_type='fragmentation_v33'
+                           AND owner_unit.unit_type='FragmentationV33Partition'
+                           AND owner_job.status!='ready'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM unit_dependencies d
+                         WHERE d.run_id=j.run_id AND d.unit_id=j.unit_id
+                           AND (NOT EXISTS (
+                             SELECT 1 FROM artifacts a
+                             WHERE a.run_id=j.run_id AND a.stream_id=j.stream_id
+                               AND a.unit_id=d.partition_id
+                               AND a.kind='v33_staged_mask' AND a.status='ready'
+                           ) OR NOT EXISTS (
+                             SELECT 1 FROM artifacts a
+                             WHERE a.run_id=j.run_id AND a.stream_id=j.stream_id
+                               AND a.unit_id=d.partition_id
+                               AND a.kind='v33_staged_audit' AND a.status='ready'
+                           ))
+                       )
+                     ))
                    ORDER BY j.priority DESC, j.job_id LIMIT 1"""
                 + lock_clause,
                 (str(run_id),),
@@ -1924,7 +1981,16 @@ class RunStateDB:
             ).fetchone()
             if job is None:
                 return False
-            production = str(job["unit_id"]) == "fragmentation_v33"
+            unit = connection.execute(
+                "SELECT unit_type, owner_key FROM spatial_units "
+                "WHERE run_id=? AND unit_id=?",
+                (str(job["run_id"]), str(job["unit_id"])),
+            ).fetchone()
+            if unit is None:
+                raise RunStateError("V3.3 spatial unit disappeared")
+            unit_type = str(unit["unit_type"])
+            production = unit_type == "FragmentationV33Finalize"
+            staged = unit_type == "FragmentationV33Partition"
             mask_kind, audit_kind, report_kind = (
                 (
                     "core_mask",
@@ -1938,6 +2004,10 @@ class RunStateDB:
                     "v33_candidate_report",
                 )
             )
+            if staged:
+                mask_kind, audit_kind, report_kind = (
+                    "v33_staged_mask", "v33_staged_audit", ""
+                )
             expected = int(
                 connection.execute(
                     """SELECT COUNT(*) FROM unit_dependencies
@@ -1947,6 +2017,7 @@ class RunStateDB:
             )
             if expected < 1:
                 raise RunStateError("V3.3 has no owner dependencies")
+            expected_owner = str(unit["owner_key"]) if staged else None
             for kind in (mask_kind, audit_kind):
                 ready_row = connection.execute(
                         """SELECT COUNT(*) AS artifact_count,
@@ -1963,12 +2034,24 @@ class RunStateDB:
                             kind,
                         ),
                     ).fetchone()
+                if expected_owner is not None:
+                    ready_row = connection.execute(
+                        """SELECT COUNT(*) AS artifact_count,
+                                  COUNT(DISTINCT unit_id) AS owner_count
+                           FROM artifacts WHERE run_id=? AND stream_id=?
+                             AND unit_id=? AND kind=? AND status='ready'""",
+                        (
+                            str(job["run_id"]), str(job["stream_id"]),
+                            expected_owner, kind,
+                        ),
+                    ).fetchone()
                 ready = int(ready_row["artifact_count"])
                 owners = int(ready_row["owner_count"])
-                if ready != expected or owners != expected:
+                needed = 1 if expected_owner is not None else expected
+                if ready != needed or owners != needed:
                     raise RunStateError(
                         f"V3.3 {kind} incomplete or duplicated: "
-                        f"artifacts={ready}, owners={owners}, expected={expected}"
+                        f"artifacts={ready}, owners={owners}, expected={needed}"
                     )
             report_ready = int(
                 connection.execute(
@@ -1982,7 +2065,7 @@ class RunStateDB:
                     ),
                 ).fetchone()[0]
             )
-            if report_ready != 1:
+            if not staged and report_ready != 1:
                 raise RunStateError("V3.3 acceptance report is not ready")
             changed = connection.execute(
                 """UPDATE jobs SET status='ready', error='', worker_id='',
@@ -1992,12 +2075,253 @@ class RunStateDB:
                      AND status='running' AND lease_token=?
                      AND lease_expires IS NOT NULL AND lease_expires>=?""",
                 (
-                    expected,
-                    expected,
+                    1 if staged else expected,
+                    1 if staged else expected,
                     now,
                     now,
                     int(job_id),
                     str(lease_token),
+                    fence_time,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            connection.execute(
+                "DELETE FROM artifact_dependencies WHERE job_id=?",
+                (int(job_id),),
+            )
+            return True
+
+    def complete_fragmentation_v33_finalize(
+        self,
+        job_id: int,
+        lease_token: str,
+        outputs: Sequence[Mapping[str, Any]],
+        *,
+        report_path: str | Path,
+        report_byte_count: int,
+        report_sha256: str,
+    ) -> bool:
+        """Atomically publish every authoritative Core and cross the barrier.
+
+        The caller writes and verifies files before entering this transaction.
+        Until this transaction commits, no ``core_mask`` or authoritative
+        audit row is visible and the finalize job remains running.  A crash can
+        therefore leave reusable files on disk, but never a partly published
+        authority set in the control plane.
+        """
+
+        token = str(lease_token)
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in outputs:
+            partition_id = str(raw.get("partition_id") or "")
+            if not partition_id or partition_id in seen:
+                raise ValueError("V3.3 finalize outputs require unique partition_id values")
+            seen.add(partition_id)
+            item = {
+                "partition_id": partition_id,
+                "mask_path": str(Path(raw["mask_path"]).expanduser().resolve()),
+                "mask_byte_count": int(raw["mask_byte_count"]),
+                "mask_sha256": str(raw["mask_sha256"]).lower(),
+                "audit_path": str(Path(raw["audit_path"]).expanduser().resolve()),
+                "audit_byte_count": int(raw["audit_byte_count"]),
+                "audit_sha256": str(raw["audit_sha256"]).lower(),
+            }
+            for size_key, sha_key in (
+                ("mask_byte_count", "mask_sha256"),
+                ("audit_byte_count", "audit_sha256"),
+            ):
+                if item[size_key] < 0:
+                    raise ValueError("artifact byte_count cannot be negative")
+                digest = item[sha_key]
+                if len(digest) != 64:
+                    raise ValueError("artifact sha256 must contain 64 hexadecimal characters")
+                try:
+                    int(digest, 16)
+                except ValueError as error:
+                    raise ValueError(
+                        "artifact sha256 must contain 64 hexadecimal characters"
+                    ) from error
+            normalized.append(item)
+        report_digest = str(report_sha256).lower()
+        if int(report_byte_count) < 0:
+            raise ValueError("artifact byte_count cannot be negative")
+        if len(report_digest) != 64:
+            raise ValueError("artifact sha256 must contain 64 hexadecimal characters")
+        try:
+            int(report_digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                "artifact sha256 must contain 64 hexadecimal characters"
+            ) from error
+
+        now = _now()
+        fence_time = time.time()
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT * FROM jobs WHERE job_id=?
+                   AND job_type='fragmentation_v33' AND status='running'
+                   AND lease_token=? AND lease_expires IS NOT NULL
+                   AND lease_expires>=?""",
+                (int(job_id), token, fence_time),
+            ).fetchone()
+            if job is None:
+                return False
+            unit = connection.execute(
+                """SELECT unit_type FROM spatial_units
+                   WHERE run_id=? AND unit_id=?""",
+                (str(job["run_id"]), str(job["unit_id"])),
+            ).fetchone()
+            if unit is None or str(unit["unit_type"]) != "FragmentationV33Finalize":
+                raise RunStateError("atomic V3.3 finalize requires the finalize unit")
+            expected_rows = connection.execute(
+                """SELECT partition_id FROM unit_dependencies
+                   WHERE run_id=? AND unit_id=? ORDER BY partition_id""",
+                (str(job["run_id"]), str(job["unit_id"])),
+            ).fetchall()
+            expected = {str(row["partition_id"]) for row in expected_rows}
+            if seen != expected:
+                missing = sorted(expected - seen)
+                extra = sorted(seen - expected)
+                raise RunStateError(
+                    f"V3.3 finalize output set mismatch: missing={missing}, extra={extra}"
+                )
+            unfinished = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM jobs owner_job
+                       JOIN spatial_units owner_unit
+                         ON owner_unit.run_id=owner_job.run_id
+                        AND owner_unit.unit_id=owner_job.unit_id
+                       WHERE owner_job.run_id=? AND owner_job.stream_id=?
+                         AND owner_job.job_type='fragmentation_v33'
+                         AND owner_unit.unit_type='FragmentationV33Partition'
+                         AND owner_job.status!='ready'""",
+                    (str(job["run_id"]), str(job["stream_id"])),
+                ).fetchone()[0]
+            )
+            if unfinished:
+                raise RunStateError("V3.3 finalize cannot publish before all owner jobs are ready")
+
+            def publish(
+                unit_id: str,
+                kind: str,
+                path: str,
+                byte_count: int,
+                digest: str,
+            ) -> None:
+                other = connection.execute(
+                    """SELECT path FROM artifacts
+                       WHERE run_id=? AND stream_id=? AND unit_id=? AND kind=?
+                         AND path!=? AND status='ready'""",
+                    (
+                        str(job["run_id"]),
+                        str(job["stream_id"]),
+                        str(unit_id),
+                        str(kind),
+                        str(path),
+                    ),
+                ).fetchone()
+                if other is not None:
+                    raise RunStateError(
+                        f"V3.3 {kind} already has another ready path: {other['path']}"
+                    )
+                connection.execute(
+                    """INSERT INTO artifacts
+                       (run_id, stream_id, unit_id, kind, path, byte_count,
+                        sha256, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                       ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
+                    (
+                        str(job["run_id"]),
+                        str(job["stream_id"]),
+                        str(unit_id),
+                        str(kind),
+                        str(path),
+                        int(byte_count),
+                        str(digest),
+                        now,
+                        now,
+                    ),
+                )
+                artifact = connection.execute(
+                    """SELECT status, byte_count, sha256 FROM artifacts
+                       WHERE run_id=? AND stream_id=? AND unit_id=?
+                         AND kind=? AND path=?""",
+                    (
+                        str(job["run_id"]),
+                        str(job["stream_id"]),
+                        str(unit_id),
+                        str(kind),
+                        str(path),
+                    ),
+                ).fetchone()
+                if artifact is None:
+                    raise RunStateError("V3.3 atomic finalize did not create an artifact")
+                if str(artifact["status"]) == "ready":
+                    if (
+                        int(artifact["byte_count"]) != int(byte_count)
+                        or str(artifact["sha256"]) != str(digest)
+                    ):
+                        raise RunStateError(f"ready V3.3 {kind} changed on disk: {path}")
+                    return
+                if str(artifact["status"]) not in {"writing", "failed"}:
+                    raise RunStateError(f"V3.3 {kind} cannot be published")
+                changed = connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=?,
+                       sha256=?, updated_at=? WHERE run_id=? AND stream_id=?
+                       AND unit_id=? AND kind=? AND path=?
+                       AND status IN ('writing','failed')""",
+                    (
+                        int(byte_count),
+                        str(digest),
+                        now,
+                        str(job["run_id"]),
+                        str(job["stream_id"]),
+                        str(unit_id),
+                        str(kind),
+                        str(path),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise RunStateError(f"cannot publish V3.3 {kind}")
+
+            for item in normalized:
+                publish(
+                    item["partition_id"],
+                    "core_mask",
+                    item["mask_path"],
+                    item["mask_byte_count"],
+                    item["mask_sha256"],
+                )
+                publish(
+                    item["partition_id"],
+                    "fragmentation_v33_audit",
+                    item["audit_path"],
+                    item["audit_byte_count"],
+                    item["audit_sha256"],
+                )
+            publish(
+                str(job["unit_id"]),
+                "fragmentation_v33_report",
+                str(Path(report_path).expanduser().resolve()),
+                int(report_byte_count),
+                report_digest,
+            )
+            changed = connection.execute(
+                """UPDATE jobs SET status='ready', error='', worker_id='',
+                   progress_current=?, progress_total=?, lease_token='',
+                   lease_expires=NULL, heartbeat_at=?, updated_at=?
+                   WHERE job_id=? AND job_type='fragmentation_v33'
+                     AND status='running' AND lease_token=?
+                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                (
+                    len(expected),
+                    len(expected),
+                    now,
+                    now,
+                    int(job_id),
+                    token,
                     fence_time,
                 ),
             ).rowcount
@@ -3215,7 +3539,7 @@ class RunStateDB:
         audit_path: str | Path,
         audit_byte_count: int,
         audit_sha256: str,
-        production: bool,
+        production: bool | None,
     ) -> tuple[int, int]:
         """Publish one V3.3 mask/audit pair atomically.
 
@@ -3228,9 +3552,13 @@ class RunStateDB:
         stream = str(stream_id)
         partition = str(partition_id)
         kinds = (
-            ("core_mask", "fragmentation_v33_audit")
-            if production
-            else ("v33_candidate_mask", "v33_candidate_audit")
+            ("v33_staged_mask", "v33_staged_audit")
+            if production is None
+            else (
+                ("core_mask", "fragmentation_v33_audit")
+                if production
+                else ("v33_candidate_mask", "v33_candidate_audit")
+            )
         )
         records = (
             (
@@ -3309,6 +3637,28 @@ class RunStateDB:
                         f"V3.3 {kind} is unavailable for publish: {artifact['status']}"
                     )
                 artifact_ids.append(artifact_id)
+            if production is None:
+                finalize_rows = connection.execute(
+                    """SELECT j.job_id FROM jobs j
+                       JOIN spatial_units u
+                         ON u.run_id=j.run_id AND u.unit_id=j.unit_id
+                       WHERE j.run_id=? AND j.stream_id=?
+                         AND j.job_type='fragmentation_v33'
+                         AND u.unit_type='FragmentationV33Finalize'
+                         AND j.status IN ('queued','interrupted','running')""",
+                    (identifier, stream),
+                ).fetchall()
+                if len(finalize_rows) != 1:
+                    raise RunStateError(
+                        "staged V3.3 output requires exactly one active finalize job"
+                    )
+                finalize_job_id = int(finalize_rows[0]["job_id"])
+                for artifact_id in artifact_ids:
+                    connection.execute(
+                        """INSERT OR IGNORE INTO artifact_dependencies
+                           (job_id, artifact_id, created_at) VALUES (?, ?, ?)""",
+                        (finalize_job_id, artifact_id, now),
+                    )
         return artifact_ids[0], artifact_ids[1]
 
     def mark_artifact_failed(self, artifact_id: int) -> bool:

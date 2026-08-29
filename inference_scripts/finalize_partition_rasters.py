@@ -14,7 +14,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from labeling_tool.core.run_spec import sha256_file
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 
 from deployment_config import load_json
 from partition_mosaic import build_vrt
@@ -53,7 +53,7 @@ def finalize_partition_rasters(run_spec_path: str | Path) -> dict[str, Any]:
         raise RasterFinalizeError("partition raster finalizer requires run_spec schema 2")
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"])
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     package_counts = database.work_package_counts(run_id)
     total_packages = sum(package_counts.values())
     if total_packages < 1 or package_counts != {"ready": total_packages}:
@@ -67,7 +67,12 @@ def finalize_partition_rasters(run_spec_path: str | Path) -> dict[str, Any]:
     )
     if production_v33:
         v33_counts = database.job_counts(run_id, job_type="fragmentation_v33")
-        if v33_counts != {"ready": 1}:
+        non_ready = {
+            status: count
+            for status, count in v33_counts.items()
+            if status != "ready" and int(count)
+        }
+        if int(v33_counts.get("ready", 0)) < 1 or non_ready:
             raise RasterFinalizeError(
                 f"V3.3 authoritative raster is not ready: {v33_counts}"
             )

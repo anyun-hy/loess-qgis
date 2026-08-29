@@ -50,10 +50,10 @@ def _json_sha(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _fragmentation_v33_unit(
+def _fragmentation_v33_units(
     partitions: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Plan one resumable second-stage job over all owner Cores."""
+) -> list[dict[str, Any]]:
+    """Plan durable owner-Core jobs and their one-way publication barrier."""
 
     if not partitions:
         raise RunBuilderV5Error("V3.3 production stage requires Partitions")
@@ -63,13 +63,45 @@ def _fragmentation_v33_unit(
         "x1": max(int(item["core_window"]["x1"]) for item in partitions),
         "y1": max(int(item["core_window"]["y1"]) for item in partitions),
     }
-    return {
-        "unit_id": "fragmentation_v33",
-        "unit_type": "FragmentationV33",
-        "owner_key": "all_partition_owner_cores",
-        "pixel_window": global_window,
-        "dependency_ids": [str(item["partition_id"]) for item in partitions],
-    }
+    units: list[dict[str, Any]] = []
+    for owner in partitions:
+        core = owner["core_window"]
+        expanded = {
+            "x0": max(global_window["x0"], int(core["x0"]) - 256),
+            "y0": max(global_window["y0"], int(core["y0"]) - 256),
+            "x1": min(global_window["x1"], int(core["x1"]) + 256),
+            "y1": min(global_window["y1"], int(core["y1"]) + 256),
+        }
+        dependencies = [
+            str(candidate["partition_id"])
+            for candidate in partitions
+            if not (
+                int(candidate["core_window"]["x1"]) <= expanded["x0"]
+                or int(candidate["core_window"]["x0"]) >= expanded["x1"]
+                or int(candidate["core_window"]["y1"]) <= expanded["y0"]
+                or int(candidate["core_window"]["y0"]) >= expanded["y1"]
+            )
+        ]
+        partition_id = str(owner["partition_id"])
+        units.append(
+            {
+                "unit_id": f"fragmentation_v33_partition:{partition_id}",
+                "unit_type": "FragmentationV33Partition",
+                "owner_key": partition_id,
+                "pixel_window": dict(core),
+                "dependency_ids": dependencies,
+            }
+        )
+    units.append(
+        {
+            "unit_id": "fragmentation_v33_finalize",
+            "unit_type": "FragmentationV33Finalize",
+            "owner_key": "all_partition_owner_cores",
+            "pixel_window": global_window,
+            "dependency_ids": [str(item["partition_id"]) for item in partitions],
+        }
+    )
+    return units
 
 
 def create_v5_run(
@@ -163,9 +195,9 @@ def create_v5_run(
         raise RunBuilderV5Error(
             "fragmentation_regularization.buffer_pixels must equal 256"
         )
-    if int(fragmentation_value.get("max_workers") or 0) < 1:
+    if not 1 <= int(fragmentation_value.get("max_workers") or 0) <= 4:
         raise RunBuilderV5Error(
-            "fragmentation_regularization.max_workers must be positive"
+            "fragmentation_regularization.max_workers must be between 1 and 4"
         )
     v33_enabled = bool(
         fragmentation_value["enabled"]
@@ -567,17 +599,20 @@ def create_v5_run(
         ),
     )
     if v33_enabled:
-        v33_unit = _fragmentation_v33_unit(partitions)
-        database.insert_spatial_units(identifier, (v33_unit,))
+        v33_units = _fragmentation_v33_units(partitions)
+        database.insert_spatial_units(identifier, v33_units)
         database.insert_jobs(
             identifier,
-            ({
-                "job_type": "fragmentation_v33",
-                "stream_id": str(stream_values[-1]["stream_id"]),
-                "unit_id": str(v33_unit["unit_id"]),
-                "priority": 50,
-                "max_attempts": int(scaling_value["max_job_retries"]) + 1,
-            },),
+            (
+                {
+                    "job_type": "fragmentation_v33",
+                    "stream_id": str(stream_values[-1]["stream_id"]),
+                    "unit_id": str(unit["unit_id"]),
+                    "priority": 50 if unit["unit_type"] == "FragmentationV33Finalize" else 60,
+                    "max_attempts": int(scaling_value["max_job_retries"]) + 1,
+                }
+                for unit in v33_units
+            ),
         )
     database.insert_jobs(
         identifier,

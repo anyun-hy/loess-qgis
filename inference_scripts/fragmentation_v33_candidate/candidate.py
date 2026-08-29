@@ -126,6 +126,7 @@ def executor_snapshot_sha256() -> str:
         Path(__file__).resolve(),
         Path(__file__).with_name("engine.py"),
         scripts_root / "fragmentation_v33_work_package.py",
+        scripts_root / "fragmentation_global_connectivity.py",
         scripts_root / "authoritative_raster.py",
         scripts_root / "partition_mosaic.py",
     }
