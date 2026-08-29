@@ -13,6 +13,8 @@
   源码、测试和实验脚本仅保存在实验分支历史；
 - V3.3 已接入 approved Fusion 正式 Work Package、状态库依赖和权威 Core
   发布流程；
+- 最终 `scale_acceptance` 已按 Work Package、V3.3 和 `unit_fit` 三类 Job 分别
+  核对冻结任务数与 ready 状态，V3.3 Partition/Finalize 不再被遗漏；
 - Generate 仍只作研究参考，失败 RAG 与空间联合解码仍保持归档状态。
 
 ## V3.3 生产代码
@@ -77,16 +79,6 @@ Tencent 使用冻结的 140-Core V3 基线和完整概率输入，执行正式 W
 
 Tencent 当前部署项目和 QGIS 插件来自同一 `cd76892` 源码与发布包。自动测试、
 部署一致性和用户在 QGIS 中完成完整真实输入验收仍是三个不同结论。
-
-## 当前发现的收口阻塞
-
-代码核对发现，`scale_acceptance.py` 的 `all_jobs_ready` 会读取全部 Job 状态，但
-计算预期 Job 总数时只包含 Work Package 和四流 `unit_fit`，没有包含 V3.3 的
-Partition Job 与全局 Finalize Job。V3.3 全部成功时，实际 ready Job 数因此会大于
-当前预期数，最终整体验收存在误判失败风险。
-
-该问题目前只完成只读定位，尚未修改代码。修复前不能把当前性能路径标记为“已
-完成原始影像到最终验收的全链现场通过”。
 
 ## 尚未取得的证据
 

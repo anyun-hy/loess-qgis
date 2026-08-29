@@ -356,11 +356,18 @@ run_scale_acceptance.sh
 fragmentation postprocess 等脚本属于实验、诊断、回放或显式工具，不会被当前 QGIS
 自动主链调用。
 
-## 12. 当前代码核对发现的收口问题
+## 12. 最终验收的 Job 计数合同
 
-当前 `scale_acceptance.py` 读取全部 Job 状态，但 `all_jobs_ready` 的预期总数只
-计算 Work Package 与四流 `unit_fit`，没有加入 V3.3 Partition 和 Finalize Job。
-因此，V3.3 任务全部成功后，最终验收仍可能因 ready Job 数大于预期而误判失败。
+`scale_acceptance.py` 分别核对三类 Job，最后再核对总数：
 
-这不改变上面的调用关系，但意味着当前主链在 `scale_acceptance` 收口处仍有一个
-已定位、尚未修复的问题。状态边界见 [../CURRENT_STATUS.md](../CURRENT_STATUS.md)。
+```text
+Work Package Job = Work Package 数量
+V3.3 Job         = Partition 数量 + 1个全局 Finalize
+unit_fit Job     = 每条 Stream 的 Core/Seam/Junction 数量之和
+总 Job           = 上述三类之和
+```
+
+V3.3 未启用时，其预期 Job 数必须为 0；V3.3 启用时，Partition 和 Finalize 必须
+全部 ready，不能只凭总 ready 数通过。基础空间单元数量来自 Run Spec 冻结的
+Core/Seam/Junction 空间计划，并与 PostgreSQL 的每条 Stream `stream_units`
+逐一核对，不把 V3.3 内部控制单元误算成矢量化单元。
