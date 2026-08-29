@@ -218,6 +218,52 @@ def _assembly_fraction(stream_status, progress) -> float:
     return min(1.0, max(0.0, (phase_index - 1 + within_phase) / phase_total))
 
 
+def _overall_completion_fraction(
+    run_status,
+    job_counts,
+    job_progress,
+    streams,
+    stream_runtime_progress,
+):
+    """Return completion across planned task groups, not estimated time."""
+
+    if str(run_status) == "ready":
+        return 1.0, 1
+    groups = []
+    for job_type in ("work_package", "fragmentation_v33", "unit_fit"):
+        counts = job_counts.get(job_type) or {}
+        progress = job_progress.get(job_type) or {}
+        total = int(progress.get("total") or sum(int(v) for v in counts.values()))
+        if total < 1:
+            continue
+        completed = float(
+            progress.get("completed")
+            if progress.get("completed") is not None
+            else counts.get("ready", 0)
+        )
+        groups.append(min(1.0, max(0.0, completed / total)))
+    if streams:
+        raster_finalized = all(
+            str(stream.get("status") or "") in {"raster_ready", "assembling", "ready"}
+            for stream in streams
+        )
+        groups.append(1.0 if raster_finalized else 0.0)
+        groups.append(
+            sum(
+                _assembly_fraction(
+                    stream.get("status"),
+                    stream_runtime_progress.get(str(stream["stream_id"])) or {},
+                )
+                for stream in streams
+            )
+            / len(streams)
+        )
+        groups.append(0.0)
+    if not groups:
+        return 0.0, 0
+    return sum(groups) / len(groups), len(groups)
+
+
 def _unit_stage_label(type_counts) -> str:
     running_types = {
         unit_type
@@ -392,6 +438,16 @@ class InferenceMonitorDialog(QDialog):
         self._summary = QLabel("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
         root.addWidget(self._summary)
 
+        self._overall_bar = QProgressBar()
+        self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+        self._overall_bar.setValue(0)
+        self._overall_bar.setFormat("整体任务完成度：等待任务图")
+        self._overall_bar.setToolTip(
+            "按 Work Package、V3.3、空间单元、栅格收口、组装和验收任务组计算；"
+            "表示任务完成度，不是剩余时间估算。"
+        )
+        root.addWidget(self._overall_bar)
+
         bottom = QHBoxLayout()
         self._stop = QPushButton("停止")
         self._stop.clicked.connect(self._request_stop)
@@ -557,6 +613,9 @@ class InferenceMonitorDialog(QDialog):
         self._update_stage_rail("compute")
         self._tile_detail_title.setText("选中结果流：未选择 | 空间单元详情")
         self._summary.setText("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
+        self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+        self._overall_bar.setValue(0)
+        self._overall_bar.setFormat("整体任务完成度：等待任务图")
         self._bar.setRange(0, 0)
         self._bar.setFormat("准备中")
         self._stop.setEnabled(True)
@@ -597,6 +656,10 @@ class InferenceMonitorDialog(QDialog):
         self._stop.setEnabled(False)
         self._stop.setText("停止")
         self._phase.setText(text)
+        if text == "已完成":
+            self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+            self._overall_bar.setValue(ASSEMBLY_PROGRESS_SCALE)
+            self._overall_bar.setFormat("整体任务完成度：100%（已完成）")
         self._bar.setRange(0, 1)
         self._bar.setValue(1)
         self._bar.setFormat(text)
@@ -1119,6 +1182,7 @@ class InferenceMonitorDialog(QDialog):
             run_row = snapshot.get("run") or {}
             run_status = str(run_row.get("status") or "planned")
             job_counts = snapshot.get("job_counts") or {}
+            job_progress = snapshot.get("job_progress") or {}
             package_counts = job_counts.get("work_package") or {}
             unit_job_counts = job_counts.get("unit_fit") or {}
             package_failed = int(package_counts.get("failed", 0))
@@ -1303,6 +1367,8 @@ class InferenceMonitorDialog(QDialog):
                 run_status=run_status,
                 package_counts=package_counts,
                 unit_job_counts=unit_job_counts,
+                job_counts=job_counts,
+                job_progress=job_progress,
                 active_package=active_package,
                 streams=streams,
                 stream_runtime_progress=all_runtime_progress,
@@ -1386,6 +1452,8 @@ class InferenceMonitorDialog(QDialog):
         run_status,
         package_counts,
         unit_job_counts,
+        job_counts,
+        job_progress,
         active_package,
         streams,
         stream_runtime_progress,
@@ -1416,6 +1484,22 @@ class InferenceMonitorDialog(QDialog):
             ),
         }.get(stage_key, stage_key)
         self._update_stage_rail(rail_key)
+
+        overall_fraction, overall_group_count = _overall_completion_fraction(
+            run_status,
+            job_counts,
+            job_progress,
+            streams,
+            stream_runtime_progress,
+        )
+        overall_value = round(overall_fraction * ASSEMBLY_PROGRESS_SCALE)
+        overall_percent = round(overall_fraction * 100)
+        self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+        self._overall_bar.setValue(overall_value)
+        self._overall_bar.setFormat(
+            f"整体任务完成度：{overall_percent}% | "
+            f"按 {overall_group_count} 类任务计算，不代表剩余时间"
+        )
 
         if stage_key == "assembly" and streams:
             assembly_units = round(
