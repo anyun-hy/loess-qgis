@@ -32,17 +32,21 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 
 ## 4. 正式运行数据流
 
+详细函数、进程、Artifact、并发和恢复关系见
+[diagrams/PRODUCTION_CALL_GRAPH.md](diagrams/PRODUCTION_CALL_GRAPH.md)。
+
 ```text
 影像 + 完整研究范围
   -> Run Spec + PostgreSQL 状态图
-  -> 共享 Tile 物化
-  -> 各模型独立概率推理
+  -> 每个位置只物化一份共享 Tile 缓存
+  -> 三个模型依次读取同一 Tile 缓存并独立推理
   -> Partition Halo cosine 概率拼接
-  -> 各模型与 Fusion 独立 Core mask/confidence
+  -> 各模型独立 Core mask/confidence + 增量 Fusion
   -> Fragmentation V3 冻结基线
-  -> Fragmentation V3.3 权威 Core
-  -> 分区矢量化与公共分界拟合
-  -> Stream 组装
+  -> Fragmentation V3.3 Partition 并行 + 全局 Finalize 权威 Core
+  -> 四条 Stream 的 Core/Seam/Junction 空间单元矢量化
+  -> GeoParquet 分片 + 边界签名
+  -> 四条 Stream 并行组装为最终 GPKG
   -> 完整范围 gap/overlap/outside 硬验收
   -> QGIS 结果层与人工修整
   -> final/topology/accepted_labels

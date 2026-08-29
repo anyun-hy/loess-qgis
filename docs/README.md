@@ -7,14 +7,16 @@
 
 1. [PROJECT_IDEA.md](PROJECT_IDEA.md)：项目为什么存在、范围和成功标准；
 2. [ARCHITECTURE.md](ARCHITECTURE.md)：当前有效的软件与数据合同；
-3. [CURRENT_STATUS.md](CURRENT_STATUS.md)：当前已验证能力、未完成项和证据；
-4. [operations/FRAGMENTATION_V3.md](operations/FRAGMENTATION_V3.md)：当前生产
+3. [diagrams/PRODUCTION_CALL_GRAPH.md](diagrams/PRODUCTION_CALL_GRAPH.md)：当前
+   QGIS 自动推理、V3.3、四流组装和人工整理的完整调用关系；
+4. [CURRENT_STATUS.md](CURRENT_STATUS.md)：当前已验证能力、未完成项和证据；
+5. [operations/FRAGMENTATION_V3.md](operations/FRAGMENTATION_V3.md)：当前生产
    碎片治理方法；
-5. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
+6. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
    V3、Generate、失败 RAG 和 V3.1 启动前的方法决策；
-6. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
+7. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
    V3.1—V3.4 全量比较与 V3.3 选择决定；
-7. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
+8. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
    请求的新对话 V3.1 启动交接。
 
 ## 文档职责
