@@ -27,6 +27,7 @@ from ..qt_compat import (
     HORIZONTAL,
     INTERACTIVE,
     NO_EDIT_TRIGGERS,
+    SCROLLBAR_AS_NEEDED,
     SELECT_ROWS,
     SINGLE_SELECTION,
     STRETCH,
@@ -72,6 +73,7 @@ STATUS_COLORS = {
 }
 
 ASSEMBLY_PROGRESS_SCALE = 1000
+STREAM_TABLE_VISIBLE_ROWS = 5
 PIPELINE_STAGES = (
     ("compute", "推理与拟合"),
     ("finalize", "栅格收口"),
@@ -371,6 +373,8 @@ class InferenceMonitorDialog(QDialog):
         self._streams.setEditTriggers(NO_EDIT_TRIGGERS)
         self._streams.setSelectionBehavior(SELECT_ROWS)
         self._streams.setSelectionMode(SINGLE_SELECTION)
+        self._streams.setHorizontalScrollBarPolicy(SCROLLBAR_AS_NEEDED)
+        self._streams.setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)
         self._streams.itemSelectionChanged.connect(self._render_selected_tiles)
         header = self._streams.horizontalHeader()
         header.setMinimumSectionSize(56)
@@ -385,7 +389,15 @@ class InferenceMonitorDialog(QDialog):
         ):
             header.setSectionResizeMode(column, INTERACTIVE)
             header.resizeSection(column, width)
-        left_layout.addWidget(self._streams, stretch=2)
+        stream_table_height = (
+            header.sizeHint().height()
+            + self._streams.verticalHeader().defaultSectionSize()
+            * STREAM_TABLE_VISIBLE_ROWS
+            + self._streams.horizontalScrollBar().sizeHint().height()
+            + self._streams.frameWidth() * 2
+        )
+        self._streams.setFixedHeight(stream_table_height)
+        left_layout.addWidget(self._streams)
 
         self._tile_detail_title = QLabel("选中结果流：未选择 | 空间单元详情")
         left_layout.addWidget(self._tile_detail_title)
