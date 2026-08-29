@@ -44,9 +44,12 @@ def _module_function(name: str) -> ast.FunctionDef:
 
 
 def _execute_module_function(name: str, *args):
-    function = copy.deepcopy(_module_function(name))
+    functions = []
+    if name == "_overall_completion_fraction":
+        functions.append(copy.deepcopy(_module_function("_assembly_fraction")))
+    functions.append(copy.deepcopy(_module_function(name)))
     module = ast.fix_missing_locations(
-        ast.Module(body=[function], type_ignores=[])
+        ast.Module(body=functions, type_ignores=[])
     )
     namespace = {}
     exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
@@ -177,6 +180,7 @@ def test_database_poll_uses_one_snapshot_with_separate_progress_lanes():
     assert 'job_counts.get("work_package")' in poll_source
     assert 'job_counts.get("unit_fit")' in poll_source
     assert 'snapshot.get("stream_unit_type_counts")' in poll_source
+    assert 'snapshot.get("job_progress")' in poll_source
 
 
 def test_mixed_v5_job_total_is_not_used_as_the_monitor_progress_bar():
@@ -533,6 +537,40 @@ def test_log_panel_is_retained_but_collapsed_by_default():
     assert "self._log_panel.setVisible(False)" in build_ui
     assert "[720, 460] if shown else [1180, 0]" in toggle
     assert "self._log_panel.setVisible(shown)" in toggle
+
+
+def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
+    build_ui = _method_source("_build_ui")
+    update = _method_source("_update_database_overviews")
+    assert "self._overall_bar = QProgressBar()" in build_ui
+    assert "整体任务完成度" in build_ui
+    assert "不是剩余时间估算" in build_ui
+    assert "_overall_completion_fraction(" in update
+
+    fraction, group_count = _execute_module_function(
+        "_overall_completion_fraction",
+        "running",
+        {
+            "work_package": {"ready": 1},
+            "fragmentation_v33": {"ready": 2, "queued": 2},
+            "unit_fit": {"ready": 5, "queued": 5},
+        },
+        {
+            "work_package": {"completed": 1.0, "total": 1},
+            "fragmentation_v33": {"completed": 2.0, "total": 4},
+            "unit_fit": {"completed": 5.0, "total": 10},
+        },
+        [
+            {"stream_id": f"model:{index}", "status": "raster_ready"}
+            for index in range(4)
+        ],
+        {},
+    )
+    assert group_count == 6
+    assert fraction == 0.5
+    assert _execute_module_function(
+        "_overall_completion_fraction", "ready", {}, {}, [], {}
+    ) == (1.0, 1)
 
 
 def test_log_count_ignores_failure_field_names_and_keeps_real_errors_visible():
