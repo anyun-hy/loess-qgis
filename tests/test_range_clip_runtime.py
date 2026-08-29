@@ -181,6 +181,48 @@ def test_vector_mode_intersects_exact_boundary_with_available_raster_extent(
     assert geometry.bounds == pytest.approx((50, 50, 100, 100))
 
 
+def test_vector_range_reprojects_wgs84_to_web_mercator_on_current_gdal(tmp_path):
+    mask_path = tmp_path / "wgs84_range.gpkg"
+    schema = {"geometry": "Polygon", "properties": {"name": "str"}}
+    with fiona.open(
+        mask_path,
+        "w",
+        driver="GPKG",
+        layer="range",
+        schema=schema,
+        crs=CRS.from_epsg(4326),
+    ) as destination:
+        destination.write(
+            {
+                "geometry": mapping(box(0.0, 0.0, 0.001, 0.001)),
+                "properties": {"name": "cross-crs"},
+            }
+        )
+    spec = {
+        "run_dir": str(tmp_path),
+        "raster": {"crs": "EPSG:3857"},
+        "range_selection": {
+            "mode": "vector_tile_intersection",
+            "vector_source": str(mask_path),
+            "vector_sha256": hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+            "clip_outputs": True,
+        },
+        "requested_extent": {
+            "xmin": -1.0,
+            "ymin": -1.0,
+            "xmax": 200.0,
+            "ymax": 200.0,
+            "crs": "EPSG:3857",
+        },
+    }
+
+    geometry = extract_range_mask_geometry(spec, "EPSG:3857")
+
+    assert geometry.bounds == pytest.approx(
+        (0.0, 0.0, 111.319490793, 111.319490799), rel=1e-8
+    )
+
+
 def test_reapplying_the_same_range_clip_keeps_the_formal_gpkg_fingerprint(
     sample_data,
 ):

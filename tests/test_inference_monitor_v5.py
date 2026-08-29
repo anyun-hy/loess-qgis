@@ -537,7 +537,9 @@ def test_log_panel_is_retained_but_collapsed_by_default():
 
 def test_log_count_ignores_failure_field_names_and_keeps_real_errors_visible():
     resource_tuning = (
-        '[resource-tuning] {"first_failed_batch":null,"status":"completed"}'
+        '[resource-tuning] {"first_failed_batch":128,'
+        '"probes":[{"status":"failed","error":"CUDA out of memory"}],'
+        '"status":"completed"}'
     )
     assert _execute_module_function(
         "_log_indicators", "system", resource_tuning
