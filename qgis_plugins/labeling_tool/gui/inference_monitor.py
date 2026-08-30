@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -37,29 +38,178 @@ from ..qt_compat import (
 from .log_panel import LogPanel
 
 
-def _log_indicators(level, message):
-    """Classify real failures without treating JSON field names as errors."""
+def _log_payload(message):
+    text = str(message).strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return {}
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _log_severity(level, message):
+    """Separate semantic severity from the stdout/stderr/system source."""
 
     lowered = str(message).lower()
     if lowered.startswith("[resource-tuning] "):
-        return False, False
-    failure = str(level) == "stderr" or any(
+        return "info"
+    payload = _log_payload(message)
+    event = str(payload.get("event") or "").lower()
+    status = str(payload.get("status") or "").lower()
+    if (
+        event.endswith("failed")
+        or status in {"failed", "error"}
+        or payload.get("success") is False
+    ):
+        return "error"
+    if any(
+        token in event
+        for token in ("warning", "retry", "reduced", "paused_low_disk")
+    ) or status == "warning":
+        return "warning"
+    explicit_failure = any(
         marker in lowered
         for marker in (
-            '"event":"stream_assembly_failed"',
-            '"status":"failed"',
-            '"status": "failed"',
-            '"success":false',
-            '"success": false',
             " failed (rc=",
             "[scheduler-error]",
             "[accelerator-restart]",
+            " timed out after ",
+            " process error:",
+            "exhausted retries",
+            "crashed repeatedly",
+            "[monitor-db]",
+            "fatal error",
         )
     )
-    warning = not failure and any(
-        token in lowered for token in ("warning", "warn", "警告")
+    named_exception = (
+        lowered.startswith(("error:", "[error]", "fatal:"))
+        or re.search(r"\b[a-z_][\w.]*?(?:error|exception):", lowered)
     )
-    return warning, failure
+    if explicit_failure or (str(level) != "stderr" and named_exception):
+        return "error"
+    if any(
+        token in lowered for token in ("warning", "warn", "警告")
+    ) or any(
+        marker in lowered
+        for marker in ("[retry]", "fallback", "降档", "自动重试")
+    ):
+        return "warning"
+    return "info"
+
+
+def _log_fingerprint(severity, error, affected, attempt=0):
+    if severity not in {"warning", "error"} or not str(affected).strip():
+        return ""
+    normalized_error = re.sub(r"\s+", " ", str(error)).strip().lower()
+    normalized_target = re.sub(r"\s+", " ", str(affected)).strip().lower()
+    return (
+        f"{severity}:{normalized_target}:attempt={int(attempt or 0)}:"
+        f"{normalized_error}"
+    )
+
+
+def _log_presentation(level, message):
+    """Build a stable, readable summary while retaining the raw message."""
+
+    source = str(level) if str(level) in {"stdout", "stderr", "system"} else "system"
+    raw = str(message)
+    lowered = raw.lower()
+    payload = _log_payload(raw)
+    severity = _log_severity(source, raw)
+    event = str(payload.get("event") or "")
+    error = str(payload.get("error") or raw)
+    affected = str(
+        payload.get("step")
+        or payload.get("label")
+        or payload.get("unit_id")
+        or payload.get("stream_id")
+        or event
+        or ""
+    )
+    if not affected and " timed out after " in lowered:
+        affected = raw[: lowered.index(" timed out after ")].strip()
+    if not affected and " failed (rc=" in lowered:
+        affected = raw[: lowered.index(" failed (rc=")].strip()
+    if not affected and "scheduler-error" in lowered:
+        affected = "调度器"
+    if not affected and "monitor-db" in lowered:
+        affected = "监控数据库"
+    if not affected and "accelerator-restart" in lowered:
+        affected = "加速器进程"
+    attempt = int(payload.get("attempt") or 0)
+
+    if severity == "warning":
+        if "retry" in lowered or "重试" in raw or "reduced" in lowered or "降档" in raw:
+            title = "任务正在自动重试"
+            system_action = "系统已调整本次执行并继续运行"
+            user_action = "通常不需要处理；重复出现时再查看技术详情"
+        elif "paused_low_disk" in lowered or "低磁盘" in raw:
+            title = "磁盘空间不足，任务已暂停"
+            system_action = "系统保留当前进度，等待空间恢复"
+            user_action = "释放磁盘空间后恢复任务"
+        else:
+            title = "运行警告"
+            system_action = "系统继续运行并保留该警告"
+            user_action = "通常不需要处理；重复出现时再检查"
+    elif severity == "error":
+        if "timed out after" in lowered or "超时" in raw:
+            title = "任务处理超时"
+            system_action = "进程已终止，系统将按恢复规则处理"
+            user_action = "等待自动重试；若再次失败，再查看技术详情"
+        elif "scheduler-error" in lowered:
+            title = "任务调度异常"
+            system_action = "系统已停止本次调度操作"
+            user_action = "查看技术详情，修复后恢复任务"
+        elif "monitor-db" in lowered:
+            title = "监控状态读取失败"
+            system_action = "推理任务不受影响，监控稍后会再次读取"
+            user_action = "若持续出现，再检查 PostgreSQL 连接"
+        elif "process error" in lowered:
+            title = "进程启动失败"
+            system_action = "本次进程没有继续执行"
+            user_action = "查看技术详情并检查运行环境"
+        elif "assembly" in event.lower() or "assemble" in lowered:
+            title = "结果流组装失败"
+            system_action = "本次结果流已标记为失败"
+            user_action = "查看技术详情，修复后恢复该结果流"
+        elif "coverage" in event.lower():
+            title = "结果完整性验收失败"
+            system_action = "结果未被发布为权威版本"
+            user_action = "检查空白、重叠和范围外统计"
+        elif "failed (rc=" in lowered:
+            title = "进程异常退出"
+            system_action = "本次任务已标记为失败"
+            user_action = "查看技术详情中的返回码和原始输出"
+        else:
+            title = "任务执行失败"
+            system_action = "本次任务已记录为失败"
+            user_action = "查看技术详情，修复后再恢复任务"
+    else:
+        title = ""
+        system_action = ""
+        user_action = ""
+
+    fingerprint = _log_fingerprint(severity, error, affected, attempt)
+    return {
+        "source": source,
+        "severity": severity,
+        "title": title,
+        "affected": affected,
+        "system_action": system_action,
+        "user_action": user_action,
+        "error": error,
+        "attempt": attempt,
+        "fingerprint": fingerprint,
+    }
+
+
+def _log_indicators(level, message):
+    """Compatibility helper used by existing monitor tests."""
+
+    severity = _log_severity(level, message)
+    return severity == "warning", severity == "error"
 from ..core.run_state_db import RunStateDB
 
 
@@ -297,6 +447,7 @@ class InferenceMonitorDialog(QDialog):
         self._tile_state = {}
         self._tile_rows = {}
         self._step_started_at = {}
+        self._step_attempts = {}
         self._active_stream_stages = {}
         self._active_global_stage = ""
         self._active_inference_stream = ""
@@ -311,6 +462,8 @@ class InferenceMonitorDialog(QDialog):
         self._coverage_state = {}
         self._log_error_count = 0
         self._log_warning_count = 0
+        self._logged_error_texts = set()
+        self._process_log_suppressions = {}
         self._detail_signature = None
         self._database = None
         self._run_id = ""
@@ -331,6 +484,25 @@ class InferenceMonitorDialog(QDialog):
         self._log_toggle.setCheckable(True)
         self._log_toggle.toggled.connect(self._set_log_visible)
         header.addWidget(self._log_toggle)
+        self._warning_log_button = QPushButton("Warning 0")
+        self._warning_log_button.setToolTip("展开日志并只显示警告")
+        self._warning_log_button.clicked.connect(
+            lambda: self._show_log_severity("warning")
+        )
+        header.addWidget(self._warning_log_button)
+        self._error_log_button = QPushButton("Error 0")
+        self._error_log_button.setToolTip("展开日志并只显示错误")
+        self._error_log_button.clicked.connect(
+            lambda: self._show_log_severity("error")
+        )
+        header.addWidget(self._error_log_button)
+        self._warning_log_button.setStyleSheet(
+            "QPushButton:enabled { color: #8a5a00; font-weight: 600; }"
+        )
+        self._error_log_button.setStyleSheet(
+            "QPushButton:enabled { color: #b42318; font-weight: 600; }"
+        )
+        self._update_log_toggle()
         root.addLayout(header)
 
         self._stage_rail = QLabel("")
@@ -477,6 +649,9 @@ class InferenceMonitorDialog(QDialog):
             (runner.stream_progress, self._on_stream_progress),
             (runner.pipeline_finished, self._on_finished),
         ]
+        process_log = getattr(runner, "process_log", None)
+        if process_log is not None:
+            pairs.insert(0, (process_log, self._on_process_log))
         for signal, slot in pairs:
             signal.connect(slot)
             self._connected.append((signal, slot))
@@ -520,9 +695,17 @@ class InferenceMonitorDialog(QDialog):
 
     def _set_log_visible(self, visible):
         shown = bool(visible)
+        if shown:
+            self._log_panel.set_visible_severities({"info", "warning", "error"})
         self._log_panel.setVisible(shown)
         self._splitter.setSizes([720, 460] if shown else [1180, 0])
         self._update_log_toggle()
+
+    def _show_log_severity(self, severity):
+        if not self._log_toggle.isChecked():
+            self._log_toggle.setChecked(True)
+        self._log_panel.set_visible_severities({str(severity)})
+        self._log_panel.scroll_to_latest()
 
     def _reset_log_counts(self):
         self._log_error_count = 0
@@ -531,14 +714,11 @@ class InferenceMonitorDialog(QDialog):
 
     def _update_log_toggle(self):
         action = "收起日志" if self._log_toggle.isChecked() else "显示日志"
-        counts = []
-        if self._log_error_count:
-            counts.append(f"{self._log_error_count}错误")
-        if self._log_warning_count:
-            counts.append(f"{self._log_warning_count}警告")
-        self._log_toggle.setText(
-            action + (" · " + "/".join(counts) if counts else "")
-        )
+        self._log_toggle.setText(action)
+        self._warning_log_button.setText(f"Warning {self._log_warning_count}")
+        self._error_log_button.setText(f"Error {self._log_error_count}")
+        self._warning_log_button.setEnabled(self._log_warning_count > 0)
+        self._error_log_button.setEnabled(self._log_error_count > 0)
 
     def _update_coverage_overview(self):
         values = [
@@ -606,6 +786,7 @@ class InferenceMonitorDialog(QDialog):
         self._tile_state.clear()
         self._tile_rows.clear()
         self._step_started_at.clear()
+        self._step_attempts.clear()
         self._active_stream_stages.clear()
         self._active_global_stage = ""
         self._active_inference_stream = ""
@@ -613,6 +794,8 @@ class InferenceMonitorDialog(QDialog):
         self._runner_message = ""
         self._runtime_progress.clear()
         self._coverage_state.clear()
+        self._logged_error_texts.clear()
+        self._process_log_suppressions.clear()
         self._detail_signature = None
         self._stage_key = ""
         self._stage_started_at = time.monotonic()
@@ -737,25 +920,83 @@ class InferenceMonitorDialog(QDialog):
                 )
             self._streams.setItem(row, column, item)
 
-    def _on_log(self, level, message):
-        warning, failure = _log_indicators(level, message)
-        if level == "stdout":
-            self._log_panel.append_stdout(message)
-        elif level == "stderr":
-            self._log_panel.append_stderr(message)
-        else:
-            self._log_panel.append_system(message)
-        if warning:
+    def _on_process_log(self, event):
+        info = dict(event or {})
+        level = str(info.get("source") or "system")
+        message = str(info.get("message") or "")
+        suppression_key = (level, message)
+        self._process_log_suppressions[suppression_key] = (
+            int(self._process_log_suppressions.get(suppression_key) or 0) + 1
+        )
+        self._on_log(level, message, log_context=info)
+
+    def _on_log(self, level, message, log_context=None):
+        if log_context is None:
+            suppression_key = (str(level), str(message))
+            suppression_count = int(
+                self._process_log_suppressions.get(suppression_key) or 0
+            )
+            if suppression_count:
+                if suppression_count == 1:
+                    self._process_log_suppressions.pop(suppression_key, None)
+                else:
+                    self._process_log_suppressions[suppression_key] = (
+                        suppression_count - 1
+                    )
+                return
+        presentation = _log_presentation(level, message)
+        context = dict(log_context or {})
+        affected = str(
+            context.get("step")
+            or context.get("unit_id")
+            or context.get("stream_id")
+            or presentation.get("affected")
+            or ""
+        )
+        presentation["affected"] = affected
+        attempt = int(context.get("attempt") or presentation.get("attempt") or 0)
+        if not attempt and affected:
+            attempt = int(self._step_attempts.get(affected) or 0)
+        context_key = (
+            f"{affected}:attempt={attempt}"
+            if affected
+            else "unscoped"
+        )
+        presentation["fingerprint"] = _log_fingerprint(
+            presentation["severity"],
+            presentation["error"],
+            affected,
+            attempt,
+        )
+        if presentation["severity"] == "error":
+            self._logged_error_texts.add(
+                re.sub(r"\s+", " ", str(presentation["error"])).strip().lower()
+            )
+        created = self._log_panel.append_event(
+            message,
+            source=presentation["source"],
+            severity=presentation["severity"],
+            title=presentation["title"],
+            affected=presentation["affected"],
+            system_action=presentation["system_action"],
+            user_action=presentation["user_action"],
+            fingerprint=presentation["fingerprint"],
+            context_key=context_key,
+        )
+        if not created:
+            return
+        if presentation["severity"] == "warning":
             self._log_warning_count += 1
-        elif level == "stderr" or failure:
+        elif presentation["severity"] == "error":
             self._log_error_count += 1
-        if warning or level == "stderr" or failure:
+        if presentation["severity"] in {"warning", "error"}:
             self._update_log_toggle()
 
     def _on_step_started(self, name):
         stream_id = _stream_from_step(name)
         stage = _stage_from_step(name)
         self._step_started_at[name] = time.time()
+        self._step_attempts[name] = int(self._step_attempts.get(name) or 0) + 1
         self._active_global_stage = stage
         if stream_id:
             stage_counts = self._active_stream_stages.setdefault(stream_id, {})
@@ -763,7 +1004,25 @@ class InferenceMonitorDialog(QDialog):
             self._set_stream(stream_id, stage=stage, status="运行中")
 
     def _on_step_finished(self, name, return_code, result):
-        del return_code
+        failed = not result.get("success") and not result.get("skipped")
+        if failed:
+            self._on_log(
+                "system",
+                json.dumps(
+                    {
+                        "event": "monitor_step_failed",
+                        "step": str(name),
+                        "stream_id": str(
+                            result.get("stream_id") or _stream_from_step(name)
+                        ),
+                        "attempt": int(self._step_attempts.get(name) or 1),
+                        "return_code": int(return_code),
+                        "error": str(result.get("error") or "任务执行失败"),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
         stream_id = str(result.get("stream_id") or _stream_from_step(name))
         stage = _stage_from_step(name)
         started = self._step_started_at.pop(name, None)
@@ -1387,7 +1646,7 @@ class InferenceMonitorDialog(QDialog):
             )
             self._render_selected_tiles()
         except Exception as error:
-            self._log_panel.append_system(f"[monitor-db] {error}")
+            self._on_log("system", f"[monitor-db] {error}")
 
     def _database_phase(
         self, run_status, package_counts, unit_job_counts, streams
@@ -1713,6 +1972,26 @@ class InferenceMonitorDialog(QDialog):
         )
 
     def _on_finished(self, result):
+        final_error = re.sub(
+            r"\s+", " ", str(result.get("error") or "")
+        ).strip().lower()
+        if (
+            not result.get("success")
+            and result.get("status") != "stopped"
+            and result.get("error")
+            and final_error not in self._logged_error_texts
+        ):
+            self._on_log(
+                "system",
+                json.dumps(
+                    {
+                        "event": "monitor_pipeline_failed",
+                        "error": str(result.get("error")),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
         for stream in result.get("streams") or []:
             status = {"ready": "成功", "failed": "失败", "stopped": "已停止"}.get(stream.get("status"), stream.get("status"))
             self._set_stream(

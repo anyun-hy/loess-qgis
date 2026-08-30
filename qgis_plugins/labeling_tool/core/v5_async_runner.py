@@ -68,6 +68,7 @@ class V5AsyncInferenceRunner(QObject):
     """Run one persistent accelerator worker and a bounded CPU geometry pool."""
 
     log_line = pyqtSignal(str, str)
+    process_log = pyqtSignal(object)
     step_started = pyqtSignal(str)
     step_finished = pyqtSignal(str, int, dict)
     pipeline_progress = pyqtSignal(int, int, str)
@@ -577,6 +578,22 @@ class V5AsyncInferenceRunner(QObject):
             line = line.rstrip("\r")
             if not line:
                 continue
+            context = entry.get("context") or {}
+            job = context.get("job") or {}
+            self.process_log.emit(
+                {
+                    "source": level,
+                    "message": line,
+                    "step": str(context.get("label") or ""),
+                    "stream_id": str(
+                        context.get("stream_id") or job.get("stream_id") or ""
+                    ),
+                    "unit_id": str(
+                        context.get("unit_id") or job.get("unit_id") or ""
+                    ),
+                    "attempt": int(job.get("attempt") or 0),
+                }
+            )
             self.log_line.emit(level, line)
             if level == "stdout":
                 self._structured(entry, line)
