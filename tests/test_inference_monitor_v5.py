@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,8 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 MONITOR_PATH = (
     ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "inference_monitor.py"
 )
+LOG_PANEL_PATH = ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "log_panel.py"
+RUNNER_PATH = ROOT / "qgis_plugins" / "labeling_tool" / "core" / "v5_async_runner.py"
 SOURCE = MONITOR_PATH.read_text(encoding="utf-8")
+LOG_PANEL_SOURCE = LOG_PANEL_PATH.read_text(encoding="utf-8")
+RUNNER_SOURCE = RUNNER_PATH.read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
+LOG_PANEL_TREE = ast.parse(LOG_PANEL_SOURCE)
 
 
 def _monitor_class() -> ast.ClassDef:
@@ -43,15 +51,32 @@ def _module_function(name: str) -> ast.FunctionDef:
     raise AssertionError(f"module function {name} is missing")
 
 
+def _log_panel_method(name: str) -> ast.FunctionDef:
+    for node in LOG_PANEL_TREE.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "LogPanel":
+            continue
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef) and child.name == name:
+                return child
+    raise AssertionError(f"LogPanel.{name} is missing")
+
+
 def _execute_module_function(name: str, *args):
-    functions = []
+    function_names = []
     if name == "_overall_completion_fraction":
-        functions.append(copy.deepcopy(_module_function("_assembly_fraction")))
-    functions.append(copy.deepcopy(_module_function(name)))
+        function_names.append("_assembly_fraction")
+    if name in {"_log_severity", "_log_presentation", "_log_indicators"}:
+        function_names.append("_log_payload")
+    if name in {"_log_presentation", "_log_indicators"}:
+        function_names.append("_log_severity")
+    if name == "_log_presentation":
+        function_names.append("_log_fingerprint")
+    function_names.append(name)
+    functions = [copy.deepcopy(_module_function(item)) for item in function_names]
     module = ast.fix_missing_locations(
         ast.Module(body=functions, type_ignores=[])
     )
-    namespace = {}
+    namespace = {"json": json, "re": re}
     exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
     return namespace[name](*args)
 
@@ -82,6 +107,14 @@ def _execute_method(name: str, instance, *args):
     }
     exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
     return namespace[name](instance, *args)
+
+
+def _execute_log_panel_method(name: str, instance, *args, **kwargs):
+    function = copy.deepcopy(_log_panel_method(name))
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    namespace = {"datetime": datetime, "time": time}
+    exec(compile(module, str(LOG_PANEL_PATH), "exec"), namespace)
+    return namespace[name](instance, *args, **kwargs)
 
 
 def _self_method_calls(node: ast.AST) -> set[str]:
@@ -551,10 +584,16 @@ def test_monitor_reads_persisted_coverage_validation_summary():
 def test_log_panel_is_retained_but_collapsed_by_default():
     build_ui = _method_source("_build_ui")
     toggle = _method_source("_set_log_visible")
+    quick_filter = _method_source("_show_log_severity")
     assert 'QPushButton("显示日志")' in build_ui
+    assert 'QPushButton("Warning 0")' in build_ui
+    assert 'QPushButton("Error 0")' in build_ui
+    assert 'self._show_log_severity("warning")' in build_ui
+    assert 'self._show_log_severity("error")' in build_ui
     assert "self._log_panel.setVisible(False)" in build_ui
     assert "[720, 460] if shown else [1180, 0]" in toggle
     assert "self._log_panel.setVisible(shown)" in toggle
+    assert "self._log_panel.scroll_to_latest()" in quick_filter
 
 
 def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
@@ -591,7 +630,7 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
     ) == (1.0, 1)
 
 
-def test_log_count_ignores_failure_field_names_and_keeps_real_errors_visible():
+def test_log_count_separates_raw_stderr_from_confirmed_failures():
     resource_tuning = (
         '[resource-tuning] {"first_failed_batch":128,'
         '"probes":[{"status":"failed","error":"CUDA out of memory"}],'
@@ -604,13 +643,218 @@ def test_log_count_ignores_failure_field_names_and_keeps_real_errors_visible():
         "_log_indicators",
         "stderr",
         "TypeError: unexpected keyword argument 'run_id'",
-    ) == (False, True)
+    ) == (False, False)
+    assert _execute_module_function(
+        "_log_severity", "stderr", "GDAL diagnostic output"
+    ) == "info"
+    assert _execute_module_function(
+        "_log_severity", "stderr", "RuntimeWarning: fallback was used"
+    ) == "warning"
+    assert _execute_module_function(
+        "_log_severity", "stdout", '{"event":"probe","status":"error"}'
+    ) == "error"
     assert _execute_module_function(
         "_log_indicators",
         "stdout",
         '{"event":"stream_assembly_failed"}',
     ) == (False, True)
-    assert "_log_indicators(level, message)" in _method_source("_on_log")
+    assert "_log_presentation(level, message)" in _method_source("_on_log")
+
+
+def test_log_presentation_explains_timeout_without_hiding_raw_source():
+    presentation = _execute_module_function(
+        "_log_presentation",
+        "stderr",
+        "Fusion Core-037 timed out after 900s",
+    )
+
+    assert presentation["source"] == "stderr"
+    assert presentation["severity"] == "error"
+    assert presentation["title"] == "任务处理超时"
+    assert presentation["affected"] == "Fusion Core-037"
+    assert "终止" in presentation["system_action"]
+    assert "自动重试" in presentation["user_action"]
+    assert presentation["fingerprint"].startswith("error:")
+
+
+def test_log_panel_separates_source_severity_and_readable_details():
+    for contract in (
+        "def append_event(",
+        'source: str,',
+        'severity: str,',
+        'self._visible_severities: set[str] = {"info", "warning", "error"}',
+        '("all", "全部")',
+        '("warning", "Warning")',
+        '("error", "Error")',
+        'QPushButton("技术详情")',
+        '("系统处理", event["system_action"])',
+        '("用户操作", event["user_action"])',
+        'event["repeat_count"] = int(event["repeat_count"]) + 1',
+        "self._raw_records.append(raw_record)",
+        "pending_records.append(raw_record)",
+        "self.log_edit.setMaximumBlockCount(20000)",
+        "QTimer.singleShot(100, self._finish_scheduled_rebuild)",
+    ):
+        assert contract in LOG_PANEL_SOURCE
+
+    assert "self._event_index.clear()" in LOG_PANEL_SOURCE
+    assert "self._raw_records.clear()" in LOG_PANEL_SOURCE
+
+
+def test_log_panel_deduplicates_display_but_preserves_every_raw_record():
+    panel = SimpleNamespace(
+        _events=[],
+        _event_index={},
+        _raw_records=[],
+        _pending_stderr_records={},
+        _event_visible=lambda _event: False,
+        _render_event=lambda _event: None,
+        _rebuild=lambda: None,
+    )
+    values = {
+        "source": "stderr",
+        "severity": "error",
+        "title": "任务处理超时",
+        "fingerprint": "error:core-037-timeout",
+    }
+
+    assert _execute_log_panel_method(
+        "append_event", panel, "Core-037 timeout", **values
+    ) is True
+    values["source"] = "system"
+    assert _execute_log_panel_method(
+        "append_event", panel, '{"error":"Core-037 timeout"}', **values
+    ) is False
+
+    assert len(panel._events) == 1
+    assert panel._events[0]["repeat_count"] == 2
+    assert [record["source"] for record in panel._events[0]["records"]] == [
+        "stderr",
+        "system",
+    ]
+    assert [record["text"] for record in panel._raw_records] == [
+        "Core-037 timeout",
+        '{"error":"Core-037 timeout"}',
+    ]
+
+
+def test_log_fingerprint_keeps_tasks_and_attempts_separate():
+    first = _execute_module_function(
+        "_log_fingerprint", "error", "worker failed", "Core-037", 1
+    )
+    other_task = _execute_module_function(
+        "_log_fingerprint", "error", "worker failed", "Core-038", 1
+    )
+    retry = _execute_module_function(
+        "_log_fingerprint", "error", "worker failed", "Core-037", 2
+    )
+
+    assert first
+    assert len({first, other_task, retry}) == 3
+    assert _execute_module_function(
+        "_log_fingerprint", "error", "worker failed", "", 0
+    ) == ""
+
+
+def test_error_event_carries_recent_stderr_trace_as_technical_context():
+    panel = SimpleNamespace(
+        _events=[],
+        _event_index={},
+        _raw_records=[],
+        _pending_stderr_records={},
+        _event_visible=lambda _event: False,
+        _render_event=lambda _event: None,
+        _rebuild=lambda: None,
+    )
+    for line in ("Traceback (most recent call last):", '  File "worker.py"'):
+        assert _execute_log_panel_method(
+            "append_event",
+            panel,
+            line,
+            source="stderr",
+            severity="info",
+        ) is True
+    assert _execute_log_panel_method(
+        "append_event",
+        panel,
+        "RuntimeError: disk full",
+        source="stderr",
+        severity="error",
+        title="任务执行失败",
+        fingerprint="error:core-037:attempt=1:disk-full",
+    ) is True
+
+    error_event = panel._events[-1]
+    assert [record["text"] for record in error_event["records"]] == [
+        "Traceback (most recent call last):",
+        '  File "worker.py"',
+        "RuntimeError: disk full",
+    ]
+    assert panel._pending_stderr_records == {}
+
+
+def test_concurrent_process_traces_are_buffered_by_context_key():
+    panel = SimpleNamespace(
+        _events=[],
+        _event_index={},
+        _raw_records=[],
+        _pending_stderr_records={},
+        _event_visible=lambda _event: False,
+        _render_event=lambda _event: None,
+        _rebuild=lambda: None,
+    )
+    for context_key, line in (("Core-A", "trace A"), ("Core-B", "trace B")):
+        _execute_log_panel_method(
+            "append_event",
+            panel,
+            line,
+            source="stderr",
+            severity="info",
+            context_key=context_key,
+        )
+    _execute_log_panel_method(
+        "append_event",
+        panel,
+        "Core-B failed",
+        source="system",
+        severity="error",
+        fingerprint="error:core-b:attempt=1:failed",
+        context_key="Core-B",
+    )
+
+    assert [record["text"] for record in panel._events[-1]["records"]] == [
+        "trace B",
+        "Core-B failed",
+    ]
+    assert list(panel._pending_stderr_records) == ["Core-A"]
+
+
+def test_runner_keeps_legacy_log_signal_and_adds_process_context_signal():
+    attach = _method_source("attach_runner")
+    process_log = _method_source("_on_process_log")
+
+    assert "log_line = pyqtSignal(str, str)" in RUNNER_SOURCE
+    assert "process_log = pyqtSignal(object)" in RUNNER_SOURCE
+    assert '"step": str(context.get("label") or "")' in RUNNER_SOURCE
+    assert '"unit_id": str(' in RUNNER_SOURCE
+    assert '"attempt": int(job.get("attempt") or 0)' in RUNNER_SOURCE
+    assert 'getattr(runner, "process_log", None)' in attach
+    assert "self._process_log_suppressions" in process_log
+    assert "log_context=info" in process_log
+    assert 'f"{affected}:attempt={attempt}"' in _method_source("_on_log")
+
+
+def test_terminal_failures_are_promoted_to_single_structured_log_events():
+    step_finished = _method_source("_on_step_finished")
+    pipeline_finished = _method_source("_on_finished")
+    poll = _method_source("_poll_database")
+
+    assert '"event": "monitor_step_failed"' in step_finished
+    assert '"attempt": int(self._step_attempts.get(name) or 1)' in step_finished
+    assert '"return_code": int(return_code)' in step_finished
+    assert '"event": "monitor_pipeline_failed"' in pipeline_finished
+    assert "final_error not in self._logged_error_texts" in pipeline_finished
+    assert 'self._on_log("system", f"[monitor-db] {error}")' in poll
 
 
 def test_tile_and_spatial_unit_details_remain_bounded_and_paged():
