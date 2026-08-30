@@ -9,10 +9,16 @@ import numpy as np
 import pytest
 from affine import Affine
 from fiona.crs import CRS
-from shapely.geometry import box, mapping
+from rasterio.features import shapes as raster_shapes
+from shapely.geometry import box, mapping, shape
+from shapely.ops import unary_union
 
+from assemble_stream import _validate_exact_range_coverage
 from authoritative_raster import regularize_partition_core
-from inference_scripts.range_clip_runtime import extract_range_mask_geometry
+from inference_scripts.range_clip_runtime import (
+    apply_adaptive_range_clip,
+    extract_range_mask_geometry,
+)
 from labeling_tool.core.run_builder_v5 import create_v5_run
 from labeling_tool.core.run_spec import reserve_run_directory, sha256_file
 import work_package_runtime
@@ -68,6 +74,155 @@ def test_vector_range_mask_invalidates_pixels_outside_the_published_core(
     assert np.all(arrays["core_mask"][:, :2] == 2)
     assert np.all(arrays["core_mask"][:, 2:] == -1)
     assert np.all(arrays["core_confidence"][:, 2:] == -1.0)
+
+
+def test_cross_crs_non_aligned_range_covers_every_boundary_sliver(tmp_path: Path):
+    """Touched boundary pixels must survive until the exact vector clip."""
+
+    snapshot = tmp_path / "cross_crs_range.gpkg"
+    with fiona.open(
+        snapshot,
+        "w",
+        driver="GPKG",
+        layer="range_mask",
+        schema={"geometry": "Polygon", "properties": {}},
+        crs=CRS.from_epsg(4326),
+    ) as destination:
+        destination.write(
+            {
+                "geometry": mapping(
+                    box(0.000001, 0.000001, 0.000004, 0.000019)
+                ),
+                "properties": {},
+            }
+        )
+    range_spec = {
+        "raster": {
+            "crs": "EPSG:3857",
+            "transform": list(Affine(1, 0, 0, 0, -1, 3))[:6],
+        },
+        "coverage_validation": {"area_tolerance_pixels": 0.01},
+        "range_selection": {
+            "mode": "vector_tile_intersection",
+            "vector_source": str(snapshot),
+            "vector_sha256": sha256_file(snapshot),
+            "clip_outputs": True,
+        }
+    }
+    range_geometry = extract_range_mask_geometry(range_spec, "EPSG:3857")
+    probabilities = np.zeros((14, 3, 3), dtype=np.float32)
+    probabilities[2, :, :] = 1.0
+    partition = {
+        "partition_id": "partition_00000_00000",
+        "halo_window": {"x0": 0, "y0": 0, "x1": 3, "y1": 3},
+        "core_window": {"x0": 0, "y0": 0, "x1": 3, "y1": 3},
+    }
+    transform = Affine(1, 0, 0, 0, -1, 3)
+
+    arrays, report = regularize_partition_core(
+        {
+            "halo_probabilities": probabilities,
+            "halo_weights": np.ones((3, 3), dtype=np.float32),
+            "core_mask": np.full((3, 3), 2, dtype=np.int16),
+            "core_confidence": np.ones((3, 3), dtype=np.float32),
+        },
+        partition,
+        global_transform=transform,
+        crs="EPSG:3857",
+        range_geometry=range_geometry,
+    )
+
+    assert np.all(arrays["core_mask"][:, 0] == 2)
+    assert np.all(arrays["core_mask"][:, 1:] == -1)
+    assert report["range_mask_method"] == "all_touched_exact_vector_support_v1"
+    pixel_coverage = unary_union(
+        [
+            shape(geometry)
+            for geometry, _value in raster_shapes(
+                arrays["core_mask"],
+                mask=arrays["core_mask"] >= 0,
+                transform=transform,
+            )
+        ]
+    )
+    exact_output = pixel_coverage.intersection(range_geometry)
+    assert range_geometry.difference(exact_output).area == pytest.approx(
+        0.0, abs=1e-12
+    )
+    assert exact_output.difference(range_geometry).area == pytest.approx(
+        0.0, abs=1e-12
+    )
+
+    output = tmp_path / "semantic_polygons.gpkg"
+    with fiona.open(
+        output,
+        "w",
+        driver="GPKG",
+        layer="semantic_polygons",
+        schema={
+            "geometry": "Polygon",
+            "properties": {"class_code": "int", "part_id": "str"},
+        },
+        crs=CRS.from_epsg(3857),
+    ) as destination:
+        destination.write(
+            {
+                "geometry": mapping(pixel_coverage),
+                "properties": {"class_code": 21, "part_id": "boundary"},
+            }
+        )
+    clip_report = apply_adaptive_range_clip(output, range_spec)
+    assert clip_report["status"] == "passed"
+    coverage = _validate_exact_range_coverage(
+        output,
+        layer="semantic_polygons",
+        spec=range_spec,
+    )
+    assert coverage["status"] == "passed"
+    assert coverage["gap_area_m2"] == pytest.approx(0.0, abs=1e-12)
+    assert coverage["overlap_area_m2"] == pytest.approx(0.0, abs=1e-12)
+    assert coverage["outside_area_m2"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_non_aligned_range_stays_covered_across_partition_core_boundary():
+    transform = Affine(1, 0, 0, 0, -1, 2)
+    range_geometry = box(1.8, 0.1, 2.2, 1.9)
+    pixel_parts = []
+
+    for index, (x0, x1) in enumerate(((0, 2), (2, 4))):
+        probabilities = np.zeros((14, 2, 2), dtype=np.float32)
+        probabilities[2, :, :] = 1.0
+        partition = {
+            "partition_id": f"partition_00000_0000{index}",
+            "halo_window": {"x0": x0, "y0": 0, "x1": x1, "y1": 2},
+            "core_window": {"x0": x0, "y0": 0, "x1": x1, "y1": 2},
+        }
+        arrays, _report = regularize_partition_core(
+            {
+                "halo_probabilities": probabilities,
+                "halo_weights": np.ones((2, 2), dtype=np.float32),
+                "core_mask": np.full((2, 2), 2, dtype=np.int16),
+                "core_confidence": np.ones((2, 2), dtype=np.float32),
+            },
+            partition,
+            global_transform=transform,
+            crs="EPSG:3857",
+            range_geometry=range_geometry,
+        )
+        part_transform = transform * Affine.translation(x0, 0)
+        pixel_parts.extend(
+            shape(geometry)
+            for geometry, _value in raster_shapes(
+                arrays["core_mask"],
+                mask=arrays["core_mask"] >= 0,
+                transform=part_transform,
+            )
+        )
+
+    exact_output = unary_union(pixel_parts).intersection(range_geometry)
+    assert range_geometry.difference(exact_output).area == pytest.approx(
+        0.0, abs=1e-12
+    )
 
 
 def test_vector_run_spec_records_the_run_local_range_snapshot_hash(tmp_path: Path):
