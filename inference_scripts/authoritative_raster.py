@@ -39,11 +39,13 @@ def apply_range_mask_to_core(
     global_transform: Affine,
     range_geometry: Any | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Set published Core pixels outside the exact range to existing nodata.
+    """Keep every Core pixel cell touched by the frozen exact range.
 
     Halo probabilities remain available for inference and boundary context. The
     non-overlapping Core rasters are the authoritative polygonization inputs,
-    so class and confidence receive their documented nodata values here.
+    so class and confidence receive their documented nodata values here. The
+    touched raster support may extend beyond the vector boundary; final output
+    is clipped back to the same frozen geometry before exact coverage gates run.
     """
 
     result = dict(arrays)
@@ -65,6 +67,7 @@ def apply_range_mask_to_core(
             [mapping(range_geometry)],
             out_shape=core_shape,
             transform=core_transform,
+            all_touched=True,
             invert=True,
         )
 
@@ -88,6 +91,11 @@ def apply_range_mask_to_core(
     outside_count = int(np.count_nonzero(~inside))
     return result, {
         "range_mask_applied": range_geometry is not None,
+        "range_mask_method": (
+            "all_touched_exact_vector_support_v1"
+            if range_geometry is not None
+            else "full_core_no_range_v1"
+        ),
         "range_masked_pixel_count": outside_count,
         "coverage_validation": {
             "status": "passed",
