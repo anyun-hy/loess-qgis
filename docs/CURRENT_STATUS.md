@@ -1,6 +1,6 @@
 # 当前实施状态
 
-更新日期：2026-08-29。
+更新日期：2026-08-30。
 
 ## 当前结论
 
@@ -15,6 +15,10 @@
   发布流程；
 - 最终 `scale_acceptance` 已按 Work Package、V3.3 和 `unit_fit` 三类 Job 分别
   核对冻结任务数与 ready 状态，V3.3 Partition/Finalize 不再被遗漏；
+- 推理监控已把来源和严重程度分开，提供 Warning/Error 快捷定位、可读中文
+  摘要、技术详情和按任务/尝试去重；结果流表格固定约五行并支持横纵滚动；
+- 非像元对齐研究范围的权威 Core 掩膜已改为 all-touched raster support，最终
+  仍按冻结精确矢量裁剪并执行 gap/overlap/outside 硬验收；
 - Generate 仍只作研究参考，失败 RAG 与空间联合解码仍保持归档状态。
 
 ## V3.3 生产代码
@@ -68,7 +72,7 @@ Tencent 使用冻结的 140-Core V3 基线和完整概率输入，执行正式 W
 范围转换、恢复和监控回归：
 
 ```text
-511 passed, 5 skipped
+522 passed, 5 skipped
 ```
 
 独立真实 PostgreSQL 集成测试：
@@ -77,7 +81,9 @@ Tencent 使用冻结的 140-Core V3 基线和完整概率输入，执行正式 W
 3 passed
 ```
 
-Tencent 当前部署项目和 QGIS 插件来自同一 `cd76892` 源码与发布包。自动测试、
+macOS 与 Tencent 当前部署项目和 QGIS 插件来自同一 `f6176dd` 源码与发布包，
+source bundle 为
+`2180b3c35a157a5761f5f42ce78bdc3c68c3032e48a67ebbd797b047b6eca1ad`。自动测试、
 部署一致性和用户在 QGIS 中完成完整真实输入验收仍是三个不同结论。
 
 ## 尚未取得的证据
@@ -85,6 +91,8 @@ Tencent 当前部署项目和 QGIS 插件来自同一 `cd76892` 源码与发布�
 - 最新提交从原始影像重新推理到最终矢量组装的 140-Core 全链复跑；当前生产
   接管验收复用了已冻结、已校验的 V3 基线和概率输入；
 - 最新提交对应的双平台 QGIS 现场验收。
+- `f6176dd` 部署后尚未创建新 Run 验证非像元对齐范围的四流最终 coverage；旧
+  Run `20260829_111032_087cae` 使用旧 Core mask，不能通过恢复来验证修复。
 
 详细选择依据见
 [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)。

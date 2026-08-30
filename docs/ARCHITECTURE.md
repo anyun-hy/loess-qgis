@@ -57,6 +57,10 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - `512 x 512` 是模型 Tile 尺寸，不代表地面分辨率；
 - 物理面积和距离必须由当前影像 Affine 与 CRS 计算；
 - Halo 只提供上下文，互不重叠的 Core 拥有正式像元；
+- 冻结矢量研究范围栅格化时保留所有 touched 边界像元，保证 raster support
+  不在非像元对齐边界内缩；正式 GPKG 再以同一冻结矢量精确裁剪；
+- 中间 touched Core 可以部分位于矢量范围外，但正式结果仍必须通过
+  gap=0、overlap=0、outside=0，不能把中间像元计数当成精确矢量面积；
 - 大图使用有界 Work Package 和 Partition，不分配整幅概率或整幅线网；
 - Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
 - Run JSON 只保存冻结配置和摘要，不保存几十万 Tile 明细；

@@ -16,8 +16,8 @@
    V3、Generate、失败 RAG 和 V3.1 启动前的方法决策；
 7. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
    V3.1—V3.4 全量比较与 V3.3 选择决定；
-8. [handoffs/V31_START_20260824.md](handoffs/V31_START_20260824.md)：用户明确
-   请求的新对话 V3.1 启动交接。
+8. [handoffs/POSTPROCESS_VALIDATION_START_20260830.md](handoffs/POSTPROCESS_VALIDATION_START_20260830.md)：
+   当前性能后处理、日志和研究范围边界修复的实机验收交接。
 
 ## 文档职责
 
