@@ -16,6 +16,50 @@ from check_environment import (
 )
 
 
+def test_old_pyogrio_is_rejected_before_importing_deprecated_shapely_geos(
+    monkeypatch,
+):
+    imports = []
+    monkeypatch.setattr(
+        check_environment.importlib.metadata,
+        "version",
+        lambda _name: "0.10.0",
+    )
+    monkeypatch.setattr(
+        check_environment.importlib,
+        "import_module",
+        lambda name: imports.append(name),
+    )
+
+    module, version, error = check_environment.import_dependency("pyogrio")
+
+    assert module is None
+    assert version == "0.10.0"
+    assert "pyogrio ==0.13.0" in error
+    assert imports == []
+
+
+def test_wrong_pyarrow_version_is_rejected_before_import(monkeypatch):
+    imports = []
+    monkeypatch.setattr(
+        check_environment.importlib.metadata,
+        "version",
+        lambda _name: "19.0.1",
+    )
+    monkeypatch.setattr(
+        check_environment.importlib,
+        "import_module",
+        lambda name: imports.append(name),
+    )
+
+    module, version, error = check_environment.import_dependency("pyarrow")
+
+    assert module is None
+    assert version == "19.0.1"
+    assert "pyarrow ==25.0.1" in error
+    assert imports == []
+
+
 def test_swin_mps_requires_pytorch_27_but_other_devices_are_unchanged():
     assert _mps_runtime_requirement("upernet_swin_b", "2.5.1")[0] is False
     assert _mps_runtime_requirement("upernet_swin_b", "2.7.0")[0] is True

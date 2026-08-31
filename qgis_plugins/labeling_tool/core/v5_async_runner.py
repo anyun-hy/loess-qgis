@@ -27,27 +27,74 @@ def _resource_value(spec, key, default):
     return max(1, int(tuning.get(key, default)))
 
 
-def cpu_worker_limit(spec, *, package_active):
+def _fragmentation_v33_process_threads(spec):
+    """Return the frozen CPU-thread reservation of one V3.3 worker."""
+
+    return _resource_value(
+        spec,
+        "fragmentation_v33_process_threads",
+        _resource_value(spec, "package_process_threads", 2),
+    )
+
+
+def _unit_fit_process_threads(spec):
+    """Return the frozen CPU-thread reservation of one unit-fit worker."""
+
+    return _resource_value(spec, "unit_process_threads", 1)
+
+
+def cpu_worker_limit(spec, *, package_active, fragmentation_v33_active=0):
+    """Return the remaining unit-fit process capacity in the shared CPU pool.
+
+    ``max_cpu_partition_workers[_with_package]`` is the frozen geometry budget.
+    A V3.3 process uses its own bounded native-thread pool, so every active
+    V3.3 process consumes that many unit-fit slots.  Returning zero is valid:
+    it prevents oversubscription until a V3.3 worker completes.
+    """
+
     scaling = spec.get("scaling") or {}
     full = max(1, int(scaling.get("max_cpu_partition_workers", 2)))
     if not package_active:
-        return full
-    return max(
-        1,
-        int(scaling.get("max_cpu_partition_workers_with_package", full)),
+        geometry_budget = full
+    else:
+        geometry_budget = max(
+            1,
+            int(scaling.get("max_cpu_partition_workers_with_package", full)),
+        )
+    v33_active = max(0, int(fragmentation_v33_active))
+    remaining_threads = max(
+        0,
+        geometry_budget - v33_active * _fragmentation_v33_process_threads(spec),
     )
+    return remaining_threads // _unit_fit_process_threads(spec)
+
+
+def fragmentation_v33_worker_limit(spec, *, package_active, unit_fit_active=0):
+    """Bound V3.3 workers so all active CPU processes fit the frozen budget."""
+
+    scaling = spec.get("scaling") or {}
+    full = max(1, int(scaling.get("max_cpu_partition_workers", 2)))
+    package_reservation = (
+        _resource_value(spec, "package_process_threads", 2)
+        if package_active
+        else 0
+    )
+    unit_reservation = max(0, int(unit_fit_active)) * _unit_fit_process_threads(spec)
+    available = max(0, full - package_reservation - unit_reservation)
+    return available // _fragmentation_v33_process_threads(spec)
 
 
 def process_thread_environment_values(spec, context):
     job = context.get("job") or {}
-    if (
+    if job.get("job_type") == "fragmentation_v33":
+        threads = _fragmentation_v33_process_threads(spec)
+    elif (
         context.get("kind") == "accelerator_worker"
         or job.get("job_type") == "work_package"
-        or job.get("job_type") == "fragmentation_v33"
     ):
         threads = _resource_value(spec, "package_process_threads", 2)
     elif job.get("job_type") == "unit_fit":
-        threads = _resource_value(spec, "unit_process_threads", 1)
+        threads = _unit_fit_process_threads(spec)
     else:
         threads = _resource_value(spec, "assembly_process_threads", 1)
     value = str(threads)
@@ -98,6 +145,179 @@ def _final_artifact_size_observation_log_message(observation):
     )
 
 
+class PipelinePhaseTiming:
+    """Record high-level wall-clock stage timing without summing parallel work."""
+
+    STAGES = (
+        "work_package",
+        "fragmentation_v33",
+        "unit_fit",
+        "finalize",
+        "assembly",
+        "acceptance",
+    )
+
+    def __init__(self, spans=None, *, recovered_incomplete_span_count=0):
+        self._spans = list(spans or [])
+        self._recovered_incomplete_span_count = max(
+            0, int(recovered_incomplete_span_count)
+        )
+
+    @classmethod
+    def from_state(cls, value):
+        """Recover durable completed observations, never counting downtime."""
+
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            return cls()
+        try:
+            recorded_at = float(value.get("recorded_at"))
+        except (TypeError, ValueError):
+            recorded_at = 0.0
+        spans = []
+        recovered_incomplete = 0
+        for item in value.get("spans") or []:
+            if not isinstance(item, dict) or item.get("stage") not in cls.STAGES:
+                continue
+            try:
+                started_at = float(item["started_at"])
+                finished_at = item.get("finished_at")
+                if finished_at is None:
+                    finished_at = float(item.get("last_observed_at") or recorded_at)
+                    recovered_incomplete += 1
+                else:
+                    finished_at = float(finished_at)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if started_at <= 0 or finished_at < started_at:
+                continue
+            spans.append(
+                {
+                    "stage": item["stage"],
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+            )
+        return cls(
+            spans,
+            recovered_incomplete_span_count=recovered_incomplete,
+        )
+
+    def start(self, stage, token, started_at):
+        if stage not in self.STAGES:
+            return
+        self._spans.append(
+            {
+                "stage": stage,
+                "token": str(token),
+                "started_at": float(started_at),
+                "finished_at": None,
+                "last_observed_at": float(started_at),
+            }
+        )
+
+    def observe_active(self, observed_at):
+        for item in self._spans:
+            if item.get("finished_at") is None:
+                item["last_observed_at"] = max(
+                    float(observed_at), item["started_at"]
+                )
+
+    def finish(self, token, finished_at):
+        for item in reversed(self._spans):
+            if item.get("token") == str(token) and item.get("finished_at") is None:
+                item["finished_at"] = max(float(finished_at), item["started_at"])
+                item["last_observed_at"] = item["finished_at"]
+                return
+
+    def finish_active(self, finished_at):
+        for item in self._spans:
+            if item.get("finished_at") is None:
+                item["finished_at"] = max(float(finished_at), item["started_at"])
+                item["last_observed_at"] = item["finished_at"]
+
+    @staticmethod
+    def _union_elapsed(spans, now):
+        intervals = sorted(
+            (
+                float(item["started_at"]),
+                max(float(item["started_at"]), float(item.get("finished_at") or now)),
+            )
+            for item in spans
+        )
+        elapsed = 0.0
+        left = right = None
+        for start, end in intervals:
+            if left is None:
+                left, right = start, end
+            elif start > right:
+                elapsed += right - left
+                left, right = start, end
+            else:
+                right = max(right, end)
+        return elapsed + (right - left if left is not None else 0.0)
+
+    def summary(self, now):
+        now = float(now)
+        result = {
+            "schema_version": 1,
+            "measurement": "wall_clock_union_sec",
+            "status": (
+                "partial_recovered"
+                if self._recovered_incomplete_span_count
+                else "in_progress"
+                if any(item.get("finished_at") is None for item in self._spans)
+                else "complete"
+            ),
+            "recovered_incomplete_span_count": self._recovered_incomplete_span_count,
+            "stages": {},
+        }
+        by_stage = {stage: [] for stage in self.STAGES}
+        for item in self._spans:
+            if item.get("stage") in by_stage:
+                by_stage[item["stage"]].append(item)
+        for stage, spans in by_stage.items():
+            result["stages"][stage] = {
+                "wall_clock_sec": round(self._union_elapsed(spans, now), 3),
+                "invocation_count": len(spans),
+            }
+        unit_spans = by_stage["unit_fit"]
+        package_spans = by_stage["work_package"]
+        last_unit_end = max(
+            (float(item.get("finished_at") or now) for item in unit_spans), default=0.0
+        )
+        last_package_end = max(
+            (float(item.get("finished_at") or now) for item in package_spans), default=0.0
+        )
+        result["unit_fit_total_wall_clock_sec"] = result["stages"]["unit_fit"][
+            "wall_clock_sec"
+        ]
+        result["unit_fit_tail_after_work_package_sec"] = round(
+            (
+                max(0.0, last_unit_end - last_package_end)
+                if last_unit_end and last_package_end
+                else 0.0
+            ),
+            3,
+        )
+        return result
+
+    def state(self, now):
+        return {
+            "schema_version": 1,
+            "recorded_at": float(now),
+            "spans": [
+                {
+                    "stage": item["stage"],
+                    "started_at": item["started_at"],
+                    "finished_at": item.get("finished_at"),
+                    "last_observed_at": item.get("last_observed_at"),
+                }
+                for item in self._spans
+            ],
+            "summary": self.summary(now),
+        }
+
+
 class V5AsyncInferenceRunner(QObject):
     """Run one persistent accelerator worker and a bounded CPU geometry pool."""
 
@@ -141,6 +361,7 @@ class V5AsyncInferenceRunner(QObject):
         self._processes = {}
         self._assembly_queue = []
         self._started_at = 0.0
+        self._phase_timing = PipelinePhaseTiming()
         self._manual_package_reset = {}
         self._scheduler = QTimer(self)
         self._scheduler.setInterval(500)
@@ -188,6 +409,7 @@ class V5AsyncInferenceRunner(QObject):
             )
             self._database.interrupt_run_jobs(self._spec["run_id"])
         self._manual_package_reset = {}
+        self._phase_timing = self._load_phase_timing()
         if reset_failed_packages:
             self._manual_package_reset = reset_failed_work_packages(
                 self._spec,
@@ -217,6 +439,7 @@ class V5AsyncInferenceRunner(QObject):
         self._accelerator_crash_count = 0
         self._assembly_queue = []
         self._started_at = time.time()
+        self._persist_phase_timing()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
         size_prediction = (
             (self._spec.get("storage_preflight") or {}).get(
@@ -370,9 +593,17 @@ class V5AsyncInferenceRunner(QObject):
                     + str(candidate_counts),
                 )
                 return
-            candidate_limit = min(
+            configured_candidate_limit = min(
                 4,
                 max(1, int(fragmentation.get("max_workers", 4))),
+            )
+            candidate_limit = min(
+                configured_candidate_limit,
+                fragmentation_v33_worker_limit(
+                    self._spec,
+                    package_active=accelerator_active,
+                    unit_fit_active=unit_active,
+                ),
             )
             leased_candidate_ids = set()
             while candidate_active < candidate_limit:
@@ -398,6 +629,7 @@ class V5AsyncInferenceRunner(QObject):
         cpu_limit = cpu_worker_limit(
             self._spec,
             package_active=accelerator_active,
+            fragmentation_v33_active=candidate_active,
         )
         while unit_active < cpu_limit:
             job = self._database.lease_next_job(
@@ -549,6 +781,40 @@ class V5AsyncInferenceRunner(QObject):
             {"kind": "scale_acceptance"},
         )
 
+    @staticmethod
+    def _timing_stage(context):
+        kind = str((context or {}).get("kind") or "")
+        job = (context or {}).get("job") or {}
+        if kind == "accelerator_worker":
+            return "work_package"
+        if job.get("job_type") == "fragmentation_v33":
+            return "fragmentation_v33"
+        if job.get("job_type") == "unit_fit":
+            return "unit_fit"
+        return {
+            "finalize_rasters": "finalize",
+            "assemble": "assembly",
+            "scale_acceptance": "acceptance",
+        }.get(kind, "")
+
+    def _phase_timing_path(self):
+        return Path(self._spec["run_dir"]) / "logs" / "phase_timing.json"
+
+    def _load_phase_timing(self):
+        try:
+            value = json.loads(self._phase_timing_path().read_text(encoding="utf-8"))
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            return PipelinePhaseTiming()
+        return PipelinePhaseTiming.from_state(value)
+
+    def _persist_phase_timing(self):
+        if not self._spec.get("run_dir"):
+            return
+        atomic_write_json(
+            self._phase_timing_path(),
+            self._phase_timing.state(time.time()),
+        )
+
     def _start_process(self, label, script, arguments, context):
         token = uuid.uuid4().hex
         path = str(Path(self.scripts_dir) / script)
@@ -574,6 +840,10 @@ class V5AsyncInferenceRunner(QObject):
             "owns_process_group": owns_process_group,
         }
         self._processes[token] = entry
+        stage = self._timing_stage(context)
+        if stage:
+            self._phase_timing.start(stage, token, entry["context"]["started_at"])
+            self._persist_phase_timing()
         process.readyReadStandardOutput.connect(lambda t=token: self._read(t, "stdout"))
         process.readyReadStandardError.connect(lambda t=token: self._read(t, "stderr"))
         process.finished.connect(
@@ -680,6 +950,10 @@ class V5AsyncInferenceRunner(QObject):
         self._processes.pop(token, None)
         entry["process"].deleteLater()
         context = entry["context"]
+        phase_timing = getattr(self, "_phase_timing", None)
+        if phase_timing is not None:
+            phase_timing.finish(token, time.time())
+            self._persist_phase_timing()
         label = context["label"]
         success = int(exit_code) == 0 and not entry["forced_error"]
         error = entry["forced_error"] or ("" if success else f"{label} failed (rc={int(exit_code)})")
@@ -816,6 +1090,8 @@ class V5AsyncInferenceRunner(QObject):
             (self._spec.get("scaling") or {}).get("max_partition_runtime_sec", 900)
         )
         now = time.time()
+        self._phase_timing.observe_active(now)
+        self._persist_phase_timing()
         for entry in list(self._processes.values()):
             context = entry["context"]
             job = context.get("job")
@@ -1039,6 +1315,10 @@ class V5AsyncInferenceRunner(QObject):
             return
         self._scheduler.stop()
         self._watchdog.stop()
+        phase_timing = getattr(self, "_phase_timing", None)
+        if phase_timing is not None:
+            phase_timing.finish_active(time.time())
+            self._persist_phase_timing()
         self._running = False
         if not success and self._processes:
             entries = list(self._processes.values())
@@ -1086,6 +1366,12 @@ class V5AsyncInferenceRunner(QObject):
             "failed_streams": failed_streams,
             "streams": ready_streams if success else failed_streams,
             "elapsed_sec": round(time.time() - self._started_at, 3),
+            "phase_timing": (
+                phase_timing.summary(time.time())
+                if phase_timing is not None
+                else PipelinePhaseTiming().summary(time.time())
+            ),
+            "deployment_identity": self._spec.get("deployment_identity") or {},
         }
         if self._manual_package_reset:
             result["manual_package_reset"] = dict(self._manual_package_reset)
@@ -1120,6 +1406,8 @@ class V5AsyncInferenceRunner(QObject):
             "success": bool(success),
             "error": str(error),
             "elapsed_sec": result["elapsed_sec"],
+            "phase_timing": result["phase_timing"],
+            "deployment_identity": result["deployment_identity"],
             "tile_grid": self._spec.get("tile_grid") or {},
             "spatial_plan_summary": self._spec.get("spatial_plan_summary") or {},
             "storage_preflight": self._spec.get("storage_preflight") or {},

@@ -56,6 +56,10 @@ FINGERPRINT_FILES = (
     "../.loess-project-id",
     "../runtime/loess_launcher.sh",
 )
+REQUIRED_VECTOR_DEPENDENCY_VERSIONS = {
+    "pyarrow": "25.0.1",
+    "pyogrio": "0.13.0",
+}
 
 
 def add_check(checks, check_id, status, value, source, message="", fix=""):
@@ -70,6 +74,24 @@ def add_check(checks, check_id, status, value, source, message="", fix=""):
 
 
 def import_dependency(name):
+    expected_version = REQUIRED_VECTOR_DEPENDENCY_VERSIONS.get(name)
+    if expected_version is not None:
+        try:
+            installed_version = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None, "not installed", f"{name} is not installed"
+        if installed_version != expected_version:
+            detail = (
+                "; older releases import the deprecated shapely.geos module"
+                if name == "pyogrio" and _version_tuple(installed_version) < (0, 11, 1)
+                else ""
+            )
+            return (
+                None,
+                installed_version,
+                f"{name} =={expected_version} is required by the frozen "
+                f"vector data plane{detail}",
+            )
     try:
         module = importlib.import_module(name)
         return module, getattr(module, "__version__", "installed"), ""

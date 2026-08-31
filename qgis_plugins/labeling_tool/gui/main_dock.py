@@ -1734,6 +1734,7 @@ class LabelingDockWidget(QgsDockWidget):
                 skip_accepted=bool(ctx.get("skip_accepted", False)),
                 config_fingerprint=report.get("config_fingerprint", ""),
                 range_selection=ctx.get("range_selection") or {},
+                deployment_project_root=Path(ctx["scripts_dir"]).parent,
             )
             self.monitor_dialog.bind_state_database(
                 database_path,

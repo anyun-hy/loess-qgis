@@ -54,6 +54,20 @@ def _pipeline_timing(path: Path) -> dict[str, float]:
     }
 
 
+def _phase_timing_snapshot(run_dir: Path) -> dict[str, Any]:
+    """Read runner-owned timing as an observation; acceptance never invents it."""
+
+    path = run_dir / "logs" / "phase_timing.json"
+    if not path.is_file():
+        return {}
+    try:
+        value = load_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    summary = value.get("summary") if isinstance(value, dict) else None
+    return dict(summary) if isinstance(summary, dict) else {}
+
+
 def _scale_level(run_dir: Path, tile_count: int) -> str:
     preparation = run_dir / "logs" / "l0_preparation_report.json"
     if preparation.is_file():
@@ -215,6 +229,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
     metrics = _database_metrics(database, run_id)
     cleanup = database.artifact_cleanup_summary(run_id)
     timing = _pipeline_timing(run_dir / "logs" / "pipeline.jsonl")
+    phase_timing = _phase_timing_snapshot(run_dir)
 
     model_load_counts: Counter[str] = Counter()
     model_cache_hit_counts: Counter[str] = Counter()
@@ -443,6 +458,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "run_id": run_id,
         "run_spec": str(spec_path),
         "run_spec_sha256": sha256_file(spec_path),
+        "deployment_identity": spec.get("deployment_identity") or {},
         "tile_count": int(metrics["counts"]["tiles"]),
         "partition_count": int(metrics["counts"]["partitions"]),
         "spatial_unit_count": expected_units,
@@ -492,6 +508,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "elapsed_sec": elapsed,
         "longest_no_heartbeat_sec": float(timing["longest_no_heartbeat_sec"]),
         "pipeline_log_record_count": int(timing["record_count"]),
+        "phase_timing_snapshot": phase_timing,
         "storage": {
             "preflight": storage,
             "actual_run_bytes": actual_run_bytes,

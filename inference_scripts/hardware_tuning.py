@@ -272,6 +272,7 @@ def resolve_hardware_tuning(
         "assembly_validation_workers": assembly_workers,
         "unit_process_threads": 1,
         "package_process_threads": package_threads,
+        "fragmentation_v33_process_threads": package_threads,
         "assembly_process_threads": 1,
     }
     automatic_fields = [
