@@ -164,6 +164,43 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
     }
 
 
+def _final_artifact_size_observation(
+    storage: dict[str, Any],
+    actual_bytes: int,
+) -> dict[str, Any]:
+    """Attach completion data to a frozen, observation-only prediction."""
+
+    prediction = dict(storage.get("final_artifact_size_prediction") or {})
+    actual = int(actual_bytes)
+    if str(prediction.get("status") or "") != "predicted":
+        return {
+            "status": str(prediction.get("status") or "not_available"),
+            "actual_final_artifact_bytes": actual,
+            "observation_only": True,
+        }
+    try:
+        predicted = int(prediction["predicted_final_artifact_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return {
+            "status": "invalid",
+            "actual_final_artifact_bytes": actual,
+            "observation_only": True,
+        }
+    if predicted < 1:
+        return {
+            "status": "invalid",
+            "actual_final_artifact_bytes": actual,
+            "observation_only": True,
+        }
+    difference = actual - predicted
+    return {
+        **prediction,
+        "actual_final_artifact_bytes": actual,
+        "signed_difference_bytes": difference,
+        "signed_difference_ratio": difference / predicted,
+    }
+
+
 def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
     spec_path = Path(run_spec_path).expanduser().resolve()
     spec = load_json(spec_path)
@@ -388,22 +425,13 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
     }
     actual_run_bytes = directory_size(run_dir)
     actual_permanent_bytes = int(metrics["ready_artifact_bytes"])
-    estimated_permanent = int(
-        storage.get("estimated_permanent_output_bytes")
-        or storage.get("permanent_base_bytes")
-        or 0
+    final_artifact_observation = _final_artifact_size_observation(
+        storage,
+        actual_permanent_bytes,
     )
-    disk_deviation = (
-        abs(actual_permanent_bytes - estimated_permanent) / estimated_permanent
-        if estimated_permanent > 0
-        else 0.0
-    )
+    # The permanent-output reserve is a disk-admission control. It is not a
+    # terminal-output prediction and must not affect acceptance as one.
     warnings = []
-    if estimated_permanent > 0 and disk_deviation > 0.20:
-        warnings.append(
-            "ready permanent Artifact bytes differ from the frozen permanent "
-            "output estimate by more than 20%"
-        )
     hard_passed = all(hard_gates.values())
     status = "failed" if not hard_passed else "warning" if warnings else "passed"
     elapsed = float(timing["elapsed_sec"] or package_elapsed)
@@ -472,7 +500,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
                 0, actual_run_bytes - actual_permanent_bytes
             ),
             "ready_artifact_bytes": metrics["ready_artifact_bytes"],
-            "permanent_estimate_deviation_ratio": disk_deviation,
+            "final_artifact_size_observation": final_artifact_observation,
             "cache_budget_gate_applicable": cache_budget_gate_applicable,
             "frozen_cache_budget_bytes": frozen_cache_budget_bytes,
             "peak_cache_bytes": peak_cache_bytes,
@@ -500,6 +528,9 @@ def main(argv=None) -> int:
                     "status": report["status"],
                     "level": report["level"],
                     "hard_gate_passed": report["hard_gate_passed"],
+                    "final_artifact_size_observation": report["storage"].get(
+                        "final_artifact_size_observation"
+                    ),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),

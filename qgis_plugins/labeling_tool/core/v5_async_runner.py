@@ -64,6 +64,40 @@ def process_thread_environment_values(spec, context):
     }
 
 
+def _final_artifact_size_prediction_log_message(prediction):
+    """Return the per-Run forecast line written to the monitor log."""
+
+    value = dict(prediction or {})
+    try:
+        predicted = int(value["predicted_final_artifact_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    return f"本次 Run 预计最终保存 {predicted / 1024**3:.2f} GiB；完成后回报实际值和差额"
+
+
+def _final_artifact_size_observation_log_message(observation):
+    """Return the per-Run final-size result written to the monitor log."""
+
+    value = dict(observation or {})
+    try:
+        actual = int(value["actual_final_artifact_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    gib = 1024**3
+    try:
+        predicted = int(value["predicted_final_artifact_bytes"])
+        difference = int(value["signed_difference_bytes"])
+        ratio = float(value["signed_difference_ratio"])
+    except (KeyError, TypeError, ValueError):
+        return f"本次 Run 最终保存 {actual / gib:.2f} GiB"
+    sign = "+" if difference >= 0 else "−"
+    return (
+        f"本次 Run：预计最终保存 {predicted / gib:.2f} GiB；"
+        f"实际最终保存 {actual / gib:.2f} GiB；"
+        f"差额 {sign}{abs(difference) / gib:.2f} GiB（{ratio:+.2%}）"
+    )
+
+
 class V5AsyncInferenceRunner(QObject):
     """Run one persistent accelerator worker and a bounded CPU geometry pool."""
 
@@ -184,6 +218,17 @@ class V5AsyncInferenceRunner(QObject):
         self._assembly_queue = []
         self._started_at = time.time()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
+        size_prediction = (
+            (self._spec.get("storage_preflight") or {}).get(
+                "final_artifact_size_prediction"
+            )
+            or {}
+        )
+        size_prediction_message = _final_artifact_size_prediction_log_message(
+            size_prediction
+        )
+        if size_prediction_message:
+            self.log_line.emit("system", f"[final-artifact-size] {size_prediction_message}")
         if resume and recovered_package_jobs:
             self.log_line.emit(
                 "system",
@@ -1049,6 +1094,23 @@ class V5AsyncInferenceRunner(QObject):
         if scale_report.is_file():
             result["scale_acceptance_report"] = str(scale_report)
             result["scale_acceptance_report_sha256"] = sha256_file(scale_report)
+            try:
+                scale_value = json.loads(scale_report.read_text(encoding="utf-8"))
+                observation = (
+                    (scale_value.get("storage") or {}).get(
+                        "final_artifact_size_observation"
+                    )
+                    or {}
+                )
+                if isinstance(observation, dict):
+                    result["final_artifact_size_observation"] = observation
+            except (OSError, ValueError):
+                pass
+        size_observation_message = _final_artifact_size_observation_log_message(
+            result.get("final_artifact_size_observation")
+        )
+        if size_observation_message:
+            self.log_line.emit("system", f"[final-artifact-size] {size_observation_message}")
         atomic_write_json(run_dir / "run_manifest.json", result)
         counts = self._database.job_counts(self._spec["run_id"])
         run_report = {
@@ -1061,6 +1123,9 @@ class V5AsyncInferenceRunner(QObject):
             "tile_grid": self._spec.get("tile_grid") or {},
             "spatial_plan_summary": self._spec.get("spatial_plan_summary") or {},
             "storage_preflight": self._spec.get("storage_preflight") or {},
+            "final_artifact_size_observation": result.get(
+                "final_artifact_size_observation"
+            ) or {},
             "job_counts": counts,
             "artifact_cleanup": self._database.artifact_cleanup_summary(
                 self._spec["run_id"]

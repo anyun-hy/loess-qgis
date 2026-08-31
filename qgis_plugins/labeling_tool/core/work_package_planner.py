@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import shutil
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,6 +19,17 @@ PERMANENT_RASTER_BYTES_PER_PIXEL_PER_STREAM = (
 VECTOR_OUTPUT_BYTES_PER_CORE_PIXEL_PER_STREAM = 1
 MIN_VECTOR_OUTPUT_RESERVE_BYTES = 64 * GIB
 PERMANENT_UNCERTAINTY_RATIO = 0.25
+# These are terminal ready Artifact totals from four accepted Tencent runs of
+# the frozen production contract: Swin-B, SETR, MambaOut-B, approved Fusion,
+# V3.3, Deflate Core GeoTIFFs, and cleanup-complete GeoPackage outputs.
+FINAL_ARTIFACT_OBSERVATION_SCHEMA_VERSION = 1
+FINAL_ARTIFACT_OBSERVATION_STREAM_COUNT = 4
+FINAL_ARTIFACT_OBSERVATION_CALIBRATION = (
+    ("20260811_100849_b56019", 20_999_430_144, 258_171_435_272),
+    ("20260817_185430_1d7a8d", 1_318_813_696, 17_059_554_866),
+    ("20260819_142656_06e6c1", 330_319_374, 5_658_539_302),
+    ("20260830_090819_0a19d1", 330_319_374, 5_063_905_503),
+)
 FILESYSTEM_FLOOR_RATIO = 0.05
 AUTO_HEADROOM_FRACTION = 0.50
 AUTO_VOLUME_FRACTION_CAP = 0.20
@@ -120,6 +132,62 @@ def permanent_output_reserve(
         "vector_minimum_reserve_bytes": MIN_VECTOR_OUTPUT_RESERVE_BYTES,
         "vector_scaled_reserve_bytes": vector_scaled_bytes,
         "vector_output_reserve_bytes": vector_reserve_bytes,
+    }
+
+
+def final_artifact_size_prediction(
+    *,
+    core_pixel_count: int,
+    stream_count: int,
+) -> dict[str, int | str | bool | list[str]]:
+    """Freeze one observation-only terminal Artifact prediction for a Run.
+
+    This deliberately has no range, warning threshold, or admission effect.
+    It exists only so a completed Run can show its actual terminal bytes next
+    to a prediction based on the same four-stream output contract.
+    """
+
+    core_pixels = int(core_pixel_count)
+    streams = int(stream_count)
+    if core_pixels < 1 or streams < 1:
+        raise WorkPackagePlanError("final Artifact prediction requires positive sizes")
+    base = {
+        "schema_version": FINAL_ARTIFACT_OBSERVATION_SCHEMA_VERSION,
+        "observation_only": True,
+        "core_pixel_count": core_pixels,
+        "stream_count": streams,
+    }
+    if streams != FINAL_ARTIFACT_OBSERVATION_STREAM_COUNT:
+        return {
+            **base,
+            "status": "not_applicable",
+            "reason": "calibration_requires_four_streams",
+        }
+
+    samples = [
+        (
+            sample_core_pixels * FINAL_ARTIFACT_OBSERVATION_STREAM_COUNT,
+            final_bytes,
+        )
+        for _run_id, sample_core_pixels, final_bytes
+        in FINAL_ARTIFACT_OBSERVATION_CALIBRATION
+    ]
+    count = len(samples)
+    sum_x = sum(item[0] for item in samples)
+    sum_y = sum(item[1] for item in samples)
+    sum_xx = sum(item[0] * item[0] for item in samples)
+    sum_xy = sum(item[0] * item[1] for item in samples)
+    denominator = count * sum_xx - sum_x * sum_x
+    if denominator <= 0:
+        raise WorkPackagePlanError("final Artifact prediction calibration is degenerate")
+    slope = Fraction(count * sum_xy - sum_x * sum_y, denominator)
+    intercept = Fraction(sum_y - slope * sum_x, count)
+    predicted = intercept + slope * (core_pixels * streams)
+    predicted_bytes = max(0, int(predicted + Fraction(1, 2)))
+    return {
+        **base,
+        "status": "predicted",
+        "predicted_final_artifact_bytes": predicted_bytes,
     }
 
 
@@ -468,6 +536,10 @@ def storage_preflight(
     if input_per_tile < 0:
         raise WorkPackagePlanError("input Tile bytes cannot be negative")
     permanent_base = raster_permanent + vector_reserve
+    final_artifact_prediction = final_artifact_size_prediction(
+        core_pixel_count=core_pixel_count,
+        stream_count=streams,
+    )
     permanent_estimate_uncertainty = int(
         math.ceil(permanent_base * PERMANENT_UNCERTAINTY_RATIO)
     )
@@ -611,6 +683,7 @@ def storage_preflight(
         "input_tile_bytes_per_tile": input_per_tile,
         "input_tile_storage_mode": "work_package_temporary",
         "estimated_input_tile_bytes": peak_input,
+        "final_artifact_size_prediction": final_artifact_prediction,
         "estimated_permanent_output_bytes": permanent_base,
         "estimated_permanent_raster_bytes": raster_permanent,
         # Raster-only compatibility field for proportional Core completion.
