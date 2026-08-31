@@ -146,6 +146,7 @@ from ..core.spatial_planner import plan_spatial_units
 
 logger = logging.getLogger("labeling_tool.main_dock")
 
+
 CHECK_LABELS = {
     "conda_env": "Conda 环境",
     "config_yaml": "配置文件",
@@ -2072,10 +2073,11 @@ class LabelingDockWidget(QgsDockWidget):
         ready_count = len(result.get("ready_streams") or [])
         failed_count = len(result.get("failed_streams") or [])
         fusion_ready = any(item.get("kind") == "fusion" for item in result.get("ready_streams") or [])
-        self.result_summary_label.setText(
+        result_summary = (
             f"模型/融合结果流 {ready_count} 个；Fusion {'成功' if fusion_ready else '无或失败'}；"
             f"失败 {failed_count} 个"
         )
+        self.result_summary_label.setText(result_summary)
         self.open_refinement_btn.setEnabled(ready_count > 0)
 
         self._pipeline_running = False
@@ -2093,8 +2095,11 @@ class LabelingDockWidget(QgsDockWidget):
             self._set_progress_terminal("失败")
 
         if result.get("success"):
-            QMessageBox.information(self, "完成",
-                f"推理完成，已加载 {len(result.get('ready_streams') or [])} 个结果流")
+            QMessageBox.information(
+                self,
+                "完成",
+                f"推理完成，已加载 {len(result.get('ready_streams') or [])} 个结果流",
+            )
         elif not stopped:
             run_report = result.get("run_report", "")
             msg = result.get("error") or "推理流程失败"

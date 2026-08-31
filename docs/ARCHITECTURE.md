@@ -65,6 +65,9 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
 - Run JSON 只保存冻结配置和摘要，不保存几十万 Tile 明细；
 - 临时 Tile/probability Artifact 只有在依赖提交后才按引用关系清理。
+- 最终成品大小预测是观察指标：新 Run 冻结单一预测值，结束后回报实际 ready
+  Artifact、带符号差额和比例；不设置上下限、不生成 warning，也不参与任何
+  验收或磁盘准入决策。
 
 ## 6. 模型与 Fusion 合同
 

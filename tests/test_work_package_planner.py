@@ -7,6 +7,7 @@ from labeling_tool.core.work_package_planner import (
     PERMANENT_RASTER_BYTES_PER_PIXEL_PER_STREAM,
     WorkPackagePlanError,
     calculate_package_tile_limit,
+    final_artifact_size_prediction,
     fusion_accumulator_atomic_overhead,
     fusion_accumulator_bytes_per_tile,
     permanent_output_reserve,
@@ -14,6 +15,26 @@ from labeling_tool.core.work_package_planner import (
     resolve_frozen_tile_batch_size,
     storage_preflight,
 )
+
+
+def test_final_artifact_prediction_is_a_single_observation_only_value():
+    prediction = final_artifact_size_prediction(
+        core_pixel_count=330_319_374,
+        stream_count=4,
+    )
+
+    assert prediction == {
+        "schema_version": 1,
+        "observation_only": True,
+        "core_pixel_count": 330_319_374,
+        "stream_count": 4,
+        "status": "predicted",
+        "predicted_final_artifact_bytes": 5_232_930_535,
+    }
+    assert final_artifact_size_prediction(
+        core_pixel_count=330_319_374,
+        stream_count=3,
+    )["status"] == "not_applicable"
 
 
 def test_fusion_accumulator_budget_matches_strategy_channels():
@@ -266,6 +287,9 @@ def test_storage_preflight_uses_measured_values_and_preserves_reserve(tmp_path):
     assert report["estimated_permanent_output_bytes"] == (
         raster_bytes + vector_reserve
     )
+    assert report["final_artifact_size_prediction"]["status"] == "predicted"
+    assert "lower_bound_bytes" not in report["final_artifact_size_prediction"]
+    assert "upper_bound_bytes" not in report["final_artifact_size_prediction"]
     assert report["estimated_permanent_bytes"] == raster_bytes
     assert report["vector_output_reserve_bytes"] == vector_reserve
     assert report["nondecaying_permanent_reserve_bytes"] == (
