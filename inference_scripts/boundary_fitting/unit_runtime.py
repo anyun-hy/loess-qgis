@@ -15,7 +15,8 @@ from typing import Any, Mapping
 import numpy as np
 import rasterio
 from affine import Affine
-from rasterio.features import geometry_mask, shapes
+from rasterio.enums import MergeAlg
+from rasterio.features import geometry_mask, rasterize, shapes
 from rasterio.windows import Window
 from scipy import ndimage
 from shapely.affinity import affine_transform
@@ -53,6 +54,11 @@ class UnitRuntimeError(RuntimeError):
 
 GPKG_ATOMIC_OVERHEAD_BYTES = 4 * 1024**2
 JSON_ATOMIC_OVERHEAD_BYTES = 64 * 1024
+# The per-polygon path is faster for small units because it avoids two complete
+# rasterizations and a stable grouping pass. Real 512 px measurements put 124
+# polygons below the crossover, while 400 polygons over 1M pixels are safely
+# above it. Keep the choice deterministic and independent of machine timing.
+BATCHED_CONFIDENCE_WORK_THRESHOLD = 100_000_000
 
 
 def _remaining_permanent_reserve_bytes(
@@ -329,6 +335,76 @@ def _attach_confidence(
     confidence = probabilities.max(axis=0)
     window = unit["pixel_window"]
     transform = Affine.translation(int(window["x0"]), int(window["y0"]))
+    if not records:
+        return
+    if len(records) * confidence.size < BATCHED_CONFIDENCE_WORK_THRESHOLD:
+        _attach_confidence_individually(
+            records,
+            confidence,
+            valid_mask,
+            transform,
+        )
+        return
+
+    indexed_shapes = [
+        (mapping(record["geometry"]), index)
+        for index, record in enumerate(records)
+    ]
+    record_ids = rasterize(
+        indexed_shapes,
+        out_shape=confidence.shape,
+        transform=transform,
+        fill=-1,
+        dtype=np.int32,
+    )
+    coverage_count = rasterize(
+        ((geometry, 1) for geometry, _index in indexed_shapes),
+        out_shape=confidence.shape,
+        transform=transform,
+        fill=0,
+        dtype=np.int32,
+        merge_alg=MergeAlg.add,
+    )
+    if np.any((coverage_count > 1) & valid_mask):
+        _attach_confidence_individually(
+            records,
+            confidence,
+            valid_mask,
+            transform,
+        )
+        return
+
+    selected = (record_ids >= 0) & valid_mask
+    selected_ids = record_ids[selected]
+    selected_values = confidence[selected]
+    if selected_ids.size:
+        # Stable sorting preserves the row-major pixel order used by boolean
+        # indexing in the former per-polygon implementation. Each group's
+        # NumPy mean/std therefore retains the same accumulation semantics.
+        order = np.argsort(selected_ids, kind="stable")
+        selected_ids = selected_ids[order]
+        selected_values = selected_values[order]
+        counts = np.bincount(selected_ids, minlength=len(records))
+    else:
+        counts = np.zeros(len(records), dtype=np.int64)
+
+    offset = 0
+    for index, record in enumerate(records):
+        count = int(counts[index])
+        values = selected_values[offset : offset + count]
+        offset += count
+        record["confidence_mean"] = float(values.mean()) if count else 0.0
+        record["confidence_std"] = float(values.std()) if count else 0.0
+
+
+def _attach_confidence_individually(
+    records: list[dict[str, Any]],
+    confidence: np.ndarray,
+    valid_mask: np.ndarray,
+    transform: Affine,
+) -> None:
+    """Preserve independent selection when polygons overlap at pixel centres."""
+
     for record in records:
         selected = geometry_mask(
             [mapping(record["geometry"])],

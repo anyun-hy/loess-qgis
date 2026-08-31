@@ -2,7 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from labeling_tool.core.run_builder_v5 import create_v5_run
+from labeling_tool.core.run_builder_v5 import create_v5_run, deployment_identity
 from labeling_tool.core.run_state_db import RunStateDB
 
 
@@ -55,6 +55,23 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         "working_bytes_per_tile": 4096,
         "status": "passed",
     }
+    deployment_project = tmp_path / "deployment-project"
+    deployment_project.mkdir()
+    (deployment_project / "project_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "deployment_kind": "loess_project",
+                "git_sha": "a" * 40,
+                "source": {
+                    "kind": "git_worktree",
+                    "git_dirty": False,
+                    "source_bundle_sha256": "b" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     spec, spec_path, database_path = create_v5_run(
         state_database=tmp_path / "state.sqlite",
         output_root=tmp_path / "output",
@@ -90,8 +107,11 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
             "overlap_tolerance": 0.000001,
         },
         run_id="20260717_210000_fixture",
+        deployment_project_root=deployment_project,
     )
     assert spec["schema_version"] == 2
+    assert spec["deployment_identity"]["status"] == "manifest_recorded"
+    assert spec["deployment_identity"]["git_sha"] == "a" * 40
     assert spec["fragmentation_regularization"] == {
         "enabled": True,
         "policy_id": "semantic_optimized_200_v3",
@@ -154,6 +174,32 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         assert first_tile[1] == ""
     assert len(RunStateDB(database_path).package_tiles(spec["run_id"], first_package)) <= 600
     assert json.loads(spec_path.read_text())["state_db"] == str(database_path)
+
+
+def test_deployment_identity_freezes_manifest_provenance_without_local_git(tmp_path):
+    project = tmp_path / "deployment-project"
+    project.mkdir()
+    manifest = {
+        "schema_version": 2,
+        "deployment_kind": "loess_project",
+        "git_sha": "a" * 40,
+        "source": {
+            "kind": "release_archive",
+            "git_dirty": False,
+            "source_bundle_sha256": "b" * 64,
+        },
+    }
+    path = project / "project_manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    identity = deployment_identity(project)
+
+    assert identity["status"] == "manifest_recorded"
+    assert identity["verification_scope"] == "manifest_fields_and_digest_only"
+    assert identity["git_sha"] == "a" * 40
+    assert identity["source_bundle_sha256"] == "b" * 64
+    assert len(identity["project_manifest_sha256"]) == 64
+    assert deployment_identity(tmp_path / "missing")["git_sha"] == "unknown"
 
 
 def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):

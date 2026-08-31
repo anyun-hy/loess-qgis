@@ -1,6 +1,8 @@
 from pathlib import Path
 import ast
 import re
+import subprocess
+import sys
 
 import yaml
 
@@ -121,6 +123,11 @@ def test_inference_environment_contract_has_two_minimal_platform_locks():
     }
     for environment in (ubuntu, macos):
         assert not any(
+            isinstance(item, str)
+            and item.split("=", 1)[0] in {"pyarrow", "pyogrio"}
+            for item in environment["dependencies"]
+        )
+        assert not any(
             isinstance(item, str) and item.split("=", 1)[0] == "qgis"
             for item in environment["dependencies"]
         )
@@ -129,13 +136,32 @@ def test_inference_environment_contract_has_two_minimal_platform_locks():
             for item in environment["dependencies"]
             if isinstance(item, dict) and "pip" in item
         )
-        assert required_sam3_packages <= set(pip_packages)
+        assert required_sam3_packages | {
+            "pyarrow==25.0.1",
+            "pyogrio==0.13.0",
+        } <= set(pip_packages)
 
     initializer = (ROOT / "bash" / "init_project.sh").read_text(
         encoding="utf-8"
     )
     assert "torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0" in initializer
     assert "https://download.pytorch.org/whl/cu124" in initializer
+
+
+def test_pyogrio_import_has_no_shapely_geos_deprecation_warning():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::DeprecationWarning",
+            "-c",
+            "import pyogrio",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_environment_check_owns_and_terminates_its_process_group():

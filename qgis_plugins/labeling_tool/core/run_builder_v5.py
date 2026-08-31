@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime as _datetime
+import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -27,6 +29,8 @@ from .work_package_planner import plan_work_packages
 RUN_SPEC_SCHEMA_VERSION = 2
 V3_POLICY_ID = "semantic_optimized_200_v3"
 V33_POLICY_ID = "fragmentation_v33_configurable_absorption_v1"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 logger = logging.getLogger("labeling_tool.run_builder_v5")
 
 
@@ -42,12 +46,92 @@ def _extent(value: Mapping[str, Any]) -> dict[str, float]:
 
 
 def _json_sha(value: Mapping[str, Any]) -> str:
-    import hashlib
-
     encoded = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def deployment_identity(project_root: str | Path | None) -> dict[str, Any]:
+    """Freeze only verifiable, non-secret deployment provenance.
+
+    A Run is created from the deployed project, which can be a Git worktree or
+    a release archive.  The deployment manifest is the common contract between
+    those two forms.  Do not query the local checkout here: it may be unrelated
+    to the runtime project and would fabricate provenance for the Run.
+    """
+
+    unknown = {
+        "schema_version": 1,
+        "status": "unknown",
+        "project_manifest_sha256": "unknown",
+        "project_manifest_schema_version": "unknown",
+        "git_sha": "unknown",
+        "source_bundle_sha256": "unknown",
+        "source_kind": "unknown",
+        "git_dirty": "unknown",
+        "verification_scope": "none",
+    }
+    if not project_root:
+        return unknown
+    root = Path(project_root).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        return unknown
+    manifest_path = root / "project_manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return unknown
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError:
+        return unknown
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return {
+            **unknown,
+            "status": "manifest_unreadable",
+            "project_manifest_sha256": manifest_sha256,
+        }
+    if not isinstance(manifest, Mapping):
+        return {
+            **unknown,
+            "status": "manifest_invalid",
+            "project_manifest_sha256": manifest_sha256,
+        }
+    source = manifest.get("source")
+    source = source if isinstance(source, Mapping) else {}
+    git_sha = str(manifest.get("git_sha") or "")
+    source_bundle_sha256 = str(source.get("source_bundle_sha256") or "")
+    source_kind = str(source.get("kind") or "")
+    git_dirty = source.get("git_dirty")
+    identity = {
+        "schema_version": 1,
+        "status": "manifest_recorded"
+        if (
+            manifest.get("schema_version") == 2
+            and manifest.get("deployment_kind") == "loess_project"
+            and _GIT_SHA_RE.fullmatch(git_sha)
+            and _SHA256_RE.fullmatch(source_bundle_sha256)
+            and source_kind in {"git_worktree", "release_archive"}
+            and isinstance(git_dirty, bool)
+        )
+        else "manifest_incomplete",
+        "verification_scope": "manifest_fields_and_digest_only",
+        "project_manifest_sha256": manifest_sha256,
+        "project_manifest_schema_version": manifest.get("schema_version", "unknown"),
+        "git_sha": git_sha if _GIT_SHA_RE.fullmatch(git_sha) else "unknown",
+        "source_bundle_sha256": (
+            source_bundle_sha256
+            if _SHA256_RE.fullmatch(source_bundle_sha256)
+            else "unknown"
+        ),
+        "source_kind": source_kind or "unknown",
+        "git_dirty": git_dirty if isinstance(git_dirty, bool) else "unknown",
+    }
+    return identity
 
 
 def _fragmentation_v33_units(
@@ -133,6 +217,7 @@ def create_v5_run(
     run_id: str | None = None,
     reserved_run_dir: str | Path | None = None,
     state_database: str | Path | None = None,
+    deployment_project_root: str | Path | None = None,
 ) -> tuple[dict[str, Any], Path, str | Path]:
     """Freeze a small run spec and atomically populate the detailed state DB."""
     if not models:
@@ -507,6 +592,7 @@ def create_v5_run(
         "class_mapping_snapshot": str(class_path),
         "config_snapshot": str(config_snapshot_path),
         "config_fingerprint": str(config_fingerprint),
+        "deployment_identity": deployment_identity(deployment_project_root),
         "state_backend": state_backend,
         "state_db": state_location,
     }

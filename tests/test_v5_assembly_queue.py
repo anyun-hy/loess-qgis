@@ -75,6 +75,53 @@ def _load_runner_module(monkeypatch):
     return importlib.import_module("labeling_tool.core.v5_async_runner")
 
 
+def test_phase_timing_uses_wall_clock_union_and_reports_geometry_tail(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 10.0)
+    timing.start("unit_fit", "unit-a", 12.0)
+    timing.start("unit_fit", "unit-b", 14.0)
+    timing.finish("package", 20.0)
+    timing.finish("unit-a", 22.0)
+    timing.finish("unit-b", 25.0)
+
+    summary = timing.summary(25.0)
+
+    assert summary["measurement"] == "wall_clock_union_sec"
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 10.0
+    assert summary["stages"]["unit_fit"]["wall_clock_sec"] == 13.0
+    assert summary["unit_fit_total_wall_clock_sec"] == 13.0
+    assert summary["unit_fit_tail_after_work_package_sec"] == 5.0
+
+
+def test_phase_timing_does_not_report_epoch_sized_tail_without_package_span(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("unit_fit", "unit-a", 1000.0)
+    timing.finish("unit-a", 1010.0)
+
+    assert timing.summary(1010.0)["unit_fit_tail_after_work_package_sec"] == 0.0
+
+
+def test_phase_timing_recovers_only_through_last_observation_and_marks_partial(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 100.0)
+    timing.observe_active(145.0)
+    state = timing.state(145.0)
+
+    recovered = module.PipelinePhaseTiming.from_state(state)
+    summary = recovered.summary(1000.0)
+
+    assert summary["status"] == "partial_recovered"
+    assert summary["recovered_incomplete_span_count"] == 1
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 45.0
+
+
 def _runner(module):
     runner = module.V5AsyncInferenceRunner.__new__(
         module.V5AsyncInferenceRunner
@@ -245,6 +292,67 @@ def test_resource_budget_reduces_geometry_pool_only_while_package_is_active(monk
     assert module.cpu_worker_limit(spec, package_active=True) == 16
 
 
+def test_shared_cpu_budget_reserves_four_v33_workers_before_unit_fit_dispatch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+
+    assert module.fragmentation_v33_worker_limit(spec, package_active=False) == 5
+    assert module.cpu_worker_limit(
+        spec,
+        package_active=False,
+        fragmentation_v33_active=4,
+    ) == 4
+
+
+def test_shared_cpu_budget_counts_unit_fit_native_threads(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "scaling": {"max_cpu_partition_workers": 20},
+        "resource_tuning": {
+            "resolved": {
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 2,
+            }
+        },
+    }
+
+    assert module.cpu_worker_limit(
+        spec,
+        package_active=False,
+        fragmentation_v33_active=2,
+    ) == 6
+
+
+def test_v33_thread_environment_uses_its_frozen_reservation(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 3,
+            }
+        }
+    }
+
+    values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "fragmentation_v33"}},
+    )
+    assert values["OMP_NUM_THREADS"] == "3"
+
+
 def test_child_process_thread_limits_prevent_nested_cpu_oversubscription(monkeypatch):
     module = _load_runner_module(monkeypatch)
     spec = {
@@ -356,6 +464,12 @@ def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_runn
             "publication": "authoritative_fusion_core",
             "max_workers": 4,
         },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 1,
+                "fragmentation_v33_process_threads": 1,
+            }
+        },
     }
     runner._cleanup_released_artifacts = lambda: None
     runner._disk_below_reserve = lambda: False
@@ -402,6 +516,216 @@ def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_runn
     runner._schedule()
 
     assert starts == [candidate, model_unit]
+
+
+def test_scheduler_does_not_dispatch_twenty_unit_fits_beside_four_v33_workers(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = True
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    runner._processes = {
+        f"v33-{index}": {
+            "context": {
+                "kind": "job",
+                "job": {"job_type": "fragmentation_v33", "job_id": index},
+            }
+        }
+        for index in range(4)
+    }
+    unit_jobs = [
+        {
+            "job_id": 100 + index,
+            "job_type": "unit_fit",
+            "stream_id": "model:a",
+            "unit_id": f"core_{index:05d}",
+            "lease_token": f"unit-{index}",
+        }
+        for index in range(20)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"running": 4}
+            raise AssertionError(job_type)
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return unit_jobs.pop(0) if unit_jobs else None
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            raise AssertionError("four active V3.3 workers already fill the cap")
+
+    runner._database = Database()
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert [job["job_id"] for job in starts] == [100, 101, 102, 103]
+
+
+def test_scheduler_starts_more_v33_workers_only_as_unit_fit_cpu_budget_frees(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = True
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    unit_context = lambda index: {
+        "context": {
+            "kind": "job",
+            "job": {"job_type": "unit_fit", "job_id": index},
+        }
+    }
+    runner._processes = {
+        f"unit-{index}": unit_context(index) for index in range(16)
+    }
+    candidate_jobs = [
+        {
+            "job_id": 300 + index,
+            "job_type": "fragmentation_v33",
+            "stream_id": "fusion:approved",
+            "unit_id": f"fragmentation_v33_partition:{index}",
+            "lease_token": f"candidate-{index}",
+        }
+        for index in range(3)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"queued": 3}
+            raise AssertionError(job_type)
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            return candidate_jobs.pop(0) if candidate_jobs else None
+
+        def lease_next_job(self, *_args, **_kwargs):
+            raise AssertionError("active unit-fit tasks already fill their allowance")
+
+    runner._database = Database()
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    # 16 unit threads leave capacity for exactly one four-thread V3.3 worker.
+    assert [job["job_id"] for job in starts] == [300]
+
+    # Once eight unit fits complete, the scheduler can grow from one to three
+    # V3.3 workers, but no farther: 8 + 3 * 4 == 20 frozen CPU threads.
+    runner._processes = {
+        "v33-0": {"context": {"kind": "job", "job": starts[0]}},
+        **{f"unit-{index}": unit_context(index) for index in range(8)},
+    }
+    runner._schedule()
+
+    assert [job["job_id"] for job in starts] == [300, 301, 302]
+
+
+def test_scheduler_uses_full_geometry_budget_when_v33_is_not_active(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = True
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "resource_tuning": {"resolved": {"unit_process_threads": 1}},
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    unit_jobs = [
+        {
+            "job_id": 200 + index,
+            "job_type": "unit_fit",
+            "stream_id": "model:a",
+            "unit_id": f"core_{index:05d}",
+            "lease_token": f"unit-{index}",
+        }
+        for index in range(20)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            assert job_type == "work_package"
+            return {"ready": 2}
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return unit_jobs.pop(0) if unit_jobs else None
+
+    runner._database = Database()
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert len(starts) == 20
 
 
 def test_active_accelerator_process_prevents_a_second_worker(monkeypatch):
