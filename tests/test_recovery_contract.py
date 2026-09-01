@@ -197,3 +197,22 @@ def test_recovery_rejects_database_spec_identity(
             bad_spec_path,
             tmp_path / "project" / "inference_scripts",
         )
+
+
+def test_recovery_rejects_archived_incomplete_run(tmp_path, monkeypatch):
+    fingerprint = "sha256:" + "a" * 64
+    spec_path, state_path = _run_fixture(tmp_path, fingerprint)
+    database = RunStateDB(state_path)
+    database.archive_incomplete_run_details(
+        protected_run_id="20260901_130000_current"
+    )
+    _ready_deployment(monkeypatch, fingerprint)
+
+    with pytest.raises(
+        recovery_contract.RecoveryContractError,
+        match="归档为不可恢复状态",
+    ):
+        recovery_contract.validate_recovery_run(
+            spec_path,
+            tmp_path / "project" / "inference_scripts",
+        )

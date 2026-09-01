@@ -121,6 +121,10 @@ def validate_recovery_run(
         raise RecoveryContractError(f"Run 状态库无法读取: {error}") from error
     if run is None:
         raise RecoveryContractError(f"Run 状态库中不存在 {run_id}")
+    if str(run.get("status") or "").startswith("archived_"):
+        raise RecoveryContractError(
+            "Run 已在创建新 Run 时归档为不可恢复状态"
+        )
     if int(run.get("schema_version") or 0) != SCHEMA_VERSION:
         raise RecoveryContractError("Run 状态库 schema 与 Run Spec 不一致")
     if str(run.get("run_spec_sha256") or "") != sha256_file(spec_path):

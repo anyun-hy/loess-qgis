@@ -27,6 +27,26 @@ SCHEMA_VERSION = 2
 MAX_TILE_PAGE_SIZE = 500
 STATE_DB_DSN_ENV = "LOESS_STATE_DB_DSN"
 STATE_DB_SCHEMA_ENV = "LOESS_STATE_DB_SCHEMA"
+ARCHIVABLE_INCOMPLETE_RUN_STATES = ("failed", "stopped")
+RUN_DETAIL_ARCHIVE_KEY = "database_detail_archive"
+RUN_ARCHIVE_REPORT_ID_LIMIT = 50
+RUN_DETAIL_TABLES = (
+    "streams",
+    "stream_runtime_progress",
+    "work_packages",
+    "partitions",
+    "tiles",
+    "spatial_units",
+    "unit_dependencies",
+    "stream_units",
+    "jobs",
+    "artifacts",
+    "artifact_dependencies",
+    "unit_report_summaries",
+    "object_links",
+    "object_nodes",
+    "events",
+)
 
 
 class RunStateError(RuntimeError):
@@ -39,6 +59,15 @@ def _now() -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _bounded_utf8(value: Any, maximum_bytes: int) -> str:
+    """Bound diagnostic text by encoded bytes without returning invalid UTF-8."""
+
+    encoded = str(value or "").encode("utf-8")
+    if len(encoded) <= int(maximum_bytes):
+        return encoded.decode("utf-8")
+    return encoded[: int(maximum_bytes)].decode("utf-8", errors="ignore")
 
 
 def _row_dict(row: Any | None) -> dict[str, Any] | None:
@@ -527,6 +556,297 @@ class RunStateDB:
                 ).fetchone()
             )
 
+    def archive_incomplete_run_details(
+        self,
+        *,
+        protected_run_id: str,
+        reason: str = "new_run_housekeeping",
+    ) -> dict[str, Any]:
+        """Archive terminal incomplete Runs and remove their process details.
+
+        ``failed`` and ``stopped`` are normally recoverable.  Explicitly
+        starting a new Run makes older terminal attempts non-resumable, but it
+        must not erase the small amount of evidence needed to explain them.
+        Keep one immutable Run tombstone with bounded diagnostics while
+        deleting only database control-plane details.  Filesystem Run outputs
+        are deliberately outside this transaction and are never removed here.
+        """
+
+        protected = str(protected_run_id).strip()
+        if not protected:
+            raise RunStateError("protected Run ID is required for housekeeping")
+        archived_at = _now()
+        lease_now = time.time()
+        archived_run_ids: list[str] = []
+        skipped_active_run_ids: list[str] = []
+        deleted_totals = {table: 0 for table in RUN_DETAIL_TABLES}
+
+        with self.transaction() as connection:
+            placeholders = ",".join(
+                "?" for _state in ARCHIVABLE_INCOMPLETE_RUN_STATES
+            )
+            candidate_sql = (
+                "SELECT run_id, status, run_spec_sha256, metadata_json, "
+                "created_at, updated_at FROM runs "
+                f"WHERE status IN ({placeholders}) AND run_id<>? "
+                "ORDER BY created_at, run_id"
+            )
+            if self.is_postgresql:
+                candidate_sql += " FOR UPDATE SKIP LOCKED"
+            candidates = connection.execute(
+                candidate_sql,
+                (*ARCHIVABLE_INCOMPLETE_RUN_STATES, protected),
+            ).fetchall()
+
+            for candidate in candidates:
+                run_id = str(candidate["run_id"])
+                active_count = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM jobs
+                           WHERE run_id=? AND (
+                             status=? OR (
+                               lease_token<>? AND lease_expires IS NOT NULL
+                               AND lease_expires>?
+                             )
+                           )""",
+                        (run_id, "running", "", lease_now),
+                    ).fetchone()[0]
+                )
+                if active_count:
+                    skipped_active_run_ids.append(run_id)
+                    continue
+
+                original_metadata_invalid = False
+                try:
+                    original_metadata = json.loads(
+                        str(candidate["metadata_json"] or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    original_metadata = {}
+                    original_metadata_invalid = True
+                if not isinstance(original_metadata, dict):
+                    original_metadata = {}
+                    original_metadata_invalid = True
+                preserved_metadata: dict[str, Any] = {}
+                run_spec_path = original_metadata.get("run_spec")
+                if run_spec_path:
+                    preserved_metadata["run_spec"] = _bounded_utf8(
+                        run_spec_path, 4096
+                    )
+                for key in ("tile_count", "partition_count", "package_count"):
+                    value = original_metadata.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        preserved_metadata[key] = value
+
+                detail_counts: dict[str, int] = {}
+                for table in RUN_DETAIL_TABLES:
+                    if table == "artifact_dependencies":
+                        row = connection.execute(
+                            """SELECT COUNT(*) FROM artifact_dependencies
+                               WHERE job_id IN (
+                                 SELECT job_id FROM jobs WHERE run_id=?
+                               ) OR artifact_id IN (
+                                 SELECT artifact_id FROM artifacts WHERE run_id=?
+                               )""",
+                            (run_id, run_id),
+                        ).fetchone()
+                    else:
+                        row = connection.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                            (run_id,),
+                        ).fetchone()
+                    detail_counts[table] = int(row[0])
+
+                job_status_counts = {
+                    str(row["status"]): int(row["n"])
+                    for row in connection.execute(
+                        """SELECT status, COUNT(*) AS n FROM jobs
+                           WHERE run_id=? GROUP BY status ORDER BY status""",
+                        (run_id,),
+                    ).fetchall()
+                }
+                artifact_status_counts = {
+                    str(row["status"]): int(row["n"])
+                    for row in connection.execute(
+                        """SELECT status, COUNT(*) AS n FROM artifacts
+                           WHERE run_id=? GROUP BY status ORDER BY status""",
+                        (run_id,),
+                    ).fetchall()
+                }
+                error_record_count = sum(
+                    int(
+                        connection.execute(sql, (run_id, "")).fetchone()[0]
+                    )
+                    for sql in (
+                        "SELECT COUNT(*) FROM jobs WHERE run_id=? AND error<>?",
+                        "SELECT COUNT(*) FROM streams WHERE run_id=? AND error<>?",
+                        """SELECT COUNT(*) FROM events WHERE run_id=?
+                           AND level IN ('warning','error') AND message<>?""",
+                    )
+                )
+                errors: list[dict[str, Any]] = []
+                for row in connection.execute(
+                    """SELECT job_type, stream_id, unit_id, package_id,
+                              status, error, updated_at
+                       FROM jobs WHERE run_id=? AND error<>?
+                       ORDER BY updated_at DESC, job_id DESC LIMIT 8""",
+                    (run_id, ""),
+                ).fetchall():
+                    errors.append(
+                        {
+                            "source": "job",
+                            "job_type": str(row["job_type"]),
+                            "stream_id": str(row["stream_id"] or ""),
+                            "unit_id": str(row["unit_id"] or ""),
+                            "package_id": str(row["package_id"] or ""),
+                            "status": str(row["status"]),
+                            "message": _bounded_utf8(row["error"], 2000),
+                            "timestamp": str(row["updated_at"] or ""),
+                        }
+                    )
+                for row in connection.execute(
+                    """SELECT stream_id, status, error, updated_at
+                       FROM streams WHERE run_id=? AND error<>?
+                       ORDER BY updated_at DESC, stream_id LIMIT 8""",
+                    (run_id, ""),
+                ).fetchall():
+                    errors.append(
+                        {
+                            "source": "stream",
+                            "stream_id": str(row["stream_id"]),
+                            "status": str(row["status"]),
+                            "message": _bounded_utf8(row["error"], 2000),
+                            "timestamp": str(row["updated_at"] or ""),
+                        }
+                    )
+                for row in connection.execute(
+                    """SELECT level, event_type, stream_id, message, timestamp
+                       FROM events WHERE run_id=? AND level IN (?,?)
+                         AND message<>?
+                       ORDER BY event_id DESC LIMIT 8""",
+                    (run_id, "warning", "error", ""),
+                ).fetchall():
+                    errors.append(
+                        {
+                            "source": "event",
+                            "level": str(row["level"]),
+                            "event_type": str(row["event_type"]),
+                            "stream_id": str(row["stream_id"] or ""),
+                            "message": _bounded_utf8(row["message"], 2000),
+                            "timestamp": str(row["timestamp"] or ""),
+                        }
+                    )
+                errors.sort(
+                    key=lambda item: str(item.get("timestamp") or ""),
+                    reverse=True,
+                )
+                errors = errors[:8]
+
+                archive = {
+                    "schema_version": 1,
+                    "status": "archived",
+                    "non_resumable": True,
+                    "reason": _bounded_utf8(reason, 256),
+                    "original_status": str(candidate["status"]),
+                    "run_spec_sha256": str(candidate["run_spec_sha256"]),
+                    "created_at": str(candidate["created_at"]),
+                    "last_updated_at": str(candidate["updated_at"]),
+                    "archived_at": archived_at,
+                    "detail_counts": detail_counts,
+                    "job_status_counts": job_status_counts,
+                    "artifact_status_counts": artifact_status_counts,
+                    "errors": errors,
+                    "error_record_count": error_record_count,
+                    "errors_truncated": error_record_count > len(errors),
+                    "original_metadata_invalid": original_metadata_invalid,
+                }
+                metadata = {
+                    **preserved_metadata,
+                    RUN_DETAIL_ARCHIVE_KEY: archive,
+                }
+
+                deleted_totals["artifact_dependencies"] += connection.execute(
+                    """DELETE FROM artifact_dependencies
+                       WHERE job_id IN (
+                         SELECT job_id FROM jobs WHERE run_id=?
+                       ) OR artifact_id IN (
+                         SELECT artifact_id FROM artifacts WHERE run_id=?
+                       )""",
+                    (run_id, run_id),
+                ).rowcount
+                for table in (
+                    "unit_report_summaries",
+                    "stream_runtime_progress",
+                    "stream_units",
+                    "unit_dependencies",
+                    "tiles",
+                    "partitions",
+                    "events",
+                    "jobs",
+                    "artifacts",
+                    "object_links",
+                    "object_nodes",
+                    "work_packages",
+                    "spatial_units",
+                    "streams",
+                ):
+                    deleted_totals[table] += connection.execute(
+                        f"DELETE FROM {table} WHERE run_id=?", (run_id,)
+                    ).rowcount
+
+                archived_status = "archived_" + str(candidate["status"])
+                updated = connection.execute(
+                    """UPDATE runs SET status=?, metadata_json=?, updated_at=?
+                       WHERE run_id=? AND status=?""",
+                    (
+                        archived_status,
+                        _json(metadata),
+                        archived_at,
+                        run_id,
+                        str(candidate["status"]),
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise RunStateError(
+                        f"Run changed during detail archive: {run_id}"
+                    )
+                connection.execute(
+                    """INSERT INTO events
+                       (run_id, timestamp, level, event_type, stream_id,
+                        job_id, message, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        archived_at,
+                        "info",
+                        "run_details_archived",
+                        "",
+                        None,
+                        "Incomplete Run details archived before a new Run",
+                        _json(archive),
+                    ),
+                )
+                archived_run_ids.append(run_id)
+
+        archived_sample = archived_run_ids[:RUN_ARCHIVE_REPORT_ID_LIMIT]
+        skipped_sample = skipped_active_run_ids[:RUN_ARCHIVE_REPORT_ID_LIMIT]
+        return {
+            "schema_version": 1,
+            "status": "completed",
+            "protected_run_id": protected,
+            "archived_run_ids": archived_sample,
+            "archived_run_count": len(archived_run_ids),
+            "archived_run_ids_truncated": (
+                len(archived_run_ids) > len(archived_sample)
+            ),
+            "skipped_active_run_ids": skipped_sample,
+            "skipped_active_run_count": len(skipped_active_run_ids),
+            "skipped_active_run_ids_truncated": (
+                len(skipped_active_run_ids) > len(skipped_sample)
+            ),
+            "deleted_detail_counts": deleted_totals,
+        }
+
     def set_run_status(
         self,
         run_id: str,
@@ -535,7 +855,10 @@ class RunStateDB:
         expected: str | Sequence[str] | None = None,
     ) -> bool:
         values: list[Any] = [str(status), _now(), str(run_id)]
-        sql = "UPDATE runs SET status=?, updated_at=? WHERE run_id=?"
+        sql = (
+            "UPDATE runs SET status=?, updated_at=? WHERE run_id=? "
+            "AND status NOT LIKE 'archived_%'"
+        )
         if expected is not None:
             states = [expected] if isinstance(expected, str) else list(expected)
             if not states:
@@ -544,6 +867,42 @@ class RunStateDB:
             values.extend(str(item) for item in states)
         with self.transaction() as connection:
             return connection.execute(sql, values).rowcount == 1
+
+    def update_run_metadata(
+        self,
+        run_id: str,
+        values: Mapping[str, Any],
+    ) -> None:
+        """Merge bounded control-plane metadata without changing Run identity."""
+
+        identifier = str(run_id)
+        with self.transaction() as connection:
+            lock = " FOR UPDATE" if self.is_postgresql else ""
+            row = connection.execute(
+                "SELECT metadata_json FROM runs WHERE run_id=?" + lock,
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise RunStateError(f"unknown Run metadata target: {identifier}")
+            try:
+                metadata = json.loads(str(row["metadata_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise RunStateError(
+                    f"Run metadata is not valid JSON: {identifier}"
+                ) from error
+            if not isinstance(metadata, dict):
+                raise RunStateError(
+                    f"Run metadata must be an object: {identifier}"
+                )
+            metadata.update(dict(values))
+            updated = connection.execute(
+                "UPDATE runs SET metadata_json=?, updated_at=? WHERE run_id=?",
+                (_json(metadata), _now(), identifier),
+            ).rowcount
+            if updated != 1:
+                raise RunStateError(
+                    f"Run metadata changed during update: {identifier}"
+                )
 
     def register_streams(
         self, run_id: str, streams: Iterable[Mapping[str, Any]]
