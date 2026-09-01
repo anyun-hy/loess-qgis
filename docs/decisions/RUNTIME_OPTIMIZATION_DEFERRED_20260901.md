@@ -23,7 +23,7 @@
 
 ### 实机证据
 
-Tencent RTX 3090 使用真实五堡影像和 MambaOut 模型执行两个 Package A/B：
+Ubuntu RTX 3090 验证主机使用真实影像和 MambaOut 模型执行两个 Package A/B：
 
 - 第二个 Package 的推理 Tile 从 6 降至 2；
 - 第二个 Partition 有 334,569 个量化 probability 元素不同，占 2.90%；
@@ -54,7 +54,7 @@ Tencent RTX 3090 使用真实五堡影像和 MambaOut 模型执行两个 Package
 
 ### 实机证据
 
-Tencent 对真实 0830 Core、Seam 和 Junction mask 执行隔离 A/B：
+Ubuntu 验证主机对真实 Core、Seam 和 Junction mask 执行隔离 A/B：
 
 - 逐进程与持久进程的逻辑几何、报告统计，以及 raw、formal、fitted edges、
   boundary signatures 四类制品哈希一致；
@@ -92,7 +92,7 @@ PyTorch 2.6.0+cu124 的有效变量是：
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-此前建议的 `PYTORCH_ALLOC_CONF` 会被该版本静默忽略。Tencent 三臂测试使用三个
+此前建议的 `PYTORCH_ALLOC_CONF` 会被该版本静默忽略。Ubuntu 三臂测试使用三个
 正式 TorchScript 模型、冻结的 64 个真实 Tile 和 `64 → 32 → 64` 压力序列：
 
 - 错误别名与默认配置行为相同，allocator snapshot 不包含 expandable segment；

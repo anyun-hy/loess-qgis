@@ -19,7 +19,7 @@ PERMANENT_RASTER_BYTES_PER_PIXEL_PER_STREAM = (
 VECTOR_OUTPUT_BYTES_PER_CORE_PIXEL_PER_STREAM = 1
 MIN_VECTOR_OUTPUT_RESERVE_BYTES = 64 * GIB
 PERMANENT_UNCERTAINTY_RATIO = 0.25
-# These are terminal ready Artifact totals from four accepted Tencent runs of
+# These are terminal ready Artifact totals from four accepted Ubuntu runs of
 # the frozen production contract: Swin-B, SETR, MambaOut-B, approved Fusion,
 # V3.3, Deflate Core GeoTIFFs, and cleanup-complete GeoPackage outputs.
 FINAL_ARTIFACT_OBSERVATION_SCHEMA_VERSION = 1

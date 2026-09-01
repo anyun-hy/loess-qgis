@@ -7,14 +7,17 @@ wrapper keeps the small DB-API surface used by :mod:`run_state_db`.
 
 from __future__ import annotations
 
+import getpass
 import os
 import re
 import sys
 from typing import Any, Iterable, Sequence
 
 
+DEFAULT_POSTGRES_ROLE = getpass.getuser()
 DEFAULT_POSTGRES_DSN = (
-    "dbname=anyun user=anyun host=/var/run/postgresql port=5432"
+    f"dbname={DEFAULT_POSTGRES_ROLE} user={DEFAULT_POSTGRES_ROLE} "
+    "host=/var/run/postgresql port=5432"
 )
 DEFAULT_POSTGRES_SCHEMA = "loess_qgis"
 POSTGRES_SCHEME_PREFIXES = ("postgresql://", "postgres://")

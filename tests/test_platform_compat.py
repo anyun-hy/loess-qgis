@@ -38,6 +38,10 @@ def test_plugin_targets_qgis3_and_qgis4_from_one_release():
     assert "qgisMinimumVersion=3.44" in metadata
     assert "qgisMaximumVersion=4.99" in metadata
     assert "version=0.4.0" in metadata
+    assert "author=anyun-hy" in metadata
+    assert "repository=https://github.com/anyun-hy/loess-qgis" in metadata
+    assert "tracker=https://github.com/anyun-hy/loess-qgis/issues" in metadata
+    assert (PLUGIN_ROOT / "LICENSE").is_file()
     assert "-linux" not in metadata
 
 

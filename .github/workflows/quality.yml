@@ -1,0 +1,36 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lightweight test dependencies
+        run: python -m pip install --disable-pip-version-check pytest==9.1.1 pyyaml==6.0.3
+      - name: Compile Python sources
+        run: python -m compileall -q bash qgis_plugins inference_scripts tests
+      - name: Validate shell entry points
+        run: find bash inference_scripts -type f -name '*.sh' -exec bash -n {} +
+      - name: Run public source contracts
+        run: >-
+          python -m pytest -q
+          tests/test_docs_structure.py
+          tests/test_public_release.py
+          tests/test_ssh_tencent.py
+          tests/test_postgres_state_contract.py
+          tests/test_platform_compat.py::test_plugin_targets_qgis3_and_qgis4_from_one_release
+          tests/test_platform_compat.py::test_business_modules_use_the_shared_qt_compatibility_facade
+          tests/test_platform_compat.py::test_plugin_install_and_project_initialization_are_independent
+          tests/test_platform_compat.py::test_inference_environment_contract_has_two_minimal_platform_locks

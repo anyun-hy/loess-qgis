@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SSH_HOST="Tencent"
+readonly SSH_HOST="${LOESS_SSH_HOST:-Tencent}"
 readonly CONTROL_PERSIST="${LOESS_SSH_CONTROL_PERSIST:-15m}"
 readonly CONTROL_DIR="${LOESS_SSH_CONTROL_DIR:-/tmp/loess-qgis-ssh-${UID}}"
 readonly SSH_BIN="${SSH_BIN:-$(command -v ssh 2>/dev/null || true)}"
@@ -10,10 +10,11 @@ usage() {
   cat <<'EOF'
 Usage: ./bash/ssh_tencent.sh [remote command [arguments...]]
 
-Connect to the project's Tencent Ubuntu host. Consecutive invocations reuse one
-SSH connection; the connection closes automatically after 15 idle minutes.
+Connect to an Ubuntu validation host. Consecutive invocations reuse one SSH
+connection; the connection closes automatically after 15 idle minutes.
 
 Environment overrides:
+  LOESS_SSH_HOST             OpenSSH host or alias. Default: Tencent
   LOESS_SSH_CONTROL_PERSIST  OpenSSH ControlPersist duration. Default: 15m
   LOESS_SSH_CONTROL_DIR      Directory for the user-owned control socket
 EOF
