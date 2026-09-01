@@ -141,6 +141,10 @@ if contains(source_root, destination) or contains(destination, source_root):
   echo "Missing plugin entry point" >&2
   exit 1
 }
+[[ -f "${PLUGIN_SRC}/LICENSE" ]] || {
+  echo "Missing plugin LICENSE" >&2
+  exit 1
+}
 for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neighbors.py; do
   [[ -f "${PLUGIN_SRC}/core/${shared_name}" ]] || {
     echo "Missing shared runtime source: ${shared_name}" >&2
@@ -337,6 +341,7 @@ mv "${STAGED_DEST}" "${DEST_PLUGIN}"
 fault_inject new_installation_moved
 
 test -f "${DEST_PLUGIN}/metadata.txt"
+test -f "${DEST_PLUGIN}/LICENSE"
 test -f "${DEST_PLUGIN}/deployment_manifest.json"
 fault_inject installation_verified
 DEPLOY_COMMITTED=1

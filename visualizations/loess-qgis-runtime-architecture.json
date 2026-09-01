@@ -23,7 +23,7 @@
         "id": "platform-branch",
         "label": "平台分支",
         "focus": ["runner", "compute"],
-        "note": "统一代码根据部署平台使用 macOS MPS 或 Tencent Ubuntu CUDA/RTX 3090。"
+        "note": "统一代码根据部署平台使用 macOS MPS 或 Ubuntu CUDA/RTX 3090。"
       }
     ]
   },
@@ -81,7 +81,7 @@
       "id": "compute",
       "type": "cloud",
       "label": "选定计算运行时",
-      "sublabel": "macOS MPS / Tencent CUDA",
+      "sublabel": "macOS MPS / Ubuntu CUDA",
       "pos": [650, 145],
       "size": [240, 82],
       "tag": "统一部署代码"
@@ -114,7 +114,7 @@
   "boundaries": [
     {
       "kind": "region",
-      "label": "统一 loess-qgis 运行时（选择 macOS 或 Tencent 部署）",
+      "label": "统一 loess-qgis 运行时（选择 macOS 或 Ubuntu 部署）",
       "wraps": ["qgis", "planner", "runner", "state-db", "compute", "assembly", "acceptance", "artifacts"],
       "pad": 8
     }

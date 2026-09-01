@@ -18,8 +18,8 @@ def postgres_database_factory(monkeypatch):
     """Create isolated PostgreSQL schemas and remove them after each test.
 
     Control-plane tests must never use the production ``loess_qgis`` schema.
-    The default DSN works through the platform socket on Tencent and is
-    resolved to the Homebrew socket by the production connector on macOS.
+    The default DSN works through the platform socket on Ubuntu and is resolved
+    to the Homebrew socket by the production connector on macOS.
     """
 
     from labeling_tool.core.postgres_state import (

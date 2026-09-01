@@ -2,8 +2,8 @@
 
 ## Authoritative source
 
-`/Users/example/Desktop/loess-qgis` is the only current authoritative source for
-the merged macOS and Ubuntu implementation. It contains the shared QGIS plugin,
+The repository checkout is the authoritative source for the merged macOS and
+Ubuntu implementation. It contains the shared QGIS plugin,
 inference runtime, Bash deployment scripts, tests, documentation, and curated
 project inputs.
 
@@ -65,8 +65,8 @@ project rules require it, not as a substitute for a session handoff.
 `docs/README.md` is the only documentation entrypoint. Keep current contracts
 in `docs/ARCHITECTURE.md`, current verified state in `docs/CURRENT_STATUS.md`,
 formal operating methods in `docs/operations/`, and durable choices in
-`docs/decisions/`. Files under `docs/archive/` are read-only historical context
-and must not be updated as current guidance.
+`docs/decisions/`. Internal session logs, handoffs, and historical runtime
+evidence are not public documentation and must not be added to the repository.
 
 Routine code changes do not require documentation edits. Do not append dated
 work logs, test transcripts, or session summaries to current documents. Update
@@ -76,10 +76,10 @@ materially changed.
 
 ## Remote Ubuntu access
 
-`Tencent` is the project's Ubuntu runtime and validation host. When a task
-requires Ubuntu, QGIS 3.44, Qt5, CUDA/RTX 3090, remote logs, or live runtime
-evidence, invoke `bash/ssh_tencent.sh <command>` directly; do not wait for the
-user to start an interactive `ssh Tencent` session.
+An Ubuntu validation host may be configured through the local SSH alias passed
+as `LOESS_SSH_HOST`. When a task requires Ubuntu, QGIS 3.44, Qt5, CUDA/RTX 3090,
+remote logs, or live runtime evidence, invoke `bash/ssh_tencent.sh <command>`
+directly; do not wait for the user to start an interactive SSH session.
 
 The project wrapper reuses an SSH connection for a short idle window and then
 closes it automatically. The local `loess-qgis` checkout remains the
@@ -89,12 +89,10 @@ must preserve the deployment-project boundary below.
 
 ## Prohibited legacy lookup by default
 
-`/Users/example/Desktop/loess-data` is a legacy/original-data workspace that
-predates the consolidation into `loess-qgis`. Do not search, inspect, read,
-compare, copy from, or modify `loess-data` unless the user explicitly names that
-directory and authorizes the specific lookup or operation in the current task.
-Do not use facts, scripts, status notes, or historical snapshots from
-`loess-data` to override the current `loess-qgis` repository.
+A legacy/original-data workspace may exist outside this repository. Do not
+search, inspect, compare, copy from, or modify an external legacy workspace
+unless the user explicitly names it and authorizes the specific operation.
+External history must not override the current repository.
 
 ## Deployment project
 
