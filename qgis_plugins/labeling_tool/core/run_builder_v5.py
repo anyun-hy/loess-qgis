@@ -715,6 +715,63 @@ def create_v5_run(
         ),
     )
     try:
+        incomplete_run_cleanup = database.archive_incomplete_run_details(
+            protected_run_id=identifier,
+        )
+    except Exception as exc:
+        incomplete_run_cleanup = {
+            "schema_version": 1,
+            "status": "warning",
+            "protected_run_id": identifier,
+            "error": str(exc),
+        }
+        logger.warning(
+            "[incomplete-run-cleanup-warning] 旧未完成 Run 明细归档失败: %s",
+            exc,
+        )
+    try:
+        database.update_run_metadata(
+            identifier,
+            {"incomplete_run_cleanup": incomplete_run_cleanup},
+        )
+        archived_count = int(
+            incomplete_run_cleanup.get("archived_run_count") or 0
+        )
+        skipped_active_count = int(
+            incomplete_run_cleanup.get("skipped_active_run_count") or 0
+        )
+        cleanup_warning = (
+            incomplete_run_cleanup.get("status") == "warning"
+            or skipped_active_count > 0
+        )
+        if archived_count or cleanup_warning:
+            database.append_event(
+                identifier,
+                "incomplete_run_cleanup",
+                level="warning" if cleanup_warning else "info",
+                message=(
+                    str(incomplete_run_cleanup.get("error") or "")
+                    if incomplete_run_cleanup.get("status") == "warning"
+                    else (
+                        "Skipped old incomplete Runs with active Jobs: "
+                        + ", ".join(
+                            incomplete_run_cleanup.get(
+                                "skipped_active_run_ids"
+                            )
+                            or []
+                        )
+                    )
+                    if skipped_active_count
+                    else "Archived old incomplete Run database details"
+                ),
+                payload=incomplete_run_cleanup,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[incomplete-run-cleanup-warning] 无法记录旧 Run 归档结果: %s",
+            exc,
+        )
+    try:
         (run_dir / RESERVATION_FILE).unlink()
     except FileNotFoundError:
         pass

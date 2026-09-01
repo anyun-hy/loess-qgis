@@ -438,11 +438,16 @@ class V5AsyncInferenceRunner(QObject):
                     separators=(",", ":"),
                 ),
             )
-        self._database.set_run_status(
+        entered_running = self._database.set_run_status(
             self._spec["run_id"],
             "running",
             expected=("planned", "running", "stopped", "failed", "raster_ready"),
         )
+        if not entered_running:
+            raise RuntimeError(
+                "Run state changed before execution; it may have been archived "
+                "or claimed by another runner"
+            )
         self._record_startup_index("running")
         self._running = True
         self._stopped = False
@@ -455,6 +460,38 @@ class V5AsyncInferenceRunner(QObject):
         self._started_at = time.time()
         self._persist_phase_timing()
         self.log_line.emit("system", f"[run-v5] {self._spec['run_id']}")
+        if not resume:
+            try:
+                run_row = self._database.get_run(self._spec["run_id"]) or {}
+                run_metadata = json.loads(
+                    str(run_row.get("metadata_json") or "{}")
+                )
+                cleanup = dict(
+                    run_metadata.get("incomplete_run_cleanup") or {}
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cleanup = {}
+            if cleanup.get("status") == "warning":
+                self.log_line.emit(
+                    "stderr",
+                    "[incomplete-run-cleanup-warning] "
+                    + str(cleanup.get("error") or "unknown cleanup error"),
+                )
+            elif int(cleanup.get("skipped_active_run_count") or 0) > 0:
+                self.log_line.emit(
+                    "stderr",
+                    "[incomplete-run-cleanup-warning] 旧未完成 Run 仍有活动 Job，"
+                    "已保留: "
+                    + ", ".join(
+                        cleanup.get("skipped_active_run_ids") or []
+                    ),
+                )
+            elif int(cleanup.get("archived_run_count") or 0) > 0:
+                self.log_line.emit(
+                    "system",
+                    "[incomplete-run-cleanup] 已归档旧未完成 Run: "
+                    + ", ".join(cleanup.get("archived_run_ids") or []),
+                )
         size_prediction = (
             (self._spec.get("storage_preflight") or {}).get(
                 "final_artifact_size_prediction"

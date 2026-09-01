@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import secrets
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -11,6 +13,7 @@ import pytest
 from labeling_tool.core.run_builder_v5 import create_v5_run
 from labeling_tool.core.run_builder_v5 import _fragmentation_v33_units
 from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RUN_DETAIL_ARCHIVE_KEY
 
 
 POSTGRES_DSN = os.environ.get("LOESS_TEST_POSTGRES_DSN", "").strip()
@@ -30,6 +33,76 @@ def _drop_schema(dsn: str, schema: str) -> None:
             cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
     finally:
         connection.close()
+
+
+def test_postgres_incomplete_run_archive_preserves_summary_and_protections():
+    schema = f"loess_test_{secrets.token_hex(6)}"
+    database = RunStateDB(POSTGRES_DSN, postgres_schema=schema)
+    failed_run = "20260901_120000_pgfail"
+    active_run = "20260901_120001_pgactive"
+    ready_run = "20260901_120002_pgready"
+    try:
+        database.initialize()
+        for run_id, status in (
+            (failed_run, "failed"),
+            (active_run, "failed"),
+            (ready_run, "ready"),
+        ):
+            database.create_run(
+                run_id,
+                "a" * 64,
+                status=status,
+                metadata={"run_spec": f"/tmp/{run_id}/run_spec.json"},
+            )
+            database.insert_jobs(
+                run_id,
+                [
+                    {
+                        "job_type": "unit_fit",
+                        "status": "running" if run_id == active_run else "failed",
+                    }
+                ],
+            )
+            database.append_event(
+                run_id,
+                "fixture",
+                level="error",
+                message=f"failure for {run_id}",
+            )
+        database.register_object_parts(
+            failed_run,
+            "model:a",
+            [{"part_id": "part-a", "class_code": 11, "unit_id": "core-a"}],
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE jobs SET lease_token=?, lease_expires=?
+                   WHERE run_id=?""",
+                ("active-token", time.time() + 3600, active_run),
+            )
+
+        report = database.archive_incomplete_run_details(
+            protected_run_id="20260901_130000_current"
+        )
+
+        assert report["archived_run_ids"] == [failed_run]
+        assert report["skipped_active_run_ids"] == [active_run]
+        archived = database.get_run(failed_run)
+        assert archived["status"] == "archived_failed"
+        archive = json.loads(archived["metadata_json"])[RUN_DETAIL_ARCHIVE_KEY]
+        assert archive["detail_counts"]["jobs"] == 1
+        assert archive["detail_counts"]["object_nodes"] == 1
+        assert archive["errors"][0]["message"] == f"failure for {failed_run}"
+        assert database.job_counts(failed_run) == {}
+        assert database.get_run(active_run)["status"] == "failed"
+        assert database.job_counts(active_run) == {"running": 1}
+        assert database.get_run(ready_run)["status"] == "ready"
+        assert database.job_counts(ready_run) == {"failed": 1}
+        assert database.archive_incomplete_run_details(
+            protected_run_id="20260901_130000_current"
+        )["archived_run_ids"] == []
+    finally:
+        _drop_schema(POSTGRES_DSN, schema)
 
 
 def test_postgres_schema_artifacts_and_true_concurrent_job_writes(tmp_path):

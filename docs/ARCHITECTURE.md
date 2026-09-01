@@ -134,6 +134,12 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 
 - 新正式 Run 使用 PostgreSQL 状态库；历史 SQLite Run 只保留兼容读取；
 - Job 领取、Artifact 引用、失败重试和清理必须事务化；
+- 新 Run 的完整控制图创建成功后，旧 `failed/stopped` Run 的数据库过程明细
+  在同一事务中归档清理；保留不可恢复的 Run 墓碑、spec 哈希、规模计数和有界
+  错误摘要，不删除任何输出文件；
+- `ready`、当前新 Run、非终态 Run、`resetting` Run，以及仍有 running Job 或
+  有效 lease 的 Run 不参与自动归档；归档或记录失败只产生可见 warning，不阻止
+  新 Run；
 - live PID 不代表 Run 成功，必须以 Job、Stream、Artifact 和 hard gate 收口；
 - `bash/install_plugin.sh` 安装共享插件；
 - `bash/init_project.sh` 初始化或更新部署项目；

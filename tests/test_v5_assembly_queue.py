@@ -156,6 +156,30 @@ def test_phase_timing_ignores_malformed_recovery_history(monkeypatch, recorded_c
     assert summary["recovered_incomplete_span_count"] == 0
 
 
+def test_archived_run_resume_and_retry_stop_before_database_writes(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = False
+    runner._database = None
+    runner.scripts_dir = "/tmp/project/inference_scripts"
+    calls = []
+
+    def reject_archived(*_args, **_kwargs):
+        calls.append("validated")
+        raise RuntimeError("Run archived as non-resumable")
+
+    monkeypatch.setattr(module, "validate_recovery_run", reject_archived)
+
+    with pytest.raises(RuntimeError, match="non-resumable"):
+        runner.resume("/tmp/archived/run_spec.json")
+    with pytest.raises(RuntimeError, match="non-resumable"):
+        runner.retry_failed("/tmp/archived/run_spec.json")
+
+    assert calls == ["validated", "validated"]
+    assert runner._database is None
+    assert runner._running is False
+
+
 def _runner(module):
     runner = module.V5AsyncInferenceRunner.__new__(
         module.V5AsyncInferenceRunner
