@@ -141,7 +141,7 @@ from ..core.work_package_planner import (
     storage_preflight,
 )
 from ..core.environment_report import compact_problem, format_check_details
-from ..core.run_state_db import RunStateDB
+from ..core.run_state_db import run_state_from_spec
 from ..core.spatial_planner import plan_spatial_units
 
 logger = logging.getLogger("labeling_tool.main_dock")
@@ -2122,7 +2122,7 @@ class LabelingDockWidget(QgsDockWidget):
         spec = self._recovery_run_spec or self._last_run_spec or {}
         try:
             if int(spec.get("schema_version") or 0) == 2:
-                database = RunStateDB(spec["state_db"])
+                database = run_state_from_spec(spec)
                 run = database.get_run(spec["run_id"]) or {}
                 status = str(run.get("status") or "")
                 resumable = status in {

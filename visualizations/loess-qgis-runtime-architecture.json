@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Loess QGIS 高层运行时架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1320, 640],
+    "views": [
+      {
+        "id": "run-path",
+        "label": "一次新 Run",
+        "focus": ["operator", "qgis", "planner", "runner", "compute", "assembly", "acceptance", "artifacts"],
+        "note": "从 QGIS 创建 Run，经工作包推理、组装和验收，生成可加载结果。"
+      },
+      {
+        "id": "runtime-state",
+        "label": "状态与可观测性",
+        "focus": ["qgis", "runner", "state-db", "acceptance", "artifacts"],
+        "note": "PostgreSQL 保存可恢复运行状态；监控日志展示本次 Run 的预测与最终成品大小。"
+      },
+      {
+        "id": "platform-branch",
+        "label": "平台分支",
+        "focus": ["runner", "compute"],
+        "note": "统一代码根据部署平台使用 macOS MPS 或 Tencent Ubuntu CUDA/RTX 3090。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "使用者",
+      "sublabel": "选择输入 / 创建新 Run",
+      "pos": [10, 300],
+      "size": [160, 72]
+    },
+    {
+      "id": "qgis",
+      "type": "frontend",
+      "label": "QGIS + Labeling Tool 插件",
+      "sublabel": "输入、结果层、推理监控",
+      "pos": [200, 300],
+      "size": [190, 72],
+      "tag": "QGIS 3.44 / 4.2"
+    },
+    {
+      "id": "inputs",
+      "type": "external",
+      "label": "受控输入与模型权重",
+      "sublabel": "影像、已接受标签、模型权重",
+      "pos": [200, 45],
+      "size": [190, 72]
+    },
+    {
+      "id": "planner",
+      "type": "backend",
+      "label": "Run 规划与磁盘预检",
+      "sublabel": "空间计划、工作包、冻结预测",
+      "pos": [420, 165],
+      "size": [205, 76]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "V5 异步编排器",
+      "sublabel": "调度、恢复、子进程日志",
+      "pos": [420, 405],
+      "size": [205, 76]
+    },
+    {
+      "id": "state-db",
+      "type": "database",
+      "label": "RunStateDB / PostgreSQL",
+      "sublabel": "Run、Job、Artifact、重试",
+      "pos": [635, 530],
+      "size": [210, 76]
+    },
+    {
+      "id": "compute",
+      "type": "cloud",
+      "label": "选定计算运行时",
+      "sublabel": "macOS MPS / Tencent CUDA",
+      "pos": [650, 145],
+      "size": [240, 82],
+      "tag": "统一部署代码"
+    },
+    {
+      "id": "assembly",
+      "type": "backend",
+      "label": "并行组装与矢量处理",
+      "sublabel": "Core、V3.3、矢量与 Fusion",
+      "pos": [650, 365],
+      "size": [220, 82]
+    },
+    {
+      "id": "acceptance",
+      "type": "backend",
+      "label": "Scale Acceptance",
+      "sublabel": "硬门禁、成品字节、实际差额",
+      "pos": [900, 365],
+      "size": [200, 82]
+    },
+    {
+      "id": "artifacts",
+      "type": "database",
+      "label": "Run 目录与最终制品",
+      "sublabel": "GPKG、报告与 JSONL 日志",
+      "pos": [1130, 365],
+      "size": [180, 82]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "统一 loess-qgis 运行时（选择 macOS 或 Tencent 部署）",
+      "wraps": ["qgis", "planner", "runner", "state-db", "compute", "assembly", "acceptance", "artifacts"],
+      "pad": 8
+    }
+  ],
+  "connections": [
+    {
+      "id": "choose-input-run",
+      "from": "operator",
+      "to": "qgis",
+      "label": "选择输入 / 创建新 Run",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "id": "input-plan",
+      "from": "inputs",
+      "to": "planner",
+      "label": "输入元数据与范围",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "launch-plan",
+      "from": "qgis",
+      "to": "planner",
+      "label": "启动前校验",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "run-spec",
+      "from": "planner",
+      "to": "runner",
+      "label": "冻结 run_spec",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "runner-state",
+      "from": "runner",
+      "to": "state-db",
+      "label": "Job / Lease / Artifact 状态",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "labelAt": [735, 480]
+    },
+    {
+      "id": "work-packages",
+      "from": "runner",
+      "to": "compute",
+      "label": "Work Package 推理",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "model-inputs",
+      "from": "inputs",
+      "to": "compute",
+      "label": "模型权重与影像读取",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "core-artifacts",
+      "from": "compute",
+      "to": "assembly",
+      "label": "Core 分区制品",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "assembled-streams",
+      "from": "assembly",
+      "to": "acceptance",
+      "label": "结果流与验收输入",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [885, 461]
+    },
+    {
+      "id": "persist-ready-artifacts",
+      "from": "acceptance",
+      "to": "artifacts",
+      "label": "ready 制品与报告",
+      "variant": "emphasis",
+      "labelDy": 65
+    },
+    {
+      "id": "acceptance-report",
+      "from": "acceptance",
+      "to": "runner",
+      "label": "验收报告",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[1000, 500], [522.5, 500]],
+      "labelAt": [760, 520]
+    },
+    {
+      "id": "load-results-log",
+      "from": "runner",
+      "to": "qgis",
+      "label": "结果流与推理监控日志",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "right"
+    }
+  ]
+}

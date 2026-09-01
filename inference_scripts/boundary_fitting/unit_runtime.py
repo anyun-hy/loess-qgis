@@ -31,7 +31,7 @@ for import_root in (PLUGIN_ROOT, SCRIPTS_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 
 from common_boundary_smoother import smooth_common_boundaries
 from polyline_smoother import SmoothingConfig
@@ -919,7 +919,7 @@ def run_unit_fit(
         raise UnitRuntimeError("unit fitting requires run_spec schema 2")
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"])
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     unit = database.get_spatial_unit(run_id, unit_id)
     job = database.job_for_unit(run_id, stream_id, unit_id)
     if unit is None or job is None or int(job["job_id"]) != int(job_id):

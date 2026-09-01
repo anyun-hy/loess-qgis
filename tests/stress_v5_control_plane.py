@@ -84,7 +84,7 @@ def _table_counts(database: RunStateDB, run_id: str) -> dict[str, int]:
         counts = {
             table: int(
                 connection.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                    f"SELECT COUNT(*) FROM {table} WHERE run_id=%s",
                     (str(run_id),),
                 ).fetchone()[0]
             )

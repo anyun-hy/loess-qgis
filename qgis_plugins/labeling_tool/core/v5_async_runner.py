@@ -19,7 +19,7 @@ from .recovery_contract import validate_recovery_run
 from .result_catalog import artifact_sha256
 from .run_index import record_run_state
 from .run_spec import atomic_write_json, sha256_file
-from .run_state_db import RunStateDB
+from .run_state_db import run_state_from_spec
 
 
 def _resource_value(spec, key, default):
@@ -416,7 +416,7 @@ class V5AsyncInferenceRunner(QObject):
                 self._spec = json.load(handle)
             if self._spec.get("schema_version") != 2:
                 raise RuntimeError("V5 runner requires run_spec schema 2")
-            self._database = RunStateDB(self._spec["state_db"])
+            self._database = run_state_from_spec(self._spec)
         if resume:
             recovered_package_jobs = self._database.recover_ready_work_package_jobs(
                 self._spec["run_id"]

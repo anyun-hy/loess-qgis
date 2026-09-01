@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Iterable
 
-from .run_state_db import RunStateDB
+from .run_state_db import RunStateDB, run_state_from_spec
 
 
 class ManualPackageResetError(RuntimeError):
@@ -283,7 +283,7 @@ def reset_failed_work_packages(
         raise ManualPackageResetError(
             f"Run directory is missing or unsafe: {run_dir}"
         )
-    state = database or RunStateDB(spec["state_db"])
+    state = database or run_state_from_spec(spec)
     plan = state.begin_failed_package_reset(run_id)
     deleted_files = 0
     deleted_bytes = 0

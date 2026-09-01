@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Run 数据库连接：修改前与修改后",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1320, 760]
+  },
+  "components": [
+    {
+      "id": "oldClients",
+      "type": "frontend",
+      "label": "QGIS / Worker / 监控",
+      "sublabel": "各自打开状态库",
+      "pos": [70, 120],
+      "size": [180, 72]
+    },
+    {
+      "id": "oldSpec",
+      "type": "backend",
+      "label": "旧 Run Spec",
+      "sublabel": "路径或 PostgreSQL DSN",
+      "pos": [350, 120],
+      "size": [180, 72]
+    },
+    {
+      "id": "oldRouter",
+      "type": "backend",
+      "label": "RunStateDB 自动判断",
+      "sublabel": "根据字符串选择后端",
+      "pos": [650, 120],
+      "size": [190, 72]
+    },
+    {
+      "id": "oldPostgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "schema 可能取环境默认值",
+      "pos": [950, 60],
+      "size": [200, 72]
+    },
+    {
+      "id": "oldSqlite",
+      "type": "database",
+      "label": "run_state.sqlite",
+      "sublabel": "旧 Run / 测试 / 回放",
+      "tag": "已移除",
+      "pos": [950, 180],
+      "size": [200, 72]
+    },
+    {
+      "id": "newClients",
+      "type": "frontend",
+      "label": "QGIS / Worker / 监控",
+      "sublabel": "统一按 Run Spec 连接",
+      "pos": [70, 390],
+      "size": [180, 72]
+    },
+    {
+      "id": "newSpec",
+      "type": "backend",
+      "label": "当前 Run Spec",
+      "sublabel": "backend + DSN + state_schema",
+      "tag": "冻结连接身份",
+      "pos": [360, 390],
+      "size": [200, 72]
+    },
+    {
+      "id": "newResolver",
+      "type": "security",
+      "label": "run_state_from_spec",
+      "sublabel": "缺字段或文件库直接拒绝",
+      "pos": [670, 390],
+      "size": [200, 72]
+    },
+    {
+      "id": "newPostgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "严格连接该 Run 的冻结 schema",
+      "tag": "唯一控制面",
+      "pos": [990, 390],
+      "size": [210, 72]
+    },
+    {
+      "id": "gpkg",
+      "type": "database",
+      "label": "GeoPackage .gpkg",
+      "sublabel": "最终矢量与图层数据",
+      "pos": [420, 620],
+      "size": [210, 72]
+    },
+    {
+      "id": "layerLoader",
+      "type": "frontend",
+      "label": "QGIS 图层加载",
+      "sublabel": "读取 .gpkg，不读取 Run schema",
+      "pos": [730, 620],
+      "size": [220, 72]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "修改前：双后端与默认值并存",
+      "wraps": ["oldClients", "oldSpec", "oldRouter", "oldPostgres", "oldSqlite"],
+      "pad": 24
+    },
+    {
+      "kind": "security-group",
+      "label": "修改后：PostgreSQL-only，连接身份失败即停止",
+      "wraps": ["newClients", "newSpec", "newResolver", "newPostgres"],
+      "pad": 24
+    },
+    {
+      "kind": "region",
+      "label": "独立的数据层：不参与 Run 控制面连接",
+      "wraps": ["gpkg", "layerLoader"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {
+      "id": "oldReadSpec",
+      "from": "oldClients",
+      "to": "oldSpec",
+      "label": "读取 state_db"
+    },
+    {
+      "id": "oldSelectBackend",
+      "from": "oldSpec",
+      "to": "oldRouter",
+      "label": "自动判断"
+    },
+    {
+      "id": "oldUsePg",
+      "from": "oldRouter",
+      "to": "oldPostgres",
+      "label": "DSN → PostgreSQL"
+    },
+    {
+      "id": "oldUseSqlite",
+      "from": "oldRouter",
+      "to": "oldSqlite",
+      "label": "文件路径 → SQLite",
+      "variant": "dashed"
+    },
+    {
+      "id": "newReadSpec",
+      "from": "newClients",
+      "to": "newSpec",
+      "label": "传入完整 Run Spec",
+      "variant": "emphasis"
+    },
+    {
+      "id": "newValidate",
+      "from": "newSpec",
+      "to": "newResolver",
+      "label": "校验 backend / DSN / schema",
+      "labelAt": [615, 476],
+      "variant": "security"
+    },
+    {
+      "id": "newConnect",
+      "from": "newResolver",
+      "to": "newPostgres",
+      "label": "连接冻结 schema",
+      "variant": "emphasis"
+    },
+    {
+      "id": "loadGpkg",
+      "from": "gpkg",
+      "to": "layerLoader",
+      "label": "加载矢量图层"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "核心变化",
+      "items": [
+        "Run 控制面从双后端变为只允许 PostgreSQL",
+        "每个 Run 冻结 DSN 与 state_schema，换机器也不再猜默认 schema",
+        "监控、Worker、恢复和验收共享同一连接身份"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "保持不变",
+      "items": [
+        "GeoPackage 仍保存最终矢量和图层",
+        ".gpkg 内部使用 SQLite 格式，但它不是 Run 控制数据库"
+      ]
+    }
+  ]
+}

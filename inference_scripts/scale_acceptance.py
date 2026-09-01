@@ -17,7 +17,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from labeling_tool.core.run_spec import atomic_write_json, sha256_file
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 
 from deployment_config import load_json
 from runtime_metrics import directory_size
@@ -91,17 +91,17 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
         for table in ("tiles", "partitions", "spatial_units", "work_packages"):
             counts[table] = int(
                 connection.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,)
+                    f"SELECT COUNT(*) FROM {table} WHERE run_id=%s", (run_id,)
                 ).fetchone()[0]
             )
         job_rows = connection.execute(
-            "SELECT status, COUNT(*) AS n FROM jobs WHERE run_id=? GROUP BY status",
+            "SELECT status, COUNT(*) AS n FROM jobs WHERE run_id=%s GROUP BY status",
             (run_id,),
         ).fetchall()
         job_counts = {str(row["status"]): int(row["n"]) for row in job_rows}
         job_type_rows = connection.execute(
             """SELECT job_type, status, COUNT(*) AS n FROM jobs
-               WHERE run_id=? GROUP BY job_type, status
+               WHERE run_id=%s GROUP BY job_type, status
                ORDER BY job_type, status""",
             (run_id,),
         ).fetchall()
@@ -114,12 +114,12 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
             connection.execute(
                 """SELECT COALESCE(SUM(
                      CASE WHEN attempt>0 THEN attempt-1 ELSE 0 END
-                   ), 0) FROM jobs WHERE run_id=?""",
+                   ), 0) FROM jobs WHERE run_id=%s""",
                 (run_id,),
             ).fetchone()[0]
         )
         package_rows = connection.execute(
-            "SELECT status, COUNT(*) AS n FROM work_packages WHERE run_id=? GROUP BY status",
+            "SELECT status, COUNT(*) AS n FROM work_packages WHERE run_id=%s GROUP BY status",
             (run_id,),
         ).fetchall()
         package_counts = {
@@ -128,13 +128,13 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
         stream_rows = [
             dict(row)
             for row in connection.execute(
-                "SELECT stream_id, status, error FROM streams WHERE run_id=? ORDER BY stream_id",
+                "SELECT stream_id, status, error FROM streams WHERE run_id=%s ORDER BY stream_id",
                 (run_id,),
             ).fetchall()
         ]
         stream_unit_rows = connection.execute(
             """SELECT stream_id, status, COUNT(*) AS n FROM stream_units
-               WHERE run_id=? GROUP BY stream_id, status ORDER BY stream_id, status""",
+               WHERE run_id=%s GROUP BY stream_id, status ORDER BY stream_id, status""",
             (run_id,),
         ).fetchall()
         stream_unit_counts: dict[str, dict[str, int]] = {}
@@ -146,7 +146,7 @@ def _database_metrics(database: RunStateDB, run_id: str) -> dict[str, Any]:
             dict(row)
             for row in connection.execute(
                 """SELECT path, sha256, byte_count, status, kind, stream_id, unit_id
-                   FROM artifacts WHERE run_id=? ORDER BY artifact_id""",
+                   FROM artifacts WHERE run_id=%s ORDER BY artifact_id""",
                 (run_id,),
             ).fetchall()
         ]
@@ -222,7 +222,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         raise ScaleAcceptanceError("scale acceptance requires run_spec schema 2")
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"])
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     package_report_paths = run_dir.glob(
         "tmp/work_packages/*/package_report.json"
     )

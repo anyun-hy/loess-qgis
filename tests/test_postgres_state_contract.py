@@ -8,14 +8,15 @@ from labeling_tool.core.postgres_state import (
     DEFAULT_POSTGRES_DSN,
     DEFAULT_POSTGRES_SCHEMA,
     POSTGRES_SCHEMA_SQL,
-    _postgres_sql,
     is_postgres_location,
     validate_schema,
 )
 from labeling_tool.core.run_state_db import (
     RunStateDB,
+    RunStateError,
     production_state_database,
     production_state_schema,
+    run_state_from_spec,
 )
 
 
@@ -30,8 +31,7 @@ def test_production_postgres_defaults_use_peer_socket_without_password(monkeypat
     assert is_postgres_location(DEFAULT_POSTGRES_DSN)
 
     database = RunStateDB(DEFAULT_POSTGRES_DSN)
-    assert database.backend == "postgresql"
-    assert database.path is None
+    assert database.location == DEFAULT_POSTGRES_DSN
     assert database.postgres_schema == DEFAULT_POSTGRES_SCHEMA
 
 
@@ -47,19 +47,23 @@ def test_postgres_environment_override_and_schema_validation(monkeypatch):
         validate_schema('loess_qgis; DROP SCHEMA public')
 
 
-def test_postgres_sql_adapter_preserves_compare_and_set_semantics():
-    assert _postgres_sql("SELECT * FROM jobs WHERE job_id=?") == (
-        "SELECT * FROM jobs WHERE job_id=%s"
-    )
-    assert _postgres_sql(
-        "INSERT OR IGNORE INTO artifact_dependencies VALUES (?, ?, ?)"
-    ) == (
-        "INSERT INTO artifact_dependencies VALUES (%s, %s, %s) "
-        "ON CONFLICT DO NOTHING"
-    )
-    assert _postgres_sql("UPDATE jobs SET attempt=MAX(0, attempt-1)") == (
-        "UPDATE jobs SET attempt=GREATEST(0, attempt-1)"
-    )
+def test_run_state_rejects_filesystem_backends_and_requires_explicit_spec_backend(
+    tmp_path,
+):
+    legacy_path = tmp_path / "legacy-state.db"
+    legacy_path.write_bytes(b"do-not-modify")
+    before = legacy_path.read_bytes()
+
+    with pytest.raises(RunStateError, match="requires a PostgreSQL DSN"):
+        RunStateDB(legacy_path)
+    with pytest.raises(RunStateError, match="state_backend=postgresql"):
+        run_state_from_spec({"state_db": str(legacy_path)})
+    with pytest.raises(RunStateError, match="state_backend=postgresql"):
+        run_state_from_spec(
+            {"state_backend": "filesystem", "state_db": str(legacy_path)}
+        )
+
+    assert legacy_path.read_bytes() == before
 
 
 def test_postgres_schema_has_concurrent_control_plane_primitives():

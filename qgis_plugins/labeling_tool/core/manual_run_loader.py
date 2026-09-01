@@ -214,9 +214,6 @@ def load_manual_run(run_directory) -> dict:
     else:
         spec["accepted_gpkg"] = ""
         spec["accepted_gpkg_sha256"] = ""
-    state_db = run_root / "state.sqlite"
-    if state_db.is_file():
-        spec["state_db"] = str(state_db)
     fusion = dict(spec.get("fusion") or {})
     fusion_snapshot = run_root / "fusion_profile_snapshot.json"
     if fusion_snapshot.is_file():

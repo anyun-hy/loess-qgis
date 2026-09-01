@@ -7,19 +7,21 @@
 
 1. [PROJECT_IDEA.md](PROJECT_IDEA.md)：项目为什么存在、范围和成功标准；
 2. [ARCHITECTURE.md](ARCHITECTURE.md)：当前有效的软件与数据合同；
-3. [diagrams/PRODUCTION_CALL_GRAPH.md](diagrams/PRODUCTION_CALL_GRAPH.md)：当前
+3. [visualizations/README.md](../visualizations/README.md)：项目高层运行时和数据库
+   连接的交互架构图；
+4. [diagrams/PRODUCTION_CALL_GRAPH.md](diagrams/PRODUCTION_CALL_GRAPH.md)：当前
    QGIS 自动推理、V3.3、四流组装和人工整理的完整调用关系；
-4. [CURRENT_STATUS.md](CURRENT_STATUS.md)：当前已验证能力、未完成项和证据；
-5. [operations/FRAGMENTATION_V3.md](operations/FRAGMENTATION_V3.md)：当前生产
+5. [CURRENT_STATUS.md](CURRENT_STATUS.md)：当前已验证能力、未完成项和证据；
+6. [operations/FRAGMENTATION_V3.md](operations/FRAGMENTATION_V3.md)：当前生产
    碎片治理方法；
-6. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
+7. [decisions/POSTPROCESSING_METHOD_20260823.md](decisions/POSTPROCESSING_METHOD_20260823.md)：
    V3、Generate、失败 RAG 和 V3.1 启动前的方法决策；
-7. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
+8. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
    V3.1—V3.4 全量比较与 V3.3 选择决定；
-8. [decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md](decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md)：
+9. [decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md](decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md)：
    跨 Package score cache、持久 geometry worker、CUDA allocator 和监控刷新候选的
    暂缓决定及重新评估条件；
-9. [handoffs/POSTPROCESS_VALIDATION_START_20260830.md](handoffs/POSTPROCESS_VALIDATION_START_20260830.md)：
+10. [handoffs/POSTPROCESS_VALIDATION_START_20260830.md](handoffs/POSTPROCESS_VALIDATION_START_20260830.md)：
    当前性能后处理、日志和研究范围边界修复的实机验收交接。
 
 ## 文档职责
@@ -32,6 +34,7 @@
 | `operations/` | 正式运行方法和操作合同 | 未验收研究候选 |
 | `decisions/` | 长期有效的方法选择及理由 | 每次代码修改记录 |
 | `diagrams/` | 当前机制图 | 无来源截图和临时导出 |
+| 根 `visualizations/` | 当前交互架构图、Archify JSON 源规格 | 视觉验收截图、联系表和临时图 |
 | `handoffs/` | 用户明确请求的跨会话任务交接 | 普通代码修改和测试流水账 |
 | `archive/` | 只读历史证据 | 当前指导性结论 |
 

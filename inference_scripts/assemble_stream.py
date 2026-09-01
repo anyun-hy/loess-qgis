@@ -731,7 +731,7 @@ def _atomic_gpkg(
 
 
 @contextmanager
-def _readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+def _readonly_geopackage(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         connection.execute("PRAGMA query_only=ON")
@@ -767,7 +767,7 @@ def _validate_existing_gpkg(
 ) -> dict[str, Any]:
     if not path.is_file():
         raise StreamAssemblyError(f"resume input is missing: {path}")
-    with _readonly_sqlite(path) as connection:
+    with _readonly_geopackage(path) as connection:
         integrity = [
             str(row[0]) for row in connection.execute("PRAGMA integrity_check")
         ]
@@ -840,7 +840,7 @@ def _validate_existing_gpkg(
         f"COALESCE(CAST(\"{key}\" AS TEXT), '') != ?"
         for key in identity
     ]
-    with _readonly_sqlite(path) as connection:
+    with _readonly_geopackage(path) as connection:
         mismatched = int(
             connection.execute(
                 f'SELECT COUNT(*) FROM "{layer}" WHERE {" OR ".join(clauses)}',
