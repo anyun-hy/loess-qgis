@@ -16,7 +16,10 @@
    V3、Generate、失败 RAG 和 V3.1 启动前的方法决策；
 7. [decisions/FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：
    V3.1—V3.4 全量比较与 V3.3 选择决定；
-8. [handoffs/POSTPROCESS_VALIDATION_START_20260830.md](handoffs/POSTPROCESS_VALIDATION_START_20260830.md)：
+8. [decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md](decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md)：
+   跨 Package score cache、持久 geometry worker、CUDA allocator 和监控刷新候选的
+   暂缓决定及重新评估条件；
+9. [handoffs/POSTPROCESS_VALIDATION_START_20260830.md](handoffs/POSTPROCESS_VALIDATION_START_20260830.md)：
    当前性能后处理、日志和研究范围边界修复的实机验收交接。
 
 ## 文档职责
