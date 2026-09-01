@@ -6,9 +6,8 @@
 - Generate 只保留为激进几何去碎片的研究参考，不接入生产。
 - 已测试的 RAG v1、完整 RAG quick v3 和单 Swin-B 空间联合解码 B 均未通过
   方法效果验收，不接入生产。
-- RAG 详细源码、测试、设计文档和实验脚本已移入 Git 忽略目录：
-  `scratch/archive/rag_failed_20260823/`。
-- 腾讯 0817 全概率归档继续保留，不属于 Git 源码。
+- RAG 详细源码、测试、设计文档和实验脚本不随公开主线分发。
+- 全概率运行归档属于用户运行数据，不属于 Git 源码。
 
 ## 证据摘要
 
@@ -50,7 +49,7 @@ V3.1 应作为独立候选实现，不能直接覆盖 `fragmentation_v3.py`。�
 ## 远程证据
 
 ```text
-/home/example/Desktop/loess-project/output/experiments/0817_swin_joint_b_20260822/full_b/audit.json
-/home/example/Desktop/loess-project/output/experiments/0817_swin_joint_b_20260822/full_audit_legacy_coverage/swin_joint_full_audit.json
-/home/example/Desktop/loess-project/output/experiments/0817_swin_joint_b_20260822/full_audit_strict_complete_mask/swin_joint_full_audit.json
+<project_root>/output/experiments/0817_swin_joint_b_20260822/full_b/audit.json
+<project_root>/output/experiments/0817_swin_joint_b_20260822/full_audit_legacy_coverage/swin_joint_full_audit.json
+<project_root>/output/experiments/0817_swin_joint_b_20260822/full_audit_strict_complete_mask/swin_joint_full_audit.json
 ```

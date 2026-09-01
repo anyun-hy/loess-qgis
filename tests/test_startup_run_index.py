@@ -14,7 +14,7 @@ def _write_run(output_root, run_id, *, ready):
         "run_id": run_id,
         "run_dir": str(run_dir.resolve()),
         "output_root": str(output_root.resolve()),
-        "state_db": "dbname=anyun user=anyun host=/var/run/postgresql port=5432",
+        "state_db": "dbname=tester user=tester host=/var/run/postgresql port=5432",
         "state_backend": "postgresql",
         "fusion": {"profile_id": "l2_fusion_v1"},
     }

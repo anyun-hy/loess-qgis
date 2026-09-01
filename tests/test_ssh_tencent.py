@@ -26,6 +26,7 @@ def test_wrapper_reuses_tencent_connection_with_user_owned_socket(tmp_path):
     env.update(
         {
             "LOESS_SSH_CONTROL_DIR": str(control_dir),
+            "LOESS_SSH_HOST": "ubuntu-validation",
             "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
             "SSH_CAPTURE": str(capture),
         }
@@ -48,7 +49,7 @@ def test_wrapper_reuses_tencent_connection_with_user_owned_socket(tmp_path):
         b"ControlPersist=15m",
         b"-o",
         f"ControlPath={control_dir}/%C".encode(),
-        b"Tencent",
+        b"ubuntu-validation",
         b"printf '%s\\n' ready",
     ]
     assert stat.S_IMODE(control_dir.stat().st_mode) == 0o700

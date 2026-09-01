@@ -108,7 +108,7 @@ def test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility(monkeypatch):
     monkeypatch.setattr(
         check_environment.sys,
         "executable",
-        "/home/example/anaconda3/envs/qgis/bin/python",
+        "/opt/conda/envs/qgis/bin/python",
         raising=False,
     )
 

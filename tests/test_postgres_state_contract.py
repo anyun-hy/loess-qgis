@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import pytest
 
 from labeling_tool.core.postgres_state import (
@@ -27,6 +28,8 @@ def test_production_postgres_defaults_use_peer_socket_without_password(monkeypat
     assert production_state_database() == DEFAULT_POSTGRES_DSN
     assert production_state_schema() == DEFAULT_POSTGRES_SCHEMA
     assert "host=/var/run/postgresql" in DEFAULT_POSTGRES_DSN
+    assert f"dbname={getpass.getuser()}" in DEFAULT_POSTGRES_DSN
+    assert f"user={getpass.getuser()}" in DEFAULT_POSTGRES_DSN
     assert "password=" not in DEFAULT_POSTGRES_DSN.lower()
     assert is_postgres_location(DEFAULT_POSTGRES_DSN)
 
@@ -36,7 +39,7 @@ def test_production_postgres_defaults_use_peer_socket_without_password(monkeypat
 
 
 def test_postgres_environment_override_and_schema_validation(monkeypatch):
-    dsn = "postgresql://anyun@localhost/anyun"
+    dsn = "postgresql://tester@localhost/tester"
     monkeypatch.setenv("LOESS_STATE_DB_DSN", dsn)
     monkeypatch.setenv("LOESS_STATE_DB_SCHEMA", "loess_isolated")
 

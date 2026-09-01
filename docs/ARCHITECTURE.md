@@ -3,14 +3,12 @@
 ## 1. 文档地位
 
 本文只描述当前仍有效的架构和不可破坏合同。实际完成程度与部署状态见
-[CURRENT_STATUS.md](CURRENT_STATUS.md)。历史完整方案保存在
-[archive/PLUGIN_PLAN_V3_LEGACY.md](archive/PLUGIN_PLAN_V3_LEGACY.md)，不得用
-其中旧状态覆盖当前代码、配置、测试和本文件。
+[CURRENT_STATUS.md](CURRENT_STATUS.md)。
 
 交互式架构视图集中维护在 [visualizations/](../visualizations/README.md)：
 
 - [高层运行时架构](../visualizations/loess-qgis-runtime-architecture.html) 展示 QGIS、
-  Conda Worker、PostgreSQL、Artifact 和 macOS/Tencent 双平台运行边界；
+  Conda Worker、PostgreSQL、Artifact 和 macOS/Ubuntu 双平台运行边界；
 - [数据库连接修改前后](../visualizations/loess-qgis-database-connection-before-after.html)
   展示 PostgreSQL-only 连接合同以及与 GeoPackage 数据层的区别。
 
@@ -19,7 +17,7 @@
 
 ## 2. 权威源码与平台
 
-`/Users/example/Desktop/loess-qgis` 是 macOS 与 Ubuntu 的唯一权威源码：
+GitHub `anyun-hy/loess-qgis` 的受保护 `main` 是 macOS 与 Ubuntu 的权威源码：
 
 - Ubuntu：QGIS 3.44、Qt5/PyQt5、独立 `qgis` Conda、CUDA/RTX 3090；
 - macOS：QGIS 4.2、Qt6/PyQt6、独立 `qgis` Conda、MPS；
@@ -33,7 +31,7 @@
 |---|---|
 | `qgis_plugins/labeling_tool/` | QGIS UI、地图交互、运行编排、监控、人工修整 |
 | `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3/V3.3、组装和验收 |
-| `bash/` | 插件安装、部署项目初始化、Tencent SSH 入口 |
+| `bash/` | 插件安装、部署项目初始化、可选 SSH 入口 |
 | `tests/` | 契约、恢复、故障、规模和平台兼容测试 |
 | `docs/` | 当前架构、状态、操作和长期决策 |
 
@@ -153,7 +151,7 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 - live PID 不代表 Run 成功，必须以 Job、Stream、Artifact 和 hard gate 收口；
 - `bash/install_plugin.sh` 安装共享插件；
 - `bash/init_project.sh` 初始化或更新部署项目；
-- Tencent 操作统一通过 `bash/ssh_tencent.sh`；
+- 远程 Ubuntu 操作可通过 `bash/ssh_tencent.sh`，主机别名可由环境变量覆盖；
 - 部署成功、自动测试通过和 QGIS 实机验收是三个不同结论。
 
 ## 11. 变更原则

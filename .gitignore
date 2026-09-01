@@ -30,3 +30,5 @@ generate_fusion_30m.py
 load_fusion_30m_to_qgis.py
 inference_scripts/manual_groundtruth_benchmarks.json
 docs/FUSION_DENOISING_PIPELINE.md
+.vscode/
+visualizations/*.visual-check.*
