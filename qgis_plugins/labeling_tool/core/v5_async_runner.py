@@ -173,8 +173,22 @@ class PipelinePhaseTiming:
             recorded_at = float(value.get("recorded_at"))
         except (TypeError, ValueError):
             recorded_at = 0.0
+        # A recovered state serializes its prior recovery count in ``summary``.
+        # Retain that history across later restarts, but only accept the exact
+        # non-negative integer produced by this schema.  In particular, avoid
+        # coercing malformed values (including booleans) into a false count.
+        previous_recovered_incomplete = 0
+        summary = value.get("summary")
+        if isinstance(summary, dict):
+            recorded_count = summary.get("recovered_incomplete_span_count")
+            if (
+                isinstance(recorded_count, int)
+                and not isinstance(recorded_count, bool)
+                and recorded_count >= 0
+            ):
+                previous_recovered_incomplete = recorded_count
         spans = []
-        recovered_incomplete = 0
+        recovered_incomplete = previous_recovered_incomplete
         for item in value.get("spans") or []:
             if not isinstance(item, dict) or item.get("stage") not in cls.STAGES:
                 continue
