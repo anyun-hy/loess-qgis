@@ -1,5 +1,4 @@
 from labeling_tool.core.ownership_neighbors import ownership_neighbors
-from labeling_tool.core.run_state_db import RunStateDB
 from labeling_tool.core.spatial_planner import plan_spatial_units
 
 
@@ -12,9 +11,10 @@ def test_ownership_neighbors_are_exact_and_deterministic():
     assert len(first) == len(set(first))
 
 
-def test_disk_union_find_assigns_one_object_id_per_connected_component(tmp_path):
-    database = RunStateDB(tmp_path / "state.sqlite")
-    database.initialize()
+def test_database_union_find_assigns_one_object_id_per_connected_component(
+    postgres_database,
+):
+    database = postgres_database
     database.create_run("run", "a" * 64)
     database.register_streams("run", [{"stream_id": "model:a", "kind": "model"}])
     database.register_object_parts(

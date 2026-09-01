@@ -1,8 +1,8 @@
-import sqlite3
 import time
 from pathlib import Path
 
 import pytest
+from psycopg2 import Error as DatabaseError
 
 from labeling_tool.core.run_state_db import RunStateDB
 
@@ -10,9 +10,7 @@ from labeling_tool.core.run_state_db import RunStateDB
 RUN_ID = "20260805_180000_atomic"
 
 
-def _leased_package(tmp_path, *, package_id="package_00000"):
-    database = RunStateDB(tmp_path / "run_state.sqlite")
-    database.initialize()
+def _leased_package(database: RunStateDB, *, package_id="package_00000"):
     database.create_run(RUN_ID, "a" * 64)
     database.insert_work_packages(
         RUN_ID,
@@ -40,8 +38,8 @@ def _leased_package(tmp_path, *, package_id="package_00000"):
     return database, job
 
 
-def test_package_and_exact_leased_job_commit_ready_together(tmp_path):
-    database, job = _leased_package(tmp_path)
+def test_package_and_exact_leased_job_commit_ready_together(postgres_database):
+    database, job = _leased_package(postgres_database)
 
     assert not database.complete_work_package_job(
         RUN_ID,
@@ -72,9 +70,8 @@ def test_package_and_exact_leased_job_commit_ready_together(tmp_path):
     assert completed["lease_expires"] is None
 
 
-def test_terminal_package_failure_blocks_every_later_package_lease(tmp_path):
-    database = RunStateDB(tmp_path / "run_state.sqlite")
-    database.initialize()
+def test_terminal_package_failure_blocks_every_later_package_lease(postgres_database):
+    database = postgres_database
     database.create_run(RUN_ID, "a" * 64)
     database.insert_work_packages(
         RUN_ID,
@@ -111,7 +108,7 @@ def test_terminal_package_failure_blocks_every_later_package_lease(tmp_path):
         max_open_frontier_units=64,
         lease_seconds=120,
     ) is None
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         second_job_id = int(
             connection.execute(
                 "SELECT job_id FROM jobs WHERE package_id='package_00001'"
@@ -122,8 +119,8 @@ def test_terminal_package_failure_blocks_every_later_package_lease(tmp_path):
 
 
 @pytest.mark.parametrize("target", ["ready", "failed", "interrupted"])
-def test_exact_lease_transitions_package_and_job_together(tmp_path, target):
-    database, job = _leased_package(tmp_path)
+def test_exact_lease_transitions_package_and_job_together(postgres_database, target):
+    database, job = _leased_package(postgres_database)
 
     assert database.transition_work_package_job(
         RUN_ID,
@@ -143,17 +140,27 @@ def test_exact_lease_transitions_package_and_job_together(tmp_path, target):
 
 
 @pytest.mark.parametrize("target", ["ready", "failed", "interrupted"])
-def test_job_update_failure_rolls_back_package_transition(tmp_path, target):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+def test_job_update_failure_rolls_back_package_transition(postgres_database, target):
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
         connection.execute(
-            f"""CREATE TRIGGER reject_package_job_transition
-               BEFORE UPDATE OF status ON jobs
-               WHEN NEW.status='{target}' AND OLD.job_type='work_package'
-               BEGIN SELECT RAISE(ABORT, 'injected job commit failure'); END"""
+            f"""CREATE FUNCTION reject_package_job_transition() RETURNS trigger
+               LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.status='{target}' AND OLD.job_type='work_package' THEN
+                   RAISE EXCEPTION 'injected job commit failure';
+                 END IF;
+                 RETURN NEW;
+               END;
+               $$"""
+        )
+        connection.execute(
+            """CREATE TRIGGER reject_package_job_transition
+               BEFORE UPDATE OF status ON jobs FOR EACH ROW
+               EXECUTE FUNCTION reject_package_job_transition()"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected job commit failure"):
+    with pytest.raises(DatabaseError, match="injected job commit failure"):
         database.transition_work_package_job(
             RUN_ID,
             "package_00000",
@@ -166,11 +173,11 @@ def test_job_update_failure_rolls_back_package_transition(tmp_path, target):
     assert database.get_job(job["job_id"])["status"] == "running"
 
 
-def test_expired_lease_cannot_transition_or_retry_package(tmp_path):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+def test_expired_lease_cannot_transition_or_retry_package(postgres_database):
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+            "UPDATE jobs SET lease_expires=%s WHERE job_id=%s",
             (time.time() - 1, job["job_id"]),
         )
 
@@ -199,12 +206,12 @@ def test_expired_lease_cannot_transition_or_retry_package(tmp_path):
     assert database.get_job(job["job_id"])["status"] == "running"
 
 
-def test_expired_lease_cannot_be_revived_by_late_heartbeat(tmp_path):
-    database, job = _leased_package(tmp_path)
+def test_expired_lease_cannot_be_revived_by_late_heartbeat(postgres_database):
+    database, job = _leased_package(postgres_database)
     expired_at = time.time() - 1
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+            "UPDATE jobs SET lease_expires=%s WHERE job_id=%s",
             (expired_at, job["job_id"]),
         )
 
@@ -225,8 +232,8 @@ def test_expired_lease_cannot_be_revived_by_late_heartbeat(tmp_path):
     )
 
 
-def test_stale_worker_cannot_change_package_after_new_lease(tmp_path):
-    database, old_job = _leased_package(tmp_path)
+def test_stale_worker_cannot_change_package_after_new_lease(postgres_database):
+    database, old_job = _leased_package(postgres_database)
     assert database.interrupt_work_package_job(
         RUN_ID,
         "package_00000",
@@ -269,8 +276,8 @@ def test_stale_worker_cannot_change_package_after_new_lease(tmp_path):
     assert current["lease_token"] == new_job["lease_token"]
 
 
-def test_fail_or_requeue_uses_attempt_limit_atomically(tmp_path):
-    database, job = _leased_package(tmp_path)
+def test_fail_or_requeue_uses_attempt_limit_atomically(postgres_database):
+    database, job = _leased_package(postgres_database)
 
     for expected_attempt in (1, 2):
         assert job["attempt"] == expected_attempt
@@ -317,17 +324,27 @@ def test_fail_or_requeue_uses_attempt_limit_atomically(tmp_path):
     assert exhausted["error"] == "attempt 3"
 
 
-def test_retry_job_update_failure_rolls_back_package_requeue(tmp_path):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+def test_retry_job_update_failure_rolls_back_package_requeue(postgres_database):
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
+        connection.execute(
+            """CREATE FUNCTION reject_package_job_requeue() RETURNS trigger
+               LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.status='queued' AND OLD.job_type='work_package' THEN
+                   RAISE EXCEPTION 'injected retry commit failure';
+                 END IF;
+                 RETURN NEW;
+               END;
+               $$"""
+        )
         connection.execute(
             """CREATE TRIGGER reject_package_job_requeue
-               BEFORE UPDATE OF status ON jobs
-               WHEN NEW.status='queued' AND OLD.job_type='work_package'
-               BEGIN SELECT RAISE(ABORT, 'injected retry commit failure'); END"""
+               BEFORE UPDATE OF status ON jobs FOR EACH ROW
+               EXECUTE FUNCTION reject_package_job_requeue()"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected retry commit failure"):
+    with pytest.raises(DatabaseError, match="injected retry commit failure"):
         database.fail_or_requeue_work_package_job(
             RUN_ID,
             "package_00000",
@@ -339,8 +356,8 @@ def test_retry_job_update_failure_rolls_back_package_requeue(tmp_path):
     assert database.get_job(job["job_id"])["status"] == "running"
 
 
-def test_interrupt_work_package_worker_updates_both_rows(tmp_path):
-    database, job = _leased_package(tmp_path)
+def test_interrupt_work_package_worker_updates_both_rows(postgres_database):
+    database, job = _leased_package(postgres_database)
 
     assert database.interrupt_work_package_worker(RUN_ID, "wrong-worker") == 0
     assert database.get_work_package(RUN_ID, "package_00000")["status"] == "running"
@@ -353,11 +370,11 @@ def test_interrupt_work_package_worker_updates_both_rows(tmp_path):
     assert interrupted["lease_expires"] is None
 
 
-def test_expired_package_lease_interrupts_package_and_job_together(tmp_path):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+def test_expired_package_lease_interrupts_package_and_job_together(postgres_database):
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+            "UPDATE jobs SET lease_expires=%s WHERE job_id=%s",
             (time.time() - 1, job["job_id"]),
         )
 
@@ -370,8 +387,8 @@ def test_expired_package_lease_interrupts_package_and_job_together(tmp_path):
     assert interrupted["lease_expires"] is None
 
 
-def test_interrupt_run_updates_running_package_and_job_together(tmp_path):
-    database, job = _leased_package(tmp_path)
+def test_interrupt_run_updates_running_package_and_job_together(postgres_database):
+    database, job = _leased_package(postgres_database)
 
     assert database.interrupt_run_jobs(RUN_ID) == 1
     assert database.get_work_package(RUN_ID, "package_00000")["status"] == "interrupted"
@@ -384,17 +401,17 @@ def test_interrupt_run_updates_running_package_and_job_together(tmp_path):
 
 @pytest.mark.parametrize("interruption", ("worker", "expired", "run"))
 def test_package_interruption_does_not_consume_last_failure_attempt(
-    tmp_path, interruption
+    postgres_database, interruption
 ):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE jobs SET attempt=max_attempts WHERE job_id=?",
+            "UPDATE jobs SET attempt=max_attempts WHERE job_id=%s",
             (job["job_id"],),
         )
         if interruption == "expired":
             connection.execute(
-                "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+                "UPDATE jobs SET lease_expires=%s WHERE job_id=%s",
                 (time.time() - 1, job["job_id"]),
             )
 
@@ -419,17 +436,17 @@ def test_package_interruption_does_not_consume_last_failure_attempt(
 
 
 @pytest.mark.parametrize("job_status", ["running", "interrupted"])
-def test_recovery_finalizes_legacy_ready_package_job_window(tmp_path, job_status):
-    database, job = _leased_package(tmp_path)
-    with sqlite3.connect(database.path) as connection:
+def test_recovery_finalizes_legacy_ready_package_job_window(postgres_database, job_status):
+    database, job = _leased_package(postgres_database)
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE work_packages SET status='ready' WHERE run_id=? AND package_id=?",
+            "UPDATE work_packages SET status='ready' WHERE run_id=%s AND package_id=%s",
             (RUN_ID, "package_00000"),
         )
         if job_status == "interrupted":
             connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='', lease_token='',
-                   lease_expires=NULL WHERE job_id=?""",
+                   lease_expires=NULL WHERE job_id=%s""",
                 (job["job_id"],),
             )
 

@@ -7,6 +7,16 @@
 [archive/PLUGIN_PLAN_V3_LEGACY.md](archive/PLUGIN_PLAN_V3_LEGACY.md)，不得用
 其中旧状态覆盖当前代码、配置、测试和本文件。
 
+交互式架构视图集中维护在 [visualizations/](../visualizations/README.md)：
+
+- [高层运行时架构](../visualizations/loess-qgis-runtime-architecture.html) 展示 QGIS、
+  Conda Worker、PostgreSQL、Artifact 和 macOS/Tencent 双平台运行边界；
+- [数据库连接修改前后](../visualizations/loess-qgis-database-connection-before-after.html)
+  展示 PostgreSQL-only 连接合同以及与 GeoPackage 数据层的区别。
+
+交互图用于帮助阅读，架构真值仍由当前代码和本文书面合同共同约束。图表必须由
+同目录 JSON 源规格生成，不得直接编辑生成后的 HTML。
+
 ## 2. 权威源码与平台
 
 `/Users/example/Desktop/loess-qgis` 是 macOS 与 Ubuntu 的唯一权威源码：
@@ -132,7 +142,7 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 
 ## 10. 状态、恢复与部署
 
-- 新正式 Run 使用 PostgreSQL 状态库；历史 SQLite Run 只保留兼容读取；
+- Run 控制面只使用 PostgreSQL；历史文件状态库不再读取或恢复，需用当前部署创建新 Run；
 - Job 领取、Artifact 引用、失败重试和清理必须事务化；
 - 新 Run 的完整控制图创建成功后，旧 `failed/stopped` Run 的数据库过程明细
   在同一事务中归档清理；保留不可恢复的 Run 墓碑、spec 哈希、规模计数和有界

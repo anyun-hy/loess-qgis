@@ -210,7 +210,7 @@ def _log_indicators(level, message):
 
     severity = _log_severity(level, message)
     return severity == "warning", severity == "error"
-from ..core.run_state_db import RunStateDB
+from ..core.run_state_db import run_state_from_spec
 
 
 STATUS_COLORS = {
@@ -660,7 +660,10 @@ class InferenceMonitorDialog(QDialog):
     def bind_state_database(
         self, database_path, run_id, *, page_size=500, run_spec=None
     ):
-        self._database = RunStateDB(database_path)
+        del database_path
+        if not run_spec:
+            raise ValueError("monitor requires the frozen PostgreSQL Run Spec")
+        self._database = run_state_from_spec(run_spec)
         self._run_id = str(run_id)
         self._run_spec = dict(run_spec or {})
         self._page_size = max(1, min(int(page_size), 500))

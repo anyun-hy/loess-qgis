@@ -6,7 +6,6 @@ import contextlib
 import datetime as _datetime
 import json
 import os
-import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -87,65 +86,45 @@ def production_state_schema() -> str:
 
 
 def run_state_from_spec(spec: Mapping[str, Any]) -> "RunStateDB":
-    """Open the state backend frozen into a Run Spec without changing it."""
+    """Open the PostgreSQL state store frozen into a Run Spec."""
 
+    backend = str(spec.get("state_backend") or "").strip().lower()
     location = str(spec.get("state_db") or "").strip()
-    if not location:
-        raise RunStateError("Run Spec does not declare a state database")
+    if backend != "postgresql" or not is_postgres_location(location):
+        raise RunStateError(
+            "Run Spec must declare state_backend=postgresql and a PostgreSQL DSN; "
+            "legacy SQLite Run state is no longer supported"
+        )
     schema = str(spec.get("state_schema") or "").strip() or None
     return RunStateDB(location, postgres_schema=schema)
 
 
 class RunStateDB:
-    """Run-state API backed by PostgreSQL for production and SQLite for legacy.
-
-    New formal Run Specs contain a PostgreSQL DSN.  Filesystem paths remain
-    supported only so historical Run directories and isolated unit tests stay
-    readable while the production control plane migrates.
-    """
+    """PostgreSQL-backed Run-state API."""
 
     def __init__(
         self,
-        path: str | Path,
+        dsn: str,
         *,
-        busy_timeout_ms: int = 5000,
         postgres_schema: str | None = None,
     ):
-        location = str(path).strip()
-        self.backend = "postgresql" if is_postgres_location(location) else "sqlite"
+        location = str(dsn).strip()
+        if not is_postgres_location(location):
+            raise RunStateError(
+                "Run state requires a PostgreSQL DSN; filesystem databases are "
+                "no longer supported"
+            )
         self.location = location
         self.postgres_schema = validate_schema(
             postgres_schema or production_state_schema()
         )
-        self.path = (
-            None
-            if self.backend == "postgresql"
-            else Path(path).expanduser().resolve()
-        )
-        self.busy_timeout_ms = max(1, int(busy_timeout_ms))
-
-    @property
-    def is_postgresql(self) -> bool:
-        return self.backend == "postgresql"
 
     def _connect(self, *, autocommit: bool = True):
-        if self.is_postgresql:
-            return connect_postgres(
-                self.location,
-                schema=self.postgres_schema,
-                autocommit=autocommit,
-            )
-        if self.path is None:
-            raise RunStateError("SQLite state path is unavailable")
-        connection = sqlite3.connect(
-            self.path,
-            timeout=self.busy_timeout_ms / 1000.0,
-            isolation_level=None,
+        return connect_postgres(
+            self.location,
+            schema=self.postgres_schema,
+            autocommit=autocommit,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
 
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -160,8 +139,6 @@ class RunStateDB:
     def transaction(self) -> Iterator[Any]:
         connection = self._connect(autocommit=False)
         try:
-            if not self.is_postgresql:
-                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except Exception:
@@ -171,356 +148,25 @@ class RunStateDB:
             connection.close()
 
     def initialize(self) -> None:
-        if self.is_postgresql:
-            initialize_postgres(
-                self.location,
-                schema=self.postgres_schema,
-                schema_version=SCHEMA_VERSION,
-                now=_now(),
-            )
-            return
-        if self.path is None:
-            raise RunStateError("SQLite state path is unavailable")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connection() as connection:
-            journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            if str(journal_mode).lower() != "wal":
-                raise RunStateError(f"cannot enable SQLite WAL: {journal_mode}")
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    schema_version INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    run_spec_sha256 TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS streams (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    model_id TEXT NOT NULL DEFAULT '',
-                    profile_id TEXT NOT NULL DEFAULT '',
-                    version TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    error TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS stream_runtime_progress (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    stage TEXT NOT NULL DEFAULT '',
-                    phase TEXT NOT NULL DEFAULT '',
-                    phase_name TEXT NOT NULL DEFAULT '',
-                    phase_index INTEGER NOT NULL DEFAULT 0,
-                    phase_total INTEGER NOT NULL DEFAULT 0,
-                    progress_current INTEGER NOT NULL DEFAULT 0,
-                    progress_total INTEGER NOT NULL DEFAULT 0,
-                    feature_count INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    message TEXT NOT NULL DEFAULT '',
-                    phase_started_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id),
-                    FOREIGN KEY (run_id, stream_id)
-                        REFERENCES streams(run_id, stream_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS work_packages (
-                    run_id TEXT NOT NULL,
-                    package_id TEXT NOT NULL,
-                    sequence_no INTEGER NOT NULL,
-                    estimated_bytes INTEGER NOT NULL DEFAULT 0,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    attempt INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, package_id),
-                    UNIQUE (run_id, sequence_no),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS partitions (
-                    run_id TEXT NOT NULL,
-                    partition_id TEXT NOT NULL,
-                    row_no INTEGER NOT NULL,
-                    col_no INTEGER NOT NULL,
-                    core_window_json TEXT NOT NULL,
-                    halo_window_json TEXT NOT NULL,
-                    package_id TEXT,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, partition_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
-                    FOREIGN KEY (run_id, package_id)
-                        REFERENCES work_packages(run_id, package_id) ON DELETE RESTRICT
-                );
-
-                CREATE TABLE IF NOT EXISTS tiles (
-                    run_id TEXT NOT NULL,
-                    tile_id TEXT NOT NULL,
-                    row_no INTEGER NOT NULL,
-                    col_no INTEGER NOT NULL,
-                    width INTEGER NOT NULL,
-                    height INTEGER NOT NULL,
-                    pixel_window_json TEXT NOT NULL DEFAULT '{}',
-                    bounds_json TEXT NOT NULL DEFAULT '{}',
-                    raster_path TEXT NOT NULL DEFAULT '',
-                    sha256 TEXT NOT NULL DEFAULT '',
-                    partition_id TEXT,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, tile_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
-                    FOREIGN KEY (run_id, partition_id)
-                        REFERENCES partitions(run_id, partition_id) ON DELETE RESTRICT
-                );
-
-                CREATE TABLE IF NOT EXISTS spatial_units (
-                    run_id TEXT NOT NULL,
-                    unit_id TEXT NOT NULL,
-                    unit_type TEXT NOT NULL,
-                    owner_key TEXT NOT NULL,
-                    pixel_window_json TEXT NOT NULL,
-                    dependency_ids_json TEXT NOT NULL DEFAULT '[]',
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, unit_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS unit_dependencies (
-                    run_id TEXT NOT NULL,
-                    unit_id TEXT NOT NULL,
-                    partition_id TEXT NOT NULL,
-                    PRIMARY KEY (run_id, unit_id, partition_id),
-                    FOREIGN KEY (run_id, unit_id)
-                        REFERENCES spatial_units(run_id, unit_id) ON DELETE CASCADE,
-                    FOREIGN KEY (run_id, partition_id)
-                        REFERENCES partitions(run_id, partition_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS stream_units (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    unit_id TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    error TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id, unit_id),
-                    FOREIGN KEY (run_id, stream_id)
-                        REFERENCES streams(run_id, stream_id) ON DELETE CASCADE,
-                    FOREIGN KEY (run_id, unit_id)
-                        REFERENCES spatial_units(run_id, unit_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    job_type TEXT NOT NULL,
-                    stream_id TEXT NOT NULL DEFAULT '',
-                    tile_id TEXT NOT NULL DEFAULT '',
-                    unit_id TEXT NOT NULL DEFAULT '',
-                    package_id TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    priority INTEGER NOT NULL DEFAULT 0,
-                    attempt INTEGER NOT NULL DEFAULT 0,
-                    max_attempts INTEGER NOT NULL DEFAULT 3,
-                    progress_current INTEGER NOT NULL DEFAULT 0,
-                    progress_total INTEGER NOT NULL DEFAULT 0,
-                    worker_id TEXT NOT NULL DEFAULT '',
-                    lease_token TEXT NOT NULL DEFAULT '',
-                    lease_expires REAL,
-                    heartbeat_at TEXT,
-                    pid INTEGER,
-                    error TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS artifacts (
-                    artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL DEFAULT '',
-                    unit_id TEXT NOT NULL DEFAULT '',
-                    kind TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    byte_count INTEGER NOT NULL DEFAULT 0,
-                    sha256 TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'writing',
-                    ref_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (run_id, stream_id, unit_id, kind, path),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS artifact_dependencies (
-                    job_id INTEGER NOT NULL,
-                    artifact_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (job_id, artifact_id),
-                    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE,
-                    FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS unit_report_summaries (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    unit_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    fit_version TEXT NOT NULL DEFAULT '',
-                    chain_count INTEGER NOT NULL DEFAULT 0,
-                    shared_chain_count INTEGER NOT NULL DEFAULT 0,
-                    spline_count INTEGER NOT NULL DEFAULT 0,
-                    unchanged_count INTEGER NOT NULL DEFAULT 0,
-                    skipped_invalid_count INTEGER NOT NULL DEFAULT 0,
-                    max_displacement_px REAL NOT NULL DEFAULT 0,
-                    diagnostic_count INTEGER NOT NULL DEFAULT 0,
-                    fitted_edge_count INTEGER NOT NULL DEFAULT 0,
-                    report_path TEXT NOT NULL,
-                    report_byte_count INTEGER NOT NULL,
-                    report_sha256 TEXT NOT NULL,
-                    report_mtime_ns INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id, unit_id),
-                    FOREIGN KEY (run_id, stream_id, unit_id)
-                        REFERENCES stream_units(run_id, stream_id, unit_id)
-                        ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS object_links (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    left_part_id TEXT NOT NULL,
-                    right_part_id TEXT NOT NULL,
-                    class_code INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id, left_part_id, right_part_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS object_nodes (
-                    run_id TEXT NOT NULL,
-                    stream_id TEXT NOT NULL,
-                    part_id TEXT NOT NULL,
-                    class_code INTEGER NOT NULL,
-                    unit_id TEXT NOT NULL,
-                    parent_id TEXT NOT NULL,
-                    rank_value INTEGER NOT NULL DEFAULT 0,
-                    object_id TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (run_id, stream_id, part_id),
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    level TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    stream_id TEXT NOT NULL DEFAULT '',
-                    job_id INTEGER,
-                    message TEXT NOT NULL DEFAULT '',
-                    payload_json TEXT NOT NULL DEFAULT '{}',
-                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
-                    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_streams_status
-                    ON streams(run_id, status, stream_id);
-                CREATE INDEX IF NOT EXISTS idx_stream_progress_stage
-                    ON stream_runtime_progress(run_id, stage, status, stream_id);
-                CREATE INDEX IF NOT EXISTS idx_packages_status
-                    ON work_packages(run_id, status, sequence_no);
-                CREATE INDEX IF NOT EXISTS idx_partitions_status
-                    ON partitions(run_id, status, package_id);
-                CREATE INDEX IF NOT EXISTS idx_tiles_grid_status
-                    ON tiles(run_id, row_no, col_no, status);
-                CREATE INDEX IF NOT EXISTS idx_tiles_partition
-                    ON tiles(run_id, partition_id, status);
-                CREATE INDEX IF NOT EXISTS idx_units_status
-                    ON spatial_units(run_id, unit_type, status, unit_id);
-                CREATE INDEX IF NOT EXISTS idx_unit_dependencies_partition
-                    ON unit_dependencies(run_id, partition_id, unit_id);
-                CREATE INDEX IF NOT EXISTS idx_stream_units_status
-                    ON stream_units(run_id, stream_id, status, unit_id);
-                CREATE INDEX IF NOT EXISTS idx_jobs_claim
-                    ON jobs(run_id, status, priority DESC, job_id);
-                CREATE INDEX IF NOT EXISTS idx_jobs_stream_unit
-                    ON jobs(run_id, stream_id, unit_id, status);
-                CREATE INDEX IF NOT EXISTS idx_jobs_tile
-                    ON jobs(run_id, stream_id, tile_id, status);
-                CREATE INDEX IF NOT EXISTS idx_jobs_monitor
-                    ON jobs(run_id, job_type, status);
-                CREATE INDEX IF NOT EXISTS idx_artifacts_state
-                    ON artifacts(run_id, status, ref_count, artifact_id);
-                CREATE INDEX IF NOT EXISTS idx_unit_report_summaries_stream
-                    ON unit_report_summaries(run_id, stream_id, status, unit_id);
-                CREATE INDEX IF NOT EXISTS idx_object_nodes_root
-                    ON object_nodes(run_id, stream_id, parent_id, part_id);
-                CREATE INDEX IF NOT EXISTS idx_events_time
-                    ON events(run_id, event_id, timestamp);
-
-                CREATE TRIGGER IF NOT EXISTS artifact_dependency_after_insert
-                AFTER INSERT ON artifact_dependencies
-                BEGIN
-                    UPDATE artifacts SET ref_count=ref_count + 1, updated_at=NEW.created_at
-                    WHERE artifact_id=NEW.artifact_id;
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS artifact_dependency_after_delete
-                AFTER DELETE ON artifact_dependencies
-                BEGIN
-                    UPDATE artifacts SET ref_count=MAX(0, ref_count - 1), updated_at=CURRENT_TIMESTAMP
-                    WHERE artifact_id=OLD.artifact_id;
-                END;
-                """
-            )
-            current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current not in (0, SCHEMA_VERSION):
-                raise RunStateError(
-                    f"unsupported run-state schema {current}; expected {SCHEMA_VERSION}"
-                )
-            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        initialize_postgres(
+            self.location,
+            schema=self.postgres_schema,
+            schema_version=SCHEMA_VERSION,
+            now=_now(),
+        )
 
     def pragmas(self) -> dict[str, Any]:
-        if self.is_postgresql:
-            report = postgres_health(
-                self.location,
-                schema=self.postgres_schema,
-                schema_version=SCHEMA_VERSION,
-            )
-            return {
-                **report,
-                "journal_mode": "postgresql-mvcc",
-                "foreign_keys": 1,
-                "user_version": SCHEMA_VERSION,
-            }
-        with self._connection() as connection:
-            return {
-                "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0],
-                "foreign_keys": connection.execute("PRAGMA foreign_keys").fetchone()[0],
-                "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
-                "integrity_check": connection.execute("PRAGMA integrity_check").fetchone()[0],
-            }
+        report = postgres_health(
+            self.location,
+            schema=self.postgres_schema,
+            schema_version=SCHEMA_VERSION,
+        )
+        return {
+            **report,
+            "journal_mode": "postgresql-mvcc",
+            "foreign_keys": 1,
+            "user_version": SCHEMA_VERSION,
+        }
 
     def create_run(
         self,
@@ -536,7 +182,7 @@ class RunStateDB:
                 """INSERT INTO runs
                    (run_id, schema_version, status, run_spec_sha256,
                     metadata_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
                     str(run_id),
                     SCHEMA_VERSION,
@@ -552,7 +198,7 @@ class RunStateDB:
         with self._connection() as connection:
             return _row_dict(
                 connection.execute(
-                    "SELECT * FROM runs WHERE run_id=?", (str(run_id),)
+                    "SELECT * FROM runs WHERE run_id=%s", (str(run_id),)
                 ).fetchone()
             )
 
@@ -583,16 +229,15 @@ class RunStateDB:
 
         with self.transaction() as connection:
             placeholders = ",".join(
-                "?" for _state in ARCHIVABLE_INCOMPLETE_RUN_STATES
+                "%s" for _state in ARCHIVABLE_INCOMPLETE_RUN_STATES
             )
             candidate_sql = (
                 "SELECT run_id, status, run_spec_sha256, metadata_json, "
                 "created_at, updated_at FROM runs "
-                f"WHERE status IN ({placeholders}) AND run_id<>? "
+                f"WHERE status IN ({placeholders}) AND run_id<>%s "
                 "ORDER BY created_at, run_id"
             )
-            if self.is_postgresql:
-                candidate_sql += " FOR UPDATE SKIP LOCKED"
+            candidate_sql += " FOR UPDATE SKIP LOCKED"
             candidates = connection.execute(
                 candidate_sql,
                 (*ARCHIVABLE_INCOMPLETE_RUN_STATES, protected),
@@ -603,10 +248,10 @@ class RunStateDB:
                 active_count = int(
                     connection.execute(
                         """SELECT COUNT(*) FROM jobs
-                           WHERE run_id=? AND (
-                             status=? OR (
-                               lease_token<>? AND lease_expires IS NOT NULL
-                               AND lease_expires>?
+                           WHERE run_id=%s AND (
+                             status=%s OR (
+                               lease_token<>%s AND lease_expires IS NOT NULL
+                               AND lease_expires>%s
                              )
                            )""",
                         (run_id, "running", "", lease_now),
@@ -644,15 +289,15 @@ class RunStateDB:
                         row = connection.execute(
                             """SELECT COUNT(*) FROM artifact_dependencies
                                WHERE job_id IN (
-                                 SELECT job_id FROM jobs WHERE run_id=?
+                                 SELECT job_id FROM jobs WHERE run_id=%s
                                ) OR artifact_id IN (
-                                 SELECT artifact_id FROM artifacts WHERE run_id=?
+                                 SELECT artifact_id FROM artifacts WHERE run_id=%s
                                )""",
                             (run_id, run_id),
                         ).fetchone()
                     else:
                         row = connection.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE run_id=?",
+                            f"SELECT COUNT(*) FROM {table} WHERE run_id=%s",
                             (run_id,),
                         ).fetchone()
                     detail_counts[table] = int(row[0])
@@ -661,7 +306,7 @@ class RunStateDB:
                     str(row["status"]): int(row["n"])
                     for row in connection.execute(
                         """SELECT status, COUNT(*) AS n FROM jobs
-                           WHERE run_id=? GROUP BY status ORDER BY status""",
+                           WHERE run_id=%s GROUP BY status ORDER BY status""",
                         (run_id,),
                     ).fetchall()
                 }
@@ -669,7 +314,7 @@ class RunStateDB:
                     str(row["status"]): int(row["n"])
                     for row in connection.execute(
                         """SELECT status, COUNT(*) AS n FROM artifacts
-                           WHERE run_id=? GROUP BY status ORDER BY status""",
+                           WHERE run_id=%s GROUP BY status ORDER BY status""",
                         (run_id,),
                     ).fetchall()
                 }
@@ -678,17 +323,17 @@ class RunStateDB:
                         connection.execute(sql, (run_id, "")).fetchone()[0]
                     )
                     for sql in (
-                        "SELECT COUNT(*) FROM jobs WHERE run_id=? AND error<>?",
-                        "SELECT COUNT(*) FROM streams WHERE run_id=? AND error<>?",
-                        """SELECT COUNT(*) FROM events WHERE run_id=?
-                           AND level IN ('warning','error') AND message<>?""",
+                        "SELECT COUNT(*) FROM jobs WHERE run_id=%s AND error<>%s",
+                        "SELECT COUNT(*) FROM streams WHERE run_id=%s AND error<>%s",
+                        """SELECT COUNT(*) FROM events WHERE run_id=%s
+                           AND level IN ('warning','error') AND message<>%s""",
                     )
                 )
                 errors: list[dict[str, Any]] = []
                 for row in connection.execute(
                     """SELECT job_type, stream_id, unit_id, package_id,
                               status, error, updated_at
-                       FROM jobs WHERE run_id=? AND error<>?
+                       FROM jobs WHERE run_id=%s AND error<>%s
                        ORDER BY updated_at DESC, job_id DESC LIMIT 8""",
                     (run_id, ""),
                 ).fetchall():
@@ -706,7 +351,7 @@ class RunStateDB:
                     )
                 for row in connection.execute(
                     """SELECT stream_id, status, error, updated_at
-                       FROM streams WHERE run_id=? AND error<>?
+                       FROM streams WHERE run_id=%s AND error<>%s
                        ORDER BY updated_at DESC, stream_id LIMIT 8""",
                     (run_id, ""),
                 ).fetchall():
@@ -721,8 +366,8 @@ class RunStateDB:
                     )
                 for row in connection.execute(
                     """SELECT level, event_type, stream_id, message, timestamp
-                       FROM events WHERE run_id=? AND level IN (?,?)
-                         AND message<>?
+                       FROM events WHERE run_id=%s AND level IN (%s,%s)
+                         AND message<>%s
                        ORDER BY event_id DESC LIMIT 8""",
                     (run_id, "warning", "error", ""),
                 ).fetchall():
@@ -768,9 +413,9 @@ class RunStateDB:
                 deleted_totals["artifact_dependencies"] += connection.execute(
                     """DELETE FROM artifact_dependencies
                        WHERE job_id IN (
-                         SELECT job_id FROM jobs WHERE run_id=?
+                         SELECT job_id FROM jobs WHERE run_id=%s
                        ) OR artifact_id IN (
-                         SELECT artifact_id FROM artifacts WHERE run_id=?
+                         SELECT artifact_id FROM artifacts WHERE run_id=%s
                        )""",
                     (run_id, run_id),
                 ).rowcount
@@ -791,13 +436,13 @@ class RunStateDB:
                     "streams",
                 ):
                     deleted_totals[table] += connection.execute(
-                        f"DELETE FROM {table} WHERE run_id=?", (run_id,)
+                        f"DELETE FROM {table} WHERE run_id=%s", (run_id,)
                     ).rowcount
 
                 archived_status = "archived_" + str(candidate["status"])
                 updated = connection.execute(
-                    """UPDATE runs SET status=?, metadata_json=?, updated_at=?
-                       WHERE run_id=? AND status=?""",
+                    """UPDATE runs SET status=%s, metadata_json=%s, updated_at=%s
+                       WHERE run_id=%s AND status=%s""",
                     (
                         archived_status,
                         _json(metadata),
@@ -814,7 +459,7 @@ class RunStateDB:
                     """INSERT INTO events
                        (run_id, timestamp, level, event_type, stream_id,
                         job_id, message, payload_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
                         run_id,
                         archived_at,
@@ -856,14 +501,14 @@ class RunStateDB:
     ) -> bool:
         values: list[Any] = [str(status), _now(), str(run_id)]
         sql = (
-            "UPDATE runs SET status=?, updated_at=? WHERE run_id=? "
-            "AND status NOT LIKE 'archived_%'"
+            "UPDATE runs SET status=%s, updated_at=%s WHERE run_id=%s "
+            "AND status NOT LIKE 'archived_%%'"
         )
         if expected is not None:
             states = [expected] if isinstance(expected, str) else list(expected)
             if not states:
                 return False
-            sql += " AND status IN (" + ",".join("?" for _ in states) + ")"
+            sql += " AND status IN (" + ",".join("%s" for _ in states) + ")"
             values.extend(str(item) for item in states)
         with self.transaction() as connection:
             return connection.execute(sql, values).rowcount == 1
@@ -877,9 +522,8 @@ class RunStateDB:
 
         identifier = str(run_id)
         with self.transaction() as connection:
-            lock = " FOR UPDATE" if self.is_postgresql else ""
             row = connection.execute(
-                "SELECT metadata_json FROM runs WHERE run_id=?" + lock,
+                "SELECT metadata_json FROM runs WHERE run_id=%s FOR UPDATE",
                 (identifier,),
             ).fetchone()
             if row is None:
@@ -896,7 +540,7 @@ class RunStateDB:
                 )
             metadata.update(dict(values))
             updated = connection.execute(
-                "UPDATE runs SET metadata_json=?, updated_at=? WHERE run_id=?",
+                "UPDATE runs SET metadata_json=%s, updated_at=%s WHERE run_id=%s",
                 (_json(metadata), _now(), identifier),
             ).rowcount
             if updated != 1:
@@ -927,7 +571,7 @@ class RunStateDB:
                 """INSERT INTO streams
                    (run_id, stream_id, kind, model_id, profile_id, version,
                     status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows,
             )
 
@@ -941,8 +585,8 @@ class RunStateDB:
     ) -> bool:
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE streams SET status=?, error=?, updated_at=?
-                   WHERE run_id=? AND stream_id=?""",
+                """UPDATE streams SET status=%s, error=%s, updated_at=%s
+                   WHERE run_id=%s AND stream_id=%s""",
                 (str(status), str(error), _now(), str(run_id), str(stream_id)),
             ).rowcount == 1
 
@@ -977,7 +621,7 @@ class RunStateDB:
                     phase_index, phase_total, progress_current,
                     progress_total, feature_count, status, message,
                     phase_started_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT(run_id, stream_id) DO UPDATE SET
                      stage=excluded.stage,
                      phase=excluded.phase,
@@ -1017,10 +661,10 @@ class RunStateDB:
     def stream_runtime_progress(
         self, run_id: str, stream_id: str = ""
     ) -> dict[str, dict[str, Any]]:
-        sql = "SELECT * FROM stream_runtime_progress WHERE run_id=?"
+        sql = "SELECT * FROM stream_runtime_progress WHERE run_id=%s"
         values: list[Any] = [str(run_id)]
         if stream_id:
-            sql += " AND stream_id=?"
+            sql += " AND stream_id=%s"
             values.append(str(stream_id))
         sql += " ORDER BY stream_id"
         with self._connection() as connection:
@@ -1052,8 +696,8 @@ class RunStateDB:
         """Fail every non-ready stream after a terminal Run failure."""
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE streams SET status='failed', error=?, updated_at=?
-                   WHERE run_id=? AND status!='ready'""",
+                """UPDATE streams SET status='failed', error=%s, updated_at=%s
+                   WHERE run_id=%s AND status!='ready'""",
                 (str(error), _now(), str(run_id)),
             ).rowcount
 
@@ -1088,7 +732,7 @@ class RunStateDB:
                 """INSERT INTO work_packages
                    (run_id, package_id, sequence_no, estimated_bytes, metadata_json,
                     status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows(),
             )
         return count
@@ -1096,7 +740,7 @@ class RunStateDB:
     def get_work_package(self, run_id: str, package_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM work_packages WHERE run_id=? AND package_id=?",
+                "SELECT * FROM work_packages WHERE run_id=%s AND package_id=%s",
                 (str(run_id), str(package_id)),
             ).fetchone()
         result = _row_dict(row)
@@ -1114,14 +758,14 @@ class RunStateDB:
     ) -> bool:
         values: list[Any] = [str(status), _now(), str(run_id), str(package_id)]
         sql = (
-            "UPDATE work_packages SET status=?, updated_at=? "
-            "WHERE run_id=? AND package_id=?"
+            "UPDATE work_packages SET status=%s, updated_at=%s "
+            "WHERE run_id=%s AND package_id=%s"
         )
         if expected is not None:
             states = [expected] if isinstance(expected, str) else list(expected)
             if not states:
                 return False
-            sql += " AND status IN (" + ",".join("?" for _ in states) + ")"
+            sql += " AND status IN (" + ",".join("%s" for _ in states) + ")"
             values.extend(str(item) for item in states)
         with self.transaction() as connection:
             return connection.execute(sql, values).rowcount == 1
@@ -1129,7 +773,7 @@ class RunStateDB:
     def package_partitions(self, run_id: str, package_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                """SELECT * FROM partitions WHERE run_id=? AND package_id=?
+                """SELECT * FROM partitions WHERE run_id=%s AND package_id=%s
                    ORDER BY row_no, col_no""",
                 (str(run_id), str(package_id)),
             ).fetchall()
@@ -1147,7 +791,7 @@ class RunStateDB:
         """Return every Run Partition in deterministic row/column order."""
         with self._connection() as connection:
             rows = connection.execute(
-                """SELECT * FROM partitions WHERE run_id=?
+                """SELECT * FROM partitions WHERE run_id=%s
                    ORDER BY row_no, col_no""",
                 (str(run_id),),
             ).fetchall()
@@ -1164,7 +808,7 @@ class RunStateDB:
     def get_partition(self, run_id: str, partition_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM partitions WHERE run_id=? AND partition_id=?",
+                "SELECT * FROM partitions WHERE run_id=%s AND partition_id=%s",
                 (str(run_id), str(partition_id)),
             ).fetchone()
         if row is None:
@@ -1188,8 +832,8 @@ class RunStateDB:
                     raise RunStateError(f"invalid Tile window in Work Package: {raw_window}")
                 row_start, row_stop, col_start, col_stop = map(int, raw_window)
                 for row in connection.execute(
-                    """SELECT * FROM tiles WHERE run_id=?
-                       AND row_no>=? AND row_no<? AND col_no>=? AND col_no<?
+                    """SELECT * FROM tiles WHERE run_id=%s
+                       AND row_no>=%s AND row_no<%s AND col_no>=%s AND col_no<%s
                        ORDER BY row_no, col_no""",
                     (str(run_id), row_start, row_stop, col_start, col_stop),
                 ):
@@ -1220,7 +864,7 @@ class RunStateDB:
             rows = connection.execute(
                 """SELECT package_id, status, metadata_json
                    FROM work_packages
-                   WHERE run_id=? AND package_id!=? AND status!='ready'
+                   WHERE run_id=%s AND package_id!=%s AND status!='ready'
                    ORDER BY sequence_no""",
                 (str(run_id), str(completing_package_id)),
             ).fetchall()
@@ -1253,7 +897,7 @@ class RunStateDB:
                 str(row["status"]): int(row["n"])
                 for row in connection.execute(
                     """SELECT status, COUNT(*) AS n FROM work_packages
-                       WHERE run_id=? GROUP BY status""",
+                       WHERE run_id=%s GROUP BY status""",
                     (str(run_id),),
                 ).fetchall()
             }
@@ -1269,7 +913,7 @@ class RunStateDB:
               ON p.run_id=ud.run_id AND p.partition_id=ud.partition_id
             JOIN work_packages wp
               ON wp.run_id=p.run_id AND wp.package_id=p.package_id
-            WHERE ud.run_id=?
+            WHERE ud.run_id=%s
             GROUP BY ud.unit_id
         """
         with self._connection() as connection:
@@ -1281,7 +925,7 @@ class RunStateDB:
             ]
             if not open_unit_ids:
                 return {"unit_count": 0, "unit_ids": [], "neighbor_package_ids": []}
-            placeholders = ",".join("?" for _ in open_unit_ids)
+            placeholders = ",".join("%s" for _ in open_unit_ids)
             package_rows = connection.execute(
                 f"""SELECT DISTINCT wp.package_id, wp.sequence_no
                     FROM unit_dependencies ud
@@ -1289,7 +933,7 @@ class RunStateDB:
                       ON p.run_id=ud.run_id AND p.partition_id=ud.partition_id
                     JOIN work_packages wp
                       ON wp.run_id=p.run_id AND wp.package_id=p.package_id
-                    WHERE ud.run_id=? AND ud.unit_id IN ({placeholders})
+                    WHERE ud.run_id=%s AND ud.unit_id IN ({placeholders})
                       AND wp.status IN ('queued','interrupted')
                     ORDER BY wp.sequence_no""",
                 [str(run_id), *open_unit_ids],
@@ -1308,12 +952,12 @@ class RunStateDB:
         offset: int = 0,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM work_packages WHERE run_id=?"
+        sql = "SELECT * FROM work_packages WHERE run_id=%s"
         values: list[Any] = [str(run_id)]
         if status is not None:
-            sql += " AND status=?"
+            sql += " AND status=%s"
             values.append(str(status))
-        sql += " ORDER BY sequence_no LIMIT ? OFFSET ?"
+        sql += " ORDER BY sequence_no LIMIT %s OFFSET %s"
         values.extend((max(1, min(int(limit), 500)), max(0, int(offset))))
         with self._connection() as connection:
             rows = connection.execute(sql, values).fetchall()
@@ -1352,7 +996,7 @@ class RunStateDB:
                 """INSERT INTO partitions
                    (run_id, partition_id, row_no, col_no, core_window_json,
                     halo_window_json, package_id, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows(),
             )
         return count
@@ -1387,12 +1031,12 @@ class RunStateDB:
                 """INSERT INTO spatial_units
                    (run_id, unit_id, unit_type, owner_key, pixel_window_json,
                     dependency_ids_json, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows,
             )
             connection.executemany(
                 """INSERT INTO unit_dependencies
-                   (run_id, unit_id, partition_id) VALUES (?, ?, ?)""",
+                   (run_id, unit_id, partition_id) VALUES (%s, %s, %s)""",
                 dependency_rows,
             )
         return len(unit_values)
@@ -1400,7 +1044,7 @@ class RunStateDB:
     def get_spatial_unit(self, run_id: str, unit_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM spatial_units WHERE run_id=? AND unit_id=?",
+                "SELECT * FROM spatial_units WHERE run_id=%s AND unit_id=%s",
                 (str(run_id), str(unit_id)),
             ).fetchone()
         result = _row_dict(row)
@@ -1412,7 +1056,7 @@ class RunStateDB:
     def spatial_units(self, run_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                """SELECT * FROM spatial_units WHERE run_id=?
+                """SELECT * FROM spatial_units WHERE run_id=%s
                    ORDER BY unit_type, unit_id""",
                 (str(run_id),),
             ).fetchall()
@@ -1434,7 +1078,7 @@ class RunStateDB:
                 """SELECT u.* FROM spatial_units u
                    JOIN stream_units su
                      ON su.run_id=u.run_id AND su.unit_id=u.unit_id
-                   WHERE u.run_id=? AND su.stream_id=?
+                   WHERE u.run_id=%s AND su.stream_id=%s
                    ORDER BY u.unit_type, u.unit_id""",
                 (str(run_id), str(stream_id)),
             ).fetchall()
@@ -1451,8 +1095,8 @@ class RunStateDB:
     ) -> bool:
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE spatial_units SET status=?, updated_at=?
-                   WHERE run_id=? AND unit_id=?""",
+                """UPDATE spatial_units SET status=%s, updated_at=%s
+                   WHERE run_id=%s AND unit_id=%s""",
                 (str(status), _now(), str(run_id), str(unit_id)),
             ).rowcount == 1
 
@@ -1474,7 +1118,7 @@ class RunStateDB:
             connection.executemany(
                 """INSERT INTO stream_units
                    (run_id, stream_id, unit_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s)""",
                 rows,
             )
         return len(rows)
@@ -1490,8 +1134,8 @@ class RunStateDB:
     ) -> bool:
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE stream_units SET status=?, error=?, updated_at=?
-                   WHERE run_id=? AND stream_id=? AND unit_id=?""",
+                """UPDATE stream_units SET status=%s, error=%s, updated_at=%s
+                   WHERE run_id=%s AND stream_id=%s AND unit_id=%s""",
                 (
                     str(status),
                     str(error),
@@ -1508,7 +1152,7 @@ class RunStateDB:
                 str(row["status"]): int(row["n"])
                 for row in connection.execute(
                     """SELECT status, COUNT(*) AS n FROM stream_units
-                       WHERE run_id=? AND stream_id=? GROUP BY status""",
+                       WHERE run_id=%s AND stream_id=%s GROUP BY status""",
                     (str(run_id), str(stream_id)),
                 ).fetchall()
             }
@@ -1523,7 +1167,7 @@ class RunStateDB:
                    FROM stream_units su
                    JOIN spatial_units u
                      ON u.run_id=su.run_id AND u.unit_id=su.unit_id
-                   WHERE su.run_id=? AND su.stream_id=?
+                   WHERE su.run_id=%s AND su.stream_id=%s
                    GROUP BY u.unit_type, su.status""",
                 (str(run_id), str(stream_id)),
             ).fetchall()
@@ -1567,7 +1211,7 @@ class RunStateDB:
                    (run_id, tile_id, row_no, col_no, width, height,
                     pixel_window_json, bounds_json, raster_path, sha256,
                     partition_id, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows(),
             )
         return count
@@ -1579,13 +1223,13 @@ class RunStateDB:
         status: str | None = None,
         search: str = "",
     ) -> int:
-        sql = "SELECT COUNT(*) FROM tiles WHERE run_id=?"
+        sql = "SELECT COUNT(*) FROM tiles WHERE run_id=%s"
         values: list[Any] = [str(run_id)]
         if status is not None:
-            sql += " AND status=?"
+            sql += " AND status=%s"
             values.append(str(status))
         if search:
-            sql += " AND tile_id LIKE ? ESCAPE '\\'"
+            sql += " AND tile_id LIKE %s ESCAPE '\\'"
             escaped = (
                 str(search)
                 .replace("\\", "\\\\")
@@ -1606,7 +1250,7 @@ class RunStateDB:
                        FROM jobs j
                        JOIN work_packages wp
                          ON wp.run_id=j.run_id AND wp.package_id=j.package_id
-                       WHERE j.run_id=? AND j.job_type='work_package'
+                       WHERE j.run_id=%s AND j.job_type='work_package'
                          AND j.status='running' AND wp.status='running'
                        ORDER BY wp.sequence_no, j.job_id LIMIT 1""",
                     (str(run_id),),
@@ -1620,14 +1264,10 @@ class RunStateDB:
             # Keep every aggregate in one read transaction. Without an
             # explicit repeatable-read snapshot, different commits may be
             # exposed to individual SELECT statements in one polling cycle.
-            connection.execute(
-                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
-                if self.is_postgresql
-                else "BEGIN"
-            )
+            connection.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             run = _row_dict(
                 connection.execute(
-                    "SELECT * FROM runs WHERE run_id=?", (identifier,)
+                    "SELECT * FROM runs WHERE run_id=%s", (identifier,)
                 ).fetchone()
             )
             monitored_job_types = (
@@ -1636,7 +1276,7 @@ class RunStateDB:
             job_counts = {job_type: {} for job_type in monitored_job_types}
             for row in connection.execute(
                 """SELECT job_type, status, COUNT(*) AS n FROM jobs
-                   WHERE run_id=? AND job_type IN (
+                   WHERE run_id=%s AND job_type IN (
                      'work_package','fragmentation_v33','unit_fit'
                    )
                    GROUP BY job_type, status""",
@@ -1658,7 +1298,7 @@ class RunStateDB:
                                    ELSE CAST(progress_current AS REAL)
                                         / CAST(progress_total AS REAL) END
                             ELSE 0.0 END) AS completed
-                   FROM jobs WHERE run_id=? AND job_type IN (
+                   FROM jobs WHERE run_id=%s AND job_type IN (
                      'work_package','fragmentation_v33','unit_fit'
                    ) GROUP BY job_type""",
                 (identifier,),
@@ -1674,7 +1314,7 @@ class RunStateDB:
                        FROM jobs j
                        JOIN work_packages wp
                          ON wp.run_id=j.run_id AND wp.package_id=j.package_id
-                       WHERE j.run_id=? AND j.job_type='work_package'
+                       WHERE j.run_id=%s AND j.job_type='work_package'
                          AND j.status='running' AND wp.status='running'
                        ORDER BY wp.sequence_no, j.job_id LIMIT 1""",
                     (identifier,),
@@ -1683,7 +1323,7 @@ class RunStateDB:
             streams = [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT * FROM streams WHERE run_id=? ORDER BY stream_id",
+                    "SELECT * FROM streams WHERE run_id=%s ORDER BY stream_id",
                     (identifier,),
                 ).fetchall()
             ]
@@ -1695,7 +1335,7 @@ class RunStateDB:
                    FROM stream_units su
                    JOIN spatial_units u
                      ON u.run_id=su.run_id AND u.unit_id=su.unit_id
-                   WHERE su.run_id=?
+                   WHERE su.run_id=%s
                    GROUP BY su.stream_id, u.unit_type, su.status""",
                 (identifier,),
             ).fetchall():
@@ -1712,7 +1352,7 @@ class RunStateDB:
                    FROM jobs j
                    JOIN spatial_units u
                      ON u.run_id=j.run_id AND u.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.job_type='unit_fit'
+                   WHERE j.run_id=%s AND j.job_type='unit_fit'
                    GROUP BY j.stream_id, u.unit_type, j.status""",
                 (identifier,),
             ).fetchall():
@@ -1729,7 +1369,7 @@ class RunStateDB:
                     str(row["stream_id"]): dict(row)
                     for row in connection.execute(
                         """SELECT * FROM stream_runtime_progress
-                           WHERE run_id=? ORDER BY stream_id""",
+                           WHERE run_id=%s ORDER BY stream_id""",
                         (identifier,),
                     ).fetchall()
                 }
@@ -1740,7 +1380,7 @@ class RunStateDB:
                 coverage_rows = connection.execute(
                     """SELECT e.stream_id, e.payload_json
                        FROM events e
-                       WHERE e.run_id=?
+                       WHERE e.run_id=%s
                          AND e.event_type='stream_coverage_validation'
                          AND e.event_id=(
                            SELECT MAX(latest.event_id) FROM events latest
@@ -1792,8 +1432,8 @@ class RunStateDB:
             ) from error
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE tiles SET raster_path=?, sha256=?, updated_at=?
-                   WHERE run_id=? AND tile_id=? AND status!='excluded'""",
+                """UPDATE tiles SET raster_path=%s, sha256=%s, updated_at=%s
+                   WHERE run_id=%s AND tile_id=%s AND status!='excluded'""",
                 (
                     str(raster_path),
                     digest,
@@ -1814,19 +1454,19 @@ class RunStateDB:
         search: str = "",
     ) -> list[dict[str, Any]]:
         page_size = max(1, min(int(limit), MAX_TILE_PAGE_SIZE))
-        sql = "SELECT * FROM tiles WHERE run_id=?"
+        sql = "SELECT * FROM tiles WHERE run_id=%s"
         values: list[Any] = [str(run_id)]
         if status is not None:
-            sql += " AND status=?"
+            sql += " AND status=%s"
             values.append(str(status))
         if partition_id is not None:
-            sql += " AND partition_id=?"
+            sql += " AND partition_id=%s"
             values.append(str(partition_id))
         if search:
-            sql += " AND tile_id LIKE ? ESCAPE '\\'"
+            sql += " AND tile_id LIKE %s ESCAPE '\\'"
             escaped = str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             values.append(f"%{escaped}%")
-        sql += " ORDER BY row_no, col_no LIMIT ? OFFSET ?"
+        sql += " ORDER BY row_no, col_no LIMIT %s OFFSET %s"
         values.extend((page_size, max(0, int(offset))))
         with self._connection() as connection:
             return [dict(row) for row in connection.execute(sql, values).fetchall()]
@@ -1843,17 +1483,17 @@ class RunStateDB:
         sql = (
             "SELECT COUNT(*) FROM stream_units su "
             "JOIN spatial_units u ON u.run_id=su.run_id AND u.unit_id=su.unit_id "
-            "WHERE su.run_id=? AND su.stream_id=?"
+            "WHERE su.run_id=%s AND su.stream_id=%s"
         )
         values: list[Any] = [str(run_id), str(stream_id)]
         if unit_type:
-            sql += " AND u.unit_type=?"
+            sql += " AND u.unit_type=%s"
             values.append(str(unit_type))
         if status:
-            sql += " AND su.status=?"
+            sql += " AND su.status=%s"
             values.append(str(status))
         if search:
-            sql += " AND su.unit_id LIKE ? ESCAPE '\\'"
+            sql += " AND su.unit_id LIKE %s ESCAPE '\\'"
             escaped = str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             values.append(f"%{escaped}%")
         with self._connection() as connection:
@@ -1875,20 +1515,20 @@ class RunStateDB:
             "SELECT su.stream_id, su.unit_id, u.unit_type, su.status, su.error, "
             "u.owner_key, u.pixel_window_json FROM stream_units su "
             "JOIN spatial_units u ON u.run_id=su.run_id AND u.unit_id=su.unit_id "
-            "WHERE su.run_id=? AND su.stream_id=?"
+            "WHERE su.run_id=%s AND su.stream_id=%s"
         )
         values: list[Any] = [str(run_id), str(stream_id)]
         if unit_type:
-            sql += " AND u.unit_type=?"
+            sql += " AND u.unit_type=%s"
             values.append(str(unit_type))
         if status:
-            sql += " AND su.status=?"
+            sql += " AND su.status=%s"
             values.append(str(status))
         if search:
-            sql += " AND su.unit_id LIKE ? ESCAPE '\\'"
+            sql += " AND su.unit_id LIKE %s ESCAPE '\\'"
             escaped = str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             values.append(f"%{escaped}%")
-        sql += " ORDER BY u.unit_type, su.unit_id LIMIT ? OFFSET ?"
+        sql += " ORDER BY u.unit_type, su.unit_id LIMIT %s OFFSET %s"
         values.extend((page_size, max(0, int(offset))))
         with self._connection() as connection:
             rows = [dict(row) for row in connection.execute(sql, values).fetchall()]
@@ -1901,7 +1541,7 @@ class RunStateDB:
             return [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT * FROM streams WHERE run_id=? ORDER BY stream_id",
+                    "SELECT * FROM streams WHERE run_id=%s ORDER BY stream_id",
                     (str(run_id),),
                 ).fetchall()
             ]
@@ -1935,7 +1575,7 @@ class RunStateDB:
                 """INSERT INTO jobs
                    (run_id, job_type, stream_id, tile_id, unit_id, package_id,
                     status, priority, max_attempts, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 rows(),
             )
         return count
@@ -1944,7 +1584,7 @@ class RunStateDB:
         with self._connection() as connection:
             return _row_dict(
                 connection.execute(
-                    "SELECT * FROM jobs WHERE job_id=?", (int(job_id),)
+                    "SELECT * FROM jobs WHERE job_id=%s", (int(job_id),)
                 ).fetchone()
             )
 
@@ -1962,8 +1602,8 @@ class RunStateDB:
         updated = connection.execute(
             """UPDATE jobs SET status='running', attempt=attempt+1,
                progress_current=0, progress_total=0,
-               worker_id=?, lease_token=?, lease_expires=?, heartbeat_at=?,
-               updated_at=? WHERE job_id=?
+               worker_id=%s, lease_token=%s, lease_expires=%s, heartbeat_at=%s,
+               updated_at=%s WHERE job_id=%s
                AND status IN ('queued','interrupted') AND attempt < max_attempts""",
             (str(worker_id), token, expires, now, now, job_id),
         )
@@ -1971,8 +1611,8 @@ class RunStateDB:
             raise RunStateError("Job state changed during lease acquisition")
         if str(row["job_type"]) == "work_package":
             package_updated = connection.execute(
-                """UPDATE work_packages SET status='running', updated_at=?
-                   WHERE run_id=? AND package_id=?
+                """UPDATE work_packages SET status='running', updated_at=%s
+                   WHERE run_id=%s AND package_id=%s
                      AND status IN ('queued','interrupted')""",
                 (now, str(row["run_id"]), str(row["package_id"])),
             )
@@ -1981,7 +1621,7 @@ class RunStateDB:
                     "Work Package state changed during lease acquisition"
                 )
         leased = connection.execute(
-            "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT * FROM jobs WHERE job_id=%s", (job_id,)
         ).fetchone()
         if leased is None:
             raise RunStateError("leased Job disappeared during lease acquisition")
@@ -1999,7 +1639,7 @@ class RunStateDB:
         expires = time.time() + max(1.0, float(lease_seconds))
         now = _now()
         sql = (
-            "SELECT * FROM jobs WHERE run_id=? "
+            "SELECT * FROM jobs WHERE run_id=%s "
             "AND status IN ('queued','interrupted') AND attempt < max_attempts "
             "AND EXISTS (SELECT 1 FROM runs r WHERE r.run_id=jobs.run_id "
             "AND r.status IN ('preflight','planned','running','raster_ready')) "
@@ -2031,11 +1671,10 @@ class RunStateDB:
         )
         values: list[Any] = [str(run_id)]
         if job_types:
-            sql += " AND job_type IN (" + ",".join("?" for _ in job_types) + ")"
+            sql += " AND job_type IN (" + ",".join("%s" for _ in job_types) + ")"
             values.extend(str(item) for item in job_types)
         sql += " ORDER BY priority DESC, job_id LIMIT 1"
-        if self.is_postgresql:
-            sql += " FOR UPDATE SKIP LOCKED"
+        sql += " FOR UPDATE SKIP LOCKED"
         with self.transaction() as connection:
             row = connection.execute(sql, values).fetchone()
             if row is None:
@@ -2056,14 +1695,14 @@ class RunStateDB:
         frontier = self.open_frontier_summary(run_id)
         preferred = list(frontier["neighbor_package_ids"])
         if int(frontier["unit_count"]) >= max(1, int(max_open_frontier_units)) and preferred:
-            placeholders = ",".join("?" for _ in preferred)
+            placeholders = ",".join("%s" for _ in preferred)
             with self._connection() as connection:
                 row = connection.execute(
                     f"""SELECT j.job_id
                         FROM jobs j
                         JOIN work_packages wp
                           ON wp.run_id=j.run_id AND wp.package_id=j.package_id
-                        WHERE j.run_id=? AND j.job_type='work_package'
+                        WHERE j.run_id=%s AND j.job_type='work_package'
                           AND j.status IN ('queued','interrupted')
                           AND j.attempt < j.max_attempts
                           AND NOT EXISTS (
@@ -2117,28 +1756,27 @@ class RunStateDB:
         expires = time.time() + max(1.0, float(lease_seconds))
         now = _now()
         with self.transaction() as connection:
-            if self.is_postgresql:
-                locked_run = connection.execute(
-                    "SELECT run_id FROM runs WHERE run_id=? FOR UPDATE",
-                    (str(run_id),),
-                ).fetchone()
-                if locked_run is None:
-                    return None
+            locked_run = connection.execute(
+                "SELECT run_id FROM runs WHERE run_id=%s FOR UPDATE",
+                (str(run_id),),
+            ).fetchone()
+            if locked_run is None:
+                return None
             running = int(
                 connection.execute(
-                    """SELECT COUNT(*) FROM jobs WHERE run_id=?
+                    """SELECT COUNT(*) FROM jobs WHERE run_id=%s
                        AND job_type='fragmentation_v33' AND status='running'""",
                     (str(run_id),),
                 ).fetchone()[0]
             )
             if running >= min(4, max(1, int(max_running))):
                 return None
-            lock_clause = " FOR UPDATE SKIP LOCKED" if self.is_postgresql else ""
+            lock_clause = " FOR UPDATE SKIP LOCKED"
             row = connection.execute(
                 """SELECT j.* FROM jobs j
                    JOIN spatial_units u
                      ON u.run_id=j.run_id AND u.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.job_type='fragmentation_v33'
+                   WHERE j.run_id=%s AND j.job_type='fragmentation_v33'
                      AND j.status IN ('queued','interrupted')
                      AND j.attempt < j.max_attempts
                      AND EXISTS (
@@ -2243,9 +1881,9 @@ class RunStateDB:
         expires = time.time() + max(1.0, float(lease_seconds))
         now = _now()
         with self.transaction() as connection:
-            lock_clause = " FOR UPDATE SKIP LOCKED" if self.is_postgresql else ""
+            lock_clause = " FOR UPDATE SKIP LOCKED"
             row = connection.execute(
-                """SELECT * FROM jobs WHERE job_id=?
+                """SELECT * FROM jobs WHERE job_id=%s
                    AND status IN ('queued','interrupted') AND attempt < max_attempts
                    AND EXISTS (
                      SELECT 1 FROM runs r WHERE r.run_id=jobs.run_id
@@ -2304,10 +1942,10 @@ class RunStateDB:
         expires = fence_time + max(1.0, float(lease_seconds))
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE jobs SET progress_current=?, progress_total=?,
-                   heartbeat_at=?, lease_expires=?, updated_at=?
-                   WHERE job_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                """UPDATE jobs SET progress_current=%s, progress_total=%s,
+                   heartbeat_at=%s, lease_expires=%s, updated_at=%s
+                   WHERE job_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     max(0, int(current)),
                     max(0, int(total)),
@@ -2334,10 +1972,10 @@ class RunStateDB:
         fence_time = time.time()
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE jobs SET status=?, error=?, worker_id='',
-                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE job_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                """UPDATE jobs SET status=%s, error=%s, worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE job_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     str(status),
                     str(error),
@@ -2360,17 +1998,17 @@ class RunStateDB:
         fence_time = time.time()
         with self.transaction() as connection:
             job = connection.execute(
-                """SELECT * FROM jobs WHERE job_id=?
+                """SELECT * FROM jobs WHERE job_id=%s
                    AND job_type='fragmentation_v33' AND status='running'
-                   AND lease_token=? AND lease_expires IS NOT NULL
-                   AND lease_expires>=?""",
+                   AND lease_token=%s AND lease_expires IS NOT NULL
+                   AND lease_expires>=%s""",
                 (int(job_id), str(lease_token), fence_time),
             ).fetchone()
             if job is None:
                 return False
             unit = connection.execute(
                 "SELECT unit_type, owner_key FROM spatial_units "
-                "WHERE run_id=? AND unit_id=?",
+                "WHERE run_id=%s AND unit_id=%s",
                 (str(job["run_id"]), str(job["unit_id"])),
             ).fetchone()
             if unit is None:
@@ -2398,7 +2036,7 @@ class RunStateDB:
             expected = int(
                 connection.execute(
                     """SELECT COUNT(*) FROM unit_dependencies
-                       WHERE run_id=? AND unit_id=?""",
+                       WHERE run_id=%s AND unit_id=%s""",
                     (str(job["run_id"]), str(job["unit_id"])),
                 ).fetchone()[0]
             )
@@ -2412,8 +2050,8 @@ class RunStateDB:
                            FROM artifacts a
                            JOIN unit_dependencies d
                              ON d.run_id=a.run_id AND d.partition_id=a.unit_id
-                           WHERE a.run_id=? AND a.stream_id=?
-                             AND d.unit_id=? AND a.kind=? AND a.status='ready'""",
+                           WHERE a.run_id=%s AND a.stream_id=%s
+                             AND d.unit_id=%s AND a.kind=%s AND a.status='ready'""",
                         (
                             str(job["run_id"]),
                             str(job["stream_id"]),
@@ -2425,8 +2063,8 @@ class RunStateDB:
                     ready_row = connection.execute(
                         """SELECT COUNT(*) AS artifact_count,
                                   COUNT(DISTINCT unit_id) AS owner_count
-                           FROM artifacts WHERE run_id=? AND stream_id=?
-                             AND unit_id=? AND kind=? AND status='ready'""",
+                           FROM artifacts WHERE run_id=%s AND stream_id=%s
+                             AND unit_id=%s AND kind=%s AND status='ready'""",
                         (
                             str(job["run_id"]), str(job["stream_id"]),
                             expected_owner, kind,
@@ -2442,8 +2080,8 @@ class RunStateDB:
                     )
             report_ready = int(
                 connection.execute(
-                    """SELECT COUNT(*) FROM artifacts WHERE run_id=?
-                       AND stream_id=? AND unit_id=? AND kind=? AND status='ready'""",
+                    """SELECT COUNT(*) FROM artifacts WHERE run_id=%s
+                       AND stream_id=%s AND unit_id=%s AND kind=%s AND status='ready'""",
                     (
                         str(job["run_id"]),
                         str(job["stream_id"]),
@@ -2456,11 +2094,11 @@ class RunStateDB:
                 raise RunStateError("V3.3 acceptance report is not ready")
             changed = connection.execute(
                 """UPDATE jobs SET status='ready', error='', worker_id='',
-                   progress_current=?, progress_total=?, lease_token='',
-                   lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE job_id=? AND job_type='fragmentation_v33'
-                     AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                   progress_current=%s, progress_total=%s, lease_token='',
+                   lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE job_id=%s AND job_type='fragmentation_v33'
+                     AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     1 if staged else expected,
                     1 if staged else expected,
@@ -2474,7 +2112,7 @@ class RunStateDB:
             if changed != 1:
                 return False
             connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=?",
+                "DELETE FROM artifact_dependencies WHERE job_id=%s",
                 (int(job_id),),
             )
             return True
@@ -2547,24 +2185,24 @@ class RunStateDB:
         fence_time = time.time()
         with self.transaction() as connection:
             job = connection.execute(
-                """SELECT * FROM jobs WHERE job_id=?
+                """SELECT * FROM jobs WHERE job_id=%s
                    AND job_type='fragmentation_v33' AND status='running'
-                   AND lease_token=? AND lease_expires IS NOT NULL
-                   AND lease_expires>=?""",
+                   AND lease_token=%s AND lease_expires IS NOT NULL
+                   AND lease_expires>=%s""",
                 (int(job_id), token, fence_time),
             ).fetchone()
             if job is None:
                 return False
             unit = connection.execute(
                 """SELECT unit_type FROM spatial_units
-                   WHERE run_id=? AND unit_id=?""",
+                   WHERE run_id=%s AND unit_id=%s""",
                 (str(job["run_id"]), str(job["unit_id"])),
             ).fetchone()
             if unit is None or str(unit["unit_type"]) != "FragmentationV33Finalize":
                 raise RunStateError("atomic V3.3 finalize requires the finalize unit")
             expected_rows = connection.execute(
                 """SELECT partition_id FROM unit_dependencies
-                   WHERE run_id=? AND unit_id=? ORDER BY partition_id""",
+                   WHERE run_id=%s AND unit_id=%s ORDER BY partition_id""",
                 (str(job["run_id"]), str(job["unit_id"])),
             ).fetchall()
             expected = {str(row["partition_id"]) for row in expected_rows}
@@ -2580,7 +2218,7 @@ class RunStateDB:
                        JOIN spatial_units owner_unit
                          ON owner_unit.run_id=owner_job.run_id
                         AND owner_unit.unit_id=owner_job.unit_id
-                       WHERE owner_job.run_id=? AND owner_job.stream_id=?
+                       WHERE owner_job.run_id=%s AND owner_job.stream_id=%s
                          AND owner_job.job_type='fragmentation_v33'
                          AND owner_unit.unit_type='FragmentationV33Partition'
                          AND owner_job.status!='ready'""",
@@ -2599,8 +2237,8 @@ class RunStateDB:
             ) -> None:
                 other = connection.execute(
                     """SELECT path FROM artifacts
-                       WHERE run_id=? AND stream_id=? AND unit_id=? AND kind=?
-                         AND path!=? AND status='ready'""",
+                       WHERE run_id=%s AND stream_id=%s AND unit_id=%s AND kind=%s
+                         AND path!=%s AND status='ready'""",
                     (
                         str(job["run_id"]),
                         str(job["stream_id"]),
@@ -2617,7 +2255,7 @@ class RunStateDB:
                     """INSERT INTO artifacts
                        (run_id, stream_id, unit_id, kind, path, byte_count,
                         sha256, status, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'ready', %s, %s)
                        ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                     (
                         str(job["run_id"]),
@@ -2633,8 +2271,8 @@ class RunStateDB:
                 )
                 artifact = connection.execute(
                     """SELECT status, byte_count, sha256 FROM artifacts
-                       WHERE run_id=? AND stream_id=? AND unit_id=?
-                         AND kind=? AND path=?""",
+                       WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                         AND kind=%s AND path=%s""",
                     (
                         str(job["run_id"]),
                         str(job["stream_id"]),
@@ -2655,9 +2293,9 @@ class RunStateDB:
                 if str(artifact["status"]) not in {"writing", "failed"}:
                     raise RunStateError(f"V3.3 {kind} cannot be published")
                 changed = connection.execute(
-                    """UPDATE artifacts SET status='ready', byte_count=?,
-                       sha256=?, updated_at=? WHERE run_id=? AND stream_id=?
-                       AND unit_id=? AND kind=? AND path=?
+                    """UPDATE artifacts SET status='ready', byte_count=%s,
+                       sha256=%s, updated_at=%s WHERE run_id=%s AND stream_id=%s
+                       AND unit_id=%s AND kind=%s AND path=%s
                        AND status IN ('writing','failed')""",
                     (
                         int(byte_count),
@@ -2697,11 +2335,11 @@ class RunStateDB:
             )
             changed = connection.execute(
                 """UPDATE jobs SET status='ready', error='', worker_id='',
-                   progress_current=?, progress_total=?, lease_token='',
-                   lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE job_id=? AND job_type='fragmentation_v33'
-                     AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                   progress_current=%s, progress_total=%s, lease_token='',
+                   lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE job_id=%s AND job_type='fragmentation_v33'
+                     AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     len(expected),
                     len(expected),
@@ -2715,7 +2353,7 @@ class RunStateDB:
             if changed != 1:
                 return False
             connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=?",
+                "DELETE FROM artifact_dependencies WHERE job_id=%s",
                 (int(job_id),),
             )
             return True
@@ -2734,9 +2372,9 @@ class RunStateDB:
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT 1 FROM jobs
-                   WHERE job_id=? AND run_id=? AND job_type='work_package'
-                     AND package_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                   WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                     AND package_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     int(job_id),
                     str(run_id),
@@ -2760,8 +2398,8 @@ class RunStateDB:
 
         Only the current, unexpired ``job_id``/``lease_token`` pair may change
         either row. A stale worker, a job for another Package, or a lost lease
-        changes neither row. Both updates share one ``BEGIN IMMEDIATE``
-        transaction so the Package and control-plane Job cannot diverge.
+        changes neither row. Both updates share one PostgreSQL transaction so
+        the Package and control-plane Job cannot diverge.
         """
         target = str(status)
         if target not in {"ready", "failed", "interrupted"}:
@@ -2779,31 +2417,31 @@ class RunStateDB:
         with self.transaction() as connection:
             matching = connection.execute(
                 """SELECT 1 FROM jobs
-                   WHERE job_id=? AND run_id=? AND job_type='work_package'
-                     AND package_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                   WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                     AND package_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (int(job_id), identifier, package, token, fence_time),
             ).fetchone()
             package_running = connection.execute(
                 """SELECT 1 FROM work_packages
-                   WHERE run_id=? AND package_id=? AND status='running'""",
+                   WHERE run_id=%s AND package_id=%s AND status='running'""",
                 (identifier, package),
             ).fetchone()
             if matching is None or package_running is None:
                 return False
             package_update = connection.execute(
-                """UPDATE work_packages SET status=?, updated_at=?
-                   WHERE run_id=? AND package_id=? AND status='running'""",
+                """UPDATE work_packages SET status=%s, updated_at=%s
+                   WHERE run_id=%s AND package_id=%s AND status='running'""",
                 (target, now, identifier, package),
             )
             job_update = connection.execute(
-                """UPDATE jobs SET status=?, error=?, worker_id='',
-                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   , attempt=CASE WHEN ?='interrupted'
-                                  THEN MAX(0, attempt-1) ELSE attempt END
-                   WHERE job_id=? AND run_id=? AND job_type='work_package'
-                     AND package_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                """UPDATE jobs SET status=%s, error=%s, worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   , attempt=CASE WHEN %s='interrupted'
+                                  THEN GREATEST(0, attempt-1) ELSE attempt END
+                   WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                     AND package_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     target,
                     job_error,
@@ -2898,14 +2536,14 @@ class RunStateDB:
         with self.transaction() as connection:
             leased = connection.execute(
                 """SELECT attempt, max_attempts FROM jobs
-                   WHERE job_id=? AND run_id=? AND job_type='work_package'
-                     AND package_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                   WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                     AND package_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (int(job_id), identifier, package, token, fence_time),
             ).fetchone()
             package_running = connection.execute(
                 """SELECT 1 FROM work_packages
-                   WHERE run_id=? AND package_id=? AND status='running'""",
+                   WHERE run_id=%s AND package_id=%s AND status='running'""",
                 (identifier, package),
             ).fetchone()
             if leased is None or package_running is None:
@@ -2916,16 +2554,16 @@ class RunStateDB:
                 else "failed"
             )
             package_update = connection.execute(
-                """UPDATE work_packages SET status=?, updated_at=?
-                   WHERE run_id=? AND package_id=? AND status='running'""",
+                """UPDATE work_packages SET status=%s, updated_at=%s
+                   WHERE run_id=%s AND package_id=%s AND status='running'""",
                 (target, now, identifier, package),
             )
             job_update = connection.execute(
-                """UPDATE jobs SET status=?, error=?, worker_id='',
-                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE job_id=? AND run_id=? AND job_type='work_package'
-                     AND package_id=? AND status='running' AND lease_token=?
-                     AND lease_expires IS NOT NULL AND lease_expires>=?""",
+                """UPDATE jobs SET status=%s, error=%s, worker_id='',
+                   lease_token='', lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                     AND package_id=%s AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
                 (
                     target,
                     "" if target == "queued" else str(error),
@@ -2962,21 +2600,21 @@ class RunStateDB:
         with self.transaction() as connection:
             leased = connection.execute(
                 """SELECT job_id, package_id, lease_token FROM jobs
-                   WHERE run_id=? AND job_type='work_package'
-                     AND status='running' AND worker_id=?
+                   WHERE run_id=%s AND job_type='work_package'
+                     AND status='running' AND worker_id=%s
                    ORDER BY job_id""",
                 (identifier, worker),
             ).fetchall()
             for row in leased:
                 package_update = connection.execute(
-                    """UPDATE work_packages SET status='interrupted', updated_at=?
-                       WHERE run_id=? AND package_id=? AND status='running'
+                    """UPDATE work_packages SET status='interrupted', updated_at=%s
+                       WHERE run_id=%s AND package_id=%s AND status='running'
                          AND EXISTS (
                            SELECT 1 FROM jobs
-                           WHERE job_id=? AND run_id=?
-                             AND job_type='work_package' AND package_id=?
-                             AND status='running' AND worker_id=?
-                             AND lease_token=?
+                           WHERE job_id=%s AND run_id=%s
+                             AND job_type='work_package' AND package_id=%s
+                             AND status='running' AND worker_id=%s
+                             AND lease_token=%s
                          )""",
                     (
                         now,
@@ -2991,11 +2629,11 @@ class RunStateDB:
                 )
                 job_update = connection.execute(
                     """UPDATE jobs SET status='interrupted', worker_id='',
-                       lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                       , attempt=MAX(0, attempt-1)
-                       WHERE job_id=? AND run_id=? AND job_type='work_package'
-                         AND package_id=? AND status='running' AND worker_id=?
-                         AND lease_token=?""",
+                       lease_token='', lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                       , attempt=GREATEST(0, attempt-1)
+                       WHERE job_id=%s AND run_id=%s AND job_type='work_package'
+                         AND package_id=%s AND status='running' AND worker_id=%s
+                         AND lease_token=%s""",
                     (
                         now,
                         now,
@@ -3024,8 +2662,8 @@ class RunStateDB:
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET status='ready', error='', worker_id='',
-                   lease_token='', lease_expires=NULL, heartbeat_at=?, updated_at=?
-                   WHERE run_id=? AND job_type='work_package' AND status!='ready'
+                   lease_token='', lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE run_id=%s AND job_type='work_package' AND status!='ready'
                      AND EXISTS (
                        SELECT 1 FROM work_packages wp
                        WHERE wp.run_id=jobs.run_id
@@ -3039,8 +2677,8 @@ class RunStateDB:
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='', lease_token='',
-                   lease_expires=NULL, updated_at=?, attempt=MAX(0, attempt-1)
-                   WHERE job_id=? AND status='running' AND lease_token=?""",
+                   lease_expires=NULL, updated_at=%s, attempt=GREATEST(0, attempt-1)
+                   WHERE job_id=%s AND status='running' AND lease_token=%s""",
                 (_now(), int(job_id), str(lease_token)),
             ).rowcount == 1
 
@@ -3048,8 +2686,8 @@ class RunStateDB:
         with self.transaction() as connection:
             return connection.execute(
                 """UPDATE jobs SET status='queued', error='', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?
-                   WHERE job_id=? AND status='failed' AND attempt < max_attempts""",
+                   lease_token='', lease_expires=NULL, updated_at=%s
+                   WHERE job_id=%s AND status='failed' AND attempt < max_attempts""",
                 (_now(), int(job_id)),
             ).rowcount == 1
 
@@ -3067,7 +2705,7 @@ class RunStateDB:
         with self.transaction() as connection:
             if identifier is None:
                 connection.execute(
-                    """UPDATE work_packages SET status='interrupted', updated_at=?
+                    """UPDATE work_packages SET status='interrupted', updated_at=%s
                        WHERE status='running' AND EXISTS (
                          SELECT 1 FROM jobs
                          WHERE jobs.run_id=work_packages.run_id
@@ -3075,37 +2713,37 @@ class RunStateDB:
                            AND jobs.job_type='work_package'
                            AND jobs.status='running'
                            AND jobs.lease_expires IS NOT NULL
-                           AND jobs.lease_expires < ?
+                           AND jobs.lease_expires < %s
                        )""",
                     (now, now_value),
                 )
                 return connection.execute(
                     """UPDATE jobs SET status='interrupted', worker_id='',
-                       lease_token='', lease_expires=NULL, updated_at=?,
-                       attempt=MAX(0, attempt-1)
+                       lease_token='', lease_expires=NULL, updated_at=%s,
+                       attempt=GREATEST(0, attempt-1)
                        WHERE status='running' AND lease_expires IS NOT NULL
-                       AND lease_expires < ?""",
+                       AND lease_expires < %s""",
                     (now, now_value),
                 ).rowcount
             connection.execute(
-                """UPDATE work_packages SET status='interrupted', updated_at=?
-                   WHERE run_id=? AND status='running' AND EXISTS (
+                """UPDATE work_packages SET status='interrupted', updated_at=%s
+                   WHERE run_id=%s AND status='running' AND EXISTS (
                      SELECT 1 FROM jobs
                      WHERE jobs.run_id=work_packages.run_id
                        AND jobs.package_id=work_packages.package_id
                        AND jobs.job_type='work_package'
                        AND jobs.status='running'
                        AND jobs.lease_expires IS NOT NULL
-                       AND jobs.lease_expires < ?
+                       AND jobs.lease_expires < %s
                    )""",
                 (now, identifier, now_value),
             )
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?,
-                   attempt=MAX(0, attempt-1)
-                   WHERE run_id=? AND status='running'
-                   AND lease_expires IS NOT NULL AND lease_expires < ?""",
+                   lease_token='', lease_expires=NULL, updated_at=%s,
+                   attempt=GREATEST(0, attempt-1)
+                   WHERE run_id=%s AND status='running'
+                   AND lease_expires IS NOT NULL AND lease_expires < %s""",
                 (now, identifier, now_value),
             ).rowcount
 
@@ -3115,8 +2753,8 @@ class RunStateDB:
         now = _now()
         with self.transaction() as connection:
             connection.execute(
-                """UPDATE work_packages SET status='interrupted', updated_at=?
-                   WHERE run_id=? AND status='running' AND EXISTS (
+                """UPDATE work_packages SET status='interrupted', updated_at=%s
+                   WHERE run_id=%s AND status='running' AND EXISTS (
                      SELECT 1 FROM jobs
                      WHERE jobs.run_id=work_packages.run_id
                        AND jobs.package_id=work_packages.package_id
@@ -3127,9 +2765,9 @@ class RunStateDB:
             )
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?,
-                   attempt=MAX(0, attempt-1)
-                   WHERE run_id=? AND status='running'""",
+                   lease_token='', lease_expires=NULL, updated_at=%s,
+                   attempt=GREATEST(0, attempt-1)
+                   WHERE run_id=%s AND status='running'""",
                 (now, identifier),
             ).rowcount
 
@@ -3146,7 +2784,7 @@ class RunStateDB:
         now = _now()
         with self.transaction() as connection:
             run = connection.execute(
-                "SELECT status FROM runs WHERE run_id=?", (identifier,)
+                "SELECT status FROM runs WHERE run_id=%s", (identifier,)
             ).fetchone()
             if run is None:
                 raise RunStateError(f"unknown Run: {identifier}")
@@ -3158,7 +2796,7 @@ class RunStateDB:
                 )
             running_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE run_id=? AND status='running'",
+                    "SELECT COUNT(*) FROM jobs WHERE run_id=%s AND status='running'",
                     (identifier,),
                 ).fetchone()[0]
             )
@@ -3177,43 +2815,43 @@ class RunStateDB:
                 # Packages again would incorrectly absorb ready neighbours of
                 # a cross-Package Seam/Junction.
                 connection.execute(
-                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                    """INSERT INTO reset_packages(package_id)
                        SELECT package_id FROM work_packages
-                       WHERE run_id=? AND status='resetting'""",
+                       WHERE run_id=%s AND status='resetting' ON CONFLICT DO NOTHING""",
                     (identifier,),
                 )
                 connection.execute(
-                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                    """INSERT INTO reset_packages(package_id)
                        SELECT package_id FROM jobs
-                       WHERE run_id=? AND job_type='work_package'
-                         AND status='resetting' AND package_id!=''""",
+                       WHERE run_id=%s AND job_type='work_package'
+                         AND status='resetting' AND package_id!='' ON CONFLICT DO NOTHING""",
                     (identifier,),
                 )
             else:
                 connection.execute(
-                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                    """INSERT INTO reset_packages(package_id)
                        SELECT package_id FROM work_packages
-                       WHERE run_id=? AND status='failed'""",
+                       WHERE run_id=%s AND status='failed' ON CONFLICT DO NOTHING""",
                     (identifier,),
                 )
                 connection.execute(
-                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                    """INSERT INTO reset_packages(package_id)
                        SELECT package_id FROM jobs
-                       WHERE run_id=? AND job_type='work_package'
-                         AND status='failed' AND package_id!=''""",
+                       WHERE run_id=%s AND job_type='work_package'
+                         AND status='failed' AND package_id!='' ON CONFLICT DO NOTHING""",
                     (identifier,),
                 )
                 connection.execute(
-                    """INSERT OR IGNORE INTO reset_packages(package_id)
+                    """INSERT INTO reset_packages(package_id)
                        SELECT DISTINCT p.package_id
                        FROM jobs j
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                        JOIN partitions p
                          ON p.run_id=d.run_id AND p.partition_id=d.partition_id
-                       WHERE j.run_id=? AND j.job_type='unit_fit'
+                       WHERE j.run_id=%s AND j.job_type='unit_fit'
                          AND j.status='failed'
-                         AND p.package_id IS NOT NULL""",
+                         AND p.package_id IS NOT NULL ON CONFLICT DO NOTHING""",
                     (identifier,),
                 )
             package_ids = [
@@ -3221,7 +2859,7 @@ class RunStateDB:
                 for row in connection.execute(
                     """SELECT rp.package_id FROM reset_packages rp
                        JOIN work_packages wp
-                         ON wp.run_id=? AND wp.package_id=rp.package_id
+                         ON wp.run_id=%s AND wp.package_id=rp.package_id
                        ORDER BY wp.sequence_no""",
                     (identifier,),
                 ).fetchall()
@@ -3235,44 +2873,44 @@ class RunStateDB:
                 """CREATE TEMP TABLE reset_units(unit_id TEXT PRIMARY KEY)"""
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_units(unit_id)
+                """INSERT INTO reset_units(unit_id)
                    SELECT DISTINCT d.unit_id
                    FROM unit_dependencies d
                    JOIN partitions p
                      ON p.run_id=d.run_id AND p.partition_id=d.partition_id
                    JOIN reset_packages rp ON rp.package_id=p.package_id
-                   WHERE d.run_id=?""",
+                   WHERE d.run_id=%s ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             connection.execute(
                 """CREATE TEMP TABLE reset_jobs(job_id INTEGER PRIMARY KEY)"""
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_jobs(job_id)
+                """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_packages rp ON rp.package_id=j.package_id
-                   WHERE j.run_id=? AND j.job_type='work_package'""",
+                   WHERE j.run_id=%s AND j.job_type='work_package' ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_jobs(job_id)
+                """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_units ru ON ru.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.job_type='unit_fit'""",
+                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
 
             connection.execute(
-                """UPDATE work_packages SET status='resetting', updated_at=?
-                   WHERE run_id=? AND package_id IN (
+                """UPDATE work_packages SET status='resetting', updated_at=%s
+                   WHERE run_id=%s AND package_id IN (
                      SELECT package_id FROM reset_packages
                    )""",
                 (now, identifier),
             )
             connection.execute(
                 """UPDATE jobs SET status='resetting', worker_id='',
-                   lease_token='', lease_expires=NULL, updated_at=?
-                   WHERE run_id=? AND job_id IN (SELECT job_id FROM reset_jobs)""",
+                   lease_token='', lease_expires=NULL, updated_at=%s
+                   WHERE run_id=%s AND job_id IN (SELECT job_id FROM reset_jobs)""",
                 (now, identifier),
             )
             connection.execute(
@@ -3280,8 +2918,8 @@ class RunStateDB:
                    WHERE job_id IN (SELECT job_id FROM reset_jobs)"""
             )
             connection.execute(
-                """UPDATE artifacts SET status='resetting', updated_at=?
-                   WHERE run_id=? AND (
+                """UPDATE artifacts SET status='resetting', updated_at=%s
+                   WHERE run_id=%s AND (
                      unit_id IN ('assembled','mosaic')
                      OR EXISTS (
                        SELECT 1 FROM partitions p
@@ -3297,8 +2935,8 @@ class RunStateDB:
                 (now, identifier),
             )
             connection.execute(
-                """UPDATE runs SET status='resetting', updated_at=?
-                   WHERE run_id=?""",
+                """UPDATE runs SET status='resetting', updated_at=%s
+                   WHERE run_id=%s""",
                 (now, identifier),
             )
 
@@ -3307,7 +2945,7 @@ class RunStateDB:
                 for row in connection.execute(
                     """SELECT p.partition_id FROM partitions p
                        JOIN reset_packages rp ON rp.package_id=p.package_id
-                       WHERE p.run_id=? ORDER BY p.row_no, p.col_no""",
+                       WHERE p.run_id=%s ORDER BY p.row_no, p.col_no""",
                     (identifier,),
                 ).fetchall()
             ]
@@ -3327,7 +2965,7 @@ class RunStateDB:
                 dict(row)
                 for row in connection.execute(
                     """SELECT * FROM artifacts
-                       WHERE run_id=? AND status='resetting'
+                       WHERE run_id=%s AND status='resetting'
                        ORDER BY artifact_id""",
                     (identifier,),
                 ).fetchall()
@@ -3335,7 +2973,7 @@ class RunStateDB:
             connection.execute(
                 """INSERT INTO events
                    (run_id, timestamp, level, event_type, message, payload_json)
-                   VALUES (?, ?, 'warning', 'manual_package_reset_started', ?, ?)""",
+                   VALUES (%s, %s, 'warning', 'manual_package_reset_started', %s, %s)""",
                 (
                     identifier,
                     now,
@@ -3374,7 +3012,7 @@ class RunStateDB:
         now = _now()
         with self.transaction() as connection:
             run = connection.execute(
-                "SELECT status FROM runs WHERE run_id=?", (identifier,)
+                "SELECT status FROM runs WHERE run_id=%s", (identifier,)
             ).fetchone()
             if run is None or str(run["status"]) != "resetting":
                 raise RunStateError(
@@ -3384,7 +3022,7 @@ class RunStateDB:
                 "CREATE TEMP TABLE reset_packages(package_id TEXT PRIMARY KEY)"
             )
             connection.executemany(
-                "INSERT INTO reset_packages(package_id) VALUES (?)",
+                "INSERT INTO reset_packages(package_id) VALUES (%s)",
                 ((item,) for item in expected_packages),
             )
             actual_packages = {
@@ -3392,7 +3030,7 @@ class RunStateDB:
                 for row in connection.execute(
                     """SELECT wp.package_id FROM work_packages wp
                        JOIN reset_packages rp ON rp.package_id=wp.package_id
-                       WHERE wp.run_id=? AND wp.status='resetting'""",
+                       WHERE wp.run_id=%s AND wp.status='resetting'""",
                     (identifier,),
                 ).fetchall()
             }
@@ -3402,7 +3040,7 @@ class RunStateDB:
                 )
             running_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM jobs WHERE run_id=? AND status='running'",
+                    "SELECT COUNT(*) FROM jobs WHERE run_id=%s AND status='running'",
                     (identifier,),
                 ).fetchone()[0]
             )
@@ -3415,30 +3053,30 @@ class RunStateDB:
                 """CREATE TEMP TABLE reset_units(unit_id TEXT PRIMARY KEY)"""
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_units(unit_id)
+                """INSERT INTO reset_units(unit_id)
                    SELECT DISTINCT d.unit_id
                    FROM unit_dependencies d
                    JOIN partitions p
                      ON p.run_id=d.run_id AND p.partition_id=d.partition_id
                    JOIN reset_packages rp ON rp.package_id=p.package_id
-                   WHERE d.run_id=?""",
+                   WHERE d.run_id=%s ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             connection.execute(
                 """CREATE TEMP TABLE reset_jobs(job_id INTEGER PRIMARY KEY)"""
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_jobs(job_id)
+                """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_packages rp ON rp.package_id=j.package_id
-                   WHERE j.run_id=? AND j.job_type='work_package'""",
+                   WHERE j.run_id=%s AND j.job_type='work_package' ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             connection.execute(
-                """INSERT OR IGNORE INTO reset_jobs(job_id)
+                """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_units ru ON ru.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.job_type='unit_fit'""",
+                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             unit_count = int(
@@ -3450,7 +3088,7 @@ class RunStateDB:
             artifact_count = int(
                 connection.execute(
                     """SELECT COUNT(*) FROM artifacts
-                       WHERE run_id=? AND status='resetting'""",
+                       WHERE run_id=%s AND status='resetting'""",
                     (identifier,),
                 ).fetchone()[0]
             )
@@ -3461,45 +3099,45 @@ class RunStateDB:
             )
             connection.execute(
                 """DELETE FROM unit_report_summaries
-                   WHERE run_id=? AND unit_id IN (
+                   WHERE run_id=%s AND unit_id IN (
                      SELECT unit_id FROM reset_units
                    )""",
                 (identifier,),
             )
             connection.execute(
-                "DELETE FROM object_links WHERE run_id=?", (identifier,)
+                "DELETE FROM object_links WHERE run_id=%s", (identifier,)
             )
             connection.execute(
-                "DELETE FROM object_nodes WHERE run_id=?", (identifier,)
+                "DELETE FROM object_nodes WHERE run_id=%s", (identifier,)
             )
             connection.execute(
-                "DELETE FROM artifacts WHERE run_id=? AND status='resetting'",
+                "DELETE FROM artifacts WHERE run_id=%s AND status='resetting'",
                 (identifier,),
             )
             connection.execute(
-                """UPDATE partitions SET status='queued', updated_at=?
-                   WHERE run_id=? AND package_id IN (
+                """UPDATE partitions SET status='queued', updated_at=%s
+                   WHERE run_id=%s AND package_id IN (
                      SELECT package_id FROM reset_packages
                    )""",
                 (now, identifier),
             )
             connection.execute(
-                """UPDATE spatial_units SET status='queued', updated_at=?
-                   WHERE run_id=? AND unit_id IN (
+                """UPDATE spatial_units SET status='queued', updated_at=%s
+                   WHERE run_id=%s AND unit_id IN (
                      SELECT unit_id FROM reset_units
                    )""",
                 (now, identifier),
             )
             connection.execute(
-                """UPDATE stream_units SET status='queued', error='', updated_at=?
-                   WHERE run_id=? AND unit_id IN (
+                """UPDATE stream_units SET status='queued', error='', updated_at=%s
+                   WHERE run_id=%s AND unit_id IN (
                      SELECT unit_id FROM reset_units
                    )""",
                 (now, identifier),
             )
             connection.execute(
                 """UPDATE work_packages SET status='queued', attempt=0,
-                   updated_at=? WHERE run_id=? AND package_id IN (
+                   updated_at=%s WHERE run_id=%s AND package_id IN (
                      SELECT package_id FROM reset_packages
                    )""",
                 (now, identifier),
@@ -3508,19 +3146,19 @@ class RunStateDB:
                 """UPDATE jobs SET status='queued', attempt=0,
                    progress_current=0, progress_total=0, worker_id='',
                    lease_token='', lease_expires=NULL, heartbeat_at=NULL,
-                   pid=NULL, error='', updated_at=?
-                   WHERE run_id=? AND job_id IN (SELECT job_id FROM reset_jobs)""",
+                   pid=NULL, error='', updated_at=%s
+                   WHERE run_id=%s AND job_id IN (SELECT job_id FROM reset_jobs)""",
                 (now, identifier),
             )
             connection.execute(
-                """UPDATE streams SET status='pending', error='', updated_at=?
-                   WHERE run_id=?""",
+                """UPDATE streams SET status='pending', error='', updated_at=%s
+                   WHERE run_id=%s""",
                 (now, identifier),
             )
             relinked = connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
+                """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
-                   SELECT j.job_id, a.artifact_id, ?
+                   SELECT j.job_id, a.artifact_id, %s
                    FROM jobs j
                    JOIN reset_jobs rj ON rj.job_id=j.job_id
                    JOIN unit_dependencies d
@@ -3531,18 +3169,18 @@ class RunStateDB:
                     AND a.unit_id=d.partition_id
                     AND a.kind='partition_probability'
                     AND a.status='ready'
-                   WHERE j.run_id=? AND j.job_type='unit_fit'""",
+                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
                 (now, identifier),
             ).rowcount
             connection.execute(
-                """UPDATE runs SET status='planned', updated_at=?
-                   WHERE run_id=? AND status='resetting'""",
+                """UPDATE runs SET status='planned', updated_at=%s
+                   WHERE run_id=%s AND status='resetting'""",
                 (now, identifier),
             )
             connection.execute(
                 """INSERT INTO events
                    (run_id, timestamp, level, event_type, message, payload_json)
-                   VALUES (?, ?, 'info', 'manual_package_reset_completed', ?, ?)""",
+                   VALUES (%s, %s, 'info', 'manual_package_reset_completed', %s, %s)""",
                 (
                     identifier,
                     now,
@@ -3583,7 +3221,7 @@ class RunStateDB:
             connection.execute(
                 """INSERT INTO artifacts
                    (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                 (
                     str(run_id),
@@ -3597,7 +3235,7 @@ class RunStateDB:
             )
             row = connection.execute(
                 """SELECT artifact_id FROM artifacts
-                   WHERE run_id=? AND stream_id=? AND unit_id=? AND kind=? AND path=?""",
+                   WHERE run_id=%s AND stream_id=%s AND unit_id=%s AND kind=%s AND path=%s""",
                 (
                     str(run_id),
                     str(stream_id),
@@ -3614,7 +3252,7 @@ class RunStateDB:
         with self._connection() as connection:
             return _row_dict(
                 connection.execute(
-                    "SELECT * FROM artifacts WHERE artifact_id=?", (int(artifact_id),)
+                    "SELECT * FROM artifacts WHERE artifact_id=%s", (int(artifact_id),)
                 ).fetchone()
             )
 
@@ -3635,8 +3273,8 @@ class RunStateDB:
             raise ValueError("artifact sha256 must contain 64 hexadecimal characters") from error
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE artifacts SET status='ready', byte_count=?, sha256=?, updated_at=?
-                   WHERE artifact_id=? AND status IN ('writing','failed')""",
+                """UPDATE artifacts SET status='ready', byte_count=%s, sha256=%s, updated_at=%s
+                   WHERE artifact_id=%s AND status IN ('writing','failed')""",
                 (int(byte_count), str(sha256).lower(), _now(), int(artifact_id)),
             ).rowcount == 1
 
@@ -3684,16 +3322,15 @@ class RunStateDB:
             connection.execute(
                 """INSERT INTO artifacts
                    (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
-                   VALUES (?, ?, ?, 'partition_probability', ?, ?, ?)
+                   VALUES (%s, %s, %s, 'partition_probability', %s, %s, %s)
                    ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                 (identifier, stream, partition, resolved_path, now, now),
             )
-            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
             artifact = connection.execute(
                 """SELECT * FROM artifacts
-                   WHERE run_id=? AND stream_id=? AND unit_id=?
-                     AND kind='partition_probability' AND path=?"""
-                + artifact_lock,
+                   WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                     AND kind='partition_probability' AND path=%s"""
+                + " FOR UPDATE",
                 (identifier, stream, partition, resolved_path),
             ).fetchone()
             if artifact is None:
@@ -3716,8 +3353,8 @@ class RunStateDB:
                     """SELECT COUNT(*) FROM jobs j
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                       WHERE j.run_id=? AND j.stream_id=?
-                         AND j.job_type='unit_fit' AND d.partition_id=?
+                       WHERE j.run_id=%s AND j.stream_id=%s
+                         AND j.job_type='unit_fit' AND d.partition_id=%s
                          AND j.status NOT IN ('queued','interrupted')""",
                     (identifier, stream, partition),
                 ).fetchone()[0]
@@ -3726,15 +3363,15 @@ class RunStateDB:
                         "cleaned Partition Artifact requires a full Package reset"
                     )
                 connection.execute(
-                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
-                       updated_at=? WHERE artifact_id=? AND status='cleaned'
+                    """UPDATE artifacts SET status='ready', byte_count=%s, sha256=%s,
+                       updated_at=%s WHERE artifact_id=%s AND status='cleaned'
                        AND ref_count=0""",
                     (size, digest, now, artifact_id),
                 )
             elif status in {"writing", "failed"}:
                 changed = connection.execute(
-                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
-                       updated_at=? WHERE artifact_id=?
+                    """UPDATE artifacts SET status='ready', byte_count=%s, sha256=%s,
+                       updated_at=%s WHERE artifact_id=%s
                        AND status IN ('writing','failed')""",
                     (size, digest, now, artifact_id),
                 ).rowcount
@@ -3752,14 +3389,14 @@ class RunStateDB:
             # exhausted jobs have already released their dependencies and must
             # not gain a reference that can never be released.
             connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
+                """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
-                   SELECT j.job_id, ?, ? FROM jobs j
+                   SELECT j.job_id, %s, %s FROM jobs j
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.stream_id=?
-                     AND j.job_type='unit_fit' AND d.partition_id=?
-                     AND j.status IN ('queued','interrupted','running')""",
+                   WHERE j.run_id=%s AND j.stream_id=%s
+                     AND j.job_type='unit_fit' AND d.partition_id=%s
+                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
             )
             # V3.3 candidate jobs are planned before the first Work Package
@@ -3767,15 +3404,15 @@ class RunStateDB:
             # the zero-ref cleanup worker can never observe an unreferenced
             # probability between publication and candidate registration.
             connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
+                """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
-                   SELECT j.job_id, ?, ? FROM jobs j
+                   SELECT j.job_id, %s, %s FROM jobs j
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.stream_id=?
+                   WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
-                     AND d.partition_id=?
-                     AND j.status IN ('queued','interrupted','running')""",
+                     AND d.partition_id=%s
+                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
             )
             return artifact_id
@@ -3819,16 +3456,15 @@ class RunStateDB:
             connection.execute(
                 """INSERT INTO artifacts
                    (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                 (identifier, stream, partition, kind, resolved_path, now, now),
             )
-            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
             artifact = connection.execute(
                 """SELECT * FROM artifacts
-                   WHERE run_id=? AND stream_id=? AND unit_id=?
-                     AND kind=? AND path=?"""
-                + artifact_lock,
+                   WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                     AND kind=%s AND path=%s"""
+                + " FOR UPDATE",
                 (identifier, stream, partition, kind, resolved_path),
             ).fetchone()
             if artifact is None:
@@ -3848,9 +3484,9 @@ class RunStateDB:
                     """SELECT COUNT(*) FROM jobs j
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                       WHERE j.run_id=? AND j.stream_id=?
+                       WHERE j.run_id=%s AND j.stream_id=%s
                          AND j.job_type='fragmentation_v33'
-                         AND d.partition_id=?
+                         AND d.partition_id=%s
                          AND j.status NOT IN ('queued','interrupted')""",
                     (identifier, stream, partition),
                 ).fetchone()[0]
@@ -3859,8 +3495,8 @@ class RunStateDB:
                         f"cleaned {label} requires a full candidate reset"
                     )
                 changed = connection.execute(
-                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
-                       updated_at=? WHERE artifact_id=? AND status='cleaned'
+                    """UPDATE artifacts SET status='ready', byte_count=%s, sha256=%s,
+                       updated_at=%s WHERE artifact_id=%s AND status='cleaned'
                        AND ref_count=0""",
                     (size, digest, now, artifact_id),
                 ).rowcount
@@ -3870,8 +3506,8 @@ class RunStateDB:
                     )
             elif status in {"writing", "failed"}:
                 changed = connection.execute(
-                    """UPDATE artifacts SET status='ready', byte_count=?, sha256=?,
-                       updated_at=? WHERE artifact_id=?
+                    """UPDATE artifacts SET status='ready', byte_count=%s, sha256=%s,
+                       updated_at=%s WHERE artifact_id=%s
                        AND status IN ('writing','failed')""",
                     (size, digest, now, artifact_id),
                 ).rowcount
@@ -3885,15 +3521,15 @@ class RunStateDB:
                     + resolved_path
                 )
             connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
+                """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
-                   SELECT j.job_id, ?, ? FROM jobs j
+                   SELECT j.job_id, %s, %s FROM jobs j
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.stream_id=?
+                   WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
-                     AND d.partition_id=?
-                     AND j.status IN ('queued','interrupted','running')""",
+                     AND d.partition_id=%s
+                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
             )
             return artifact_id
@@ -4008,8 +3644,8 @@ class RunStateDB:
             for kind, resolved_path, size, digest in records:
                 other = connection.execute(
                     """SELECT path FROM artifacts
-                       WHERE run_id=? AND stream_id=? AND unit_id=? AND kind=?
-                         AND path!=? AND status='ready'""",
+                       WHERE run_id=%s AND stream_id=%s AND unit_id=%s AND kind=%s
+                         AND path!=%s AND status='ready'""",
                     (identifier, stream, partition, kind, resolved_path),
                 ).fetchone()
                 if other is not None:
@@ -4019,14 +3655,14 @@ class RunStateDB:
                 connection.execute(
                     """INSERT INTO artifacts
                        (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
                     (identifier, stream, partition, kind, resolved_path, now, now),
                 )
                 artifact = connection.execute(
                     """SELECT * FROM artifacts
-                       WHERE run_id=? AND stream_id=? AND unit_id=?
-                         AND kind=? AND path=?""",
+                       WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                         AND kind=%s AND path=%s""",
                     (identifier, stream, partition, kind, resolved_path),
                 ).fetchone()
                 if artifact is None:
@@ -4042,8 +3678,8 @@ class RunStateDB:
                         )
                 elif str(artifact["status"]) in {"writing", "failed"}:
                     changed = connection.execute(
-                        """UPDATE artifacts SET status='ready', byte_count=?,
-                           sha256=?, updated_at=? WHERE artifact_id=?
+                        """UPDATE artifacts SET status='ready', byte_count=%s,
+                           sha256=%s, updated_at=%s WHERE artifact_id=%s
                            AND status IN ('writing','failed')""",
                         (size, digest, now, artifact_id),
                     ).rowcount
@@ -4059,7 +3695,7 @@ class RunStateDB:
                     """SELECT j.job_id FROM jobs j
                        JOIN spatial_units u
                          ON u.run_id=j.run_id AND u.unit_id=j.unit_id
-                       WHERE j.run_id=? AND j.stream_id=?
+                       WHERE j.run_id=%s AND j.stream_id=%s
                          AND j.job_type='fragmentation_v33'
                          AND u.unit_type='FragmentationV33Finalize'
                          AND j.status IN ('queued','interrupted','running')""",
@@ -4072,8 +3708,8 @@ class RunStateDB:
                 finalize_job_id = int(finalize_rows[0]["job_id"])
                 for artifact_id in artifact_ids:
                     connection.execute(
-                        """INSERT OR IGNORE INTO artifact_dependencies
-                           (job_id, artifact_id, created_at) VALUES (?, ?, ?)""",
+                        """INSERT INTO artifact_dependencies
+                           (job_id, artifact_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING""",
                         (finalize_job_id, artifact_id, now),
                     )
         return artifact_ids[0], artifact_ids[1]
@@ -4081,19 +3717,18 @@ class RunStateDB:
     def mark_artifact_failed(self, artifact_id: int) -> bool:
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE artifacts SET status='failed', updated_at=?
-                   WHERE artifact_id=? AND status='writing'""",
+                """UPDATE artifacts SET status='failed', updated_at=%s
+                   WHERE artifact_id=%s AND status='writing'""",
                 (_now(), int(artifact_id)),
             ).rowcount == 1
 
     def add_artifact_dependency(self, job_id: int, artifact_id: int) -> bool:
         """Attach a ready input to a job; the trigger updates ref_count atomically."""
         with self.transaction() as connection:
-            artifact_lock = " FOR UPDATE OF a" if self.is_postgresql else ""
             relation = connection.execute(
                 """SELECT 1 FROM jobs j JOIN artifacts a ON a.run_id=j.run_id
-                   WHERE j.job_id=? AND a.artifact_id=? AND a.status='ready'"""
-                + artifact_lock,
+                   WHERE j.job_id=%s AND a.artifact_id=%s AND a.status='ready'"""
+                + " FOR UPDATE OF a",
                 (int(job_id), int(artifact_id)),
             ).fetchone()
             if relation is None:
@@ -4101,8 +3736,8 @@ class RunStateDB:
                     "artifact dependency requires a ready artifact from the same run"
                 )
             cursor = connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
-                   (job_id, artifact_id, created_at) VALUES (?, ?, ?)""",
+                """INSERT INTO artifact_dependencies
+                   (job_id, artifact_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING""",
                 (int(job_id), int(artifact_id), _now()),
             )
             return cursor.rowcount == 1
@@ -4123,8 +3758,8 @@ class RunStateDB:
         with self.transaction() as connection:
             artifact = connection.execute(
                 """SELECT kind FROM artifacts
-                   WHERE artifact_id=? AND run_id=? AND stream_id=?
-                     AND unit_id=? AND status='ready'
+                   WHERE artifact_id=%s AND run_id=%s AND stream_id=%s
+                     AND unit_id=%s AND status='ready'
                      AND kind IN ('partition_probability','v3_context_core',
                                   'v3_baseline_core')""",
                 (int(artifact_id), identifier, stream, partition),
@@ -4134,15 +3769,15 @@ class RunStateDB:
                     "V3.3 dependency Artifact is not ready or mismatched"
                 )
             cursor = connection.execute(
-                """INSERT OR IGNORE INTO artifact_dependencies
+                """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
-                   SELECT j.job_id, ?, ? FROM jobs j
+                   SELECT j.job_id, %s, %s FROM jobs j
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   WHERE j.run_id=? AND j.stream_id=?
+                   WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
-                     AND d.partition_id=?
-                     AND j.status IN ('queued','interrupted','running')""",
+                     AND d.partition_id=%s
+                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (int(artifact_id), now, identifier, stream, partition),
             )
             return cursor.rowcount
@@ -4156,12 +3791,11 @@ class RunStateDB:
     ) -> int:
         """Link one ready Partition probability to every dependent unit job."""
         with self.transaction() as connection:
-            artifact_lock = " FOR UPDATE" if self.is_postgresql else ""
             artifact = connection.execute(
-                """SELECT 1 FROM artifacts WHERE artifact_id=? AND run_id=?
-                   AND stream_id=? AND unit_id=? AND kind='partition_probability'
+                """SELECT 1 FROM artifacts WHERE artifact_id=%s AND run_id=%s
+                   AND stream_id=%s AND unit_id=%s AND kind='partition_probability'
                    AND status='ready'"""
-                + artifact_lock,
+                + " FOR UPDATE",
                 (int(artifact_id), str(run_id), str(stream_id), str(partition_id)),
             ).fetchone()
             if artifact is None:
@@ -4172,8 +3806,8 @@ class RunStateDB:
                     """SELECT j.job_id FROM jobs j
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                       WHERE j.run_id=? AND j.stream_id=? AND j.job_type='unit_fit'
-                         AND d.partition_id=?""",
+                       WHERE j.run_id=%s AND j.stream_id=%s AND j.job_type='unit_fit'
+                         AND d.partition_id=%s""",
                     (str(run_id), str(stream_id), str(partition_id)),
                 ).fetchall()
             ]
@@ -4181,8 +3815,8 @@ class RunStateDB:
             inserted = 0
             for job_id in job_ids:
                 cursor = connection.execute(
-                    """INSERT OR IGNORE INTO artifact_dependencies
-                       (job_id, artifact_id, created_at) VALUES (?, ?, ?)""",
+                    """INSERT INTO artifact_dependencies
+                       (job_id, artifact_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING""",
                     (job_id, int(artifact_id), now),
                 )
                 inserted += cursor.rowcount
@@ -4192,36 +3826,34 @@ class RunStateDB:
         """Release one job input; the trigger prevents a negative ref_count."""
         with self.transaction() as connection:
             cursor = connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=? AND artifact_id=?",
+                "DELETE FROM artifact_dependencies WHERE job_id=%s AND artifact_id=%s",
                 (int(job_id), int(artifact_id)),
             )
             return cursor.rowcount == 1
 
     def release_job_artifacts(self, job_id: int) -> int:
         with self.transaction() as connection:
-            if self.is_postgresql:
-                artifact_ids = [
-                    int(row["artifact_id"])
-                    for row in connection.execute(
-                        """SELECT artifact_id FROM artifact_dependencies
-                           WHERE job_id=? ORDER BY artifact_id""",
-                        (int(job_id),),
-                    ).fetchall()
-                ]
-                if artifact_ids:
-                    placeholders = ",".join("?" for _ in artifact_ids)
-                    # Every releaser locks shared Artifact rows in the same
-                    # order before DELETE triggers decrement ref_count.  This
-                    # prevents cross-unit deadlocks without reducing worker
-                    # concurrency.
-                    connection.execute(
-                        f"""SELECT artifact_id FROM artifacts
-                            WHERE artifact_id IN ({placeholders})
-                            ORDER BY artifact_id FOR UPDATE""",
-                        artifact_ids,
-                    ).fetchall()
+            artifact_ids = [
+                int(row["artifact_id"])
+                for row in connection.execute(
+                    """SELECT artifact_id FROM artifact_dependencies
+                       WHERE job_id=%s ORDER BY artifact_id""",
+                    (int(job_id),),
+                ).fetchall()
+            ]
+            if artifact_ids:
+                placeholders = ",".join("%s" for _ in artifact_ids)
+                # Every releaser locks shared Artifact rows in the same order
+                # before DELETE triggers decrement ref_count.  This prevents
+                # cross-unit deadlocks without reducing worker concurrency.
+                connection.execute(
+                    f"""SELECT artifact_id FROM artifacts
+                        WHERE artifact_id IN ({placeholders})
+                        ORDER BY artifact_id FOR UPDATE""",
+                    artifact_ids,
+                ).fetchall()
             return connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=?", (int(job_id),)
+                "DELETE FROM artifact_dependencies WHERE job_id=%s", (int(job_id),)
             ).rowcount
 
     def job_for_unit(
@@ -4230,8 +3862,8 @@ class RunStateDB:
         with self._connection() as connection:
             return _row_dict(
                 connection.execute(
-                    """SELECT * FROM jobs WHERE run_id=? AND stream_id=?
-                       AND unit_id=? AND job_type='unit_fit'""",
+                    """SELECT * FROM jobs WHERE run_id=%s AND stream_id=%s
+                       AND unit_id=%s AND job_type='unit_fit'""",
                     (str(run_id), str(stream_id), str(unit_id)),
                 ).fetchone()
             )
@@ -4244,12 +3876,12 @@ class RunStateDB:
         kinds: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
         """Return ready, unreferenced artifacts; deletion remains an explicit caller action."""
-        sql = "SELECT * FROM artifacts WHERE run_id=? AND status='ready' AND ref_count=0"
+        sql = "SELECT * FROM artifacts WHERE run_id=%s AND status='ready' AND ref_count=0"
         values: list[Any] = [str(run_id)]
         if kinds:
-            sql += " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
+            sql += " AND kind IN (" + ",".join("%s" for _ in kinds) + ")"
             values.extend(str(item) for item in kinds)
-        sql += " ORDER BY artifact_id LIMIT ?"
+        sql += " ORDER BY artifact_id LIMIT %s"
         values.append(max(1, min(int(limit), 1000)))
         with self._connection() as connection:
             return [dict(row) for row in connection.execute(sql, values).fetchall()]
@@ -4258,15 +3890,15 @@ class RunStateDB:
         """Atomically reserve one unreferenced ready Artifact for deletion."""
         with self.transaction() as connection:
             changed = connection.execute(
-                """UPDATE artifacts SET status='cleaning', updated_at=?
-                   WHERE artifact_id=? AND status='ready' AND ref_count=0""",
+                """UPDATE artifacts SET status='cleaning', updated_at=%s
+                   WHERE artifact_id=%s AND status='ready' AND ref_count=0""",
                 (_now(), int(artifact_id)),
             ).rowcount
             if changed != 1:
                 return None
             return _row_dict(
                 connection.execute(
-                    "SELECT * FROM artifacts WHERE artifact_id=?", (int(artifact_id),)
+                    "SELECT * FROM artifacts WHERE artifact_id=%s", (int(artifact_id),)
                 ).fetchone()
             )
 
@@ -4280,8 +3912,8 @@ class RunStateDB:
         next_status = "cleaned" if success else "ready"
         with self.transaction() as connection:
             return connection.execute(
-                """UPDATE artifacts SET status=?, updated_at=?
-                   WHERE artifact_id=? AND status='cleaning' AND ref_count=0""",
+                """UPDATE artifacts SET status=%s, updated_at=%s
+                   WHERE artifact_id=%s AND status='cleaning' AND ref_count=0""",
                 (next_status, _now(), int(artifact_id)),
             ).rowcount == 1
 
@@ -4290,7 +3922,7 @@ class RunStateDB:
             row = connection.execute(
                 """SELECT COUNT(*) AS artifact_count,
                           COALESCE(SUM(byte_count), 0) AS cleaned_bytes
-                   FROM artifacts WHERE run_id=? AND status='cleaned'""",
+                   FROM artifacts WHERE run_id=%s AND status='cleaned'""",
                 (str(run_id),),
             ).fetchone()
         return {
@@ -4306,13 +3938,13 @@ class RunStateDB:
         kind: str | None = None,
         status: str | None = "ready",
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM artifacts WHERE run_id=? AND stream_id=?"
+        sql = "SELECT * FROM artifacts WHERE run_id=%s AND stream_id=%s"
         values: list[Any] = [str(run_id), str(stream_id)]
         if kind is not None:
-            sql += " AND kind=?"
+            sql += " AND kind=%s"
             values.append(str(kind))
         if status is not None:
-            sql += " AND status=?"
+            sql += " AND status=%s"
             values.append(str(status))
         sql += " ORDER BY unit_id, artifact_id"
         with self._connection() as connection:
@@ -4362,7 +3994,7 @@ class RunStateDB:
                     max_displacement_px, diagnostic_count, fitted_edge_count,
                     report_path, report_byte_count, report_sha256,
                     report_mtime_ns, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT(run_id, stream_id, unit_id) DO UPDATE SET
                      status=excluded.status,
                      fit_version=excluded.fit_version,
@@ -4409,18 +4041,11 @@ class RunStateDB:
     ) -> list[dict[str, Any]]:
         """Return summary rows, or no rows when the current contract is incomplete."""
         with self._connection() as connection:
-            if not self.is_postgresql:
-                exists = connection.execute(
-                    """SELECT 1 FROM sqlite_master
-                       WHERE type='table' AND name='unit_report_summaries'"""
-                ).fetchone()
-                if exists is None:
-                    return []
             return [
                 dict(row)
                 for row in connection.execute(
                     """SELECT * FROM unit_report_summaries
-                       WHERE run_id=? AND stream_id=? ORDER BY unit_id""",
+                       WHERE run_id=%s AND stream_id=%s ORDER BY unit_id""",
                     (str(run_id), str(stream_id)),
                 ).fetchall()
             ]
@@ -4450,7 +4075,7 @@ class RunStateDB:
                           COALESCE(SUM(fitted_edge_count), 0)
                             AS fitted_edge_count
                    FROM unit_report_summaries
-                   WHERE run_id=? AND stream_id=?""",
+                   WHERE run_id=%s AND stream_id=%s""",
                 (str(run_id), str(stream_id)),
             ).fetchone()
         return dict(row)
@@ -4469,10 +4094,10 @@ class RunStateDB:
         with self._connection() as connection:
             for offset in range(0, len(values), 400):
                 batch = values[offset : offset + 400]
-                placeholders = ",".join("?" for _ in batch)
+                placeholders = ",".join("%s" for _ in batch)
                 rows = connection.execute(
                     f"""SELECT part_id, object_id FROM object_nodes
-                        WHERE run_id=? AND stream_id=?
+                        WHERE run_id=%s AND stream_id=%s
                           AND part_id IN ({placeholders})""",
                     (str(run_id), str(stream_id), *batch),
                 ).fetchall()
@@ -4512,10 +4137,10 @@ class RunStateDB:
         ]
         with self.transaction() as connection:
             connection.executemany(
-                """INSERT OR IGNORE INTO object_nodes
+                """INSERT INTO object_nodes
                    (run_id, stream_id, part_id, class_code, unit_id,
                     parent_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
                 rows,
             )
             return len(rows)
@@ -4534,15 +4159,15 @@ class RunStateDB:
         with self.transaction() as connection:
             rows = connection.execute(
                 """SELECT part_id, class_code FROM object_nodes
-                   WHERE run_id=? AND stream_id=? AND part_id IN (?, ?)""",
+                   WHERE run_id=%s AND stream_id=%s AND part_id IN (%s, %s)""",
                 (str(run_id), str(stream_id), left, right),
             ).fetchall()
             if len(rows) != 2 or any(int(row["class_code"]) != int(class_code) for row in rows):
                 raise RunStateError("object link parts are missing or have different classes")
             cursor = connection.execute(
-                """INSERT OR IGNORE INTO object_links
+                """INSERT INTO object_links
                    (run_id, stream_id, left_part_id, right_part_id, class_code, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
                 (str(run_id), str(stream_id), left, right, int(class_code), _now()),
             )
             return cursor.rowcount == 1
@@ -4552,7 +4177,7 @@ class RunStateDB:
             return int(
                 connection.execute(
                     """SELECT COUNT(*) FROM object_links
-                       WHERE run_id=? AND stream_id=?""",
+                       WHERE run_id=%s AND stream_id=%s""",
                     (str(run_id), str(stream_id)),
                 ).fetchone()[0]
             )
@@ -4564,7 +4189,7 @@ class RunStateDB:
         with self.transaction() as connection:
             rows = connection.execute(
                 """SELECT part_id, parent_id, rank_value FROM object_nodes
-                   WHERE run_id=? AND stream_id=? ORDER BY part_id""",
+                   WHERE run_id=%s AND stream_id=%s ORDER BY part_id""",
                 (str(run_id), str(stream_id)),
             ).fetchall()
             if not rows:
@@ -4591,7 +4216,7 @@ class RunStateDB:
 
             links = connection.execute(
                 """SELECT left_part_id, right_part_id FROM object_links
-                   WHERE run_id=? AND stream_id=? ORDER BY left_part_id, right_part_id""",
+                   WHERE run_id=%s AND stream_id=%s ORDER BY left_part_id, right_part_id""",
                 (str(run_id), str(stream_id)),
             ).fetchall()
 
@@ -4641,8 +4266,8 @@ class RunStateDB:
                 chunk = update_rows[offset : offset + 2000]
                 connection.executemany(
                     """UPDATE object_nodes
-                       SET parent_id=?, rank_value=?, object_id=?, updated_at=?
-                       WHERE run_id=? AND stream_id=? AND part_id=?""",
+                       SET parent_id=%s, rank_value=%s, object_id=%s, updated_at=%s
+                       WHERE run_id=%s AND stream_id=%s AND part_id=%s""",
                     chunk,
                 )
             return len(distinct_roots)
@@ -4653,7 +4278,7 @@ class RunStateDB:
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT object_id FROM object_nodes
-                   WHERE run_id=? AND stream_id=? AND part_id=?""",
+                   WHERE run_id=%s AND stream_id=%s AND part_id=%s""",
                 (str(run_id), str(stream_id), str(part_id)),
             ).fetchone()
         if row is None or not row["object_id"]:
@@ -4672,8 +4297,8 @@ class RunStateDB:
         with self._connection() as connection:
             return _row_dict(
                 connection.execute(
-                    """SELECT * FROM artifacts WHERE run_id=? AND stream_id=?
-                       AND unit_id=? AND kind=? AND status=?""",
+                    """SELECT * FROM artifacts WHERE run_id=%s AND stream_id=%s
+                       AND unit_id=%s AND kind=%s AND status=%s""",
                     (str(run_id), str(stream_id), str(unit_id), str(kind), str(status)),
                 ).fetchone()
             )
@@ -4693,7 +4318,7 @@ class RunStateDB:
             cursor = connection.execute(
                 """INSERT INTO events
                    (run_id, timestamp, level, event_type, stream_id, job_id,
-                    message, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    message, payload_json) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING event_id""",
                 (
                     str(run_id),
@@ -4718,13 +4343,13 @@ class RunStateDB:
         stream_id: str = "",
         job_type: str = "",
     ) -> dict[str, int]:
-        sql = "SELECT status, COUNT(*) AS n FROM jobs WHERE run_id=?"
+        sql = "SELECT status, COUNT(*) AS n FROM jobs WHERE run_id=%s"
         values: list[Any] = [str(run_id)]
         if stream_id:
-            sql += " AND stream_id=?"
+            sql += " AND stream_id=%s"
             values.append(str(stream_id))
         if job_type:
-            sql += " AND job_type=?"
+            sql += " AND job_type=%s"
             values.append(str(job_type))
         sql += " GROUP BY status"
         with self._connection() as connection:

@@ -1348,7 +1348,7 @@ def test_resume_contract_failure_precedes_database_mutation(monkeypatch):
     monkeypatch.setattr(module, "validate_recovery_run", reject_recovery)
     monkeypatch.setattr(
         module,
-        "RunStateDB",
+        "run_state_from_spec",
         lambda *_args: events.append("database-open"),
     )
 

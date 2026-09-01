@@ -1,5 +1,4 @@
 import json
-import sqlite3
 from pathlib import Path
 
 from labeling_tool.core.run_builder_v5 import create_v5_run, deployment_identity
@@ -45,7 +44,7 @@ def _tiles(rows, cols, path):
             }
 
 
-def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
+def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path, postgres_database):
     raster = tmp_path / "source.tif"
     raster.write_bytes(b"fixture")
     model = tmp_path / "model.pt"
@@ -73,7 +72,7 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
         encoding="utf-8",
     )
     spec, spec_path, database_path = create_v5_run(
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         output_root=tmp_path / "output",
         raster={
             "path": raster,
@@ -155,25 +154,25 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path):
     assert startup_index["latest_run_status"] == "planned"
     assert startup_index["latest_ready_run_id"] == ""
 
-    with sqlite3.connect(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM tiles").fetchone()[0] == 100_000
-        assert connection.execute("SELECT COUNT(*) FROM partitions").fetchone()[0] == 32 * 50
-        package_count = connection.execute("SELECT COUNT(*) FROM work_packages").fetchone()[0]
+    database = RunStateDB(database_path)
+    with database._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) AS n FROM tiles").fetchone()["n"] == 100_000
+        assert connection.execute("SELECT COUNT(*) AS n FROM partitions").fetchone()["n"] == 32 * 50
+        package_count = connection.execute("SELECT COUNT(*) AS n FROM work_packages").fetchone()["n"]
         first_package = connection.execute(
             "SELECT package_id FROM work_packages ORDER BY sequence_no LIMIT 1"
-        ).fetchone()[0]
-        unit_count = connection.execute("SELECT COUNT(*) FROM spatial_units").fetchone()[0]
-        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == (
+        ).fetchone()["package_id"]
+        unit_count = connection.execute("SELECT COUNT(*) AS n FROM spatial_units").fetchone()["n"]
+        assert connection.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == (
             package_count + unit_count
         )
-        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         first_tile = connection.execute(
             "SELECT raster_path, sha256 FROM tiles ORDER BY row_no, col_no LIMIT 1"
         ).fetchone()
-        assert Path(first_tile[0]) == expected_tile_cache / "tile_0_0.tif"
-        assert first_tile[1] == ""
-    assert len(RunStateDB(database_path).package_tiles(spec["run_id"], first_package)) <= 600
-    assert json.loads(spec_path.read_text())["state_db"] == str(database_path)
+        assert Path(first_tile["raster_path"]) == expected_tile_cache / "tile_0_0.tif"
+        assert first_tile["sha256"] == ""
+    assert len(database.package_tiles(spec["run_id"], first_package)) <= 600
+    assert json.loads(spec_path.read_text())["state_db"] == postgres_database.location
 
 
 def test_deployment_identity_freezes_manifest_provenance_without_local_git(tmp_path):
@@ -202,7 +201,7 @@ def test_deployment_identity_freezes_manifest_provenance_without_local_git(tmp_p
     assert deployment_identity(tmp_path / "missing")["git_sha"] == "unknown"
 
 
-def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):
+def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path, postgres_database):
     raster = tmp_path / "source.tif"
     raster.write_bytes(b"fixture")
     models = []
@@ -226,7 +225,7 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):
         "weights": [[0.5, 0.5] for _ in range(14)],
     }
     spec, _spec_path, database_path = create_v5_run(
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         output_root=tmp_path / "output",
         raster={
             "path": raster,
@@ -268,30 +267,33 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):
     assert spec["fragmentation_regularization"]["publication"] == (
         "authoritative_fusion_core"
     )
-    with sqlite3.connect(database_path) as connection:
+    database = RunStateDB(database_path)
+    with database._connection() as connection:
         job = connection.execute(
             "SELECT job_type, stream_id, unit_id, status FROM jobs "
             "WHERE job_type='fragmentation_v33'"
         ).fetchall()
         units = connection.execute(
             "SELECT unit_id, unit_type, owner_key FROM spatial_units "
-            "WHERE unit_type LIKE 'FragmentationV33%' ORDER BY unit_id"
+            "WHERE unit_type LIKE 'FragmentationV33%%' ORDER BY unit_id"
         ).fetchall()
         dependencies = connection.execute(
             "SELECT unit_id, partition_id FROM unit_dependencies "
-            "WHERE unit_id LIKE 'fragmentation_v33_%' ORDER BY unit_id, partition_id"
+            "WHERE unit_id LIKE 'fragmentation_v33_%%' ORDER BY unit_id, partition_id"
         ).fetchall()
         partition_count = connection.execute(
-            "SELECT COUNT(*) FROM partitions"
-        ).fetchone()[0]
-    partition_jobs = [row for row in job if ":partition_" in row[2]]
-    finalize_jobs = [row for row in job if row[2] == "fragmentation_v33_finalize"]
+            "SELECT COUNT(*) AS count FROM partitions"
+        ).fetchone()["count"]
+    partition_jobs = [row for row in job if ":partition_" in row["unit_id"]]
+    finalize_jobs = [row for row in job if row["unit_id"] == "fragmentation_v33_finalize"]
     assert len(partition_jobs) == partition_count
-    assert finalize_jobs == [
+    assert [(row["job_type"], row["stream_id"], row["unit_id"], row["status"]) for row in finalize_jobs] == [
         ("fragmentation_v33", "fusion:approved", "fragmentation_v33_finalize", "queued")
     ]
-    assert all(row[:2] == ("fragmentation_v33", "fusion:approved") for row in job)
-    assert units == [
+    assert all((row["job_type"], row["stream_id"]) == ("fragmentation_v33", "fusion:approved") for row in job)
+    assert [
+        (row["unit_id"], row["unit_type"], row["owner_key"]) for row in units
+    ] == [
         (
             "fragmentation_v33_finalize",
             "FragmentationV33Finalize",
@@ -303,7 +305,7 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path):
             "partition_00000_00000",
         ),
     ]
-    assert dependencies == [
+    assert [(row["unit_id"], row["partition_id"]) for row in dependencies] == [
         ("fragmentation_v33_finalize", "partition_00000_00000"),
         (
             "fragmentation_v33_partition:partition_00000_00000",

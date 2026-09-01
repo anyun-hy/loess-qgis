@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 import assemble_stream
-from labeling_tool.core.run_state_db import RunStateDB
 
 
 RUN_ID = "cleanup-recovery-run"
@@ -13,14 +12,13 @@ STREAM_ID = "model:test"
 
 def _ready_unit_artifact(
     tmp_path: Path,
+    database,
     *,
     unit_id: str = "core_00000",
     kind: str = "unit_raw_geoparquet",
 ):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    database = RunStateDB(run_dir / "run_state.sqlite")
-    database.initialize()
     database.create_run(RUN_ID, "a" * 64)
     unit_root = run_dir / "tmp" / "unit_outputs" / "model_test"
     unit_root.mkdir(parents=True)
@@ -51,8 +49,8 @@ def _ready_unit_artifact(
     )
 
 
-def test_cleanup_removes_only_owned_unit_intermediate(tmp_path):
-    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path)
+def test_cleanup_removes_only_owned_unit_intermediate(tmp_path, postgres_database):
+    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path, postgres_database)
     unit_root = path.parent
     user_file = unit_root / "research-notes.txt"
     user_file.write_text("keep", encoding="utf-8")
@@ -90,9 +88,9 @@ def test_cleanup_removes_only_owned_unit_intermediate(tmp_path):
 
 @pytest.mark.parametrize("fault_stage", ["claim", "rename", "finish_db", "unlink"])
 def test_cleanup_recovers_every_transaction_crash_window(
-    tmp_path, monkeypatch, fault_stage
+    tmp_path, monkeypatch, fault_stage, postgres_database
 ):
-    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path)
+    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path, postgres_database)
     tombstone = assemble_stream._cleanup_tombstone(path, artifact_id)
 
     with monkeypatch.context() as patch:
@@ -163,9 +161,9 @@ def test_cleanup_recovers_every_transaction_crash_window(
 
 
 def test_cleanup_recovers_legacy_crash_after_data_unlink_before_manifest_unlink(
-    tmp_path,
+    tmp_path, postgres_database
 ):
-    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path)
+    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path, postgres_database)
     manifest = path.with_name(f"{path.name}.manifest.json")
     tombstone = assemble_stream._cleanup_tombstone(path, artifact_id)
     assert database.claim_artifact_cleanup(artifact_id)
@@ -183,13 +181,13 @@ def test_cleanup_recovers_legacy_crash_after_data_unlink_before_manifest_unlink(
     assert database.get_artifact(artifact_id)["status"] == "cleaned"
 
 
-def test_cleanup_rejects_traversal_unit_id_without_deleting_target(tmp_path):
-    spec, database, artifact_id, original_path = _ready_unit_artifact(tmp_path)
+def test_cleanup_rejects_traversal_unit_id_without_deleting_target(tmp_path, postgres_database):
+    spec, database, artifact_id, original_path = _ready_unit_artifact(tmp_path, postgres_database)
     victim = Path(spec["run_dir"]) / "victim.gpkg"
     victim.write_bytes(b"user data")
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE artifacts SET unit_id=?, path=? WHERE artifact_id=?",
+            "UPDATE artifacts SET unit_id=%s, path=%s WHERE artifact_id=%s",
             ("../../victim", str(victim), artifact_id),
         )
     original_path.unlink()
@@ -203,8 +201,8 @@ def test_cleanup_rejects_traversal_unit_id_without_deleting_target(tmp_path):
     assert database.get_artifact(artifact_id)["status"] == "ready"
 
 
-def test_cleanup_rejects_symlink_without_touching_target(tmp_path):
-    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path)
+def test_cleanup_rejects_symlink_without_touching_target(tmp_path, postgres_database):
+    spec, database, artifact_id, path = _ready_unit_artifact(tmp_path, postgres_database)
     victim = Path(spec["run_dir"]) / "user-file.gpkg"
     victim.write_bytes(b"user data")
     path.unlink()

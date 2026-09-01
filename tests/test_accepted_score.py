@@ -70,7 +70,7 @@ def test_incompletely_accepted_tile_is_rejected(tmp_path):
         raise AssertionError("partially accepted Tile was treated as fully accepted")
 
 
-def test_work_package_skips_model_for_fully_accepted_tile(tmp_path):
+def test_work_package_skips_model_for_fully_accepted_tile(tmp_path, postgres_database):
     tile = tmp_path / "tile.tif"
     accepted = tmp_path / "accepted.gpkg"
     model = tmp_path / "model.pt"
@@ -78,7 +78,7 @@ def test_work_package_skips_model_for_fully_accepted_tile(tmp_path):
     _accepted(accepted, box(0, 0, 512, 512))
     model.write_bytes(b"fixture")
     spec, spec_path, database_path = create_v5_run(
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         output_root=tmp_path / "output",
         raster={
             "path": tile,

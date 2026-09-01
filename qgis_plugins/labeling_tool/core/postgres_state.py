@@ -1,9 +1,8 @@
 """PostgreSQL connection and schema support for the v5 run-state store.
 
 The production control plane uses PostgreSQL so independent QGIS, accelerator,
-and geometry processes can write different rows concurrently.  The adapter
-keeps the small DB-API surface used by :mod:`run_state_db` while translating
-the legacy qmark SQL parameters during the backend migration.
+and geometry processes can write different rows concurrently.  The connection
+wrapper keeps the small DB-API surface used by :mod:`run_state_db`.
 """
 
 from __future__ import annotations
@@ -64,24 +63,8 @@ def _driver():
     return psycopg2, DictCursor, execute_batch
 
 
-def _postgres_sql(statement: str) -> str:
-    """Translate the SQLite-compatible routine SQL used by RunStateDB."""
-
-    value = str(statement)
-    ignored = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\b", value, re.I))
-    if ignored:
-        value = re.sub(r"\bINSERT\s+OR\s+IGNORE\b", "INSERT", value, flags=re.I)
-    value = re.sub(r"\bMAX\s*\(\s*0\s*,", "GREATEST(0,", value, flags=re.I)
-    value = value.replace("?", "%s")
-    if ignored:
-        stripped = value.rstrip().rstrip(";")
-        if " ON CONFLICT " not in stripped.upper():
-            value = stripped + " ON CONFLICT DO NOTHING"
-    return value
-
-
 class PostgresConnection:
-    """Small connection facade exposing SQLite-style ``execute`` helpers."""
+    """Small connection facade exposing ``execute`` and batch helpers."""
 
     def __init__(self, raw: Any, cursor_factory: Any, execute_batch: Any):
         self.raw = raw
@@ -94,7 +77,7 @@ class PostgresConnection:
         parameters: Sequence[Any] | None = None,
     ):
         cursor = self.raw.cursor(cursor_factory=self._cursor_factory)
-        cursor.execute(_postgres_sql(statement), tuple(parameters or ()))
+        cursor.execute(str(statement), tuple(parameters or ()))
         return cursor
 
     def executemany(
@@ -105,7 +88,7 @@ class PostgresConnection:
         cursor = self.raw.cursor(cursor_factory=self._cursor_factory)
         self._execute_batch(
             cursor,
-            _postgres_sql(statement),
+            str(statement),
             parameters,
             page_size=1000,
         )

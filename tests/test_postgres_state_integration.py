@@ -8,25 +8,25 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
-
+from labeling_tool.core.postgres_state import (
+    DEFAULT_POSTGRES_DSN,
+    _resolve_postgres_dsn,
+)
 from labeling_tool.core.run_builder_v5 import create_v5_run
 from labeling_tool.core.run_builder_v5 import _fragmentation_v33_units
 from labeling_tool.core.run_state_db import RunStateDB
 from labeling_tool.core.run_state_db import RUN_DETAIL_ARCHIVE_KEY
 
 
-POSTGRES_DSN = os.environ.get("LOESS_TEST_POSTGRES_DSN", "").strip()
-pytestmark = pytest.mark.skipif(
-    not POSTGRES_DSN,
-    reason="LOESS_TEST_POSTGRES_DSN is required for PostgreSQL integration",
-)
+POSTGRES_DSN = str(
+    os.environ.get("LOESS_TEST_POSTGRES_DSN") or DEFAULT_POSTGRES_DSN
+).strip()
 
 
 def _drop_schema(dsn: str, schema: str) -> None:
     import psycopg2
 
-    connection = psycopg2.connect(dsn)
+    connection = psycopg2.connect(_resolve_postgres_dsn(dsn))
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
@@ -76,8 +76,8 @@ def test_postgres_incomplete_run_archive_preserves_summary_and_protections():
         )
         with database.transaction() as connection:
             connection.execute(
-                """UPDATE jobs SET lease_token=?, lease_expires=?
-                   WHERE run_id=?""",
+                """UPDATE jobs SET lease_token=%s, lease_expires=%s
+                   WHERE run_id=%s""",
                 ("active-token", time.time() + 3600, active_run),
             )
 
@@ -221,7 +221,7 @@ def test_postgres_schema_artifacts_and_true_concurrent_job_writes(tmp_path):
             release_job_ids = [
                 int(row["job_id"])
                 for row in connection.execute(
-                    """SELECT job_id FROM jobs WHERE run_id=?
+                    """SELECT job_id FROM jobs WHERE run_id=%s
                        AND job_type='release_test' ORDER BY job_id""",
                     (run_id,),
                 ).fetchall()

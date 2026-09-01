@@ -225,7 +225,7 @@ def test_non_aligned_range_stays_covered_across_partition_core_boundary():
     )
 
 
-def test_vector_run_spec_records_the_run_local_range_snapshot_hash(tmp_path: Path):
+def test_vector_run_spec_records_the_run_local_range_snapshot_hash(tmp_path: Path, postgres_database):
     """The frozen range snapshot, not a mutable external layer, is the run input."""
     raster = tmp_path / "source.tif"
     model = tmp_path / "model.pt"
@@ -246,7 +246,7 @@ def test_vector_run_spec_records_the_run_local_range_snapshot_hash(tmp_path: Pat
         output_root=output_root,
         reserved_run_dir=run_dir,
         run_id=run_id,
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         raster={
             "path": raster,
             "crs": "EPSG:3857",

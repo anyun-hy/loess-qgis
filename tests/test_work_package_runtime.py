@@ -1,6 +1,5 @@
 import hashlib
 import json
-import sqlite3
 import sys
 import threading
 import time
@@ -78,7 +77,7 @@ def _boundary():
     }
 
 
-def _single_tile_two_model_run(tmp_path, *, run_id):
+def _single_tile_two_model_run(tmp_path, database, *, run_id):
     tile = tmp_path / f"{run_id}_source.tif"
     with rasterio.open(
         tile,
@@ -113,7 +112,7 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         "weights": [[0.5, 0.5] for _ in range(14)],
     }
     return create_v5_run(
-        state_database=tmp_path / f"{run_id}_state.sqlite",
+        state_database=database.location,
         output_root=tmp_path / f"{run_id}_output",
         raster={
             "path": tile,
@@ -148,6 +147,16 @@ def _single_tile_two_model_run(tmp_path, *, run_id):
         fusion={"profile_id": "fixture_fusion", "profile": profile},
         run_id=run_id,
     )
+
+
+def _database_scalar(database, statement, parameters=()):
+    with database._connection() as connection:
+        return connection.execute(statement, parameters).fetchone()[0]
+
+
+def _database_rows(database, statement, parameters=()):
+    with database._connection() as connection:
+        return connection.execute(statement, parameters).fetchall()
 
 
 def test_unit_polygonize_does_not_emit_deprecated_memory_driver_warning(capfd):
@@ -231,10 +240,11 @@ def test_accelerator_cache_cleanup_synchronizes_before_release(
 
 
 def test_model_boundaries_release_cache_without_unloading_resident_models(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, postgres_database
 ):
     _spec, spec_path, _database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260809_230000_cache",
     )
     cleanup_calls = []
@@ -269,12 +279,13 @@ def test_model_boundaries_release_cache_without_unloading_resident_models(
     assert [item["cold_load_count"] for item in report["models"]] == [1, 1]
 
 
-def test_late_second_model_failure_reuses_committed_first_model_outputs(tmp_path):
+def test_late_second_model_failure_reuses_committed_first_model_outputs(tmp_path, postgres_database):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_190000_a1b2c3",
     )
-    database = RunStateDB(database_path)
+    database = postgres_database
     package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
         "package_id"
     ]
@@ -334,9 +345,10 @@ def test_late_second_model_failure_reuses_committed_first_model_outputs(tmp_path
     assert {str(path): _sha(path) for path in first_model_paths} == before
 
 
-def test_linear_work_package_passes_fusion_head_to_partition_finalize(tmp_path):
+def test_linear_work_package_passes_fusion_head_to_partition_finalize(tmp_path, postgres_database):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_190500_linear",
     )
     profile = spec["fusion"]["profile"]
@@ -364,7 +376,7 @@ def test_linear_work_package_passes_fusion_head_to_partition_finalize(tmp_path):
         probabilities[0 if model_id == "a" else 1] = 1.0
         return probabilities
 
-    database = RunStateDB(database_path)
+    database = postgres_database
     package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
         "package_id"
     ]
@@ -418,13 +430,14 @@ def test_linear_fusion_head_loader_verifies_and_adapts_torchscript(tmp_path):
 
 
 def test_preflight_failure_after_lease_is_atomically_requeued(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_194000_d4e5f6",
     )
-    database = RunStateDB(database_path)
+    database = postgres_database
     job = database.lease_next_work_package(
         spec["run_id"],
         "preflight-failure-worker",
@@ -450,17 +463,16 @@ def test_preflight_failure_after_lease_is_atomically_requeued(
 
 
 def test_heartbeat_thread_surfaces_database_exception_as_lease_loss(
-    tmp_path, monkeypatch
+    monkeypatch, postgres_database
 ):
-    database = RunStateDB(tmp_path / "state.sqlite")
-    database.initialize()
+    database = postgres_database
     monkeypatch.setattr(
         RunStateDB,
         "heartbeat",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("db unavailable")),
     )
     heartbeat = _LeaseHeartbeat(
-        database.path,
+        database.location,
         run_id="run",
         package_id="package",
         job_id=1,
@@ -485,10 +497,9 @@ def test_heartbeat_thread_surfaces_database_exception_as_lease_loss(
 
 
 def test_heartbeat_keeps_lease_alive_after_stop_until_owner_closes(
-    tmp_path, monkeypatch
+    monkeypatch, postgres_database
 ):
-    database = RunStateDB(tmp_path / "state.sqlite")
-    database.initialize()
+    database = postgres_database
     calls = []
 
     def accepted_heartbeat(*_args, **_kwargs):
@@ -498,7 +509,7 @@ def test_heartbeat_keeps_lease_alive_after_stop_until_owner_closes(
     monkeypatch.setattr(RunStateDB, "heartbeat", accepted_heartbeat)
     stopper = threading.Event()
     heartbeat = _LeaseHeartbeat(
-        database.path,
+        database.location,
         run_id="run",
         package_id="package",
         job_id=1,
@@ -520,13 +531,14 @@ def test_heartbeat_keeps_lease_alive_after_stop_until_owner_closes(
 
 
 def test_lease_loss_fences_persistent_session_before_next_package(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_194000_fenced",
     )
-    database = RunStateDB(database_path)
+    database = postgres_database
     database.insert_work_packages(
         spec["run_id"],
         [{"package_id": "package_00001", "sequence_no": 1}],
@@ -552,12 +564,13 @@ def test_lease_loss_fences_persistent_session_before_next_package(
     assert calls == ["package_00000"]
     assert report["session_fenced"] is True
     assert report["package_attempt_count"] == 1
-    with sqlite3.connect(database_path) as connection:
-        states = dict(
-            connection.execute(
-                "SELECT package_id, status FROM jobs WHERE job_type='work_package'"
-            ).fetchall()
+    states = {
+        row["package_id"]: row["status"]
+        for row in _database_rows(
+            database,
+            "SELECT package_id, status FROM jobs WHERE job_type='work_package'",
         )
+    }
     assert states == {"package_00000": "running", "package_00001": "queued"}
 
 
@@ -571,10 +584,11 @@ def test_lease_loss_fences_persistent_session_before_next_package(
     ),
 )
 def test_persistent_worker_waits_for_low_disk_without_consuming_attempt(
-    tmp_path, monkeypatch, target_prefix
+    tmp_path, monkeypatch, target_prefix, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_191000_c4d5e6",
     )
     checks = {"fired": False}
@@ -613,13 +627,12 @@ def test_persistent_worker_waits_for_low_disk_without_consuming_attempt(
         low_disk_poll_sec=0.01,
     )
 
-    database = RunStateDB(database_path)
+    database = postgres_database
     package = database.page_work_packages(spec["run_id"], limit=1)[0]
     jobs = database.job_counts(spec["run_id"], job_type="work_package")
-    with sqlite3.connect(database_path) as connection:
-        attempt = connection.execute(
-            "SELECT attempt FROM jobs WHERE job_type='work_package'"
-        ).fetchone()[0]
+    attempt = _database_scalar(
+        database, "SELECT attempt FROM jobs WHERE job_type='work_package'"
+    )
     assert worker_report["status"] == "ready"
     assert checks["fired"] is True
     assert worker_report["low_disk_pause_count"] == 1
@@ -629,10 +642,11 @@ def test_persistent_worker_waits_for_low_disk_without_consuming_attempt(
 
 
 def test_persistent_worker_fails_fixed_managed_budget_instead_of_waiting(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_193000_b1c2d3",
     )
     original_check = work_package_runtime.StorageGuard.check
@@ -664,7 +678,7 @@ def test_persistent_worker_fails_fixed_managed_budget_instead_of_waiting(
         low_disk_poll_sec=0.01,
     )
 
-    database = RunStateDB(database_path)
+    database = postgres_database
     assert fired["value"] is True
     assert report["status"] == "failed"
     assert report["low_disk_pause_count"] == 0
@@ -674,10 +688,11 @@ def test_persistent_worker_fails_fixed_managed_budget_instead_of_waiting(
 
 
 def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(
-    tmp_path,
+    tmp_path, postgres_database,
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_193500_cache",
     )
     spec["runtime"]["keep_score_cache"] = True
@@ -700,7 +715,7 @@ def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(
     )
 
     assert report["status"] == "ready"
-    database = RunStateDB(database_path)
+    database = postgres_database
     package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
         "package_id"
     ]
@@ -716,10 +731,11 @@ def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(
 
 
 def test_fusion_accumulator_separates_atomic_write_from_final_managed_growth(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_193700_a1b2c3",
     )
     observed = []
@@ -756,7 +772,7 @@ def test_fusion_accumulator_separates_atomic_write_from_final_managed_growth(
         probabilities[0 if model_id == "a" else 1] = 1.0
         return probabilities
 
-    database = RunStateDB(database_path)
+    database = postgres_database
     package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
         "package_id"
     ]
@@ -787,7 +803,7 @@ def test_fusion_accumulator_separates_atomic_write_from_final_managed_growth(
 
 @pytest.mark.parametrize("failure_stage", ("partition", "fusion_accumulator"))
 def test_large_writer_failure_always_settles_package_storage_reservation(
-    tmp_path, monkeypatch, failure_stage
+    tmp_path, monkeypatch, failure_stage, postgres_database
 ):
     run_id = {
         "partition": "20260805_193800_a1b2c4",
@@ -795,6 +811,7 @@ def test_large_writer_failure_always_settles_package_storage_reservation(
     }[failure_stage]
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id=run_id,
     )
     guards = set()
@@ -829,7 +846,7 @@ def test_large_writer_failure_always_settles_package_storage_reservation(
         probabilities[0 if model_id == "a" else 1] = 1.0
         return probabilities
 
-    database = RunStateDB(database_path)
+    database = postgres_database
     package_id = database.page_work_packages(spec["run_id"], limit=1)[0][
         "package_id"
     ]
@@ -848,18 +865,19 @@ def test_large_writer_failure_always_settles_package_storage_reservation(
 
 @pytest.mark.parametrize("residual_status", ("queued", "interrupted", "running"))
 def test_persistent_worker_never_reports_residual_jobs_as_ready(
-    tmp_path, residual_status
+    tmp_path, residual_status, postgres_database
 ):
     spec, spec_path, database_path = _single_tile_two_model_run(
         tmp_path,
+        postgres_database,
         run_id="20260805_192000_e7f8a9",
     )
-    with sqlite3.connect(database_path) as connection:
+    with postgres_database.transaction() as connection:
         connection.execute(
-            """UPDATE jobs SET status=?, attempt=max_attempts,
-               worker_id=CASE WHEN ?='running' THEN 'other-worker' ELSE '' END,
-               lease_token=CASE WHEN ?='running' THEN 'other-token' ELSE '' END,
-               lease_expires=CASE WHEN ?='running' THEN ? ELSE NULL END
+            """UPDATE jobs SET status=%s, attempt=max_attempts,
+               worker_id=CASE WHEN %s='running' THEN 'other-worker' ELSE '' END,
+               lease_token=CASE WHEN %s='running' THEN 'other-token' ELSE '' END,
+               lease_expires=CASE WHEN %s='running' THEN %s ELSE NULL END
                WHERE job_type='work_package'""",
             (
                 residual_status,
@@ -870,7 +888,7 @@ def test_persistent_worker_never_reports_residual_jobs_as_ready(
             ),
         )
         connection.execute(
-            "UPDATE work_packages SET status=? WHERE run_id=?",
+            "UPDATE work_packages SET status=%s WHERE run_id=%s",
             (residual_status, spec["run_id"]),
         )
 
@@ -892,6 +910,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     tmp_path,
     capsys,
     monkeypatch,
+    postgres_database,
 ):
     tile = tmp_path / "tile_0_0.tif"
     with rasterio.open(
@@ -921,7 +940,7 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         "weights": [[0.5, 0.5] for _ in range(14)],
     }
     spec, spec_path, database_path = create_v5_run(
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         output_root=tmp_path / "output",
         raster={
             "path": tile,
@@ -992,10 +1011,8 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         probabilities[0 if model_id == "a" else 1] = 1.0
         return probabilities
 
-    with sqlite3.connect(database_path) as connection:
-        package_id = connection.execute(
-            "SELECT package_id FROM work_packages"
-        ).fetchone()[0]
+    database = postgres_database
+    package_id = _database_scalar(database, "SELECT package_id FROM work_packages")
     model_a.write_bytes(b"corrupt-model-a")
     with pytest.raises(WorkPackageRuntimeError, match="model SHA256 mismatch"):
         run_work_package(
@@ -1010,10 +1027,11 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert (
         Path(spec["tile_cache_dir"]) / "tile_0_0.tif"
     ).is_file()
-    with sqlite3.connect(database_path) as connection:
-        assert connection.execute(
-            "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
-        ).fetchone()[0] == "failed"
+    assert _database_scalar(
+        database,
+        "SELECT status FROM work_packages WHERE package_id=%s",
+        (package_id,),
+    ) == "failed"
 
     model_a.write_bytes(b"model-a")
     original_build_partition_arrays = work_package_runtime.build_partition_arrays
@@ -1109,24 +1127,26 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert result["models"][0]["checkpoint_reused_count"] == 1
     assert result["models"][0]["checkpoint_written_count"] == 0
     assert result["models"][1]["checkpoint_written_count"] == 1
-    with sqlite3.connect(database_path) as connection:
-        assert connection.execute(
-            "SELECT status FROM work_packages WHERE package_id=?", (package_id,)
-        ).fetchone()[0] == "ready"
-        # Partition workers retain two cleaned staging rows for auditability;
-        # finalize adds the same three authoritative rows as the former
-        # single-job implementation.
-        assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 15
-        assert connection.execute(
-            """SELECT COUNT(*) FROM artifacts
-               WHERE kind IN ('v33_staged_mask','v33_staged_audit')
-                 AND status='cleaned'"""
-        ).fetchone()[0] == 2
-        unit_job_id = connection.execute(
-            """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
-               AND job_type='unit_fit'"""
-        ).fetchone()[0]
-    database = RunStateDB(database_path)
+    assert _database_scalar(
+        database,
+        "SELECT status FROM work_packages WHERE package_id=%s",
+        (package_id,),
+    ) == "ready"
+    # Partition workers retain two cleaned staging rows for auditability;
+    # finalize adds the same three authoritative rows as the former
+    # single-job implementation.
+    assert _database_scalar(database, "SELECT COUNT(*) FROM artifacts") == 15
+    assert _database_scalar(
+        database,
+        """SELECT COUNT(*) FROM artifacts
+           WHERE kind IN ('v33_staged_mask','v33_staged_audit')
+             AND status='cleaned'""",
+    ) == 2
+    unit_job_id = _database_scalar(
+        database,
+        """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
+           AND job_type='unit_fit'""",
+    )
     leased = database.lease_job(unit_job_id, "unit-test", lease_seconds=60)
     assert leased is not None
     unit_report = run_unit_fit(
@@ -1286,7 +1306,9 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     }
 
 
-def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp_path):
+def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(
+    tmp_path, postgres_database
+):
     tile = tmp_path / "shared_tile.tif"
     with rasterio.open(
         tile,
@@ -1342,7 +1364,7 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         "partition_tile_cols": 2,
     }
     spec, spec_path, database_path = create_v5_run(
-        state_database=tmp_path / "state.sqlite",
+        state_database=postgres_database.location,
         output_root=tmp_path / "output",
         raster={
             "path": tile,
@@ -1404,14 +1426,13 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
         probabilities[:, 0 if model_id == "a" else 1] = 1.0
         return probabilities
 
-    database = RunStateDB(database_path)
-    with sqlite3.connect(database_path) as connection:
-        package_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT package_id FROM work_packages ORDER BY sequence_no"
-            )
-        ]
+    database = postgres_database
+    package_ids = [
+        row["package_id"]
+        for row in _database_rows(
+            database, "SELECT package_id FROM work_packages ORDER BY sequence_no"
+        )
+    ]
     assert package_ids == ["package_00000", "package_00001"]
     source_sha256 = _sha(tile)
     first_tile_ids = {
@@ -1517,13 +1538,13 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     assert finalized["status"] == "raster_ready"
     assert len(finalized["streams"]) == 3
 
-    with sqlite3.connect(database_path) as connection:
-        unit_job_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT job_id FROM jobs WHERE job_type='unit_fit' ORDER BY job_id"
-            )
-        ]
+    unit_job_ids = [
+        row["job_id"]
+        for row in _database_rows(
+            database,
+            "SELECT job_id FROM jobs WHERE job_type='unit_fit' ORDER BY job_id",
+        )
+    ]
     assert len(unit_job_ids) == 9
     for job_id in unit_job_ids:
         leased = database.lease_job(job_id, "multi-package-test", lease_seconds=120)
@@ -1618,11 +1639,10 @@ def test_two_models_multiple_work_packages_complete_fusion_seam_and_assembly(tmp
     )
 
 
-def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
+def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path, postgres_database):
     run_id = "20260717_230000_multi_unit"
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    state_path = run_dir / "run_state.sqlite"
     class_path = run_dir / "class_mapping_snapshot.json"
     atomic_write_json(
         class_path,
@@ -1645,7 +1665,9 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
         "schema_version": 2,
         "run_id": run_id,
         "run_dir": str(run_dir),
-        "state_db": str(state_path),
+        "state_backend": "postgresql",
+        "state_db": postgres_database.location,
+        "state_schema": postgres_database.postgres_schema,
         "raster": {
             "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, plan["processing_window"]["y1"]],
@@ -1664,8 +1686,7 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     }
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)
-    database = RunStateDB(state_path)
-    database.initialize()
+    database = postgres_database
     database.create_run(run_id, _sha(spec_path))
     database.register_streams(run_id, spec["streams"])
     database.insert_work_packages(
@@ -1852,11 +1873,12 @@ def test_multi_partition_seam_junction_assembly_is_gap_free(tmp_path):
     assert reassembled["object_link_count"] == report["object_link_count"]
 
 
-def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
+def test_full_assembly_streams_64_spatial_unit_reports(
+    tmp_path, monkeypatch, postgres_database
+):
     run_id = "20260729_120000_queue64"
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    state_path = run_dir / "run_state.sqlite"
     class_path = run_dir / "class_mapping_snapshot.json"
     atomic_write_json(
         class_path,
@@ -1885,7 +1907,9 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
         "schema_version": 2,
         "run_id": run_id,
         "run_dir": str(run_dir),
-        "state_db": str(state_path),
+        "state_backend": "postgresql",
+        "state_db": postgres_database.location,
+        "state_schema": postgres_database.postgres_schema,
         "raster": {
             "crs": "EPSG:3857",
             "transform": [1, 0, 0, 0, -1, 1],
@@ -1904,8 +1928,7 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
     }
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)
-    database = RunStateDB(state_path)
-    database.initialize()
+    database = postgres_database
     database.create_run(run_id, _sha(spec_path))
     database.register_streams(run_id, spec["streams"])
     database.insert_spatial_units(run_id, units)
@@ -2088,10 +2111,10 @@ def test_full_assembly_streams_64_spatial_unit_reports(tmp_path, monkeypatch):
         "failed",
         error="injected report recovery failure",
     )
-    with sqlite3.connect(state_path) as connection:
+    with database.transaction() as connection:
         connection.execute(
             """UPDATE artifacts SET status='failed'
-               WHERE run_id=? AND stream_id=? AND unit_id='assembled'
+               WHERE run_id=%s AND stream_id=%s AND unit_id='assembled'
                AND kind IN ('boundary_fitting_report', 'fitted_edges')""",
             (run_id, "model:a"),
         )

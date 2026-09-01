@@ -1,7 +1,7 @@
 import json
-import sqlite3
 import time
 
+import psycopg2
 import pytest
 
 from labeling_tool.core.run_builder_v5 import create_v5_run
@@ -22,16 +22,16 @@ def _count(database, table, run_id):
                 connection.execute(
                     """SELECT COUNT(*) FROM artifact_dependencies
                        WHERE job_id IN (
-                         SELECT job_id FROM jobs WHERE run_id=?
+                         SELECT job_id FROM jobs WHERE run_id=%s
                        ) OR artifact_id IN (
-                         SELECT artifact_id FROM artifacts WHERE run_id=?
+                         SELECT artifact_id FROM artifacts WHERE run_id=%s
                        )""",
                     (run_id, run_id),
                 ).fetchone()[0]
             )
         return int(
             connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,)
+                f"SELECT COUNT(*) FROM {table} WHERE run_id=%s", (run_id,)
             ).fetchone()[0]
         )
 
@@ -132,12 +132,12 @@ def _seed_run(
     with database.transaction() as connection:
         job_id = int(
             connection.execute(
-                "SELECT job_id FROM jobs WHERE run_id=?", (run_id,)
+                "SELECT job_id FROM jobs WHERE run_id=%s", (run_id,)
             ).fetchone()[0]
         )
         connection.execute(
-            """UPDATE jobs SET error=?, lease_token=?, lease_expires=?
-               WHERE job_id=?""",
+            """UPDATE jobs SET error=%s, lease_token=%s, lease_expires=%s
+               WHERE job_id=%s""",
             (
                 "fixture unit failure",
                 "active-token" if active_lease else "",
@@ -194,17 +194,11 @@ def _seed_run(
     )
 
 
-def _database(tmp_path):
-    database = RunStateDB(tmp_path / "state.sqlite")
-    database.initialize()
-    return database
-
-
 @pytest.mark.parametrize("status", ["failed", "stopped"])
 def test_archive_incomplete_run_details_preserves_tombstone_and_deletes_graph(
-    tmp_path, status
+    tmp_path, status, postgres_database
 ):
-    database = _database(tmp_path)
+    database = postgres_database
     run_id = f"20260901_100000_{status}"
     _seed_run(database, tmp_path, run_id, status)
 
@@ -234,15 +228,22 @@ def test_archive_incomplete_run_details_preserves_tombstone_and_deletes_graph(
         assert _count(database, table, run_id) == expected, table
     with database._connection() as connection:
         event = connection.execute(
-            "SELECT event_type FROM events WHERE run_id=?", (run_id,)
+            "SELECT event_type FROM events WHERE run_id=%s", (run_id,)
         ).fetchone()
         assert event["event_type"] == "run_details_archived"
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        invalid_constraints = connection.execute(
+            """SELECT COUNT(*) FROM pg_constraint
+               WHERE connamespace=current_schema()::regnamespace
+                 AND contype='f' AND NOT convalidated"""
+        ).fetchone()[0]
+        assert int(invalid_constraints) == 0
     assert not database.set_run_status(run_id, "running")
 
 
-def test_archive_protects_ready_running_active_lease_and_current_run(tmp_path):
-    database = _database(tmp_path)
+def test_archive_protects_ready_running_active_lease_and_current_run(
+    tmp_path, postgres_database
+):
+    database = postgres_database
     for run_id, status, active in (
         ("20260901_100001_ready", "ready", False),
         ("20260901_100002_running", "running", False),
@@ -271,8 +272,10 @@ def test_archive_protects_ready_running_active_lease_and_current_run(tmp_path):
         assert _count(database, "jobs", run_id) == 1
 
 
-def test_archive_tombstone_whitelists_metadata_and_bounds_utf8_errors(tmp_path):
-    database = _database(tmp_path)
+def test_archive_tombstone_whitelists_metadata_and_bounds_utf8_errors(
+    tmp_path, postgres_database
+):
+    database = postgres_database
     run_id = "20260901_100011_bounded"
     _seed_run(database, tmp_path, run_id, "failed")
     database.update_run_metadata(
@@ -285,7 +288,7 @@ def test_archive_tombstone_whitelists_metadata_and_bounds_utf8_errors(tmp_path):
     long_message = "错" * 2000
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE jobs SET error=? WHERE run_id=?",
+            "UPDATE jobs SET error=%s WHERE run_id=%s",
             (long_message, run_id),
         )
     for index in range(10):
@@ -313,8 +316,10 @@ def test_archive_tombstone_whitelists_metadata_and_bounds_utf8_errors(tmp_path):
     )
 
 
-def test_archive_is_cross_run_isolated_and_idempotent(tmp_path):
-    database = _database(tmp_path)
+def test_archive_is_cross_run_isolated_and_idempotent(
+    tmp_path, postgres_database
+):
+    database = postgres_database
     old_run = "20260901_100006_old"
     protected = "20260901_100007_current"
     _seed_run(database, tmp_path, old_run, "failed")
@@ -334,8 +339,8 @@ def test_archive_is_cross_run_isolated_and_idempotent(tmp_path):
     assert _count(database, "jobs", protected) == 1
 
 
-def test_archive_report_bounds_run_id_lists(tmp_path):
-    database = _database(tmp_path)
+def test_archive_report_bounds_run_id_lists(tmp_path, postgres_database):
+    database = postgres_database
     for index in range(51):
         database.create_run(
             f"20260901_09{index:04d}_old",
@@ -352,20 +357,33 @@ def test_archive_report_bounds_run_id_lists(tmp_path):
     assert report["archived_run_ids_truncated"] is True
 
 
-def test_archive_rolls_back_everything_on_late_delete_failure(tmp_path):
-    database = _database(tmp_path)
+def test_archive_rolls_back_everything_on_late_delete_failure(
+    tmp_path, postgres_database
+):
+    database = postgres_database
     run_id = "20260901_100008_rollback"
     _seed_run(database, tmp_path, run_id, "failed")
     before = {table: _count(database, table, run_id) for table in RUN_DETAIL_TABLES}
     with database._connection() as connection:
         connection.execute(
-            f"""CREATE TRIGGER fail_archive_delete
-                BEFORE DELETE ON artifacts
-                WHEN OLD.run_id='{run_id}'
-                BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END"""
+            f"""CREATE OR REPLACE FUNCTION fail_archive_delete_fn()
+                RETURNS trigger LANGUAGE plpgsql AS $function$
+                BEGIN
+                  IF OLD.run_id='{run_id}' THEN
+                    RAISE EXCEPTION 'injected archive failure'
+                      USING ERRCODE='23514';
+                  END IF;
+                  RETURN OLD;
+                END
+                $function$"""
+        )
+        connection.execute(
+            """CREATE TRIGGER fail_archive_delete
+               BEFORE DELETE ON artifacts FOR EACH ROW
+               EXECUTE FUNCTION fail_archive_delete_fn()"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected archive failure"):
+    with pytest.raises(psycopg2.IntegrityError, match="injected archive failure"):
         database.archive_incomplete_run_details(
             protected_run_id="20260901_110000_current"
         )
@@ -378,13 +396,13 @@ def test_archive_rolls_back_everything_on_late_delete_failure(tmp_path):
     assert RUN_DETAIL_ARCHIVE_KEY not in metadata
 
 
-def _create_minimal_v5(tmp_path, database_path, run_id):
+def _create_minimal_v5(tmp_path, database_location, run_id):
     raster = tmp_path / f"{run_id}.tif"
     model = tmp_path / f"{run_id}.pt"
     raster.write_bytes(b"raster")
     model.write_bytes(b"model")
     return create_v5_run(
-        state_database=database_path,
+        state_database=database_location,
         output_root=tmp_path / "output",
         run_id=run_id,
         raster={
@@ -442,11 +460,9 @@ def _create_minimal_v5(tmp_path, database_path, run_id):
 
 
 def test_create_v5_run_archives_old_incomplete_details_after_graph_creation(
-    tmp_path,
+    tmp_path, postgres_database
 ):
-    database_path = tmp_path / "state.sqlite"
-    database = RunStateDB(database_path)
-    database.initialize()
+    database = postgres_database
     _seed_run(
         database,
         tmp_path,
@@ -456,7 +472,7 @@ def test_create_v5_run_archives_old_incomplete_details_after_graph_creation(
 
     spec, _spec_path, _location = _create_minimal_v5(
         tmp_path,
-        database_path,
+        database.location,
         "20260901_110000_0a0001",
     )
 
@@ -470,7 +486,7 @@ def test_create_v5_run_archives_old_incomplete_details_after_graph_creation(
 
 
 def test_create_v5_run_warns_but_succeeds_when_cleanup_fails(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch, caplog, postgres_database
 ):
     def fail_cleanup(*_args, **_kwargs):
         raise RuntimeError("injected cleanup failure")
@@ -480,15 +496,16 @@ def test_create_v5_run_warns_but_succeeds_when_cleanup_fails(
         "archive_incomplete_run_details",
         fail_cleanup,
     )
-    database_path = tmp_path / "state.sqlite"
-
     spec, _spec_path, _location = _create_minimal_v5(
         tmp_path,
-        database_path,
+        postgres_database.location,
         "20260901_110001_0a0002",
     )
 
-    database = RunStateDB(database_path)
+    database = RunStateDB(
+        postgres_database.location,
+        postgres_schema=postgres_database.postgres_schema,
+    )
     run = database.get_run(spec["run_id"])
     cleanup = json.loads(run["metadata_json"])["incomplete_run_cleanup"]
     assert run["status"] == "planned"

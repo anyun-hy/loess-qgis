@@ -268,12 +268,12 @@ def test_resume_gpkg_requires_matching_schema_crs_identity_and_count(tmp_path):
         )
 
 
-def test_readonly_sqlite_context_closes_its_file_descriptor(
+def test_readonly_geopackage_context_closes_its_file_descriptor(
     tmp_path,
     monkeypatch,
 ):
-    database_path = tmp_path / "state.sqlite"
-    with sqlite3.connect(database_path) as connection:
+    geopackage_path = tmp_path / "integrity-fixture.gpkg"
+    with sqlite3.connect(geopackage_path) as connection:
         connection.execute("CREATE TABLE evidence(value INTEGER)")
 
     real_connect = assemble_stream.sqlite3.connect
@@ -289,7 +289,7 @@ def test_readonly_sqlite_context_closes_its_file_descriptor(
         "connect",
         tracking_connect,
     )
-    with assemble_stream._readonly_sqlite(database_path) as connection:
+    with assemble_stream._readonly_geopackage(geopackage_path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM evidence"
         ).fetchone()[0] == 0
@@ -324,17 +324,19 @@ def test_resume_failure_event_is_actionable(monkeypatch, capsys):
     assert event["safe_retry"] == "rerun_without_resume_from_reports"
 
 
-def test_assembly_exception_marks_stream_failed(monkeypatch, tmp_path):
-    state_path = tmp_path / "run_state.sqlite"
-    database = assemble_stream.RunStateDB(state_path)
-    database.initialize()
+def test_assembly_exception_marks_stream_failed(
+    monkeypatch, tmp_path, postgres_database
+):
+    database = postgres_database
     spec_path = tmp_path / "run_spec.json"
     spec_path.write_text(
         json.dumps(
             {
                 "schema_version": 2,
                 "run_id": "run-1",
-                "state_db": str(state_path),
+                "state_backend": "postgresql",
+                "state_db": database.location,
+                "state_schema": database.postgres_schema,
             }
         ),
         encoding="utf-8",

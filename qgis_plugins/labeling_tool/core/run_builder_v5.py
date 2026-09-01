@@ -21,7 +21,11 @@ from .run_spec import (
     sha256_file,
 )
 from .postgres_state import is_postgres_location
-from .run_state_db import RunStateDB, production_state_database
+from .run_state_db import (
+    RunStateDB,
+    production_state_database,
+    production_state_schema,
+)
 from .spatial_planner import plan_spatial_units
 from .work_package_planner import plan_work_packages
 
@@ -219,9 +223,16 @@ def create_v5_run(
     state_database: str | Path | None = None,
     deployment_project_root: str | Path | None = None,
 ) -> tuple[dict[str, Any], Path, str | Path]:
-    """Freeze a small run spec and atomically populate the detailed state DB."""
+    """Freeze a Run Spec and atomically populate its PostgreSQL control graph."""
     if not models:
         raise RunBuilderV5Error("at least one semantic model is required")
+    state_location = str(state_database or production_state_database()).strip()
+    if not is_postgres_location(state_location):
+        raise RunBuilderV5Error(
+            "v5 Run state requires a PostgreSQL DSN; filesystem databases are "
+            "no longer supported"
+        )
+    state_schema = production_state_schema()
     output = Path(output_root).expanduser().resolve()
     if reserved_run_dir is None:
         identifier, run_dir = reserve_run_directory(output, run_id)
@@ -521,10 +532,6 @@ def create_v5_run(
             parents=True, exist_ok=True
         )
 
-    state_location = str(state_database or production_state_database()).strip()
-    state_backend = (
-        "postgresql" if is_postgres_location(state_location) else "sqlite"
-    )
     spec = {
         "schema_version": RUN_SPEC_SCHEMA_VERSION,
         "run_id": identifier,
@@ -593,19 +600,16 @@ def create_v5_run(
         "config_snapshot": str(config_snapshot_path),
         "config_fingerprint": str(config_fingerprint),
         "deployment_identity": deployment_identity(deployment_project_root),
-        "state_backend": state_backend,
+        "state_backend": "postgresql",
         "state_db": state_location,
+        "state_schema": state_schema,
     }
     spec["run_spec_content_sha256"] = _json_sha(spec)
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)
 
-    database_location: str | Path = (
-        state_location
-        if state_backend == "postgresql"
-        else Path(state_location).expanduser().resolve()
-    )
-    database = RunStateDB(database_location)
+    database_location = state_location
+    database = RunStateDB(database_location, postgres_schema=state_schema)
     database.initialize()
     database.create_run(
         identifier,

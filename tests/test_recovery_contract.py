@@ -24,18 +24,19 @@ def _content_sha(spec):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _run_fixture(tmp_path: Path, fingerprint: str, *, database_sha=None):
+def _run_fixture(tmp_path: Path, fingerprint: str, database, *, database_sha=None):
     output_root = tmp_path / "output"
     run_dir = output_root / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
     spec_path = run_dir / "run_spec.json"
-    state_path = run_dir / "run_state.sqlite"
     spec = {
         "schema_version": 2,
         "run_id": RUN_ID,
         "run_dir": str(run_dir),
         "output_root": str(output_root),
-        "state_db": str(state_path),
+        "state_backend": "postgresql",
+        "state_db": database.location,
+        "state_schema": database.postgres_schema,
         "config_fingerprint": fingerprint,
     }
     spec["run_spec_content_sha256"] = _content_sha(spec)
@@ -43,15 +44,13 @@ def _run_fixture(tmp_path: Path, fingerprint: str, *, database_sha=None):
         json.dumps(spec, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    database = RunStateDB(state_path)
-    database.initialize()
     database.create_run(
         RUN_ID,
         database_sha or sha256_file(spec_path),
         status="failed",
         metadata={"run_spec": str(spec_path)},
     )
-    return spec_path, state_path
+    return spec_path, database
 
 
 def _ready_deployment(monkeypatch, fingerprint):
@@ -70,9 +69,10 @@ def _ready_deployment(monkeypatch, fingerprint):
 def test_valid_recovery_contract_returns_bound_spec_and_database(
     tmp_path,
     monkeypatch,
+    postgres_database,
 ):
     fingerprint = "sha256:" + "a" * 64
-    spec_path, state_path = _run_fixture(tmp_path, fingerprint)
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
     _ready_deployment(monkeypatch, fingerprint)
 
     spec, database, validated_path = recovery_contract.validate_recovery_run(
@@ -81,16 +81,18 @@ def test_valid_recovery_contract_returns_bound_spec_and_database(
     )
 
     assert spec["run_id"] == RUN_ID
-    assert database.path == state_path
+    assert database.location == postgres_database.location
+    assert database.location.startswith("dbname=")
     assert validated_path == spec_path
 
 
 def test_recovery_rejects_changed_deployment_before_opening_database(
     tmp_path,
     monkeypatch,
+    postgres_database,
 ):
     fingerprint = "sha256:" + "a" * 64
-    spec_path, _state_path = _run_fixture(tmp_path, fingerprint)
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
     monkeypatch.setattr(
         recovery_contract,
         "verify_project_runtime",
@@ -121,9 +123,10 @@ def test_recovery_rejects_changed_deployment_before_opening_database(
 def test_recovery_rejects_changed_fingerprint_before_opening_database(
     tmp_path,
     monkeypatch,
+    postgres_database,
 ):
     fingerprint = "sha256:" + "a" * 64
-    spec_path, _state_path = _run_fixture(tmp_path, fingerprint)
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
     _ready_deployment(monkeypatch, "sha256:" + "b" * 64)
     opened = []
     monkeypatch.setattr(
@@ -146,9 +149,10 @@ def test_recovery_rejects_changed_fingerprint_before_opening_database(
 def test_recovery_rejects_run_identity_before_opening_database(
     tmp_path,
     monkeypatch,
+    postgres_database,
 ):
     fingerprint = "sha256:" + "a" * 64
-    spec_path, _state_path = _run_fixture(tmp_path, fingerprint)
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     spec["run_dir"] = str(tmp_path / "different-run")
     spec.pop("run_spec_content_sha256")
@@ -179,6 +183,7 @@ def test_recovery_rejects_run_identity_before_opening_database(
 def test_recovery_rejects_database_spec_identity(
     tmp_path,
     monkeypatch,
+    postgres_database,
 ):
     fingerprint = "sha256:" + "a" * 64
     other_root = tmp_path / "second"
@@ -186,6 +191,7 @@ def test_recovery_rejects_database_spec_identity(
     bad_spec_path, _bad_state = _run_fixture(
         other_root,
         fingerprint,
+        postgres_database,
         database_sha="0" * 64,
     )
     _ready_deployment(monkeypatch, fingerprint)
@@ -199,10 +205,9 @@ def test_recovery_rejects_database_spec_identity(
         )
 
 
-def test_recovery_rejects_archived_incomplete_run(tmp_path, monkeypatch):
+def test_recovery_rejects_archived_incomplete_run(tmp_path, monkeypatch, postgres_database):
     fingerprint = "sha256:" + "a" * 64
-    spec_path, state_path = _run_fixture(tmp_path, fingerprint)
-    database = RunStateDB(state_path)
+    spec_path, database = _run_fixture(tmp_path, fingerprint, postgres_database)
     database.archive_incomplete_run_details(
         protected_run_id="20260901_130000_current"
     )
@@ -216,3 +221,31 @@ def test_recovery_rejects_archived_incomplete_run(tmp_path, monkeypatch):
             spec_path,
             tmp_path / "project" / "inference_scripts",
         )
+
+
+def test_recovery_rejects_legacy_sqlite_state_without_touching_file(
+    tmp_path, monkeypatch, postgres_database
+):
+    fingerprint = "sha256:" + "a" * 64
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
+    legacy_path = spec_path.parent / "run_state.sqlite"
+    legacy_bytes = b"legacy sqlite placeholder"
+    legacy_path.write_bytes(legacy_bytes)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["state_backend"] = "sqlite"
+    spec["state_db"] = str(legacy_path)
+    spec["state_schema"] = ""
+    spec.pop("run_spec_content_sha256", None)
+    spec["run_spec_content_sha256"] = _content_sha(spec)
+    spec_path.write_text(
+        json.dumps(spec, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _ready_deployment(monkeypatch, fingerprint)
+
+    with pytest.raises(recovery_contract.RecoveryContractError):
+        recovery_contract.validate_recovery_run(
+            spec_path,
+            tmp_path / "project" / "inference_scripts",
+        )
+    assert legacy_path.read_bytes() == legacy_bytes

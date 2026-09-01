@@ -1,8 +1,9 @@
 import hashlib
-import sqlite3
 import time
 
 import pytest
+from psycopg2 import Error as DatabaseError
+from psycopg2 import InterfaceError
 
 from labeling_tool.core.run_state_db import (
     MAX_TILE_PAGE_SIZE,
@@ -15,27 +16,25 @@ from labeling_tool.core.spatial_planner import plan_spatial_units
 RUN_ID = "20260717_200000_fixture"
 
 
-def _database(tmp_path):
-    database = RunStateDB(tmp_path / "run_state.sqlite")
-    database.initialize()
+def _database(database: RunStateDB):
     database.create_run(RUN_ID, "a" * 64)
     return database
 
 
-def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
-    database = _database(tmp_path)
+def test_schema_reports_postgresql_control_plane_health(postgres_database):
+    database = _database(postgres_database)
     pragmas = database.pragmas()
-    assert str(pragmas["journal_mode"]).lower() == "wal"
+    assert pragmas["backend"] == "postgresql"
+    assert pragmas["journal_mode"] == "postgresql-mvcc"
     assert pragmas["foreign_keys"] == 1
     assert pragmas["user_version"] == 2
-    assert pragmas["integrity_check"] == "ok"
-
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         tables = {
-            row[0]
+            str(row["table_name"])
             for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema=current_schema()"""
+            ).fetchall()
         }
     assert {
         "runs",
@@ -54,8 +53,8 @@ def test_schema_enables_wal_foreign_keys_and_integrity(tmp_path):
     }.issubset(tables)
 
 
-def test_stream_runtime_progress_is_bounded_restart_visible_and_phase_aware(tmp_path):
-    database = _database(tmp_path)
+def test_stream_runtime_progress_is_bounded_restart_visible_and_phase_aware(postgres_database):
+    database = _database(postgres_database)
     database.register_streams(
         RUN_ID,
         [{"stream_id": "model:test", "kind": "model", "model_id": "test"}],
@@ -117,8 +116,8 @@ def test_stream_runtime_progress_is_bounded_restart_visible_and_phase_aware(tmp_
     assert failed["message"] == "disk error"
 
 
-def test_monitor_snapshot_keeps_pre_progress_schema_v2_runs_readable(tmp_path):
-    database = _database(tmp_path)
+def test_monitor_snapshot_keeps_pre_progress_schema_v2_runs_readable(postgres_database):
+    database = _database(postgres_database)
     with database._connection() as connection:
         connection.execute("DROP TABLE stream_runtime_progress")
 
@@ -128,8 +127,8 @@ def test_monitor_snapshot_keeps_pre_progress_schema_v2_runs_readable(tmp_path):
     assert snapshot["stream_runtime_progress"] == {}
 
 
-def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path):
-    database = _database(tmp_path)
+def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path, postgres_database):
+    database = _database(postgres_database)
     database.register_streams(
         RUN_ID,
         [
@@ -202,15 +201,15 @@ def test_unit_report_summary_is_tied_to_ready_artifact(tmp_path):
     assert aggregate["max_displacement_px"] == 1.25
 
 
-def test_run_status_compare_and_set(tmp_path):
-    database = _database(tmp_path)
+def test_run_status_compare_and_set(postgres_database):
+    database = _database(postgres_database)
     assert database.set_run_status(RUN_ID, "running", expected="preflight")
     assert not database.set_run_status(RUN_ID, "failed", expected="preflight")
     assert database.get_run(RUN_ID)["status"] == "running"
 
 
-def test_100k_tiles_are_paged_without_unbounded_result(tmp_path):
-    database = _database(tmp_path)
+def test_100k_tiles_are_paged_without_unbounded_result(postgres_database):
+    database = _database(postgres_database)
 
     def tiles():
         for index in range(100_000):
@@ -236,8 +235,8 @@ def test_100k_tiles_are_paged_without_unbounded_result(tmp_path):
     assert database.count_tiles(RUN_ID, search="249_399") == 1
 
 
-def test_tile_search_escapes_like_metacharacters_and_matches_page_count(tmp_path):
-    database = _database(tmp_path)
+def test_tile_search_escapes_like_metacharacters_and_matches_page_count(postgres_database):
+    database = _database(postgres_database)
     database.insert_tiles(
         RUN_ID,
         [
@@ -257,8 +256,8 @@ def test_tile_search_escapes_like_metacharacters_and_matches_page_count(tmp_path
     assert database.count_tiles(RUN_ID, status="failed", search="a_b") == 0
 
 
-def test_monitor_aggregates_unit_types_and_active_package(tmp_path):
-    database = _database(tmp_path)
+def test_monitor_aggregates_unit_types_and_active_package(postgres_database):
+    database = _database(postgres_database)
     database.register_streams(
         RUN_ID,
         [{"stream_id": "model:test", "kind": "model", "model_id": "test"}],
@@ -357,9 +356,9 @@ def test_monitor_aggregates_unit_types_and_active_package(tmp_path):
     }
 
 def test_monitor_snapshot_uses_one_explicitly_closed_connection(
-    tmp_path, monkeypatch
+    postgres_database, monkeypatch
 ):
-    database = _database(tmp_path)
+    database = _database(postgres_database)
     original_connect = database._connect
     opened = []
 
@@ -372,12 +371,12 @@ def test_monitor_snapshot_uses_one_explicitly_closed_connection(
     snapshot = database.monitor_snapshot(RUN_ID)
     assert snapshot["run"]["run_id"] == RUN_ID
     assert len(opened) == 1
-    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+    with pytest.raises(InterfaceError, match="closed"):
         opened[0].execute("SELECT 1")
 
 
-def test_job_lease_heartbeat_completion_and_recovery(tmp_path):
-    database = _database(tmp_path)
+def test_job_lease_heartbeat_completion_and_recovery(postgres_database):
+    database = _database(postgres_database)
     database.insert_jobs(
         RUN_ID,
         [
@@ -405,8 +404,8 @@ def test_job_lease_heartbeat_completion_and_recovery(tmp_path):
     assert database.job_counts(RUN_ID) == {"ready": 1, "running": 1}
 
 
-def test_expired_job_recovery_can_be_limited_to_one_run(tmp_path):
-    database = _database(tmp_path)
+def test_expired_job_recovery_can_be_limited_to_one_run(postgres_database):
+    database = _database(postgres_database)
     other_run = "20260717_200001_other"
     database.create_run(other_run, "b" * 64)
     for run_id in (RUN_ID, other_run):
@@ -422,8 +421,8 @@ def test_expired_job_recovery_can_be_limited_to_one_run(tmp_path):
     assert database.get_job(untouched["job_id"])["status"] == "running"
 
 
-def test_work_package_lease_and_crash_cleanup_are_atomic(tmp_path):
-    database = _database(tmp_path)
+def test_work_package_lease_and_crash_cleanup_are_atomic(postgres_database):
+    database = _database(postgres_database)
     database.insert_work_packages(
         RUN_ID,
         [{"package_id": "package_00000", "sequence_no": 0}],
@@ -461,14 +460,14 @@ def test_work_package_lease_and_crash_cleanup_are_atomic(tmp_path):
     assert database.get_work_package(RUN_ID, "package_00000")["status"] == "running"
 
 
-def test_expired_worker_token_cannot_finish_but_admin_can_interrupt(tmp_path):
-    database = _database(tmp_path)
+def test_expired_worker_token_cannot_finish_but_admin_can_interrupt(postgres_database):
+    database = _database(postgres_database)
     database.insert_jobs(RUN_ID, [{"job_type": "tile_inference", "tile_id": "0_0"}])
     leased = database.lease_next_job(RUN_ID, "worker", lease_seconds=120)
     assert leased is not None
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         connection.execute(
-            "UPDATE jobs SET lease_expires=? WHERE job_id=?",
+            "UPDATE jobs SET lease_expires=%s WHERE job_id=%s",
             (time.time() - 1, leased["job_id"]),
         )
 
@@ -482,10 +481,10 @@ def test_expired_worker_token_cannot_finish_but_admin_can_interrupt(tmp_path):
 
 @pytest.mark.parametrize("lease_mode", ["next", "exact"])
 def test_unit_fit_waits_for_all_dependency_packages_to_be_ready(
-    tmp_path,
+    tmp_path, postgres_database,
     lease_mode,
 ):
-    database = _database(tmp_path)
+    database = _database(postgres_database)
     database.insert_work_packages(
         RUN_ID,
         [{"package_id": "package_00000", "sequence_no": 0}],
@@ -526,10 +525,10 @@ def test_unit_fit_waits_for_all_dependency_packages_to_be_ready(
             },
         ],
     )
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         rows = dict(
             connection.execute(
-                "SELECT job_type, job_id FROM jobs WHERE run_id=?",
+                "SELECT job_type, job_id FROM jobs WHERE run_id=%s",
                 (RUN_ID,),
             ).fetchall()
         )
@@ -586,8 +585,8 @@ def test_unit_fit_waits_for_all_dependency_packages_to_be_ready(
     assert leased_unit["attempt"] == 1
 
 
-def test_resumed_package_reset_keeps_original_cross_package_scope(tmp_path):
-    database = _database(tmp_path)
+def test_resumed_package_reset_keeps_original_cross_package_scope(postgres_database):
+    database = _database(postgres_database)
     assert database.set_run_status(RUN_ID, "failed", expected="preflight")
     database.insert_work_packages(
         RUN_ID,
@@ -665,17 +664,17 @@ def test_resumed_package_reset_keeps_original_cross_package_scope(tmp_path):
     resumed = database.begin_failed_package_reset(RUN_ID)
     assert resumed["package_ids"] == ["package_00000"]
     assert database.get_work_package(RUN_ID, "package_00001")["status"] == "ready"
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         neighbor_job_status = connection.execute(
-            """SELECT status FROM jobs WHERE run_id=?
+            """SELECT status FROM jobs WHERE run_id=%s
                AND job_type='work_package' AND package_id='package_00001'""",
             (RUN_ID,),
         ).fetchone()[0]
     assert neighbor_job_status == "ready"
 
 
-def test_events_are_persistent_and_foreign_keys_are_enforced(tmp_path):
-    database = _database(tmp_path)
+def test_events_are_persistent_and_foreign_keys_are_enforced(postgres_database):
+    database = _database(postgres_database)
     event_id = database.append_event(
         RUN_ID,
         "partition_planned",
@@ -684,25 +683,24 @@ def test_events_are_persistent_and_foreign_keys_are_enforced(tmp_path):
     )
     assert event_id == 1
 
-    with sqlite3.connect(database.path) as connection:
-        connection.execute("PRAGMA foreign_keys=ON")
+    with database._connection() as connection:
         row = connection.execute(
             "SELECT event_type, payload_json FROM events WHERE event_id=1"
         ).fetchone()
-        assert row == ("partition_planned", '{"col":0,"row":0}')
+        assert tuple(row) == ("partition_planned", '{"col":0,"row":0}')
         try:
             connection.execute(
                 "INSERT INTO events(run_id,timestamp,level,event_type,message,payload_json) "
                 "VALUES('missing','now','info','bad','','{}')"
             )
-        except sqlite3.IntegrityError:
+        except DatabaseError:
             pass
         else:
             raise AssertionError("foreign key violation was accepted")
 
 
-def test_artifact_dependencies_update_reference_count_atomically(tmp_path):
-    database = _database(tmp_path)
+def test_artifact_dependencies_update_reference_count_atomically(tmp_path, postgres_database):
+    database = _database(postgres_database)
     database.insert_jobs(
         RUN_ID,
         [{"job_type": "partition_vectorize", "unit_id": "partition-0"}],
@@ -718,7 +716,7 @@ def test_artifact_dependencies_update_reference_count_atomically(tmp_path):
         artifact_id, byte_count=1234, sha256="a" * 64
     )
 
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         job_id = int(connection.execute("SELECT job_id FROM jobs").fetchone()[0])
 
     assert database.add_artifact_dependency(job_id, artifact_id)
@@ -734,8 +732,8 @@ def test_artifact_dependencies_update_reference_count_atomically(tmp_path):
     ] == [artifact_id]
 
 
-def test_artifact_cleanup_claim_is_atomic_and_auditable(tmp_path):
-    database = _database(tmp_path)
+def test_artifact_cleanup_claim_is_atomic_and_auditable(tmp_path, postgres_database):
+    database = _database(postgres_database)
     artifact_id = database.register_artifact(
         RUN_ID,
         "partition_probability",
@@ -763,8 +761,8 @@ def test_artifact_cleanup_claim_is_atomic_and_auditable(tmp_path):
     }
 
 
-def _partition_publish_state(tmp_path):
-    database = _database(tmp_path)
+def _partition_publish_state(database: RunStateDB, tmp_path):
+    _database(database)
     stream_id = "model:test"
     partition_id = "partition_00000_00023"
     database.register_streams(
@@ -819,9 +817,9 @@ def _partition_publish_state(tmp_path):
     return database, stream_id, partition_id, path, digest
 
 
-def test_partition_publish_links_all_consumers_before_cleanup_visibility(tmp_path):
+def test_partition_publish_links_all_consumers_before_cleanup_visibility(tmp_path, postgres_database):
     database, stream_id, partition_id, path, digest = _partition_publish_state(
-        tmp_path
+        postgres_database, tmp_path
     )
 
     artifact_id = database.publish_partition_artifact(
@@ -839,25 +837,33 @@ def test_partition_publish_links_all_consumers_before_cleanup_visibility(tmp_pat
     assert database.cleanup_candidates(
         RUN_ID, kinds=("partition_probability",)
     ) == []
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM artifact_dependencies WHERE artifact_id=?",
+            "SELECT COUNT(*) FROM artifact_dependencies WHERE artifact_id=%s",
             (artifact_id,),
         ).fetchone()[0] == 6
 
 
-def test_partition_publish_rolls_back_ready_when_dependency_link_fails(tmp_path):
+def test_partition_publish_rolls_back_ready_when_dependency_link_fails(tmp_path, postgres_database):
     database, stream_id, partition_id, path, digest = _partition_publish_state(
-        tmp_path
+        postgres_database, tmp_path
     )
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
+        connection.execute(
+            """CREATE FUNCTION reject_partition_dependency() RETURNS trigger
+               LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected dependency failure';
+               END;
+               $$"""
+        )
         connection.execute(
             """CREATE TRIGGER reject_partition_dependency
-               BEFORE INSERT ON artifact_dependencies
-               BEGIN SELECT RAISE(ABORT, 'injected dependency failure'); END"""
+               BEFORE INSERT ON artifact_dependencies FOR EACH ROW
+               EXECUTE FUNCTION reject_partition_dependency()"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected dependency failure"):
+    with pytest.raises(DatabaseError, match="injected dependency failure"):
         database.publish_partition_artifact(
             RUN_ID,
             stream_id,
@@ -875,9 +881,9 @@ def test_partition_publish_rolls_back_ready_when_dependency_link_fails(tmp_path)
     ) == []
 
 
-def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path):
+def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path, postgres_database):
     database, stream_id, partition_id, path, digest = _partition_publish_state(
-        tmp_path
+        postgres_database, tmp_path
     )
     artifact_id = database.publish_partition_artifact(
         RUN_ID,
@@ -887,7 +893,7 @@ def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path):
         byte_count=path.stat().st_size,
         sha256=digest,
     )
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         job_ids = [
             int(row[0])
             for row in connection.execute(
@@ -912,8 +918,8 @@ def test_cleaned_partition_can_be_republished_before_consumers_start(tmp_path):
     assert restored["ref_count"] == 6
 
 
-def _fragmentation_v33_state(tmp_path):
-    database = _database(tmp_path)
+def _fragmentation_v33_state(database: RunStateDB):
+    _database(database)
     stream_id = "fusion:test"
     partition_id = "partition_00000_00000"
     database.register_streams(
@@ -994,8 +1000,8 @@ def _publish_v33_outputs(database, tmp_path, stream_id, partition_id):
     )
 
 
-def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
-    database, stream_id, partition_id = _fragmentation_v33_state(tmp_path)
+def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path, postgres_database):
+    database, stream_id, partition_id = _fragmentation_v33_state(postgres_database)
     context = tmp_path / "context.tif"
     context.write_bytes(b"context")
     digest = hashlib.sha256(context.read_bytes()).hexdigest()
@@ -1066,8 +1072,8 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path):
     ) == []
 
 
-def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
-    database, stream_id, partition_id = _fragmentation_v33_state(tmp_path)
+def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path, postgres_database):
+    database, stream_id, partition_id = _fragmentation_v33_state(postgres_database)
     context = tmp_path / "context.tif"
     context.write_bytes(b"context")
     artifact_id = database.publish_fragmentation_v33_context(
@@ -1103,14 +1109,22 @@ def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
     )
     assert leased is not None
     _publish_v33_outputs(database, tmp_path, stream_id, partition_id)
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
+        connection.execute(
+            """CREATE FUNCTION reject_v33_dependency_release() RETURNS trigger
+               LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected release failure';
+               END;
+               $$"""
+        )
         connection.execute(
             """CREATE TRIGGER reject_v33_dependency_release
-               BEFORE DELETE ON artifact_dependencies
-               BEGIN SELECT RAISE(ABORT, 'injected release failure'); END"""
+               BEFORE DELETE ON artifact_dependencies FOR EACH ROW
+               EXECUTE FUNCTION reject_v33_dependency_release()"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected release failure"):
+    with pytest.raises(DatabaseError, match="injected release failure"):
         database.complete_fragmentation_v33_job(
             leased["job_id"], leased["lease_token"]
         )
@@ -1120,8 +1134,8 @@ def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path):
     assert database.get_artifact(baseline_id)["ref_count"] == 2
 
 
-def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path):
-    database, fusion_stream, partition_id = _fragmentation_v33_state(tmp_path)
+def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path, postgres_database):
+    database, fusion_stream, partition_id = _fragmentation_v33_state(postgres_database)
     model_stream = "model:test"
     database.register_streams(
         RUN_ID,
@@ -1236,10 +1250,10 @@ def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path):
     assert second["stream_id"] == fusion_stream
 
 
-def test_v33_partition_leases_cap_at_four_and_failed_owner_recovers(tmp_path):
+def test_v33_partition_leases_cap_at_four_and_failed_owner_recovers(tmp_path, postgres_database):
     """The PostgreSQL/SKIP-LOCKED path shares this four-lease SQL contract."""
 
-    database = _database(tmp_path)
+    database = _database(postgres_database)
     stream_id = "fusion:lease-cap"
     partition_ids = [f"partition_{index:05d}" for index in range(5)]
     database.register_streams(
@@ -1331,8 +1345,8 @@ def test_v33_partition_leases_cap_at_four_and_failed_owner_recovers(tmp_path):
     assert recovered["lease_token"] != failed["lease_token"]
 
 
-def test_fail_open_streams_preserves_ready_streams(tmp_path):
-    database = _database(tmp_path)
+def test_fail_open_streams_preserves_ready_streams(postgres_database):
+    database = _database(postgres_database)
     database.register_streams(
         RUN_ID,
         [
@@ -1351,8 +1365,8 @@ def test_fail_open_streams_preserves_ready_streams(tmp_path):
     assert rows["model:running"]["error"] == "Package exhausted retries"
 
 
-def test_frontier_limit_prioritizes_neighbor_package(tmp_path):
-    database = _database(tmp_path)
+def test_frontier_limit_prioritizes_neighbor_package(postgres_database):
+    database = _database(postgres_database)
     database.insert_work_packages(
         RUN_ID,
         [
@@ -1412,15 +1426,15 @@ def test_frontier_limit_prioritizes_neighbor_package(tmp_path):
     assert leased["package_id"] == "package_00001"
 
 
-def test_artifact_dependency_rejects_cross_run_and_incomplete_inputs(tmp_path):
-    database = _database(tmp_path)
+def test_artifact_dependency_rejects_cross_run_and_incomplete_inputs(tmp_path, postgres_database):
+    database = _database(postgres_database)
     database.create_run("run-b", "b" * 64)
     database.insert_jobs(RUN_ID, [{"job_type": "fusion"}])
     artifact_id = database.register_artifact(
         "run-b", "mask", tmp_path / "mask.tif"
     )
 
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         job_id = int(connection.execute("SELECT job_id FROM jobs").fetchone()[0])
 
     with pytest.raises(RunStateError, match="ready artifact from the same run"):
@@ -1433,8 +1447,8 @@ def test_artifact_dependency_rejects_cross_run_and_incomplete_inputs(tmp_path):
         database.add_artifact_dependency(job_id, artifact_id)
 
 
-def test_spatial_plan_and_packages_are_persisted_with_foreign_keys(tmp_path):
-    database = _database(tmp_path)
+def test_spatial_plan_and_packages_are_persisted_with_foreign_keys(postgres_database):
+    database = _database(postgres_database)
     plan = plan_spatial_units(tile_rows=17, tile_cols=17)
     packages = [
         {
@@ -1471,7 +1485,7 @@ def test_spatial_plan_and_packages_are_persisted_with_foreign_keys(tmp_path):
     assert persisted_partitions[0]["core_window"] == partitions[0]["core_window"]
     assert persisted_partitions[0]["halo_window"] == partitions[0]["halo_window"]
 
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         assert connection.execute("SELECT COUNT(*) FROM work_packages").fetchone()[0] == len(
             packages
         )
@@ -1483,8 +1497,8 @@ def test_spatial_plan_and_packages_are_persisted_with_foreign_keys(tmp_path):
         )
 
 
-def test_stream_unit_details_are_filtered_and_paginated(tmp_path):
-    database = _database(tmp_path)
+def test_stream_unit_details_are_filtered_and_paginated(postgres_database):
+    database = _database(postgres_database)
     database.register_streams(
         RUN_ID,
         [{"stream_id": "model:a", "kind": "model", "model_id": "a"}],

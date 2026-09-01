@@ -1,5 +1,4 @@
 import hashlib
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -45,12 +44,10 @@ def _ready_artifact(
     return artifact_id
 
 
-def _state(tmp_path):
+def _state(tmp_path, database):
     output_root = tmp_path / "output"
     run_dir = output_root / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
-    database = RunStateDB(run_dir / "run_state.sqlite")
-    database.initialize()
     database.create_run(RUN_ID, "a" * 64, status="failed")
     database.register_streams(
         RUN_ID,
@@ -148,7 +145,7 @@ def _state(tmp_path):
             ],
         ],
     )
-    with sqlite3.connect(database.path) as connection:
+    with database.transaction() as connection:
         connection.execute(
             """UPDATE jobs SET attempt=3, progress_current=7,
                progress_total=9, error='exhausted'
@@ -253,7 +250,7 @@ def _state(tmp_path):
             },
         )
 
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         jobs = {
             row[0]: int(row[1])
             for row in connection.execute(
@@ -308,7 +305,9 @@ def _state(tmp_path):
         "schema_version": 2,
         "run_id": RUN_ID,
         "run_dir": str(run_dir),
-        "state_db": str(database.path),
+        "state_backend": "postgresql",
+        "state_db": database.location,
+        "state_schema": database.postgres_schema,
         "output_root": str(output_root),
         "tile_cache_dir": str(tile_cache.parent),
         "streams": [
@@ -334,9 +333,9 @@ def _state(tmp_path):
 
 
 def test_manual_retry_resets_failed_package_and_downstream_but_preserves_cache(
-    tmp_path,
+    tmp_path, postgres_database
 ):
-    state = _state(tmp_path)
+    state = _state(tmp_path, postgres_database)
     database = state["database"]
 
     result = reset_failed_work_packages(
@@ -377,8 +376,7 @@ def test_manual_retry_resets_failed_package_and_downstream_but_preserves_cache(
     assert database.get_work_package(RUN_ID, "package_00000")["status"] == "queued"
     assert database.get_work_package(RUN_ID, "package_00000")["attempt"] == 0
     assert database.get_work_package(RUN_ID, "package_00001")["status"] == "ready"
-    with sqlite3.connect(database.path) as connection:
-        connection.row_factory = sqlite3.Row
+    with database._connection() as connection:
         jobs = {
             (row["job_type"], row["package_id"], row["unit_id"]): dict(row)
             for row in connection.execute(
@@ -406,11 +404,11 @@ def test_manual_retry_resets_failed_package_and_downstream_but_preserves_cache(
     assert len(summaries) == 1
     remaining_summary = summaries[0]
     assert remaining_summary["unit_id"] == "core_1"
-    with sqlite3.connect(database.path) as connection:
+    with database._connection() as connection:
         seam_dependency_ids = {
             int(row[0])
             for row in connection.execute(
-                "SELECT artifact_id FROM artifact_dependencies WHERE job_id=?",
+                "SELECT artifact_id FROM artifact_dependencies WHERE job_id=%s",
                 (state["jobs"]["seam_0_1"],),
             )
         }
@@ -419,8 +417,10 @@ def test_manual_retry_resets_failed_package_and_downstream_but_preserves_cache(
     }
 
 
-def test_manual_reset_refuses_active_stable_package_lock_before_deleting(tmp_path):
-    state = _state(tmp_path)
+def test_manual_reset_refuses_active_stable_package_lock_before_deleting(
+    tmp_path, postgres_database
+):
+    state = _state(tmp_path, postgres_database)
     lock = _PackageFileLock(
         state["run_dir"] / "tmp" / "package_locks" / "package_00000.lock"
     )
@@ -446,10 +446,12 @@ def test_manual_reset_refuses_active_stable_package_lock_before_deleting(tmp_pat
     assert not state["unit_temp"].exists()
 
 
-def test_failed_unit_reset_maps_every_partition_back_to_its_package(tmp_path):
-    state = _state(tmp_path)
+def test_failed_unit_reset_maps_every_partition_back_to_its_package(
+    tmp_path, postgres_database
+):
+    state = _state(tmp_path, postgres_database)
     database = state["database"]
-    with sqlite3.connect(database.path) as connection:
+    with database.transaction() as connection:
         connection.execute(
             "UPDATE work_packages SET status='ready', attempt=1"
         )
@@ -471,8 +473,10 @@ def test_failed_unit_reset_maps_every_partition_back_to_its_package(tmp_path):
     assert database.lease_next_job(RUN_ID, "unexpected-worker") is None
 
 
-def test_manual_package_reset_rejects_completed_run(tmp_path):
-    state = _state(tmp_path)
+def test_manual_package_reset_rejects_completed_run(
+    tmp_path, postgres_database
+):
+    state = _state(tmp_path, postgres_database)
     database = state["database"]
     assert database.set_run_status(RUN_ID, "ready", expected="failed")
 

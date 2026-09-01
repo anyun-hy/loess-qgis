@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +22,56 @@ from partition_mosaic import write_partition_rasters
 
 RUN_ID = "20260826_v33_work_package_fixture"
 STREAM_ID = "fusion:fixture"
+
+
+def _copy_control_plane_state(source: RunStateDB, destination: RunStateDB) -> None:
+    """Copy a frozen PostgreSQL test schema into another isolated schema."""
+    table_order = (
+        "runs",
+        "streams",
+        "stream_runtime_progress",
+        "work_packages",
+        "partitions",
+        "tiles",
+        "spatial_units",
+        "unit_dependencies",
+        "stream_units",
+        "jobs",
+        "artifacts",
+        "artifact_dependencies",
+        "unit_report_summaries",
+        "object_links",
+        "object_nodes",
+        "events",
+    )
+    source_schema = source.postgres_schema
+    destination_schema = destination.postgres_schema
+    with source._connection() as source_connection:
+        with destination.transaction() as destination_connection:
+            for table in table_order:
+                rows = source_connection.execute(
+                    f'SELECT * FROM "{source_schema}"."{table}"'
+                ).fetchall()
+                if not rows:
+                    continue
+                columns = tuple(rows[0].keys())
+                quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                placeholders = ", ".join("%s" for _ in columns)
+                statement = (
+                    f'INSERT INTO "{destination_schema}"."{table}" '
+                    f'({quoted_columns}) OVERRIDING SYSTEM VALUE VALUES ({placeholders})'
+                )
+                for row in rows:
+                    destination_connection.execute(
+                        statement, tuple(row[column] for column in columns)
+                    )
+            for table, key in (("jobs", "job_id"), ("artifacts", "artifact_id"), ("events", "event_id")):
+                destination_connection.execute(
+                    "SELECT setval(pg_get_serial_sequence(%s, %s), "
+                    "COALESCE((SELECT MAX(" + key + ") FROM \""
+                    + destination_schema + "\".\"" + table + "\"), 1), true)",
+                    (f"{destination_schema}.{table}", key),
+                )
 
 
 def test_empty_strict_core_is_an_explicit_noop():
@@ -68,9 +117,10 @@ def _ready_artifact(
     return artifact_id
 
 
-def test_partition_workers_use_neighbor_context_then_finalize_authoritatively(tmp_path):
-    database = RunStateDB(tmp_path / "state.sqlite")
-    database.initialize()
+def test_partition_workers_use_neighbor_context_then_finalize_authoritatively(
+    tmp_path, postgres_database, postgres_database_factory
+):
+    database = postgres_database
     database.create_run(RUN_ID, "a" * 64, status="running")
     database.register_streams(
         RUN_ID,
@@ -230,7 +280,9 @@ def test_partition_workers_use_neighbor_context_then_finalize_authoritatively(tm
                 "schema_version": 2,
                 "run_id": RUN_ID,
                 "run_dir": str(run_dir),
-                "state_db": str(database.path),
+                "state_backend": "postgresql",
+                "state_db": database.location,
+                "state_schema": database.postgres_schema,
                 "raster": {
                     "path": str(tmp_path / "source.tif"),
                     "crs": "EPSG:3857",
@@ -250,21 +302,22 @@ def test_partition_workers_use_neighbor_context_then_finalize_authoritatively(tm
     )
 
     # Keep two frozen control-plane snapshots. They retain the same immutable
-    # V3/probability inputs, but publish into independent run directories.
+    # V3/probability inputs, but publish into independent PostgreSQL schemas.
     snapshots = {}
     for worker_limit in (1, 2):
         root = tmp_path / f"workers-{worker_limit}"
         root.mkdir()
-        state_copy = root / "state.sqlite"
-        shutil.copy2(database.path, state_copy)
+        snapshot_database = postgres_database_factory()
+        _copy_control_plane_state(database, snapshot_database)
         run_copy = root / "run"
         payload = json.loads(spec_path.read_text(encoding="utf-8"))
-        payload["state_db"] = str(state_copy)
+        payload["state_db"] = snapshot_database.location
+        payload["state_schema"] = snapshot_database.postgres_schema
         payload["run_dir"] = str(run_copy)
         run_copy.mkdir()
         copied_spec = run_copy / "run_spec.json"
         copied_spec.write_text(json.dumps(payload), encoding="utf-8")
-        snapshots[worker_limit] = (RunStateDB(state_copy), copied_spec)
+        snapshots[worker_limit] = (snapshot_database, copied_spec)
 
     def execute_v33_graph(active_database, active_spec, worker_limit):
         partition_reports = []

@@ -32,7 +32,7 @@ from labeling_tool.core.run_spec import (
     sha256_file,
     validated_run_tile_cache_dir,
 )
-from labeling_tool.core.run_state_db import RunStateDB
+from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 
 from _device import resolve_device, validate_device
 from accepted_score import accepted_probabilities
@@ -321,6 +321,7 @@ class _LeaseHeartbeat:
         self,
         database_path: str | Path,
         *,
+        database_schema: str | None = None,
         run_id: str,
         package_id: str,
         job_id: int,
@@ -330,6 +331,7 @@ class _LeaseHeartbeat:
         lease_seconds: int = 120,
     ) -> None:
         self.database_path = str(database_path)
+        self.database_schema = str(database_schema or "").strip() or None
         self.run_id = str(run_id)
         self.package_id = str(package_id)
         self.job_id = int(job_id)
@@ -361,7 +363,10 @@ class _LeaseHeartbeat:
                 current = self._progress_current
                 total = self._progress_total
             try:
-                database = RunStateDB(self.database_path)
+                database = RunStateDB(
+                    self.database_path,
+                    postgres_schema=self.database_schema,
+                )
                 accepted = database.heartbeat(
                     self.job_id,
                     self.lease_token,
@@ -390,7 +395,10 @@ class _LeaseHeartbeat:
         if self.lost_event.is_set():
             detail = self._heartbeat_error or "heartbeat was rejected"
             raise LeaseLostError(f"Work Package lease lost: {detail}")
-        database = RunStateDB(self.database_path)
+        database = RunStateDB(
+            self.database_path,
+            postgres_schema=self.database_schema,
+        )
         if not database.work_package_job_holds_lease(
             self.run_id,
             self.package_id,
@@ -835,7 +843,7 @@ def _run_work_package_impl(
         tile_cache_dir = validated_run_tile_cache_dir(spec)
     except RunSpecError as error:
         raise WorkPackageRuntimeError(str(error)) from error
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     package = database.get_work_package(run_id, package_id)
     if package is None:
         raise WorkPackageRuntimeError(f"unknown Work Package: {package_id}")
@@ -2393,7 +2401,7 @@ def run_work_package(
             return
         try:
             spec = load_json(Path(run_spec_path).resolve())
-            database = RunStateDB(spec["state_db"])
+            database = run_state_from_spec(spec)
             run_id = str(spec["run_id"])
             if transition == "interrupted":
                 database.interrupt_work_package_job(
@@ -2491,7 +2499,7 @@ def run_persistent_worker(
         )
     run_id = str(spec["run_id"])
     run_dir = Path(spec["run_dir"]).resolve()
-    database = RunStateDB(spec["state_db"])
+    database = run_state_from_spec(spec)
     stopper = stop_event or threading.Event()
     provider = model_provider or PersistentModelProvider()
     profile = _load_profile(spec)
@@ -2569,6 +2577,7 @@ def run_persistent_worker(
         package_count += 1
         heartbeat = _LeaseHeartbeat(
             spec["state_db"],
+            database_schema=spec.get("state_schema"),
             run_id=run_id,
             package_id=package_id,
             job_id=int(job["job_id"]),
