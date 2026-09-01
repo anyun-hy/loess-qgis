@@ -122,6 +122,40 @@ def test_phase_timing_recovers_only_through_last_observation_and_marks_partial(
     assert summary["stages"]["work_package"]["wall_clock_sec"] == 45.0
 
 
+def test_phase_timing_preserves_recovery_history_across_later_restarts(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 100.0)
+    timing.observe_active(145.0)
+
+    recovered = module.PipelinePhaseTiming.from_state(timing.state(145.0))
+    recovered_state = recovered.state(200.0)
+    recovered_again = module.PipelinePhaseTiming.from_state(recovered_state)
+    summary = recovered_again.summary(1000.0)
+
+    assert summary["status"] == "partial_recovered"
+    assert summary["recovered_incomplete_span_count"] == 1
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 45.0
+
+
+@pytest.mark.parametrize("recorded_count", [-1, True, "1", 1.0])
+def test_phase_timing_ignores_malformed_recovery_history(monkeypatch, recorded_count):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming.from_state(
+        {
+            "schema_version": 1,
+            "recorded_at": 100.0,
+            "spans": [],
+            "summary": {"recovered_incomplete_span_count": recorded_count},
+        }
+    )
+
+    summary = timing.summary(100.0)
+
+    assert summary["status"] == "complete"
+    assert summary["recovered_incomplete_span_count"] == 0
+
+
 def _runner(module):
     runner = module.V5AsyncInferenceRunner.__new__(
         module.V5AsyncInferenceRunner
