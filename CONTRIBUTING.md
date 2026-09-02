@@ -5,7 +5,7 @@ Pull Request 合并。
 
 ## 工作流
 
-1. 从最新 `main` 创建 `feature/<topic>` 或 `codex/<topic>`；
+1. 从最新 `main` 创建 `feature/<topic>` ；
 2. 不提交模型、checkpoint、输入、输出、数据库、QGIS 工程或本机配置；
 3. 在 `qgis` Conda 环境运行相关测试和完整回归；
 4. 推送分支并创建 Pull Request；
