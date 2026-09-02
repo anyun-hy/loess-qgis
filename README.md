@@ -19,11 +19,11 @@
 
 完整文档从 [`docs/README.md`](docs/README.md) 进入。
 
-## 资产边界
+## 模型边界
 
 仓库**不包含**语义模型 TorchScript、SAM3 checkpoint、Fusion profile、输入影像、
 范围数据、QGIS 工程、PostgreSQL 数据或 Run 输出。`inference_scripts/config.yaml`
-只登记正式资产的文件名与可信 SHA-256；使用者必须自行取得有权使用的资产并放入
+只登记正式权重的文件名与可信 SHA-256；使用者必须自行取得有权使用的资产并放入
 部署项目的 `weights/`。
 
 ## 快速开始
