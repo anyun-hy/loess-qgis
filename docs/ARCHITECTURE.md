@@ -51,7 +51,9 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
   -> Partition Halo cosine 概率拼接
   -> 各模型独立 Core mask/confidence + 增量 Fusion
   -> Fragmentation V3 冻结基线
-  -> Fragmentation V3.3 Partition 并行 + 全局 Finalize 权威 Core
+  -> V3.3 Partition 与后续 Work Package 流水并行
+  -> Fusion 单元 lossless max-confidence 压缩并提前释放 14 波段概率
+  -> Fragmentation V3.3 全局 Finalize 权威 Core
   -> 四条 Stream 的 Core/Seam/Junction 空间单元矢量化
   -> GeoParquet 分片 + 边界签名
   -> 四条 Stream 并行组装为最终 GPKG
@@ -72,7 +74,13 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - 大图使用有界 Work Package 和 Partition，不分配整幅概率或整幅线网；
 - Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
 - Run JSON 只保存冻结配置和摘要，不保存几十万 Tile 明细；
-- 临时 Tile/probability Artifact 只有在依赖提交后才按引用关系清理。
+- 临时 Tile/probability Artifact 只有在依赖提交后才按引用关系清理；V3.3 Run
+  中，Fusion 空间单元先把归一化 14 类概率的逐像元最大值无损保存为 float32
+  `unit_confidence`，V3.3 与该压缩任务都释放依赖后即可清理原概率 Halo；
+- 磁盘准入冻结永久结果、安全底线、原子写开销、紧凑 `unit_confidence` 全额和
+  一个有界 Work Package。所有概率 Halo 的理论全量只作为运行时托管 Artifact
+  上限，不是必须同时存在的准入需求；实际增长由引用清理和运行时 backpressure
+  约束。
 - 最终成品大小预测是观察指标：新 Run 冻结单一预测值，结束后回报实际 ready
   Artifact、带符号差额和比例；不设置上下限、不生成 warning，也不参与任何
   验收或磁盘准入决策。
@@ -92,8 +100,11 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - V3 先从 Fusion 概率生成冻结基线和上下文，V3.3 再统一裁决所有 Core，
   V3.3 输出才是矢量化使用的唯一权威 Core；
 - V3.3 必须保持单标签，不得产生 gap、overlap 或范围外发布；
-- V3.3 任务只有在全部 Work Package 的 V3 基线、上下文和概率都 ready 后才能
-  领取；同一 Fusion 的空间单元必须等 V3.3 整体 ready 后才可执行；
+- 每个 V3.3 Partition 在自己的全部依赖 Work Package ready 后即可领取，并可与
+  GPU 后续 Work Package 并行；全局 Finalize 仍必须等待所有 V3.3 Partition；
+- 每个 Fusion Core/Seam/Junction 在自己的概率依赖 ready 后先生成 lossless
+  `unit_confidence`；正式 Fusion 空间单元必须同时等待该置信度 Artifact 和 V3.3
+  全局 Finalize，类别仍只读取 V3.3 权威 Core；
 - V3 保留为新 Run 的明确回滚选项，但同一个 Run 内不允许 V3.3 失败后静默退回
   V3；
 - Generate 只作研究参考，不是生产入口；

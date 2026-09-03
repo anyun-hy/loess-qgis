@@ -576,6 +576,76 @@ def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_runn
     assert starts == [candidate, model_unit]
 
 
+def test_scheduler_streams_v33_while_accelerator_is_still_running(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = False
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._processes = {
+        "accelerator": {
+            "context": {"kind": "accelerator_worker"},
+        }
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    candidate = {
+        "job_id": 30,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33_partition:partition_00000_00000",
+        "lease_token": "candidate-token",
+    }
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"running": 1, "queued": 1}
+            if job_type == "fragmentation_v33":
+                return {"queued": 1}
+            raise AssertionError(job_type)
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            if not hasattr(self, "leased"):
+                self.leased = True
+                return candidate
+            return None
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return None
+
+    runner._database = Database()
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert starts == [candidate]
+
+
 def test_scheduler_does_not_dispatch_twenty_unit_fits_beside_four_v33_workers(
     monkeypatch,
 ):
@@ -1366,5 +1436,5 @@ def test_unified_plugin_version_includes_startup_hardening():
         / "metadata.txt"
     ).read_text(encoding="utf-8")
 
-    assert "version=0.4.0" in metadata
+    assert "version=1.0.0" in metadata
     assert "-linux" not in metadata

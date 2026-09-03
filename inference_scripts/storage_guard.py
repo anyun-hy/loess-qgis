@@ -281,9 +281,42 @@ class StorageGuard:
             return self._managed_bytes
 
 
+def remaining_deferred_temporary_reserve_bytes(
+    spec: Mapping[str, Any],
+    database: Any,
+    *,
+    exclusion_bytes: int = 0,
+) -> int:
+    """Return the still-unconsumed frozen Unit-confidence allowance."""
+
+    storage = dict(spec.get("storage_preflight") or {})
+    reserve = max(
+        0, int(storage.get("deferred_temporary_reserve_bytes") or 0)
+    )
+    if (
+        reserve <= 0
+        or storage.get("v33_storage_mode")
+        != "streamed_unit_confidence_v1"
+    ):
+        return reserve
+    persisted = database.artifact_byte_count(
+        str(spec["run_id"]),
+        kind="unit_confidence",
+        statuses=("ready", "cleaning", "cleaned"),
+    )
+    return max(
+        0,
+        reserve
+        - max(0, int(persisted))
+        - max(0, int(exclusion_bytes)),
+    )
+
+
 def exact_remaining_permanent_bytes(
     spec: Mapping[str, Any],
     database: Any,
+    *,
+    deferred_temporary_exclusion_bytes: int = 0,
 ) -> int:
     """Return exact unwritten Core raster bytes plus non-decaying reserve.
 
@@ -308,8 +341,17 @@ def exact_remaining_permanent_bytes(
         else storage.get("permanent_uncertainty_bytes")
         or 0
     )
+    deferred_temporary_reserve = (
+        remaining_deferred_temporary_reserve_bytes(
+            spec,
+            database,
+            exclusion_bytes=deferred_temporary_exclusion_bytes,
+        )
+    )
     if raster_bytes <= 0:
-        return max(0, nondecaying_bytes)
+        return max(0, nondecaying_bytes) + max(
+            0, deferred_temporary_reserve
+        )
 
     run_id = str(spec["run_id"])
     stream_ids = [
@@ -359,4 +401,8 @@ def exact_remaining_permanent_bytes(
         for key, byte_count in bytes_by_key.items()
         if key not in ready_keys
     )
-    return max(0, remaining_raster) + max(0, nondecaying_bytes)
+    return (
+        max(0, remaining_raster)
+        + max(0, nondecaying_bytes)
+        + max(0, deferred_temporary_reserve)
+    )

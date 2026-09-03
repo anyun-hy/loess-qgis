@@ -35,8 +35,13 @@ AUTO_HEADROOM_FRACTION = 0.50
 AUTO_VOLUME_FRACTION_CAP = 0.20
 AUTO_ABSOLUTE_CAP_BYTES = 512 * GIB
 CHECKPOINT_METADATA_OVERHEAD_BYTES = MIB
+UNIT_CONFIDENCE_BYTES_PER_PIXEL = 4
+UNIT_CONFIDENCE_FILE_OVERHEAD_BYTES = 64 * 1024
+UNIT_CONFIDENCE_COMPRESSION_OVERHEAD_DENOMINATOR = 100
 STORAGE_TUNING_SCHEMA_VERSION = 2
-STORAGE_TUNING_FORMULA_VERSION = "disk-aware-cache-v3-exact-core"
+STORAGE_TUNING_FORMULA_VERSION = (
+    "disk-aware-cache-v4-streamed-v33-confidence"
+)
 
 
 class WorkPackagePlanError(ValueError):
@@ -132,6 +137,73 @@ def permanent_output_reserve(
         "vector_minimum_reserve_bytes": MIN_VECTOR_OUTPUT_RESERVE_BYTES,
         "vector_scaled_reserve_bytes": vector_scaled_bytes,
         "vector_output_reserve_bytes": vector_reserve_bytes,
+    }
+
+
+def unit_confidence_write_reserve(pixel_count: int) -> int:
+    """Bound one lossless Deflate GeoTIFF without assuming compression gain."""
+
+    pixels = int(pixel_count)
+    if pixels < 1:
+        raise WorkPackagePlanError(
+            "unit confidence write reserve requires positive pixel count"
+        )
+    payload = pixels * UNIT_CONFIDENCE_BYTES_PER_PIXEL
+    compression_and_tiff_overhead = max(
+        UNIT_CONFIDENCE_FILE_OVERHEAD_BYTES,
+        (
+            payload
+            + UNIT_CONFIDENCE_COMPRESSION_OVERHEAD_DENOMINATOR
+            - 1
+        )
+        // UNIT_CONFIDENCE_COMPRESSION_OVERHEAD_DENOMINATOR,
+    )
+    return payload + compression_and_tiff_overhead
+
+
+def unit_confidence_reserve(spatial_plan: Mapping[str, Any]) -> dict[str, int]:
+    """Reserve one lossless float32 confidence surface per spatial Unit.
+
+    V3.3 cannot release its 14-band Partition probabilities until both the
+    fragmentation candidate and the later geometry confidence consumer have
+    finished.  Persisting the already-normalized ``max(probability)`` surface
+    decouples those lifetimes without changing the confidence values used by
+    unit fitting.  Spatial Units are mutually exclusive, so their pixel total
+    is the exact Core domain rather than another Halo-sized estimate.
+    """
+
+    units = list(spatial_plan.get("spatial_units") or [])
+    if not units:
+        raise WorkPackagePlanError(
+            "unit confidence planning requires spatial Units"
+        )
+    pixel_count = 0
+    reserve_bytes = 0
+    for unit in units:
+        window = unit.get("pixel_window") or {}
+        try:
+            width = int(window["x1"]) - int(window["x0"])
+            height = int(window["y1"]) - int(window["y0"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise WorkPackagePlanError(
+                "spatial Unit window is incomplete or invalid"
+            ) from error
+        if width < 1 or height < 1:
+            raise WorkPackagePlanError(
+                "spatial Unit confidence window must have positive area"
+            )
+        unit_pixels = width * height
+        pixel_count += unit_pixels
+        reserve_bytes += unit_confidence_write_reserve(unit_pixels)
+    payload_bytes = pixel_count * UNIT_CONFIDENCE_BYTES_PER_PIXEL
+    file_overhead_bytes = reserve_bytes - payload_bytes
+    return {
+        "unit_count": len(units),
+        "pixel_count": pixel_count,
+        "bytes_per_pixel": UNIT_CONFIDENCE_BYTES_PER_PIXEL,
+        "payload_bytes": payload_bytes,
+        "file_overhead_bytes": file_overhead_bytes,
+        "reserve_bytes": reserve_bytes,
     }
 
 
@@ -488,6 +560,7 @@ def storage_preflight(
     safety_margin_bytes: int,
     fixed_temporary_overhead_bytes: int = 0,
     fusion_atomic_write_overhead_bytes: int = 0,
+    deferred_temporary_reserve_bytes: int = 0,
     available_disk_bytes: int | None = None,
     total_disk_bytes: int | None = None,
     tile_batch_size: int = 1,
@@ -560,11 +633,13 @@ def storage_preflight(
         + CHECKPOINT_METADATA_OVERHEAD_BYTES
     )
     fusion_atomic_overhead = int(fusion_atomic_write_overhead_bytes)
+    deferred_temporary_reserve = int(deferred_temporary_reserve_bytes)
     atomic_write_overhead = atomic_checkpoint_overhead + fusion_atomic_overhead
     if (
         configured_reserve < 0
         or atomic_checkpoint_overhead < CHECKPOINT_METADATA_OVERHEAD_BYTES
         or fusion_atomic_overhead < 0
+        or deferred_temporary_reserve < 0
     ):
         raise WorkPackagePlanError("disk reserve and atomic overhead must be non-negative")
     components = {
@@ -584,6 +659,7 @@ def storage_preflight(
         - protected_permanent
         - effective_reserve
         - atomic_write_overhead
+        - deferred_temporary_reserve
     )
     batch_size = resolve_frozen_tile_batch_size(tile_batch_size)
     if cache_budget_mode == "auto":
@@ -634,7 +710,9 @@ def storage_preflight(
         input_tile_bytes=input_per_tile,
         available_disk_bytes=available,
         min_free_disk_gb=effective_reserve / GIB,
-        permanent_estimated_bytes=protected_permanent,
+        permanent_estimated_bytes=(
+            protected_permanent + deferred_temporary_reserve
+        ),
     )
     package_tile_limit = min(count, budget["package_tile_limit"])
     if package_tile_limit >= batch_size and package_tile_limit < count:
@@ -655,7 +733,12 @@ def storage_preflight(
         + budget["fixed_temporary_overhead_bytes"]
     )
     peak_input = budget["package_tile_limit"] * input_per_tile
-    required = budget["min_free_disk_bytes"] + protected_permanent + peak_temp
+    required = (
+        budget["min_free_disk_bytes"]
+        + protected_permanent
+        + deferred_temporary_reserve
+        + peak_temp
+    )
     return {
         "storage_tuning_schema_version": STORAGE_TUNING_SCHEMA_VERSION,
         "formula_version": STORAGE_TUNING_FORMULA_VERSION,
@@ -708,6 +791,7 @@ def storage_preflight(
         "atomic_checkpoint_overhead_bytes": atomic_checkpoint_overhead,
         "fusion_accumulator_atomic_overhead_bytes": fusion_atomic_overhead,
         "atomic_write_overhead_bytes": atomic_write_overhead,
+        "deferred_temporary_reserve_bytes": deferred_temporary_reserve,
         "checkpoint_metadata_overhead_bytes": CHECKPOINT_METADATA_OVERHEAD_BYTES,
         "safe_headroom_bytes": safe_headroom,
         "auto_headroom_fraction": AUTO_HEADROOM_FRACTION,

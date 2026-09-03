@@ -246,6 +246,10 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path, p
         storage_report={
             "package_tile_limit": 4,
             "working_bytes_per_tile": 4096,
+            "working_cache_budget_bytes": 1,
+            "safe_headroom_bytes": 1,
+            "storage_tuning_schema_version": 2,
+            "deferred_temporary_reserve_bytes": 1_114_112,
             "status": "passed",
         },
         fragmentation_regularization={
@@ -267,6 +271,15 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path, p
     assert spec["fragmentation_regularization"]["publication"] == (
         "authoritative_fusion_core"
     )
+    assert spec["storage_preflight"]["v33_storage_mode"] == (
+        "streamed_unit_confidence_v1"
+    )
+    assert spec["storage_preflight"]["v33_unit_confidence_unit_count"] == 1
+    assert spec["storage_preflight"]["v33_admission_reserve_bytes"] == 1_114_112
+    assert "v33_retained_input_budget_bytes" not in spec["storage_preflight"]
+    assert spec["storage_preflight"]["v33_managed_artifact_ceiling_bytes"] > (
+        spec["storage_preflight"]["v33_admission_reserve_bytes"]
+    )
     database = RunStateDB(database_path)
     with database._connection() as connection:
         job = connection.execute(
@@ -284,6 +297,10 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path, p
         partition_count = connection.execute(
             "SELECT COUNT(*) AS count FROM partitions"
         ).fetchone()["count"]
+        confidence_jobs = connection.execute(
+            "SELECT job_type, stream_id, unit_id, priority FROM jobs "
+            "WHERE job_type='unit_confidence'"
+        ).fetchall()
     partition_jobs = [row for row in job if ":partition_" in row["unit_id"]]
     finalize_jobs = [row for row in job if row["unit_id"] == "fragmentation_v33_finalize"]
     assert len(partition_jobs) == partition_count
@@ -291,6 +308,10 @@ def test_v33_plans_one_partition_job_per_owner_plus_finalize_barrier(tmp_path, p
         ("fragmentation_v33", "fusion:approved", "fragmentation_v33_finalize", "queued")
     ]
     assert all((row["job_type"], row["stream_id"]) == ("fragmentation_v33", "fusion:approved") for row in job)
+    assert [
+        (row["job_type"], row["stream_id"], row["unit_id"], row["priority"])
+        for row in confidence_jobs
+    ] == [("unit_confidence", "fusion:approved", "core_00000_00000", 120)]
     assert [
         (row["unit_id"], row["unit_type"], row["owner_key"]) for row in units
     ] == [

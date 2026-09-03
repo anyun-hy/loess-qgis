@@ -1271,13 +1271,16 @@ class RunStateDB:
                 ).fetchone()
             )
             monitored_job_types = (
-                "work_package", "fragmentation_v33", "unit_fit"
+                "work_package",
+                "fragmentation_v33",
+                "unit_confidence",
+                "unit_fit",
             )
             job_counts = {job_type: {} for job_type in monitored_job_types}
             for row in connection.execute(
                 """SELECT job_type, status, COUNT(*) AS n FROM jobs
                    WHERE run_id=%s AND job_type IN (
-                     'work_package','fragmentation_v33','unit_fit'
+                     'work_package','fragmentation_v33','unit_confidence','unit_fit'
                    )
                    GROUP BY job_type, status""",
                 (identifier,),
@@ -1299,7 +1302,7 @@ class RunStateDB:
                                         / CAST(progress_total AS REAL) END
                             ELSE 0.0 END) AS completed
                    FROM jobs WHERE run_id=%s AND job_type IN (
-                     'work_package','fragmentation_v33','unit_fit'
+                     'work_package','fragmentation_v33','unit_confidence','unit_fit'
                    ) GROUP BY job_type""",
                 (identifier,),
             ).fetchall():
@@ -1651,23 +1654,46 @@ class RunStateDB:
             " WHERE failed_package.run_id=jobs.run_id"
             " AND failed_package.job_type='work_package'"
             " AND failed_package.status='failed'))) "
-            "AND (job_type!='unit_fit' OR "
-            "(NOT EXISTS (SELECT 1 FROM jobs v33"
-            "  WHERE v33.run_id=jobs.run_id AND v33.stream_id=jobs.stream_id"
-            "    AND v33.job_type='fragmentation_v33'"
-            "    AND v33.status!='ready')"
-            " AND (SELECT COUNT(*) FROM artifact_dependencies ad"
-            " WHERE ad.job_id=jobs.job_id)="
-            " (SELECT COUNT(*) FROM unit_dependencies ud"
-            " WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)"
-            " AND NOT EXISTS ("
+            "AND (job_type NOT IN ('unit_fit','unit_confidence') OR NOT EXISTS ("
             "  SELECT 1 FROM unit_dependencies ud"
             "  LEFT JOIN partitions p ON p.run_id=ud.run_id"
             "   AND p.partition_id=ud.partition_id"
             "  LEFT JOIN work_packages wp ON wp.run_id=p.run_id"
             "   AND wp.package_id=p.package_id"
             "  WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id"
-            "   AND COALESCE(wp.status,'')!='ready')))"
+            "   AND COALESCE(wp.status,'')!='ready')) "
+            "AND (job_type!='unit_confidence' OR "
+            " (SELECT COUNT(*) FROM artifact_dependencies ad"
+            "  JOIN artifacts a ON a.artifact_id=ad.artifact_id"
+            "  WHERE ad.job_id=jobs.job_id"
+            "    AND a.kind='partition_probability' AND a.status='ready')="
+            " (SELECT COUNT(*) FROM unit_dependencies ud"
+            "  WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)) "
+            "AND (job_type!='unit_fit' OR ("
+            " (NOT EXISTS (SELECT 1 FROM jobs v33"
+            "  WHERE v33.run_id=jobs.run_id AND v33.stream_id=jobs.stream_id"
+            "    AND v33.job_type='fragmentation_v33')"
+            " OR NOT EXISTS (SELECT 1 FROM jobs v33"
+            "  WHERE v33.run_id=jobs.run_id AND v33.stream_id=jobs.stream_id"
+            "    AND v33.job_type='fragmentation_v33' AND v33.status!='ready'))"
+            " AND ((EXISTS (SELECT 1 FROM jobs compact"
+            "  WHERE compact.run_id=jobs.run_id"
+            "    AND compact.stream_id=jobs.stream_id"
+            "    AND compact.unit_id=jobs.unit_id"
+            "    AND compact.job_type='unit_confidence')"
+            " AND 1=(SELECT COUNT(*) FROM artifact_dependencies ad"
+            "  JOIN artifacts a ON a.artifact_id=ad.artifact_id"
+            "  WHERE ad.job_id=jobs.job_id"
+            "    AND a.kind='unit_confidence' AND a.status='ready'))"
+            " OR (NOT EXISTS (SELECT 1 FROM jobs compact"
+            "  WHERE compact.run_id=jobs.run_id"
+            "    AND compact.stream_id=jobs.stream_id"
+            "    AND compact.unit_id=jobs.unit_id"
+            "    AND compact.job_type='unit_confidence')"
+            " AND (SELECT COUNT(*) FROM artifact_dependencies ad"
+            "  WHERE ad.job_id=jobs.job_id)="
+            " (SELECT COUNT(*) FROM unit_dependencies ud"
+            "  WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)))))"
         )
         values: list[Any] = [str(run_id)]
         if job_types:
@@ -1903,12 +1929,8 @@ class RunStateDB:
                        AND failed_package.job_type='work_package'
                        AND failed_package.status='failed'
                    ))
-                   AND (job_type!='unit_fit' OR
-                     ((SELECT COUNT(*) FROM artifact_dependencies ad
-                       WHERE ad.job_id=jobs.job_id)=
-                      (SELECT COUNT(*) FROM unit_dependencies ud
-                       WHERE ud.run_id=jobs.run_id AND ud.unit_id=jobs.unit_id)
-                      AND NOT EXISTS (
+                   AND (job_type NOT IN ('unit_fit','unit_confidence') OR
+                      NOT EXISTS (
                         SELECT 1 FROM unit_dependencies ud
                         LEFT JOIN partitions p
                           ON p.run_id=ud.run_id
@@ -1918,12 +1940,88 @@ class RunStateDB:
                         WHERE ud.run_id=jobs.run_id
                           AND ud.unit_id=jobs.unit_id
                           AND COALESCE(wp.status,'')!='ready'
-                      )))"""
+                      ))"""
                 + lock_clause,
                 (int(job_id),),
             ).fetchone()
             if row is None:
                 return None
+            job_type = str(row["job_type"])
+            if job_type == "unit_confidence":
+                ready_probabilities = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM artifact_dependencies ad
+                           JOIN artifacts a ON a.artifact_id=ad.artifact_id
+                           WHERE ad.job_id=%s
+                             AND a.kind='partition_probability'
+                             AND a.status='ready'""",
+                        (int(job_id),),
+                    ).fetchone()[0]
+                )
+                unit_dependencies = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM unit_dependencies ud
+                           WHERE ud.run_id=%s AND ud.unit_id=%s""",
+                        (str(row["run_id"]), str(row["unit_id"])),
+                    ).fetchone()[0]
+                )
+                if ready_probabilities != unit_dependencies:
+                    return None
+            elif job_type == "unit_fit":
+                v33_incomplete = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM jobs v33
+                           WHERE v33.run_id=%s AND v33.stream_id=%s
+                             AND v33.job_type='fragmentation_v33'
+                             AND v33.status!='ready'""",
+                        (str(row["run_id"]), str(row["stream_id"])),
+                    ).fetchone()[0]
+                )
+                if v33_incomplete:
+                    return None
+                compact_jobs = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM jobs compact
+                           WHERE compact.run_id=%s AND compact.stream_id=%s
+                             AND compact.unit_id=%s
+                             AND compact.job_type='unit_confidence'""",
+                        (
+                            str(row["run_id"]),
+                            str(row["stream_id"]),
+                            str(row["unit_id"]),
+                        ),
+                    ).fetchone()[0]
+                )
+                dependency_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM artifact_dependencies WHERE job_id=%s",
+                        (int(job_id),),
+                    ).fetchone()[0]
+                )
+                if compact_jobs:
+                    ready_confidence = int(
+                        connection.execute(
+                            """SELECT COUNT(*) FROM artifact_dependencies ad
+                               JOIN artifacts a
+                                 ON a.artifact_id=ad.artifact_id
+                               WHERE ad.job_id=%s
+                                 AND a.kind='unit_confidence'
+                                 AND a.status='ready'""",
+                            (int(job_id),),
+                        ).fetchone()[0]
+                    )
+                    if dependency_count != 1 or ready_confidence != 1:
+                        return None
+                else:
+                    unit_dependencies = int(
+                        connection.execute(
+                            """SELECT COUNT(*) FROM unit_dependencies ud
+                               WHERE ud.run_id=%s AND ud.unit_id=%s""",
+                            (str(row["run_id"]), str(row["unit_id"])),
+                        ).fetchone()[0]
+                    )
+                    if dependency_count != unit_dependencies:
+                        return None
             return self._lease_selected_job(
                 connection, row, worker_id, token, expires, now
             )
@@ -2849,7 +2947,9 @@ class RunStateDB:
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                        JOIN partitions p
                          ON p.run_id=d.run_id AND p.partition_id=d.partition_id
-                       WHERE j.run_id=%s AND j.job_type='unit_fit'
+                       WHERE j.run_id=%s AND j.job_type IN (
+                         'unit_fit','unit_confidence','fragmentation_v33'
+                       )
                          AND j.status='failed'
                          AND p.package_id IS NOT NULL ON CONFLICT DO NOTHING""",
                     (identifier,),
@@ -2896,7 +2996,29 @@ class RunStateDB:
                 """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_units ru ON ru.unit_id=j.unit_id
-                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
+                   WHERE j.run_id=%s AND j.job_type IN (
+                     'unit_fit','unit_confidence','fragmentation_v33'
+                   ) ON CONFLICT DO NOTHING""",
+                (identifier,),
+            )
+
+            connection.execute(
+                """CREATE TEMP TABLE reset_v33_owners(
+                     stream_id TEXT NOT NULL,
+                     partition_id TEXT NOT NULL,
+                     PRIMARY KEY(stream_id, partition_id)
+                   )"""
+            )
+            connection.execute(
+                """INSERT INTO reset_v33_owners(stream_id, partition_id)
+                   SELECT DISTINCT j.stream_id, u.owner_key
+                   FROM jobs j
+                   JOIN reset_jobs rj ON rj.job_id=j.job_id
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
+                   WHERE j.run_id=%s AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Partition'
+                   ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
 
@@ -2930,6 +3052,15 @@ class RunStateDB:
                      OR EXISTS (
                        SELECT 1 FROM reset_units ru
                        WHERE ru.unit_id=artifacts.unit_id
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM reset_v33_owners rv
+                       WHERE rv.stream_id=artifacts.stream_id
+                         AND rv.partition_id=artifacts.unit_id
+                         AND artifacts.kind IN (
+                           'v33_staged_mask','v33_staged_audit',
+                           'core_mask','fragmentation_v33_audit'
+                         )
                      )
                    )""",
                 (now, identifier),
@@ -3076,7 +3207,9 @@ class RunStateDB:
                 """INSERT INTO reset_jobs(job_id)
                    SELECT j.job_id FROM jobs j
                    JOIN reset_units ru ON ru.unit_id=j.unit_id
-                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
+                   WHERE j.run_id=%s AND j.job_type IN (
+                     'unit_fit','unit_confidence','fragmentation_v33'
+                   ) ON CONFLICT DO NOTHING""",
                 (identifier,),
             )
             unit_count = int(
@@ -3169,7 +3302,60 @@ class RunStateDB:
                     AND a.unit_id=d.partition_id
                     AND a.kind='partition_probability'
                     AND a.status='ready'
-                   WHERE j.run_id=%s AND j.job_type='unit_fit' ON CONFLICT DO NOTHING""",
+                   WHERE j.run_id=%s AND (
+                     j.job_type='unit_confidence'
+                     OR (
+                       j.job_type='unit_fit'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM jobs compact
+                         WHERE compact.run_id=j.run_id
+                           AND compact.stream_id=j.stream_id
+                           AND compact.unit_id=j.unit_id
+                           AND compact.job_type='unit_confidence'
+                       )
+                     )
+                   ) ON CONFLICT DO NOTHING""",
+                (now, identifier),
+            ).rowcount
+            relinked += connection.execute(
+                """INSERT INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, a.artifact_id, %s
+                   FROM jobs j
+                   JOIN reset_jobs rj ON rj.job_id=j.job_id
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   JOIN artifacts a
+                     ON a.run_id=j.run_id
+                    AND a.stream_id=j.stream_id
+                    AND a.unit_id=d.partition_id
+                    AND a.kind IN (
+                      'partition_probability','v3_context_core','v3_baseline_core'
+                    )
+                    AND a.status='ready'
+                   WHERE j.run_id=%s AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Partition'
+                   ON CONFLICT DO NOTHING""",
+                (now, identifier),
+            ).rowcount
+            relinked += connection.execute(
+                """INSERT INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, a.artifact_id, %s
+                   FROM jobs j
+                   JOIN reset_jobs rj ON rj.job_id=j.job_id
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
+                   JOIN artifacts a
+                     ON a.run_id=j.run_id
+                    AND a.stream_id=j.stream_id
+                    AND a.kind IN ('v33_staged_mask','v33_staged_audit')
+                    AND a.status='ready'
+                   WHERE j.run_id=%s AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Finalize'
+                   ON CONFLICT DO NOTHING""",
                 (now, identifier),
             ).rowcount
             connection.execute(
@@ -3354,7 +3540,9 @@ class RunStateDB:
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                        WHERE j.run_id=%s AND j.stream_id=%s
-                         AND j.job_type='unit_fit' AND d.partition_id=%s
+                         AND j.job_type IN (
+                           'unit_fit','unit_confidence','fragmentation_v33'
+                         ) AND d.partition_id=%s
                          AND j.status NOT IN ('queued','interrupted')""",
                     (identifier, stream, partition),
                 ).fetchone()[0]
@@ -3396,6 +3584,27 @@ class RunStateDB:
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                    WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='unit_fit' AND d.partition_id=%s
+                     AND NOT EXISTS (
+                       SELECT 1 FROM jobs compact
+                       WHERE compact.run_id=j.run_id
+                         AND compact.stream_id=j.stream_id
+                         AND compact.unit_id=j.unit_id
+                         AND compact.job_type='unit_confidence'
+                     )
+                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
+                (artifact_id, now, identifier, stream, partition),
+            )
+            # V3.3 Fusion geometry consumes a compact, lossless confidence
+            # surface.  Link the 14-band probability only to the compactor so
+            # it can be released before the global publication barrier.
+            connection.execute(
+                """INSERT INTO artifact_dependencies
+                   (job_id, artifact_id, created_at)
+                   SELECT j.job_id, %s, %s FROM jobs j
+                   JOIN unit_dependencies d
+                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
+                   WHERE j.run_id=%s AND j.stream_id=%s
+                     AND j.job_type='unit_confidence' AND d.partition_id=%s
                      AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
             )
@@ -3407,15 +3616,142 @@ class RunStateDB:
                 """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
                    SELECT j.job_id, %s, %s FROM jobs j
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                    WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Partition'
                      AND d.partition_id=%s
                      AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
             )
             return artifact_id
+
+    def complete_unit_confidence_job(
+        self,
+        job_id: int,
+        lease_token: str,
+        *,
+        path: str | Path,
+        byte_count: int,
+        sha256: str,
+    ) -> bool:
+        """Publish one compact confidence surface and release probabilities.
+
+        The ready Artifact, its geometry-job dependency, the compaction Job
+        completion, and release of every 14-band probability dependency share
+        one transaction.  A cleanup worker can therefore observe neither an
+        unreferenced ready confidence surface nor an early probability release.
+        """
+
+        size = int(byte_count)
+        digest = str(sha256).lower()
+        if size < 0:
+            raise ValueError("unit confidence byte_count cannot be negative")
+        if len(digest) != 64:
+            raise ValueError("unit confidence sha256 must contain 64 hexadecimal characters")
+        try:
+            int(digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                "unit confidence sha256 must contain 64 hexadecimal characters"
+            ) from error
+        resolved_path = str(Path(path).expanduser().resolve())
+        now = _now()
+        fence_time = time.time()
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT * FROM jobs WHERE job_id=%s
+                   AND job_type='unit_confidence' AND status='running'
+                   AND lease_token=%s AND lease_expires IS NOT NULL
+                   AND lease_expires>=%s""",
+                (int(job_id), str(lease_token), fence_time),
+            ).fetchone()
+            if job is None:
+                return False
+            run_id = str(job["run_id"])
+            stream_id = str(job["stream_id"])
+            unit_id = str(job["unit_id"])
+            connection.execute(
+                """INSERT INTO artifacts
+                   (run_id, stream_id, unit_id, kind, path, created_at, updated_at)
+                   VALUES (%s, %s, %s, 'unit_confidence', %s, %s, %s)
+                   ON CONFLICT(run_id, stream_id, unit_id, kind, path) DO NOTHING""",
+                (run_id, stream_id, unit_id, resolved_path, now, now),
+            )
+            artifact = connection.execute(
+                """SELECT * FROM artifacts
+                   WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                     AND kind='unit_confidence' AND path=%s FOR UPDATE""",
+                (run_id, stream_id, unit_id, resolved_path),
+            ).fetchone()
+            if artifact is None:
+                raise RunStateError(
+                    "unit confidence registration did not create a row"
+                )
+            artifact_id = int(artifact["artifact_id"])
+            status = str(artifact["status"])
+            if status == "ready":
+                if (
+                    int(artifact["byte_count"]) != size
+                    or str(artifact["sha256"]) != digest
+                ):
+                    raise RunStateError(
+                        "ready unit confidence changed: " + resolved_path
+                    )
+            elif status in {"writing", "failed"}:
+                changed = connection.execute(
+                    """UPDATE artifacts SET status='ready', byte_count=%s,
+                       sha256=%s, updated_at=%s WHERE artifact_id=%s
+                       AND status IN ('writing','failed')""",
+                    (size, digest, now, artifact_id),
+                ).rowcount
+                if changed != 1:
+                    raise RunStateError("cannot publish unit confidence")
+            else:
+                raise RunStateError(
+                    f"unit confidence is unavailable for publish: {status}"
+                )
+            fit_jobs = connection.execute(
+                """SELECT job_id FROM jobs WHERE run_id=%s AND stream_id=%s
+                   AND unit_id=%s AND job_type='unit_fit'
+                   AND status IN ('queued','interrupted','running')""",
+                (run_id, stream_id, unit_id),
+            ).fetchall()
+            if len(fit_jobs) != 1:
+                raise RunStateError(
+                    "unit confidence requires exactly one live geometry consumer"
+                )
+            connection.execute(
+                """INSERT INTO artifact_dependencies
+                   (job_id, artifact_id, created_at) VALUES (%s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (int(fit_jobs[0]["job_id"]), artifact_id, now),
+            )
+            changed = connection.execute(
+                """UPDATE jobs SET status='ready', error='', worker_id='',
+                   progress_current=1, progress_total=1, lease_token='',
+                   lease_expires=NULL, heartbeat_at=%s, updated_at=%s
+                   WHERE job_id=%s AND job_type='unit_confidence'
+                     AND status='running' AND lease_token=%s
+                     AND lease_expires IS NOT NULL AND lease_expires>=%s""",
+                (
+                    now,
+                    now,
+                    int(job_id),
+                    str(lease_token),
+                    fence_time,
+                ),
+            ).rowcount
+            if changed != 1:
+                return False
+            connection.execute(
+                "DELETE FROM artifact_dependencies WHERE job_id=%s",
+                (int(job_id),),
+            )
+            return True
 
     def _publish_fragmentation_v33_input(
         self,
@@ -3482,10 +3818,13 @@ class RunStateDB:
             elif status == "cleaned":
                 started = connection.execute(
                     """SELECT COUNT(*) FROM jobs j
+                       JOIN spatial_units u
+                         ON u.run_id=j.run_id AND u.unit_id=j.unit_id
                        JOIN unit_dependencies d
                          ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                        WHERE j.run_id=%s AND j.stream_id=%s
                          AND j.job_type='fragmentation_v33'
+                         AND u.unit_type='FragmentationV33Partition'
                          AND d.partition_id=%s
                          AND j.status NOT IN ('queued','interrupted')""",
                     (identifier, stream, partition),
@@ -3524,10 +3863,13 @@ class RunStateDB:
                 """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
                    SELECT j.job_id, %s, %s FROM jobs j
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                    WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Partition'
                      AND d.partition_id=%s
                      AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (artifact_id, now, identifier, stream, partition),
@@ -3772,10 +4114,13 @@ class RunStateDB:
                 """INSERT INTO artifact_dependencies
                    (job_id, artifact_id, created_at)
                    SELECT j.job_id, %s, %s FROM jobs j
+                   JOIN spatial_units u
+                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
                    JOIN unit_dependencies d
                      ON d.run_id=j.run_id AND d.unit_id=j.unit_id
                    WHERE j.run_id=%s AND j.stream_id=%s
                      AND j.job_type='fragmentation_v33'
+                     AND u.unit_type='FragmentationV33Partition'
                      AND d.partition_id=%s
                      AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
                 (int(artifact_id), now, identifier, stream, partition),
@@ -3929,6 +4274,29 @@ class RunStateDB:
             "artifact_count": int(row["artifact_count"]),
             "cleaned_bytes": int(row["cleaned_bytes"]),
         }
+
+    def artifact_byte_count(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        statuses: Sequence[str],
+    ) -> int:
+        """Return persisted bytes for one artifact lifecycle class."""
+
+        values = tuple(str(item) for item in statuses)
+        if not values:
+            return 0
+        placeholders = ",".join("%s" for _ in values)
+        with self._connection() as connection:
+            return int(
+                connection.execute(
+                    f"""SELECT COALESCE(SUM(byte_count), 0) FROM artifacts
+                        WHERE run_id=%s AND kind=%s
+                          AND status IN ({placeholders})""",
+                    (str(run_id), str(kind), *values),
+                ).fetchone()[0]
+            )
 
     def artifacts_for_stream(
         self,

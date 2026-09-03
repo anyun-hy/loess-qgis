@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from storage_guard import StorageGuard, StorageReserveError
+from storage_guard import (
+    StorageGuard,
+    StorageReserveError,
+    remaining_deferred_temporary_reserve_bytes,
+)
 
 
 def test_storage_guard_enforces_reserve_and_managed_high_water(tmp_path):
@@ -61,6 +65,28 @@ def test_storage_guard_reserve_is_recomputed_without_expanding_budget(tmp_path):
     permanent["value"] = 700
     with pytest.raises(StorageReserveError):
         guard.check("second", write_bytes=101)
+
+
+def test_streamed_confidence_reserve_decays_by_persisted_and_current_writes():
+    class Database:
+        def artifact_byte_count(self, *_args, **_kwargs):
+            assert _kwargs == {
+                "kind": "unit_confidence",
+                "statuses": ("ready", "cleaning", "cleaned"),
+            }
+            return 125
+
+    spec = {
+        "run_id": "run-1",
+        "storage_preflight": {
+            "v33_storage_mode": "streamed_unit_confidence_v1",
+            "deferred_temporary_reserve_bytes": 1_000,
+        },
+    }
+
+    assert remaining_deferred_temporary_reserve_bytes(
+        spec, Database(), exclusion_bytes=200
+    ) == 675
 
 
 def test_concurrent_write_reservation_is_counted_before_commit(tmp_path):

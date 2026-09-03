@@ -364,9 +364,18 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         )
         else 0
     )
+    storage = dict(spec.get("storage_preflight") or {})
+    expected_confidence_jobs = (
+        expected_units
+        if storage.get("v33_storage_mode") == "streamed_unit_confidence_v1"
+        else 0
+    )
     job_type_counts = metrics["job_type_counts"]
     expected_job_total = (
-        expected_packages + expected_unit_reports + expected_v33_jobs
+        expected_packages
+        + expected_unit_reports
+        + expected_v33_jobs
+        + expected_confidence_jobs
     )
     unit_artifact_rows = [
         row
@@ -390,7 +399,6 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
     unit_artifact_status_counts = Counter(
         str(row.get("status") or "") for row in unit_artifact_rows
     )
-    storage = dict(spec.get("storage_preflight") or {})
     storage_schema = int(storage.get("storage_tuning_schema_version") or 0)
     frozen_cache_budget_bytes = int(
         storage.get("working_cache_budget_bytes")
@@ -414,6 +422,13 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "all_v33_jobs_ready": job_type_counts.get(
             "fragmentation_v33", {}
         ) == ({"ready": expected_v33_jobs} if expected_v33_jobs else {}),
+        "all_unit_confidence_jobs_ready": job_type_counts.get(
+            "unit_confidence", {}
+        ) == (
+            {"ready": expected_confidence_jobs}
+            if expected_confidence_jobs
+            else {}
+        ),
         "all_unit_jobs_ready": job_type_counts.get("unit_fit", {}) == {
             "ready": expected_unit_reports
         },
@@ -476,6 +491,7 @@ def build_scale_acceptance_report(run_spec_path: str | Path) -> dict[str, Any]:
         "expected_job_counts": {
             "work_package": expected_packages,
             "fragmentation_v33": expected_v33_jobs,
+            "unit_confidence": expected_confidence_jobs,
             "unit_fit": expected_unit_reports,
             "total": expected_job_total,
         },

@@ -33,6 +33,7 @@ run_builder_v5.create_v5_run
   ├─ Work Package
   ├─ Partition / Core / Seam / Junction
   ├─ V3.3 Partition + Finalize Job
+  ├─ Fusion unit_confidence Job
   └─ 四条 Stream 的 unit_fit Job
                               │
                               ▼
@@ -40,8 +41,8 @@ V5AsyncInferenceRunner.run_from_spec
                               │
        ┌──────────────────────┼──────────────────────┐
        ▼                      ▼                      ▼
-GPU Work Package       CPU unit_fit            PostgreSQL监控
-三模型 + Fusion        空间单元矢量化           租约/进度/恢复
+GPU Work Package       CPU V3.3 / confidence / unit_fit    PostgreSQL监控
+三模型 + Fusion        碎片裁决、概率压缩、矢量化           租约/进度/恢复
        │                      │                      │
        └──────────────┬───────┴──────────────────────┘
                       ▼
@@ -155,7 +156,7 @@ V3规则处理
     └─ core_confidence
             │
             ▼
-等待全部 Work Package ready
+等待该 owner 的依赖 Work Package ready
             │
             ▼
 V3.3 Partition Job，最多4个并行
@@ -164,6 +165,12 @@ V3.3 Partition Job，最多4个并行
     ├─ 读取 Fusion probability
     ├─ 执行冻结 V3.3 规则
     └─ 发布 staged mask + audit
+            │
+            ▼
+同一批 probability 还供 unit_confidence
+    ├─ 计算归一化 14 类概率的逐像元 max
+    ├─ 无损写入 float32 单波段空间单元 Artifact
+    └─ 与 V3.3 消费者都完成后释放 probability Halo
             │
             ▼
 V3.3 Finalize 单一发布屏障
@@ -176,19 +183,21 @@ V3.3 Finalize 单一发布屏障
 ```
 
 模型 Stream 不依赖 V3.3，可在 GPU 继续处理后续 Work Package 时由 CPU 提前执行
-空间单元任务。Fusion Stream 的空间单元任务必须等 V3.3 Finalize 发布权威
-Core 后才能领取。
+空间单元任务。V3.3 Partition 和 `unit_confidence` 也按依赖就绪流式执行。
+Fusion Stream 的正式空间单元任务必须等 V3.3 Finalize 发布权威 Core，并等本单元
+`unit_confidence` ready 后才能领取。
 
 ## 6. Core、Seam、Junction 空间单元
 
 每条模型 Stream 和 Fusion Stream 都执行同样的单元任务：
 
 ```text
-Partition probability Halo + 权威 Core mask
+模型：Partition probability Halo + 权威 Core mask
+Fusion V3.3：unit_confidence + 权威 Core mask
                   │
                   ▼
 boundary_fitting.unit_runtime.run_unit_fit
-  ├─ 拼接概率上下文
+  ├─ 模型流拼接概率上下文；Fusion 读取紧凑 confidence
   ├─ 拼接不重叠的权威类别
   ├─ 像元转 Polygon
   ├─ 公共分界拟合或保持原边界
@@ -260,7 +269,7 @@ Accepted差分 + 正式Artifact提交
 
 ```text
 scale_acceptance
-  ├─ Work Package、V3.3、unit_fit和Stream是否收口
+  ├─ Work Package、V3.3、unit_confidence、unit_fit和Stream是否收口
   ├─ 报告、Artifact路径、大小和SHA
   ├─ GeoParquet中间文件是否按合同清理
   ├─ 模型加载、驻留和复用次数
@@ -281,13 +290,13 @@ PostgreSQL
   ├─ Job lease / heartbeat / retry / resume
   ├─ Artifact path / SHA / ref_count / cleanup
   ├─ Stream和空间单元状态
-  └─ Work Package、V3.3、unit_fit阶段进度
+  └─ Work Package、V3.3、unit_confidence、unit_fit阶段进度
           │
           ▼
 InferenceMonitorDialog
   ├─ 当前阶段进度
   └─ 整体任务完成度
-       Work Package + V3.3 + unit_fit + 栅格收口 + 四流组装 + 验收
+       Work Package + V3.3 + unit_confidence + unit_fit + 栅格收口 + 四流组装 + 验收
 ```
 
 整体进度表示任务完成度，不是剩余时间预测。
@@ -358,13 +367,14 @@ fragmentation postprocess 等脚本属于实验、诊断、回放或显式工具
 
 ## 12. 最终验收的 Job 计数合同
 
-`scale_acceptance.py` 分别核对三类 Job，最后再核对总数：
+`scale_acceptance.py` 分别核对四类 Job，最后再核对总数：
 
 ```text
 Work Package Job = Work Package 数量
 V3.3 Job         = Partition 数量 + 1个全局 Finalize
+unit_confidence   = V3.3 Fusion 的 Core/Seam/Junction 数量之和
 unit_fit Job     = 每条 Stream 的 Core/Seam/Junction 数量之和
-总 Job           = 上述三类之和
+总 Job           = 上述四类之和
 ```
 
 V3.3 未启用时，其预期 Job 数必须为 0；V3.3 启用时，Partition 和 Finalize 必须

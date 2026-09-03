@@ -610,11 +610,13 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
         {
             "work_package": {"ready": 1},
             "fragmentation_v33": {"ready": 2, "queued": 2},
+            "unit_confidence": {"ready": 5, "queued": 5},
             "unit_fit": {"ready": 5, "queued": 5},
         },
         {
             "work_package": {"completed": 1.0, "total": 1},
             "fragmentation_v33": {"completed": 2.0, "total": 4},
+            "unit_confidence": {"completed": 5.0, "total": 10},
             "unit_fit": {"completed": 5.0, "total": 10},
         },
         [
@@ -623,7 +625,7 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
         ],
         {},
     )
-    assert group_count == 6
+    assert group_count == 7
     assert fraction == 0.5
     assert _execute_module_function(
         "_overall_completion_fraction", "ready", {}, {}, [], {}

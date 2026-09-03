@@ -151,8 +151,8 @@ for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neigh
     exit 1
   }
 done
-grep -q '^version=0\.4\.0$' "${PLUGIN_SRC}/metadata.txt" || {
-  echo "Plugin metadata is not the unified 0.4.0 release" >&2
+grep -q '^version=1\.0\.0$' "${PLUGIN_SRC}/metadata.txt" || {
+  echo "Plugin metadata is not the unified 1.0.0 release" >&2
   exit 1
 }
 grep -q '^qgisMinimumVersion=3\.44$' "${PLUGIN_SRC}/metadata.txt"
@@ -295,7 +295,7 @@ payload = {
     "deployment_kind": "qgis_plugin",
     "git_sha": os.environ["LOESS_GIT_SHA"],
     "source": json.loads(os.environ["LOESS_SOURCE_INFO"]),
-    "plugin_version": "0.4.0",
+    "plugin_version": "1.0.0",
     "platform": os.environ["LOESS_PLATFORM"],
     "qgis_profile": os.environ["LOESS_PROFILE"],
     "shared_runtime": {
@@ -311,7 +311,7 @@ payload = {
 )
 '
 
-echo "Validated ${PLUGIN_NAME} 0.4.0"
+echo "Validated ${PLUGIN_NAME} 1.0.0"
 echo "  platform: ${PLATFORM}"
 echo "  QGIS: ${qgis_version}"
 echo "  Git SHA: ${GIT_SHA}"

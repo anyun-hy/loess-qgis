@@ -35,6 +35,7 @@ from fragmentation_v33_candidate import (
     policy_snapshot_sha256,
 )
 from fragmentation_v33_work_package import run_worker as run_v33_worker
+from unit_confidence import run_unit_confidence
 from scale_acceptance import build_scale_acceptance_report
 from work_package_runtime import (
     BatchCapacityError,
@@ -1140,15 +1141,59 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
         database,
         """SELECT COUNT(*) FROM artifacts
            WHERE kind IN ('v33_staged_mask','v33_staged_audit')
-             AND status='cleaned'""",
+           AND status='cleaned'""",
     ) == 2
     unit_job_id = _database_scalar(
         database,
         """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
            AND job_type='unit_fit'""",
     )
-    leased = database.lease_job(unit_job_id, "unit-test", lease_seconds=60)
-    assert leased is not None
+    assert database.lease_job(
+        unit_job_id, "confidence-not-ready", lease_seconds=60
+    ) is None
+    confidence_job = database.lease_next_job(
+        spec["run_id"],
+        "confidence-test",
+        job_types=("unit_confidence",),
+        lease_seconds=60,
+    )
+    assert confidence_job is not None
+    confidence_report = run_unit_confidence(
+        spec_path,
+        "fusion:fixture_fusion",
+        confidence_job["unit_id"],
+        job_id=confidence_job["job_id"],
+        lease_token=confidence_job["lease_token"],
+    )
+    with rasterio.open(confidence_report["path"]) as source:
+        assert source.tags()["storage_role"] == "lossless_unit_confidence_v1"
+        assert np.all(source.read(1) == np.float32(0.5))
+    probability = database.artifact_for_stream_unit(
+        spec["run_id"],
+        "fusion:fixture_fusion",
+        "partition_00000_00000",
+        "partition_probability",
+    )
+    assert probability["ref_count"] == 0
+    compact_artifact = database.artifact_for_stream_unit(
+        spec["run_id"],
+        "fusion:fixture_fusion",
+        confidence_job["unit_id"],
+        "unit_confidence",
+    )
+    assert compact_artifact["ref_count"] == 1
+    assert database.lease_job(
+        unit_job_id, "unit-test", lease_seconds=60
+    ) is not None
+    leased = database.get_job(unit_job_id)
+    assert leased["status"] == "running"
+    assert leased["worker_id"] == "unit-test"
+    unit_job_id_check = _database_scalar(
+        database,
+        """SELECT job_id FROM jobs WHERE stream_id='fusion:fixture_fusion'
+           AND job_type='unit_fit'""",
+    )
+    assert unit_job_id_check == unit_job_id
     unit_report = run_unit_fit(
         spec_path,
         "fusion:fixture_fusion",
@@ -1292,15 +1337,18 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assert scale_report["status"] == "passed"
     assert scale_report["hard_gate_passed"] is True
     assert scale_report["hard_gates"]["all_v33_jobs_ready"] is True
+    assert scale_report["hard_gates"]["all_unit_confidence_jobs_ready"] is True
     assert scale_report["hard_gates"]["all_unit_jobs_ready"] is True
     assert scale_report["expected_job_counts"] == {
         "work_package": 1,
         "fragmentation_v33": 2,
+        "unit_confidence": 1,
         "unit_fit": 3,
-        "total": 6,
+        "total": 7,
     }
     assert scale_report["job_type_counts"] == {
         "fragmentation_v33": {"ready": 2},
+        "unit_confidence": {"ready": 1},
         "unit_fit": {"ready": 3},
         "work_package": {"ready": 1},
     }

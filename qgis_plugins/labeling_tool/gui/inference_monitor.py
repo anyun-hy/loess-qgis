@@ -382,7 +382,12 @@ def _overall_completion_fraction(
     if str(run_status) == "ready":
         return 1.0, 1
     groups = []
-    for job_type in ("work_package", "fragmentation_v33", "unit_fit"):
+    for job_type in (
+        "work_package",
+        "fragmentation_v33",
+        "unit_confidence",
+        "unit_fit",
+    ):
         counts = job_counts.get(job_type) or {}
         progress = job_progress.get(job_type) or {}
         total = int(progress.get("total") or sum(int(v) for v in counts.values()))

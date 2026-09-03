@@ -2,15 +2,20 @@
 
 V3.3 is the class-aware authoritative-raster stage for new Fusion Runs. Each
 Work Package first applies frozen V3 to its Fusion probability Halo and stores
-the V3 baseline Core, context, and probability. After every Work Package is
-ready, one V3.3 job adjudicates the frozen owner Cores and publishes the final
-non-overlapping Core masks. Core, Seam, and Junction units read only those
-V3.3 masks before the one vectorization and common-boundary fitting pass.
+the V3 baseline Core, context, and probability. Each owner Partition may run
+as soon as all of its dependent Work Packages are ready, while the accelerator
+continues later Packages. A global Finalize job still waits for every owner and
+publishes the final non-overlapping Core masks. Core, Seam, and Junction units
+read only those V3.3 masks before the one vectorization and common-boundary
+fitting pass.
 
 ## Data contract
 
 - Fusion Halo probabilities are read-only and remain the source for confidence
-  statistics.
+  statistics. Before they are released, one `unit_confidence` job per spatial
+  unit stores the exact float32 maximum of the normalized 14-class probability
+  vector. This lossless scalar is the only probability-derived value consumed
+  by later Fusion geometry.
 - `fusion/<profile>/raster_parts/*_mask.tif` is the V3.3 authoritative Core
   classification; its GeoTIFF tags record the policy, version, production
   replacement state, actual context, and changed-pixel count.
@@ -48,11 +53,15 @@ report, and final GeoPackage still match their recorded fingerprints.
 `fragmentation_regularization` in `inference_scripts/config.yaml` selects V3.3
 and records V3 as its baseline in each new `run_spec.json`. The configured
 Partition Halo must be at least the policy buffer. Work Packages publish the
-frozen inputs; the singleton V3.3 job then atomically publishes one mask and
-one audit per Core plus the global report. Dependent Fusion spatial units stay
-blocked until that report is ready. After one vectorization/fitting/assembly
-pass, the runner records the formal GeoPackage as the review source and
-continues directly to scale acceptance.
+frozen inputs; bounded V3.3 Partition workers publish staged masks and audits,
+then the singleton Finalize job atomically publishes one authoritative mask and
+audit per Core plus the global report. In parallel, bounded `unit_confidence`
+workers compact Fusion confidence. A Fusion spatial unit stays blocked until
+both its compact confidence and the global V3.3 report are ready.
+Probability/context/baseline artifacts are reference-counted and may be cleaned
+as soon as their V3.3 and confidence consumers commit. After one
+vectorization/fitting/assembly pass, the runner records the formal GeoPackage
+as the review source and continues directly to scale acceptance.
 
 To roll back a newly created Run, explicitly set `policy_id` to
 `semantic_optimized_200_v3`. A running V3.3 Run never falls back silently.

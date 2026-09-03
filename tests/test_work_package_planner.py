@@ -14,6 +14,8 @@ from labeling_tool.core.work_package_planner import (
     plan_work_packages,
     resolve_frozen_tile_batch_size,
     storage_preflight,
+    unit_confidence_reserve,
+    unit_confidence_write_reserve,
 )
 
 
@@ -84,6 +86,79 @@ def test_fusion_atomic_overhead_uses_one_largest_partition_halo_generation():
     assert fusion_accumulator_atomic_overhead(linear, spatial) == (
         largest_halo_pixels * 70 * 4 + 64 * 1024
     )
+
+
+def test_unit_confidence_reserve_is_exact_core_domain_plus_file_overhead():
+    spatial = plan_spatial_units(
+        tile_rows=3,
+        tile_cols=5,
+        tile_size=512,
+        overlap=128,
+        partition_tile_rows=2,
+        partition_tile_cols=3,
+        seam_band_px=64,
+        halo_px=128,
+    )
+
+    reserve = unit_confidence_reserve(spatial)
+
+    processing = spatial["processing_window"]
+    expected_pixels = (
+        processing["x1"] - processing["x0"]
+    ) * (processing["y1"] - processing["y0"])
+    assert reserve["pixel_count"] == expected_pixels
+    assert reserve["payload_bytes"] == expected_pixels * 4
+    assert reserve["reserve_bytes"] == sum(
+        unit_confidence_write_reserve(
+            (unit["pixel_window"]["x1"] - unit["pixel_window"]["x0"])
+            * (unit["pixel_window"]["y1"] - unit["pixel_window"]["y0"])
+        )
+        for unit in spatial["spatial_units"]
+    )
+    assert reserve["file_overhead_bytes"] >= (
+        len(spatial["spatial_units"]) * 64 * 1024
+    )
+    assert reserve["reserve_bytes"] == (
+        reserve["payload_bytes"] + reserve["file_overhead_bytes"]
+    )
+    assert unit_confidence_write_reserve(10_000_000) == 40_400_000
+
+
+def test_storage_preflight_reserves_deferred_confidence_without_double_guessing(
+    tmp_path,
+):
+    raster_bytes, vector_reserve = _permanent_bytes(1_000, 4)
+    deferred = 3 * GIB
+    report = storage_preflight(
+        tmp_path,
+        tile_count=1_000,
+        stream_count=4,
+        permanent_raster_bytes=raster_bytes,
+        vector_output_reserve_bytes=vector_reserve,
+        permanent_core_pixel_count=1_000,
+        score_cache_budget_gb="auto",
+        min_free_disk_gb=10,
+        current_model_probability_bytes=4096,
+        fusion_accumulator_bytes=2048,
+        mask_confidence_workspace_bytes=1024,
+        safety_margin_bytes=1024,
+        deferred_temporary_reserve_bytes=deferred,
+        available_disk_bytes=100 * GIB,
+        total_disk_bytes=200 * GIB,
+    )
+
+    assert report["formula_version"] == (
+        "disk-aware-cache-v4-streamed-v33-confidence"
+    )
+    assert report["deferred_temporary_reserve_bytes"] == deferred
+    assert report["safe_headroom_bytes"] == (
+        report["available_disk_bytes"]
+        - report["protected_permanent_estimated_bytes"]
+        - report["effective_min_free_disk_bytes"]
+        - report["atomic_write_overhead_bytes"]
+        - deferred
+    )
+    assert report["estimated_required_bytes"] <= report["available_disk_bytes"]
 
 
 def test_storage_preflight_freezes_fusion_atomic_peak_separately(tmp_path):

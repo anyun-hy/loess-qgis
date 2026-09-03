@@ -1,5 +1,17 @@
 # 当前实施状态
 
+## v1.0 冻结基线
+
+`v1.0` 固化 Ubuntu 升级 QGIS 4.2 之前的稳定状态：
+
+| 平台 | QGIS 主机运行时 | 独立推理运行时 |
+| --- | --- | --- |
+| Ubuntu 24.04 | QGIS 3.44.x、Qt5、PyQt5 | Python 3.12、PyTorch 2.6.0 cu124、CUDA、RTX 3090 |
+| macOS | QGIS 4.2.x、Qt6、PyQt6 | Python 3.12.13、PyTorch 2.7.1、MPS |
+
+后续 Ubuntu QGIS 4.2/Qt6 迁移必须以此标签为回滚边界，不得修改
+`v1.0` 标签指向。
+
 ## 已实现
 
 - macOS QGIS 4.2/Qt6/MPS 与 Ubuntu QGIS 3.44/Qt5/CUDA 共用一套源码；

@@ -93,7 +93,7 @@ def process_thread_environment_values(spec, context):
         or job.get("job_type") == "work_package"
     ):
         threads = _resource_value(spec, "package_process_threads", 2)
-    elif job.get("job_type") == "unit_fit":
+    elif job.get("job_type") in {"unit_fit", "unit_confidence"}:
         threads = _unit_fit_process_threads(spec)
     else:
         threads = _resource_value(spec, "assembly_process_threads", 1)
@@ -151,6 +151,7 @@ class PipelinePhaseTiming:
     STAGES = (
         "work_package",
         "fragmentation_v33",
+        "unit_confidence",
         "unit_fit",
         "finalize",
         "assembly",
@@ -606,7 +607,10 @@ class V5AsyncInferenceRunner(QObject):
             entry["context"].get("job") for entry in self._processes.values()
             if entry["context"].get("kind") == "job"
         ]
-        unit_active = sum(1 for job in active_jobs if job and job["job_type"] == "unit_fit")
+        unit_active = sum(
+            1 for job in active_jobs
+            if job and job["job_type"] in {"unit_fit", "unit_confidence"}
+        )
         candidate_active = sum(
             1 for job in active_jobs
             if job and job["job_type"] == "fragmentation_v33"
@@ -633,7 +637,7 @@ class V5AsyncInferenceRunner(QObject):
             and fragmentation.get("publication") == "authoritative_fusion_core"
         )
         v33_enabled = production_v33
-        if v33_enabled and not package_pending:
+        if v33_enabled:
             candidate_counts = self._database.job_counts(
                 self._spec["run_id"], job_type="fragmentation_v33"
             )
@@ -645,7 +649,7 @@ class V5AsyncInferenceRunner(QObject):
                 )
                 return
             configured_candidate_limit = min(
-                4,
+                2 if accelerator_active else 4,
                 max(1, int(fragmentation.get("max_workers", 4))),
             )
             candidate_limit = min(
@@ -686,7 +690,7 @@ class V5AsyncInferenceRunner(QObject):
             job = self._database.lease_next_job(
                 self._spec["run_id"],
                 self._worker_id + f"-geometry-{unit_active}",
-                job_types=("unit_fit",),
+                job_types=("unit_confidence", "unit_fit"),
                 lease_seconds=300,
             )
             if not job:
@@ -734,9 +738,23 @@ class V5AsyncInferenceRunner(QObject):
                 {"kind": "job", "job": job},
             )
             return
+        if job["job_type"] == "unit_confidence":
+            self._start_process(
+                f"unit_confidence:{job['stream_id']}:{job['unit_id']}",
+                "run_unit_confidence.sh",
+                [
+                    "--run-spec", self._spec_path,
+                    "--stream-id", job["stream_id"],
+                    "--unit-id", job["unit_id"],
+                    "--job-id", str(job["job_id"]),
+                    "--lease-token", job["lease_token"],
+                ],
+                {"kind": "job", "job": job},
+            )
+            return
         if job["job_type"] != "unit_fit":
             raise RuntimeError(
-                "QGIS may only launch unit_fit jobs directly; "
+                "QGIS may only launch unit confidence or unit_fit jobs directly; "
                 "Work Packages belong to the persistent accelerator worker"
             )
         self._start_process(
@@ -840,6 +858,8 @@ class V5AsyncInferenceRunner(QObject):
             return "work_package"
         if job.get("job_type") == "fragmentation_v33":
             return "fragmentation_v33"
+        if job.get("job_type") == "unit_confidence":
+            return "unit_confidence"
         if job.get("job_type") == "unit_fit":
             return "unit_fit"
         return {
@@ -1093,11 +1113,19 @@ class V5AsyncInferenceRunner(QObject):
             job = context["job"]
             current = self._database.get_job(job["job_id"])
             if current and current["status"] == "running":
-                if job.get("job_type") == "fragmentation_v33" and success:
+                if job.get("job_type") in {
+                    "fragmentation_v33", "unit_confidence"
+                } and success:
                     success = False
-                    error = (
-                        "V3.3 worker exited without its atomic output commit"
-                    )
+                    if job.get("job_type") == "fragmentation_v33":
+                        error = (
+                            "V3.3 worker exited without its atomic output commit"
+                        )
+                    else:
+                        error = (
+                            "unit confidence worker exited without its atomic "
+                            "output commit"
+                        )
                 self._database.finish_job(
                     job["job_id"],
                     job["lease_token"],
@@ -1231,7 +1259,7 @@ class V5AsyncInferenceRunner(QObject):
             limit=1000,
             kinds=(
                 "partition_probability", "v3_context_core", "v3_baseline_core",
-                "v33_staged_mask", "v33_staged_audit",
+                "v33_staged_mask", "v33_staged_audit", "unit_confidence",
             ),
         )
         for candidate in candidates:

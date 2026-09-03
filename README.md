@@ -1,13 +1,23 @@
 # Loess QGIS 标注与推理
 
-跨平台 QGIS 半自动土地覆盖标注插件与 PostgreSQL 推理运行时，同时支持：
+跨平台 QGIS 半自动土地覆盖标注插件与 PostgreSQL 推理运行时。
 
-- Ubuntu：QGIS 3.44、Qt5/PyQt5、CUDA；
-- macOS：QGIS 4.2、Qt6/PyQt6、MPS。
+## v1.0 平台基线
+
+`v1.0` 是 Ubuntu 升级 QGIS 4.2 之前的冻结基线：
+
+| 平台 | QGIS | Qt / PyQt | 推理后端 | 推理环境 |
+| --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | QGIS 3.44.x | Qt5 / PyQt5 | CUDA / RTX 3090 | Python 3.12、PyTorch 2.6.0 cu124 |
+| macOS | QGIS 4.2.x | Qt6 / PyQt6 | MPS | Python 3.12.13、PyTorch 2.7.1 |
+
+两个平台共用同一套插件、PostgreSQL 控制面和推理协议；QGIS 自带的
+Python/Qt 运行时与独立的 `qgis` Conda 推理环境保持隔离。
 
 > **English summary:** A cross-platform QGIS plugin and PostgreSQL-backed
-> inference runtime for semi-automatic land-cover labeling. The same source
-> tree supports QGIS 3.44 on Ubuntu/CUDA and QGIS 4.2 on macOS/MPS.
+> inference runtime for semi-automatic land-cover labeling. The v1.0 baseline
+> supports QGIS 3.44/Qt5 on Ubuntu/CUDA and QGIS 4.2/Qt6 on macOS/MPS from one
+> shared source tree.
 
 ## 代码组成
 

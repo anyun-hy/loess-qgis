@@ -139,6 +139,7 @@ from ..core.work_package_planner import (
     permanent_output_reserve,
     resolve_frozen_tile_batch_size,
     storage_preflight,
+    unit_confidence_reserve,
 )
 from ..core.environment_report import compact_problem, format_check_details
 from ..core.run_state_db import run_state_from_spec
@@ -1576,6 +1577,15 @@ class LabelingDockWidget(QgsDockWidget):
                 spatial_plan,
                 stream_count=stream_count,
             )
+            v33_confidence = (
+                unit_confidence_reserve(spatial_plan)
+                if bool(
+                    fragmentation.get("enabled", True)
+                    and fragmentation.get("policy_id")
+                    == "fragmentation_v33_configurable_absorption_v1"
+                )
+                else {"reserve_bytes": 0}
+            )
             resolved_resources = (
                 (effective.get("resource_tuning") or {}).get("resolved") or {}
             )
@@ -1637,6 +1647,9 @@ class LabelingDockWidget(QgsDockWidget):
                         (fusion or {}).get("profile"),
                         spatial_plan,
                     )
+                ),
+                deferred_temporary_reserve_bytes=int(
+                    v33_confidence["reserve_bytes"]
                 ),
                 tile_batch_size=storage_batch_size,
             )

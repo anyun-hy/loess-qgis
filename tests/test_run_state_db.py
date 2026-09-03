@@ -1015,7 +1015,9 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path, postgres_d
         sha256=digest,
     )
 
-    assert database.get_artifact(artifact_id)["ref_count"] == 2
+    # Only the owner candidate retains frozen inputs. The global Finalize
+    # consumes staged outputs, so it must not pin probability/context files.
+    assert database.get_artifact(artifact_id)["ref_count"] == 1
     assert database.cleanup_candidates(
         RUN_ID, kinds=("v3_context_core",)
     ) == []
@@ -1042,7 +1044,7 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path, postgres_d
         byte_count=baseline.stat().st_size,
         sha256=hashlib.sha256(baseline.read_bytes()).hexdigest(),
     )
-    assert database.get_artifact(baseline_id)["ref_count"] == 2
+    assert database.get_artifact(baseline_id)["ref_count"] == 1
     leased = database.lease_next_fragmentation_v33(
         RUN_ID, "v33-worker", lease_seconds=120
     )
@@ -1063,13 +1065,14 @@ def test_v33_inputs_publish_and_terminal_release_are_atomic(tmp_path, postgres_d
     assert completed["status"] == "ready"
     assert completed["progress_current"] == 1
     assert completed["progress_total"] == 1
-    # The finalize barrier retains the same inputs after an owner-stage commit.
-    assert database.get_artifact(artifact_id)["ref_count"] == 1
-    assert database.get_artifact(baseline_id)["ref_count"] == 1
-    assert database.cleanup_candidates(
+    # Finalize retains only staged outputs. Frozen owner inputs become
+    # immediately reclaimable after the candidate commits.
+    assert database.get_artifact(artifact_id)["ref_count"] == 0
+    assert database.get_artifact(baseline_id)["ref_count"] == 0
+    assert len(database.cleanup_candidates(
         RUN_ID,
         kinds=("partition_probability", "v3_context_core", "v3_baseline_core"),
-    ) == []
+    )) == 3
 
 
 def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path, postgres_database):
@@ -1130,8 +1133,92 @@ def test_v33_terminal_release_rolls_back_if_dependency_delete_fails(tmp_path, po
         )
 
     assert database.get_job(leased["job_id"])["status"] == "running"
-    assert database.get_artifact(artifact_id)["ref_count"] == 2
-    assert database.get_artifact(baseline_id)["ref_count"] == 2
+    assert database.get_artifact(artifact_id)["ref_count"] == 1
+    assert database.get_artifact(baseline_id)["ref_count"] == 1
+
+
+def test_unit_confidence_publish_and_probability_release_are_atomic(
+    tmp_path, postgres_database
+):
+    database, stream_id, partition_id = _fragmentation_v33_state(
+        postgres_database
+    )
+    unit_id = "core_confidence_atomic"
+    database.insert_spatial_units(
+        RUN_ID,
+        [
+            {
+                "unit_id": unit_id,
+                "unit_type": "Core",
+                "owner_key": partition_id,
+                "pixel_window": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                "dependency_ids": [partition_id],
+            }
+        ],
+    )
+    database.insert_jobs(
+        RUN_ID,
+        [
+            {
+                "job_type": "unit_confidence",
+                "stream_id": stream_id,
+                "unit_id": unit_id,
+            },
+            {
+                "job_type": "unit_fit",
+                "stream_id": stream_id,
+                "unit_id": unit_id,
+            },
+        ],
+    )
+    probability = tmp_path / "atomic_probability.tif"
+    probability.write_bytes(b"probability")
+    probability_id = database.publish_partition_artifact(
+        RUN_ID,
+        stream_id,
+        partition_id,
+        probability,
+        byte_count=probability.stat().st_size,
+        sha256=hashlib.sha256(probability.read_bytes()).hexdigest(),
+    )
+    leased = database.lease_next_job(
+        RUN_ID,
+        "confidence-worker",
+        job_types=("unit_confidence",),
+        lease_seconds=120,
+    )
+    assert leased is not None
+    confidence = tmp_path / "atomic_confidence.tif"
+    confidence.write_bytes(b"confidence")
+    with database._connection() as connection:
+        connection.execute(
+            """CREATE FUNCTION reject_confidence_dependency_release()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected confidence release failure';
+               END;
+               $$"""
+        )
+        connection.execute(
+            """CREATE TRIGGER reject_confidence_dependency_release
+               BEFORE DELETE ON artifact_dependencies FOR EACH ROW
+               EXECUTE FUNCTION reject_confidence_dependency_release()"""
+        )
+
+    with pytest.raises(DatabaseError, match="injected confidence release failure"):
+        database.complete_unit_confidence_job(
+            leased["job_id"],
+            leased["lease_token"],
+            path=confidence,
+            byte_count=confidence.stat().st_size,
+            sha256=hashlib.sha256(confidence.read_bytes()).hexdigest(),
+        )
+
+    assert database.get_job(leased["job_id"])["status"] == "running"
+    assert database.artifact_for_stream_unit(
+        RUN_ID, stream_id, unit_id, "unit_confidence"
+    ) is None
+    assert database.get_artifact(probability_id)["ref_count"] == 2
 
 
 def test_v33_blocks_only_its_fusion_unit_jobs_until_ready(tmp_path, postgres_database):

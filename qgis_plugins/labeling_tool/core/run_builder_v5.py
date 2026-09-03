@@ -27,7 +27,7 @@ from .run_state_db import (
     production_state_schema,
 )
 from .spatial_planner import plan_spatial_units
-from .work_package_planner import plan_work_packages
+from .work_package_planner import plan_work_packages, unit_confidence_reserve
 
 
 RUN_SPEC_SCHEMA_VERSION = 2
@@ -402,6 +402,7 @@ def create_v5_run(
     ]
     storage_value = dict(storage_report)
     if v33_enabled:
+        confidence_reserve = unit_confidence_reserve(spatial_plan)
         retained_input_bytes = sum(
             (
                 (int(partition["halo_window"]["x1"]) - int(partition["halo_window"]["x0"]))
@@ -415,22 +416,42 @@ def create_v5_run(
             )
             for partition in partitions
         )
-        storage_value["v33_retained_input_budget_bytes"] = retained_input_bytes
-        storage_value["v33_retained_input_estimate"] = (
-            "all_probability_halos_uint16_plus_v3_context_and_baseline_cores_int16"
+        storage_value["v33_managed_artifact_ceiling_bytes"] = retained_input_bytes
+        storage_value["v33_managed_artifact_ceiling_basis"] = (
+            "maximum_all_probability_halos_uint16_plus_v3_context_and_"
+            "baseline_cores_int16_not_an_admission_requirement"
         )
         if int(storage_value.get("storage_tuning_schema_version") or 0) >= 2:
-            safe_headroom = int(storage_value.get("safe_headroom_bytes") or 0)
-            working_budget = int(
-                storage_value.get("working_cache_budget_bytes") or 0
+            frozen_confidence_reserve = int(
+                storage_value.get("deferred_temporary_reserve_bytes") or 0
             )
-            if working_budget + retained_input_bytes > safe_headroom:
+            if frozen_confidence_reserve != confidence_reserve["reserve_bytes"]:
                 raise RunBuilderV5Error(
-                    "V3.3 retained inputs exceed frozen storage headroom"
+                    "V3.3 Unit confidence reserve does not match spatial plan"
                 )
-            storage_value["estimated_required_bytes"] = int(
-                storage_value.get("estimated_required_bytes") or 0
-            ) + retained_input_bytes
+        storage_value.update(
+            {
+                "v33_storage_mode": "streamed_unit_confidence_v1",
+                "v33_unit_confidence_budget_bytes": confidence_reserve[
+                    "reserve_bytes"
+                ],
+                "v33_unit_confidence_payload_bytes": confidence_reserve[
+                    "payload_bytes"
+                ],
+                "v33_unit_confidence_file_overhead_bytes": confidence_reserve[
+                    "file_overhead_bytes"
+                ],
+                "v33_unit_confidence_unit_count": confidence_reserve[
+                    "unit_count"
+                ],
+                "v33_retained_input_admission_mode": (
+                    "runtime_backpressure_until_confidence_and_v33_release"
+                ),
+                "v33_admission_reserve_bytes": confidence_reserve[
+                    "reserve_bytes"
+                ],
+            }
+        )
 
     class_snapshot = {
         "class_mapping": {str(code): CLASS_NAMES[code] for code in CLASS_ORDER},
@@ -702,6 +723,21 @@ def create_v5_run(
                     "max_attempts": int(scaling_value["max_job_retries"]) + 1,
                 }
                 for unit in v33_units
+            ),
+        )
+        database.insert_jobs(
+            identifier,
+            (
+                {
+                    "job_type": "unit_confidence",
+                    "stream_id": str(stream_values[-1]["stream_id"]),
+                    "unit_id": str(unit["unit_id"]),
+                    # Confidence compaction releases 14-band probability
+                    # Halos, so it outranks geometry work while Packages run.
+                    "priority": 120,
+                    "max_attempts": int(scaling_value["max_job_retries"]) + 1,
+                }
+                for unit in spatial_plan["spatial_units"]
             ),
         )
     database.insert_jobs(

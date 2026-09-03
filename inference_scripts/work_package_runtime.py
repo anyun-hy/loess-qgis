@@ -58,7 +58,11 @@ from score_batch_cache import (
     remove_owned_temporary_files,
     write_checkpoint,
 )
-from storage_guard import StorageGuard, StorageReserveError
+from storage_guard import (
+    StorageGuard,
+    StorageReserveError,
+    remaining_deferred_temporary_reserve_bytes,
+)
 from semantic_batch import (
     _atomic_json,
     _atomic_npz,
@@ -967,6 +971,11 @@ def _run_work_package_impl(
         if storage_schema >= 2
         else 0
     )
+    deferred_temporary_reserve_bytes = (
+        int(storage_report.get("deferred_temporary_reserve_bytes") or 0)
+        if storage_schema >= 2
+        else 0
+    )
     stream_ids = [
         str(item.get("stream_id") or "")
         for item in spec.get("streams") or []
@@ -1007,25 +1016,38 @@ def _run_work_package_impl(
                     )
                 )
     def remaining_permanent_reserve_bytes() -> int:
+        deferred_remaining = remaining_deferred_temporary_reserve_bytes(
+            spec, database
+        )
         if permanent_estimated_bytes <= 0:
-            return 0
+            return permanent_uncertainty_bytes + deferred_remaining
         remaining = sum(
             byte_count
             for key, byte_count in permanent_bytes_by_key.items()
             if key not in ready_permanent_keys
         )
-        return remaining + permanent_uncertainty_bytes
+        return (
+            remaining
+            + permanent_uncertainty_bytes
+            + deferred_remaining
+        )
 
     managed_budget_bytes = int(
         storage_report.get("working_cache_budget_bytes")
         or storage_report.get("resolved_score_cache_budget_bytes")
         or 0
-    ) + int(storage_report.get("v33_retained_input_budget_bytes") or 0)
+    ) + int(
+        storage_report.get("v33_managed_artifact_ceiling_bytes")
+        or storage_report.get("v33_retained_input_budget_bytes")
+        or 0
+    )
+    managed_budget_bytes += deferred_temporary_reserve_bytes
     managed_roots = (
         package_root,
         tile_cache_dir,
         run_dir / "tmp" / "probability_parts",
         run_dir / "tmp" / "fragmentation_v33_inputs",
+        run_dir / "tmp" / "unit_confidence",
     )
     storage_guard = StorageGuard(
         run_dir,

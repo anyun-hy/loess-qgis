@@ -65,6 +65,8 @@ def _remaining_permanent_reserve_bytes(
     spec: Mapping[str, Any],
     database: RunStateDB,
 ) -> int:
+    """Compatibility wrapper for the shared exact storage calculation."""
+
     return exact_remaining_permanent_bytes(spec, database)
 
 
@@ -73,6 +75,7 @@ def _run_storage_guard(
     database: RunStateDB,
     *,
     disk_usage=None,
+    deferred_temporary_exclusion_bytes: int = 0,
 ) -> StorageGuard:
     storage = dict(spec.get("storage_preflight") or {})
     min_free_bytes = int(
@@ -80,7 +83,13 @@ def _run_storage_guard(
         or float((spec.get("scaling") or {}).get("min_free_disk_gb", 0.0))
         * 1024**3
     )
-    remaining = _remaining_permanent_reserve_bytes(spec, database)
+    remaining = exact_remaining_permanent_bytes(
+        spec,
+        database,
+        deferred_temporary_exclusion_bytes=(
+            deferred_temporary_exclusion_bytes
+        ),
+    )
     options = {
         "min_free_bytes": max(0, min_free_bytes),
         "remaining_permanent_bytes": lambda: remaining,
@@ -227,6 +236,43 @@ def _unit_probabilities(
     return normalized, valid
 
 
+def _unit_confidence_surface(
+    database: RunStateDB,
+    run_id: str,
+    stream_id: str,
+    unit: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the lossless confidence surface produced before V3.3 finalize."""
+
+    artifact = database.artifact_for_stream_unit(
+        run_id,
+        stream_id,
+        str(unit["unit_id"]),
+        "unit_confidence",
+    )
+    if artifact is None:
+        raise UnitRuntimeError(
+            f"Unit confidence dependency is missing: {stream_id}/{unit['unit_id']}"
+        )
+    window = unit["pixel_window"]
+    expected_shape = (
+        int(window["y1"]) - int(window["y0"]),
+        int(window["x1"]) - int(window["x0"]),
+    )
+    with rasterio.open(artifact["path"]) as source:
+        if source.count != 1 or source.dtypes != ("float32",):
+            raise UnitRuntimeError("Unit confidence raster contract is invalid")
+        confidence = source.read(1).astype(np.float32, copy=False)
+    if confidence.shape != expected_shape:
+        raise UnitRuntimeError(
+            f"Unit confidence raster has unexpected shape: {confidence.shape}"
+        )
+    valid = confidence >= 0.0
+    if np.any(~np.isfinite(confidence[valid])) or np.any(confidence[valid] > 1.0):
+        raise UnitRuntimeError("Unit confidence values are outside [0, 1]")
+    return confidence, valid
+
+
 def _unit_authoritative_labels(
     database: RunStateDB,
     run_id: str,
@@ -333,6 +379,18 @@ def _attach_confidence(
     unit: Mapping[str, Any],
 ) -> None:
     confidence = probabilities.max(axis=0)
+    _attach_confidence_surface(records, confidence, valid_mask, unit)
+
+
+def _attach_confidence_surface(
+    records: list[dict[str, Any]],
+    confidence: np.ndarray,
+    valid_mask: np.ndarray,
+    unit: Mapping[str, Any],
+) -> None:
+    confidence = np.asarray(confidence, dtype=np.float32)
+    if confidence.shape != np.asarray(valid_mask).shape:
+        raise UnitRuntimeError("confidence and valid mask shapes differ")
     window = unit["pixel_window"]
     transform = Affine.translation(int(window["x0"]), int(window["y0"]))
     if not records:
@@ -939,9 +997,21 @@ def run_unit_fit(
             )
         smoothing_enabled = bool(boundary.get("enabled", True))
         emit("polygonize_started", run_id=run_id, stream_id=stream_id, unit_id=unit_id)
-        probabilities, probability_valid = _unit_probabilities(
-            database, run_id, stream_id, unit
+        storage = dict(spec.get("storage_preflight") or {})
+        compact_confidence = bool(
+            storage.get("v33_storage_mode") == "streamed_unit_confidence_v1"
+            and str(stream_id).startswith("fusion:")
         )
+        if compact_confidence:
+            confidence, probability_valid = _unit_confidence_surface(
+                database, run_id, stream_id, unit
+            )
+            probabilities = None
+        else:
+            probabilities, probability_valid = _unit_probabilities(
+                database, run_id, stream_id, unit
+            )
+            confidence = probabilities.max(axis=0)
         labels, valid_mask = _unit_authoritative_labels(
             database, run_id, stream_id, unit
         )
@@ -982,8 +1052,8 @@ def run_unit_fit(
             smoothing_enabled=smoothing_enabled,
             output_transform=output_transform,
         )
-        _attach_confidence(raw_records, probabilities, valid_mask, unit)
-        _attach_confidence(formal_records, probabilities, valid_mask, unit)
+        _attach_confidence_surface(raw_records, confidence, valid_mask, unit)
+        _attach_confidence_surface(formal_records, confidence, valid_mask, unit)
         vertex_count = _vertex_count(raw_records)
         emit(
             "polygonize_finished",
