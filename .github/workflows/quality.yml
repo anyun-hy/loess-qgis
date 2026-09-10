@@ -30,7 +30,9 @@ jobs:
           tests/test_public_release.py
           tests/test_ssh_tencent.py
           tests/test_postgres_state_contract.py
-          tests/test_platform_compat.py::test_plugin_targets_qgis3_and_qgis4_from_one_release
-          tests/test_platform_compat.py::test_business_modules_use_the_shared_qt_compatibility_facade
+          tests/test_v5_runner_thread_affinity.py
+          tests/test_ui_design_regressions.py
+          tests/test_platform_compat.py::test_plugin_targets_qgis42_pyqt6_qt6_from_one_release
+          tests/test_platform_compat.py::test_business_modules_use_the_shared_qt6_enum_api
           tests/test_platform_compat.py::test_plugin_install_and_project_initialization_are_independent
           tests/test_platform_compat.py::test_inference_environment_contract_has_two_minimal_platform_locks

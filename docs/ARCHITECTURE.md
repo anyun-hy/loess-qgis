@@ -19,9 +19,10 @@
 
 GitHub `anyun-hy/loess-qgis` 的受保护 `main` 是 macOS 与 Ubuntu 的权威源码：
 
-- Ubuntu：QGIS 3.44、Qt5/PyQt5、独立 `qgis` Conda、CUDA/RTX 3090；
+- Ubuntu：QGIS 4.2、Qt6/PyQt6、原生 Wayland QPA、独立 `qgis` Conda、CUDA/RTX 3090；
 - macOS：QGIS 4.2、Qt6/PyQt6、独立 `qgis` Conda、MPS；
 - 两个平台安装相同插件、推理运行时和 Bash 部署入口；
+- Ubuntu 插件启动契约只接受 Qt6 `wayland` QPA，不提供 X11/xcb 回退；
 - `loess-project` 是生成的部署项目，不是源码仓库；
 - 权重、输入、QGIS 工程、人工标签和输出由用户控制，不随源码部署覆盖。
 
@@ -37,6 +38,42 @@ GitHub `anyun-hy/loess-qgis` 的受保护 `main` 是 macOS 与 Ubuntu 的权威�
 
 QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和其他推理
 任务只使用当前平台的 `qgis` Conda 子进程，禁止混用两边 `site-packages`。
+
+QGIS 插件内部的线程边界也是正式合同：
+
+- GUI 主线程只处理 QWidget、QGIS 图层和经过合并的只读进度快照；
+- 独立 Qt runtime worker 拥有推理调度器、推理 `QProcess` 生命周期、stdout/stderr
+  解析和批量 Job 心跳，创建、启动、停止和销毁不能跨线程；
+- 完整 `pipeline.jsonl` 由独立日志 worker 保持单一打开句柄并按批刷新；
+- 推理监控的 PostgreSQL snapshot、计数和分页查询由独立 worker 串行执行，任一
+  时刻最多一个查询在途，GUI 丢弃旧 Run/旧筛选条件的过期返回；
+- 推理监控由一份汇总状态驱动总览、详细进度、结果与验收、事件与日志四页；
+  四页共享当前 Run、结果流和对象选择，隐藏窗口只降低摘要轮询频率，不停止
+  推理或运行时历史记录；监控内只保留原停止入口，恢复和重做失败包仍由主界面
+  执行原控制流程；
+- `monitor_executions` 为每次开始、恢复和重做建立独立执行，`monitor_spans`
+  保存 Job 尝试、包内模型及组装阶段，`monitor_events` 保存失败、重试、降档、
+  复用和控制转换等低频事件；重试预算与历史尝试编号分离，后续成功通过关联
+  标记旧失败已恢复，不改写历史终态；
+- 高频当前进度仍由现有 Job 与 Stream 快照承载，不能把每个 Tile、像元或进度
+  刷新追加为历史事件；历史写入失败必须报告记录不完整，但监控读取失败只保留
+  最后有效快照并提示过期，不修改实际 Run；
+- 旧未完成 Run 自动归档时仅保留有界的监控执行/尝试/失败/恢复摘要，详细监控
+  行随过程数据清理；旧 Run 没有升级后的历史时明确显示记录不完整；
+- Artifact 清理的 SHA-256 与删除在独立清理 worker 执行；最终制品哈希与调度
+  数据库操作仍在 runtime worker，尚不代表控制线程内已消除所有长任务；
+- runtime、监控查询和 SAM3 的界面关闭路径只请求退出，不同步等待；对象脱离
+  被关闭的父控件后保持存活，直到所属线程或进程实际退出才释放；
+- 运行输入冻结、范围筛选和 accepted 审计使用可取消的后台任务。GUI 只采集
+  独立 feature source、CRS 和 transform context 副本，不把活动图层交给后台；
+- 普通类别编辑依据 edit buffer 中的变化 FID 追踪；提交只更新受影响类别的
+  文件哈希，纯 SAM3 会话状态更新不重算文件。恢复和最终组装仍校验全部类别；
+  provider transaction 模式保留完整快照，不能假设其具有普通编辑缓冲的提交信号；
+- 人工最终组装和拓扑检查在后台执行，组装按批写文件；完成前只写临时结果。
+  GUI 发布前核对源文件身份和未保存编辑；取消、输入变化或计算失败不覆盖旧结果，
+  两个结果文件替换中发生普通 I/O 错误时回滚。它不提供进程崩溃时的跨文件事务；
+- runtime 线程间传递字符串、数字、路径和普通字典；QGIS 文件任务可持有独立
+  feature source 和值对象副本，不传递 QWidget 或活动 QgsMapLayer。
 
 ## 4. 正式运行数据流
 
@@ -72,6 +109,14 @@ QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和�
 - 中间 touched Core 可以部分位于矢量范围外，但正式结果仍必须通过
   gap=0、overlap=0、outside=0，不能把中间像元计数当成精确矢量面积；
 - 大图使用有界 Work Package 和 Partition，不分配整幅概率或整幅线网；
+- CPU 几何并发把 Run Spec 中的冻结核心数作为上限，而不是固定同时启动数：
+  调度器从低并发逐级增容；Ubuntu 同时读取宿主与 cgroup 祖先的 memory PSI、
+  可用内存和 Swap，提前暂停派发并原子中断可重跑 Job，压力恢复后再逐级增容；
+  只有当前并发额度已实际占满且出现新的成功 worker 观测时才允许继续增容，
+  禁止在几何任务尚未启动时空载爬升到冻结上限；非 Linux 平台在压力传感器
+  不可用时保留冻结上限；
+- 模型空间单元的 14 波段概率以 float32 原位解码、累加和归一化；生成单波段
+  confidence 后必须在矢量化前释放概率数组，不能让并行 polygonize 长期持有；
 - Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
 - Run JSON 只保存冻结配置和摘要，不保存几十万 Tile 明细；
 - 临时 Tile/probability Artifact 只有在依赖提交后才按引用关系清理；V3.3 Run

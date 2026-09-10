@@ -43,7 +43,7 @@
       "sublabel": "输入、结果层、推理监控",
       "pos": [200, 300],
       "size": [190, 72],
-      "tag": "QGIS 3.44 / 4.2"
+      "tag": "QGIS 4.2 / PyQt6 / Qt6"
     },
     {
       "id": "inputs",

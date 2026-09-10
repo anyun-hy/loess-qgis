@@ -2,22 +2,26 @@
 
 跨平台 QGIS 半自动土地覆盖标注插件与 PostgreSQL 推理运行时。
 
-## v1.0 平台基线
+## 当前开发运行时目标
 
-`v1.0` 是 Ubuntu 升级 QGIS 4.2 之前的冻结基线：
+当前源码以 macOS 与腾讯 Ubuntu 的 QGIS 4.2 / PyQt6 / Qt6 为共同主机运行时：
 
 | 平台 | QGIS | Qt / PyQt | 推理后端 | 推理环境 |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | QGIS 3.44.x | Qt5 / PyQt5 | CUDA / RTX 3090 | Python 3.12、PyTorch 2.6.0 cu124 |
+| 腾讯 Ubuntu 26.04.1 | QGIS 4.2.2 | Qt6 / PyQt6 / Wayland | CUDA / RTX 3090 | 主机 Python 3.14.4；推理 Python 3.12、PyTorch 2.6.0 cu124 |
 | macOS | QGIS 4.2.x | Qt6 / PyQt6 | MPS | Python 3.12.13、PyTorch 2.7.1 |
 
 两个平台共用同一套插件、PostgreSQL 控制面和推理协议；QGIS 自带的
 Python/Qt 运行时与独立的 `qgis` Conda 推理环境保持隔离。
+Ubuntu 插件只支持原生 Qt6 Wayland QPA，不提供 X11/xcb 兼容入口。
 
-> **English summary:** A cross-platform QGIS plugin and PostgreSQL-backed
-> inference runtime for semi-automatic land-cover labeling. The v1.0 baseline
-> supports QGIS 3.44/Qt5 on Ubuntu/CUDA and QGIS 4.2/Qt6 on macOS/MPS from one
-> shared source tree.
+`v1.0` 标签仍是 Ubuntu QGIS 3.44 / Qt5 的冻结回滚点；当前分支不再以
+QGIS 3 或 Qt5 作为可部署目标。
+
+> **English summary:** The current source targets QGIS 4.2 / PyQt6 / Qt6 on
+> both macOS and Ubuntu, while retaining separate QGIS-host and Conda-inference
+> runtimes. The v1.0 tag remains the frozen Ubuntu QGIS 3.44 / Qt5 rollback
+> baseline.
 
 ## 代码组成
 
