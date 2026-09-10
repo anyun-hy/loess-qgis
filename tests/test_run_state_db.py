@@ -50,7 +50,120 @@ def test_schema_reports_postgresql_control_plane_health(postgres_database):
         "unit_report_summaries",
         "object_links",
         "events",
+        "monitor_executions",
+        "monitor_spans",
+        "monitor_events",
     }.issubset(tables)
+
+
+def test_monitor_history_uses_independent_execution_and_attempt_ids(postgres_database):
+    database = _database(postgres_database)
+    execution_id = database.begin_monitor_execution(RUN_ID, "start")
+    database.insert_jobs(
+        RUN_ID,
+        [{"job_type": "tile_inference", "tile_id": "0_0"}],
+    )
+
+    leased = database.lease_next_job(RUN_ID, "worker", lease_seconds=120)
+    assert leased is not None
+    assert leased["monitor_execution_id"] == execution_id
+    assert leased["monitor_span_id"]
+    event_id = database.append_monitor_event(
+        RUN_ID,
+        "job_retry_warning",
+        execution_id=execution_id,
+        span_id=leased["monitor_span_id"],
+        level="warning",
+        object_type="job",
+        object_id=str(leased["job_id"]),
+        job_id=leased["job_id"],
+        message="temporary warning",
+    )
+    assert database.finish_job(
+        leased["job_id"], leased["lease_token"], status="ready"
+    )
+
+    spans = database.page_monitor_spans(RUN_ID)
+    assert len(spans) == 1
+    assert spans[0]["span_id"] == leased["monitor_span_id"]
+    assert spans[0]["attempt_no"] == 1
+    assert spans[0]["budget_attempt"] == 1
+    assert spans[0]["status"] == "completed"
+    assert spans[0]["ended_at"]
+    recovered = database.page_monitor_events(RUN_ID, limit=20)
+    warning = next(row for row in recovered if row["monitor_event_id"] == event_id)
+    assert warning["recovered_by_span_id"] == leased["monitor_span_id"]
+
+    assert database.finish_monitor_execution(
+        RUN_ID, execution_id, status="completed"
+    )
+    next_execution = database.begin_monitor_execution(RUN_ID, "resume")
+    assert next_execution != execution_id
+    snapshot = database.monitor_history_snapshot(RUN_ID)
+    assert snapshot["available"] is True
+    assert snapshot["latest_execution"]["execution_id"] == next_execution
+    assert snapshot["span_status_counts"] == {"completed": 1}
+
+
+def test_monitor_events_are_idempotent_and_cursor_paged(postgres_database):
+    database = _database(postgres_database)
+    execution_id = database.begin_monitor_execution(RUN_ID, "start")
+    first = database.append_monitor_event(
+        RUN_ID,
+        "package_tile_batch_reduced",
+        execution_id=execution_id,
+        object_type="package",
+        object_id="package_00000",
+        message="batch 16 to 8",
+        idempotency_key="batch-reduction:package_00000:1",
+    )
+    duplicate = database.append_monitor_event(
+        RUN_ID,
+        "package_tile_batch_reduced",
+        execution_id=execution_id,
+        object_type="package",
+        object_id="package_00000",
+        message="duplicate callback",
+        idempotency_key="batch-reduction:package_00000:1",
+    )
+    assert duplicate == first
+    rows = database.page_monitor_events(RUN_ID, search="batch", limit=2)
+    assert rows[0]["monitor_event_id"] == first
+    assert rows[0]["message"] == "batch 16 to 8"
+    assert database.page_monitor_events(
+        RUN_ID, before_event_id=first, limit=10
+    )
+
+
+def test_monitor_attempt_number_is_independent_from_retry_budget(postgres_database):
+    database = _database(postgres_database)
+    execution_id = database.begin_monitor_execution(RUN_ID, "start")
+    database.insert_jobs(
+        RUN_ID,
+        [{"job_type": "unit_fit", "unit_id": "unit-1", "max_attempts": 3}],
+    )
+    first = database.lease_next_job(RUN_ID, "worker-1", lease_seconds=120)
+    assert first is not None
+    assert database.interrupt_job(first["job_id"], first["lease_token"])
+
+    second = database.lease_next_job(RUN_ID, "worker-2", lease_seconds=120)
+    assert second is not None
+    assert second["monitor_span_id"] != first["monitor_span_id"]
+    assert database.finish_job(
+        second["job_id"], second["lease_token"], status="ready"
+    )
+
+    spans = database.page_monitor_spans(RUN_ID)
+    assert [row["attempt_no"] for row in spans] == [2, 1]
+    assert [row["budget_attempt"] for row in spans] == [1, 1]
+    assert [row["status"] for row in spans] == ["completed", "interrupted"]
+    events = database.page_monitor_events(RUN_ID, object_id="unit-1", limit=20)
+    retry = next(row for row in events if row["event_type"] == "job_retry_started")
+    interrupted = next(
+        row for row in events if row["event_type"] == "job_attempt_interrupted"
+    )
+    assert retry["execution_id"] == execution_id
+    assert interrupted["recovered_by_span_id"] == second["monitor_span_id"]
 
 
 def test_stream_runtime_progress_is_bounded_restart_visible_and_phase_aware(postgres_database):

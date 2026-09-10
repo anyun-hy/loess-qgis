@@ -390,6 +390,84 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS monitor_executions (
+    execution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    last_observed_at TEXT NOT NULL,
+    recording_complete BOOLEAN NOT NULL DEFAULT TRUE,
+    message TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS monitor_spans (
+    span_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    parent_span_id TEXT,
+    span_kind TEXT NOT NULL,
+    object_type TEXT NOT NULL DEFAULT '',
+    object_id TEXT NOT NULL DEFAULT '',
+    stream_id TEXT NOT NULL DEFAULT '',
+    package_id TEXT NOT NULL DEFAULT '',
+    unit_id TEXT NOT NULL DEFAULT '',
+    model_id TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL DEFAULT '',
+    job_id BIGINT,
+    attempt_no INTEGER NOT NULL DEFAULT 0,
+    budget_attempt INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    last_observed_at TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL,
+    UNIQUE (run_id, idempotency_key),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY (execution_id) REFERENCES monitor_executions(execution_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (parent_span_id) REFERENCES monitor_spans(span_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS monitor_events (
+    monitor_event_id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    execution_id TEXT,
+    span_id TEXT,
+    timestamp TEXT NOT NULL,
+    level TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    object_type TEXT NOT NULL DEFAULT '',
+    object_id TEXT NOT NULL DEFAULT '',
+    stream_id TEXT NOT NULL DEFAULT '',
+    package_id TEXT NOT NULL DEFAULT '',
+    unit_id TEXT NOT NULL DEFAULT '',
+    job_id BIGINT,
+    message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    recovered_by_span_id TEXT,
+    idempotency_key TEXT NOT NULL,
+    UNIQUE (run_id, idempotency_key),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY (execution_id) REFERENCES monitor_executions(execution_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (span_id) REFERENCES monitor_spans(span_id) ON DELETE SET NULL,
+    FOREIGN KEY (recovered_by_span_id) REFERENCES monitor_spans(span_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE SET NULL
+);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS monitor_execution_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS monitor_span_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS monitor_runtime_json TEXT NOT NULL DEFAULT '{}';
+
 CREATE INDEX IF NOT EXISTS idx_streams_status
     ON streams(run_id, status, stream_id);
 CREATE INDEX IF NOT EXISTS idx_stream_progress_stage
@@ -426,6 +504,19 @@ CREATE INDEX IF NOT EXISTS idx_object_nodes_root
     ON object_nodes(run_id, stream_id, parent_id, part_id);
 CREATE INDEX IF NOT EXISTS idx_events_time
     ON events(run_id, event_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_monitor_executions_run
+    ON monitor_executions(run_id, started_at DESC, execution_id);
+CREATE INDEX IF NOT EXISTS idx_monitor_spans_run_cursor
+    ON monitor_spans(run_id, started_at DESC, span_id);
+CREATE INDEX IF NOT EXISTS idx_monitor_spans_execution_object
+    ON monitor_spans(run_id, execution_id, object_type, object_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_spans_job
+    ON monitor_spans(run_id, job_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_events_run_cursor
+    ON monitor_events(run_id, monitor_event_id DESC);
+CREATE INDEX IF NOT EXISTS idx_monitor_events_execution_object
+    ON monitor_events(run_id, execution_id, object_type, object_id,
+                      monitor_event_id DESC);
 
 CREATE OR REPLACE FUNCTION artifact_dependency_refcount_insert()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -448,6 +539,65 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION monitor_job_span_terminal_update()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.status='running' AND NEW.status!='running'
+       AND COALESCE(OLD.monitor_span_id,'')!='' THEN
+        UPDATE monitor_spans
+           SET status=CASE NEW.status
+                 WHEN 'ready' THEN 'completed'
+                 WHEN 'failed' THEN 'failed'
+                 WHEN 'stopped' THEN 'stopped'
+                 WHEN 'interrupted' THEN 'interrupted'
+                 ELSE NEW.status
+               END,
+               ended_at=NEW.updated_at,
+               last_observed_at=NEW.updated_at,
+               message=NEW.error
+         WHERE span_id=OLD.monitor_span_id AND status='running';
+        IF NEW.status IN ('failed','stopped','interrupted') THEN
+            INSERT INTO monitor_events
+                (run_id,execution_id,span_id,timestamp,level,event_type,
+                 object_type,object_id,stream_id,package_id,unit_id,job_id,
+                 message,payload_json,idempotency_key)
+            VALUES (
+                NEW.run_id,NULLIF(OLD.monitor_execution_id,''),OLD.monitor_span_id,
+                NEW.updated_at,
+                CASE WHEN NEW.status='failed' THEN 'error' ELSE 'warning' END,
+                'job_attempt_' || NEW.status,
+                CASE WHEN NEW.job_type='work_package' THEN 'package' ELSE 'job' END,
+                COALESCE(NULLIF(NEW.package_id,''),NULLIF(NEW.unit_id,''),NEW.job_id::text),
+                NEW.stream_id,NEW.package_id,NEW.unit_id,NEW.job_id,
+                COALESCE(NULLIF(NEW.error,''),'Job attempt ' || NEW.status),
+                json_build_object('job_type',NEW.job_type,'status',NEW.status,
+                                  'budget_attempt',NEW.attempt)::text,
+                'job:' || NEW.job_id::text || ':span:' || OLD.monitor_span_id ||
+                ':terminal:' || NEW.status
+            )
+            ON CONFLICT(run_id,idempotency_key) DO NOTHING;
+        END IF;
+        IF NEW.status='ready' THEN
+            UPDATE monitor_events e
+               SET recovered_by_span_id=OLD.monitor_span_id
+              FROM monitor_spans s
+             WHERE s.span_id=OLD.monitor_span_id
+               AND e.run_id=s.run_id
+               AND e.recovered_by_span_id IS NULL
+               AND e.level IN ('warning','error')
+               AND e.timestamp<=NEW.updated_at
+               AND e.stream_id=s.stream_id
+               AND (
+                 (s.job_id IS NOT NULL AND e.job_id=s.job_id) OR
+                 (e.job_id IS NULL AND s.object_id<>''
+                  AND e.object_type=s.object_type AND e.object_id=s.object_id)
+               );
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 DO $trigger$
 BEGIN
     IF NOT EXISTS (
@@ -467,6 +617,15 @@ BEGIN
         CREATE TRIGGER artifact_dependency_after_delete
         AFTER DELETE ON artifact_dependencies
         FOR EACH ROW EXECUTE FUNCTION artifact_dependency_refcount_delete();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgname='monitor_job_span_terminal'
+           AND tgrelid='jobs'::regclass
+    ) THEN
+        CREATE TRIGGER monitor_job_span_terminal
+        AFTER UPDATE OF status ON jobs
+        FOR EACH ROW EXECUTE FUNCTION monitor_job_span_terminal_update();
     END IF;
 END;
 $trigger$;
@@ -513,6 +672,13 @@ def initialize_postgres(
                        ON CONFLICT(name) DO UPDATE SET
                          value=EXCLUDED.value,updated_at=EXCLUDED.updated_at""",
                     (str(int(schema_version)), str(now)),
+                )
+                cursor.execute(
+                    """INSERT INTO schema_metadata(name,value,updated_at)
+                       VALUES ('monitor_history_version','1',%s)
+                       ON CONFLICT(name) DO UPDATE SET
+                         value=EXCLUDED.value,updated_at=EXCLUDED.updated_at""",
+                    (str(now),),
                 )
             finally:
                 cursor.execute(

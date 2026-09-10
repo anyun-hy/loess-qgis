@@ -201,6 +201,21 @@ def test_archive_incomplete_run_details_preserves_tombstone_and_deletes_graph(
     database = postgres_database
     run_id = f"20260901_100000_{status}"
     _seed_run(database, tmp_path, run_id, status)
+    execution_id = database.begin_monitor_execution(run_id, "start")
+    span_id = database.start_monitor_span(
+        run_id,
+        execution_id=execution_id,
+        span_kind="package_model",
+        object_type="model_in_package",
+        object_id="package_00000:model:a",
+        package_id="package_00000",
+        stream_id=STREAM_ID,
+        idempotency_key="fixture-span",
+    )
+    database.finish_monitor_span(span_id, status="failed", message="fixture")
+    database.finish_monitor_execution(
+        run_id, execution_id, status="failed", message="fixture"
+    )
 
     report = database.archive_incomplete_run_details(
         protected_run_id="20260901_110000_current"
@@ -218,6 +233,10 @@ def test_archive_incomplete_run_details_preserves_tombstone_and_deletes_graph(
     assert archive["detail_counts"]["artifacts"] == 1
     assert archive["detail_counts"]["object_nodes"] == 2
     assert archive["detail_counts"]["object_links"] == 1
+    assert archive["monitor_history_summary"]["details_archived"] is True
+    assert archive["monitor_history_summary"]["execution_count"] == 1
+    assert archive["monitor_history_summary"]["attempt_count"] == 1
+    assert archive["monitor_history_summary"]["failed_count"] == 1
     assert archive["errors"][0]["message"] in {
         "fixture event failure",
         "fixture unit failure",
