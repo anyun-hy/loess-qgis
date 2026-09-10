@@ -73,6 +73,28 @@ def test_rtx3090_profile_uses_sixteen_tile_batch_and_twenty_core_budget():
     assert scaling["max_concurrent_assembly"] == 4
     assert evidence["resolved"]["package_process_threads"] == 4
     assert evidence["resolved"]["fragmentation_v33_process_threads"] == 4
+    assert evidence["schema_version"] == 3
+    assert evidence["resolved"]["memory_admission"] == {
+        "schema_version": 1,
+        "mode": "adaptive_psi_aimd_v1",
+        "sample_interval_sec": 1.0,
+        "stable_growth_sec": 5.0,
+        "initial_geometry_slots_with_package": 4,
+        "initial_geometry_slots_without_package": 8,
+        "default_worker_peak_bytes": int(2.5 * GIB),
+        "minimum_available_reserve_bytes": 16 * GIB,
+        "available_reserve_ratio": 0.20,
+        "pressure_some_avg10": 8.0,
+        "pressure_full_avg10": 1.0,
+        "severe_some_avg10": 25.0,
+        "severe_full_avg10": 5.0,
+        "stable_some_avg10": 2.0,
+        "stable_full_avg10": 0.2,
+        "low_available_ratio": 0.20,
+        "severe_available_ratio": 0.10,
+        "high_swap_used_ratio": 0.65,
+        "severe_swap_used_ratio": 0.85,
+    }
     assert (
         scaling["max_cpu_partition_workers_with_package"]
         + evidence["resolved"]["package_process_threads"]
@@ -117,14 +139,32 @@ def test_accelerator_probe_candidates_are_exponential_but_cpu_stays_at_one():
     ) == [1]
 
 
-def test_cuda_batch_probe_keeps_ten_percent_or_two_gib_headroom():
+def test_environment_probe_can_stop_at_the_production_starting_batch():
     hardware = _hardware(
         cores=20,
         memory_gib=100,
         kind="cuda",
         accelerator_gib=24,
     )
-    assert batch_probe_safety_reserve_bytes(hardware) == int(24 * GIB * 0.10)
+
+    assert model_batch_probe_candidates(
+        hardware,
+        maximum_batch_size=16,
+    ) == [1, 2, 4, 8, 16]
+    assert model_batch_probe_candidates(
+        hardware,
+        maximum_batch_size=12,
+    ) == [1, 2, 4, 8, 12]
+
+
+def test_cuda_batch_probe_keeps_twenty_percent_or_four_gib_headroom():
+    hardware = _hardware(
+        cores=20,
+        memory_gib=100,
+        kind="cuda",
+        accelerator_gib=24,
+    )
+    assert batch_probe_safety_reserve_bytes(hardware) == int(24 * GIB * 0.20)
 
 
 def test_per_model_probe_mapping_is_frozen_and_scalar_uses_safe_minimum():

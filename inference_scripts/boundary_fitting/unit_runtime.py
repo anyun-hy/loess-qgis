@@ -195,7 +195,10 @@ def _decode_partition_window(
         y1 - y0,
     )
     with rasterio.open(artifact["path"]) as source:
-        raw = source.read(window=window)
+        # Decode directly into float32 and scale in place.  The old expression
+        # first kept the quantized raster, then allocated both an ``astype``
+        # buffer and a multiplied result for every active unit-fit process.
+        raw = source.read(window=window, out_dtype="float32")
         scales = np.asarray(source.scales, dtype=np.float32)
     if raw.shape != (14, y1 - y0, x1 - x0):
         raise UnitRuntimeError(
@@ -203,7 +206,8 @@ def _decode_partition_window(
         )
     if scales.shape != (14,) or np.any(scales <= 0):
         raise UnitRuntimeError("Partition probability scale metadata is invalid")
-    return raw.astype(np.float32) * scales[:, None, None]
+    raw *= scales[:, None, None]
+    return raw
 
 
 def _unit_probabilities(
@@ -212,28 +216,40 @@ def _unit_probabilities(
     stream_id: str,
     unit: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    arrays = [
-        _decode_partition_window(
+    probabilities = None
+    dependency_count = 0
+    for partition_id in unit["dependency_ids"]:
+        decoded = _decode_partition_window(
             database,
             run_id,
             stream_id,
             partition_id,
             unit["pixel_window"],
         )
-        for partition_id in unit["dependency_ids"]
-    ]
-    if not arrays:
+        dependency_count += 1
+        if probabilities is None:
+            probabilities = decoded
+        else:
+            if decoded.shape != probabilities.shape:
+                raise UnitRuntimeError("Partition Halo crops disagree on unit shape")
+            np.add(probabilities, decoded, out=probabilities)
+            del decoded
+    if probabilities is None:
         raise UnitRuntimeError("spatial unit has no Partition dependencies")
-    reference = arrays[0].shape
-    if any(array.shape != reference for array in arrays):
-        raise UnitRuntimeError("Partition Halo crops disagree on unit shape")
-    probabilities = np.mean(arrays, axis=0, dtype=np.float32)
-    denominator = probabilities.sum(axis=0, keepdims=True)
-    valid = denominator[0] > 0
-    normalized = np.zeros_like(probabilities)
+    if dependency_count > 1:
+        probabilities /= np.float32(dependency_count)
+    denominator = probabilities.sum(axis=0, dtype=np.float32)
+    valid = denominator > 0
     if np.any(valid):
-        normalized[:, valid] = probabilities[:, valid] / denominator[:, valid]
-    return normalized, valid
+        np.divide(
+            probabilities,
+            denominator[None, :, :],
+            out=probabilities,
+            where=valid[None, :, :],
+        )
+    if np.any(~valid):
+        probabilities[:, ~valid] = 0.0
+    return probabilities, valid
 
 
 def _unit_confidence_surface(
@@ -1012,6 +1028,11 @@ def run_unit_fit(
                 database, run_id, stream_id, unit
             )
             confidence = probabilities.max(axis=0)
+            # Geometry fitting only needs the confidence surface from here on.
+            # Releasing fourteen probability bands before polygonization keeps
+            # each concurrent process from retaining hundreds of MiB while
+            # Shapely/GDAL build their own geometry structures.
+            del probabilities
         labels, valid_mask = _unit_authoritative_labels(
             database, run_id, stream_id, unit
         )
@@ -1206,6 +1227,7 @@ def run_unit_fit(
             stream_id=stream_id,
             unit_id=unit_id,
             status=report["status"],
+            peak_rss_bytes=int(report["peak_rss_bytes"]),
         )
         return report
     except Exception as error:

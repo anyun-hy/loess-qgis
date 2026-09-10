@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 
 GIB = 1024**3
-TUNING_SCHEMA_VERSION = 2
+TUNING_SCHEMA_VERSION = 3
 BATCH_PROBE_SCHEMA_VERSION = 1
 CUDA_BATCH_PROBE_CEILING = 128
 MPS_BATCH_PROBE_CEILING = 64
@@ -108,7 +108,11 @@ def batch_probe_safety_reserve_bytes(hardware: Mapping[str, Any]) -> int:
     kind = str(hardware.get("accelerator_kind") or "cpu")
     total = int(hardware.get("accelerator_memory_total_bytes") or 0)
     if kind == "cuda":
-        return max(2 * GIB, int(total * 0.10)) if total > 0 else 2 * GIB
+        # The isolated probe does not include the live Package tile buffers,
+        # score queues, and allocator fragmentation.  Keep enough headroom for
+        # those resident allocations instead of treating a nearly full probe
+        # as a production-safe batch.
+        return max(4 * GIB, int(total * 0.20)) if total > 0 else 4 * GIB
     if kind == "mps":
         return max(4 * GIB, int(total * 0.20)) if total > 0 else 4 * GIB
     return 0
@@ -116,13 +120,15 @@ def batch_probe_safety_reserve_bytes(hardware: Mapping[str, Any]) -> int:
 
 def model_batch_probe_candidates(
     hardware: Mapping[str, Any],
+    *,
+    maximum_batch_size: int | None = None,
 ) -> list[int]:
     """Build one bounded exponential probe sequence for the active device.
 
     CPU remains deliberately conservative.  Accelerator probes are isolated by
-    ``check_environment.py`` and stop at the first failed or low-headroom
-    candidate, so this ceiling is only an upper bound rather than a promised
-    allocation.
+    ``check_environment.py``.  ``maximum_batch_size`` lets environment checks
+    validate the production starting Batch without stress-testing unused larger
+    allocations; omitting it retains the hardware diagnostic ceiling.
     """
 
     kind = str(hardware.get("accelerator_kind") or "cpu")
@@ -133,11 +139,15 @@ def model_batch_probe_candidates(
         if kind == "cuda"
         else MPS_BATCH_PROBE_CEILING
     )
+    if maximum_batch_size is not None:
+        ceiling = min(ceiling, max(1, int(maximum_batch_size)))
     values: list[int] = []
     value = 1
     while value <= ceiling:
         values.append(value)
         value *= 2
+    if values[-1] != ceiling:
+        values.append(ceiling)
     return values
 
 
@@ -274,6 +284,32 @@ def resolve_hardware_tuning(
         "package_process_threads": package_threads,
         "fragmentation_v33_process_threads": package_threads,
         "assembly_process_threads": 1,
+        # This is a runtime ceiling policy rather than another frozen worker
+        # count.  The QGIS scheduler starts below the CPU ceiling, grows one
+        # slot at a time, and backs off before systemd-oomd's PSI threshold.
+        "memory_admission": {
+            "schema_version": 1,
+            "mode": "adaptive_psi_aimd_v1",
+            "sample_interval_sec": 1.0,
+            "stable_growth_sec": 5.0,
+            "initial_geometry_slots_with_package": min(
+                4, geometry_with_package
+            ),
+            "initial_geometry_slots_without_package": min(8, geometry_workers),
+            "default_worker_peak_bytes": int(2.5 * GIB),
+            "minimum_available_reserve_bytes": 16 * GIB,
+            "available_reserve_ratio": 0.20,
+            "pressure_some_avg10": 8.0,
+            "pressure_full_avg10": 1.0,
+            "severe_some_avg10": 25.0,
+            "severe_full_avg10": 5.0,
+            "stable_some_avg10": 2.0,
+            "stable_full_avg10": 0.2,
+            "low_available_ratio": 0.20,
+            "severe_available_ratio": 0.10,
+            "high_swap_used_ratio": 0.65,
+            "severe_swap_used_ratio": 0.85,
+        },
     }
     automatic_fields = [
         name
