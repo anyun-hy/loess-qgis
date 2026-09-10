@@ -8,7 +8,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .run_index import record_run_state
 from .run_spec import (
@@ -40,6 +40,23 @@ logger = logging.getLogger("labeling_tool.run_builder_v5")
 
 class RunBuilderV5Error(ValueError):
     pass
+
+
+class RunBuilderV5Cancelled(RuntimeError):
+    """Raised only when an asynchronous Run build is explicitly cancelled."""
+
+
+def _build_checkpoint(
+    *,
+    progress: Callable[[float, str], None] | None,
+    is_canceled: Callable[[], bool] | None,
+    value: float,
+    message: str,
+) -> None:
+    if is_canceled is not None and is_canceled():
+        raise RunBuilderV5Cancelled("Run task graph creation was cancelled")
+    if progress is not None:
+        progress(float(value), str(message))
 
 
 def _extent(value: Mapping[str, Any]) -> dict[str, float]:
@@ -222,6 +239,8 @@ def create_v5_run(
     reserved_run_dir: str | Path | None = None,
     state_database: str | Path | None = None,
     deployment_project_root: str | Path | None = None,
+    progress: Callable[[float, str], None] | None = None,
+    is_canceled: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], Path, str | Path]:
     """Freeze a Run Spec and atomically populate its PostgreSQL control graph."""
     if not models:
@@ -243,6 +262,13 @@ def create_v5_run(
             raise RunBuilderV5Error("reserved run directory is outside the output workspace")
         if not (run_dir / RESERVATION_FILE).is_file():
             raise RunBuilderV5Error("reserved run directory has already been consumed")
+
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=0,
+        message="正在验证 Run 参数",
+    )
 
     scaling_value = dict(scaling)
     boundary_value = dict(boundary_fitting)
@@ -391,6 +417,12 @@ def create_v5_run(
         spatial_plan,
         package_tile_limit=int(storage_report["package_tile_limit"]),
         estimated_bytes_per_tile=int(storage_report["working_bytes_per_tile"]),
+    )
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=8,
+        message="空间单元与 Work Package 规划完成",
     )
     package_by_partition = package_plan["package_by_partition"]
     partitions = [
@@ -628,6 +660,12 @@ def create_v5_run(
     spec["run_spec_content_sha256"] = _json_sha(spec)
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=12,
+        message="Run Spec 已冻结",
+    )
 
     database_location = state_location
     database = RunStateDB(database_location, postgres_schema=state_schema)
@@ -643,14 +681,38 @@ def create_v5_run(
             "package_count": package_plan["package_count"],
         },
     )
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=16,
+        message="PostgreSQL Run 已创建",
+    )
     database.register_streams(identifier, stream_values)
     database.insert_work_packages(identifier, package_plan["packages"])
     database.insert_partitions(identifier, partitions)
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=22,
+        message="Partition 与 Work Package 已写入",
+    )
     database.insert_spatial_units(identifier, spatial_plan["spatial_units"])
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=32,
+        message="空间单元已写入",
+    )
     database.insert_stream_units(
         identifier,
         (stream["stream_id"] for stream in stream_values),
         (unit["unit_id"] for unit in spatial_plan["spatial_units"]),
+    )
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=45,
+        message="结果流空间单元已写入",
     )
 
     partition_rows = int(spatial_plan["partition_rows"])
@@ -688,6 +750,12 @@ def create_v5_run(
             }
 
     inserted = database.insert_tiles(identifier, normalized_tiles())
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=68,
+        message="Tile 索引已写入",
+    )
     if inserted != int(tile_rows) * int(tile_cols):
         raise RunBuilderV5Error(
             f"Tile count mismatch: expected {int(tile_rows) * int(tile_cols)}, got {inserted}"
@@ -709,6 +777,12 @@ def create_v5_run(
             for package in package_plan["packages"]
         ),
     )
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=70,
+        message="Work Package Job 已写入",
+    )
     if v33_enabled:
         v33_units = _fragmentation_v33_units(partitions)
         database.insert_spatial_units(identifier, v33_units)
@@ -725,6 +799,12 @@ def create_v5_run(
                 for unit in v33_units
             ),
         )
+        _build_checkpoint(
+            progress=progress,
+            is_canceled=is_canceled,
+            value=78,
+            message="V3.3 Job 已写入",
+        )
         database.insert_jobs(
             identifier,
             (
@@ -740,6 +820,12 @@ def create_v5_run(
                 for unit in spatial_plan["spatial_units"]
             ),
         )
+        _build_checkpoint(
+            progress=progress,
+            is_canceled=is_canceled,
+            value=86,
+            message="置信度 Job 已写入",
+        )
     database.insert_jobs(
         identifier,
         (
@@ -753,6 +839,12 @@ def create_v5_run(
             for stream in stream_values
             for unit in spatial_plan["spatial_units"]
         ),
+    )
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=97,
+        message="空间拟合 Job 已写入",
     )
     try:
         incomplete_run_cleanup = database.archive_incomplete_run_details(
@@ -819,4 +911,10 @@ def create_v5_run(
         record_run_state(output, identifier, status="planned")
     except (OSError, ValueError) as exc:
         logger.warning("无法更新轻量 Run 启动索引: %s", exc)
+    _build_checkpoint(
+        progress=progress,
+        is_canceled=is_canceled,
+        value=100,
+        message="Run 任务图建立完成",
+    )
     return spec, spec_path, database_location

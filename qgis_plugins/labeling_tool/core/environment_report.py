@@ -51,3 +51,25 @@ def format_problem_details(checks, stderr=""):
 def format_check_details(checks, stderr=""):
     """Build selectable text containing every environment check."""
     return _format_check_details(checks, stderr)
+
+
+def format_execution_details(report):
+    """Build the stable identity and QProcess result for one check attempt."""
+
+    process = report.get("process") or {}
+    values = (
+        ("检查编号", report.get("check_id")),
+        ("开始时间", report.get("started_at")),
+        ("完成时间", report.get("finished_at")),
+        ("退出码", process.get("exit_code")),
+        ("退出状态", process.get("exit_status")),
+        ("结果来源", process.get("report_source")),
+        ("进程错误", process.get("error")),
+        ("诊断文件", report.get("diagnostics_path")),
+    )
+    lines = [
+        f"{label}: {value}"
+        for label, value in values
+        if value not in (None, "")
+    ]
+    return "[本次检查]\n" + ("\n".join(lines) if lines else "无进程元数据")

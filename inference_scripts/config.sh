@@ -1,4 +1,4 @@
-# Shared launcher config for Ubuntu/QGIS 3.44 and macOS/QGIS 4.2.
+# Shared launcher config for Ubuntu and macOS QGIS 4.2 hosts.
 LOESS_INFERENCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOESS_PROJECT_ROOT="$(cd "${LOESS_INFERENCE_DIR}/.." && pwd)"
 LOESS_RUNTIME_ROOT="${LOESS_PROJECT_ROOT}/runtime"
@@ -23,8 +23,8 @@ else
   LOESS_PLATFORM="${LOESS_PLATFORM:-auto}"
 fi
 
-# An initialized project carries a minimal, hash-bound copy of the three pure
-# Python modules shared with the QGIS plugin.  Source checkouts continue to use
+# An initialized project carries a minimal, hash-bound copy of the pure Python
+# modules shared with the QGIS plugin.  Source checkouts continue to use
 # their adjacent qgis_plugins tree; deployed projects resolve the same import
 # names from this runtime root without rewriting Python files.
 if [ -d "${LOESS_RUNTIME_ROOT}/labeling_tool/core" ]; then
@@ -95,4 +95,8 @@ export PYTHONNOUSERSITE=1
 if [ "$LOESS_PLATFORM" = "ubuntu" ]; then
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
   export CUDA_LAUNCH_BLOCKING=0
+  # The persistent worker deliberately changes batch sizes after capacity
+  # pressure.  Expandable segments reduce allocator fragmentation across those
+  # differently sized allocations while preserving an explicit operator value.
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
 fi

@@ -83,8 +83,8 @@ fi
 
 case "${PLATFORM}" in
   ubuntu)
-    EXPECTED_QGIS="3.44."
-    DEFAULT_PLUGIN_ROOT="${HOME}/.local/share/QGIS/QGIS3/profiles/${PROFILE}/python/plugins"
+    EXPECTED_QGIS="4.2."
+    DEFAULT_PLUGIN_ROOT="${HOME}/.local/share/QGIS/QGIS4/profiles/${PROFILE}/python/plugins"
     ;;
   macos)
     EXPECTED_QGIS="4.2."
@@ -145,7 +145,7 @@ if contains(source_root, destination) or contains(destination, source_root):
   echo "Missing plugin LICENSE" >&2
   exit 1
 }
-for shared_name in run_spec.py run_state_db.py postgres_state.py ownership_neighbors.py; do
+for shared_name in run_spec.py run_state_db.py postgres_state.py monitor_contract.py ownership_neighbors.py work_package_planner.py; do
   [[ -f "${PLUGIN_SRC}/core/${shared_name}" ]] || {
     echo "Missing shared runtime source: ${shared_name}" >&2
     exit 1
@@ -155,7 +155,7 @@ grep -q '^version=1\.0\.0$' "${PLUGIN_SRC}/metadata.txt" || {
   echo "Plugin metadata is not the unified 1.0.0 release" >&2
   exit 1
 }
-grep -q '^qgisMinimumVersion=3\.44$' "${PLUGIN_SRC}/metadata.txt"
+grep -q '^qgisMinimumVersion=4\.2$' "${PLUGIN_SRC}/metadata.txt"
 grep -q '^qgisMaximumVersion=4\.99$' "${PLUGIN_SRC}/metadata.txt"
 
 detect_qgis_version() {
@@ -281,7 +281,7 @@ for path in sorted(p for p in root.rglob("*") if p.is_file()):
 
 shared = {}
 aggregate = hashlib.sha256()
-for name in sorted(("run_spec.py", "run_state_db.py", "postgres_state.py", "ownership_neighbors.py")):
+for name in sorted(("run_spec.py", "run_state_db.py", "postgres_state.py", "monitor_contract.py", "ownership_neighbors.py", "work_package_planner.py")):
     canonical = f"qgis_plugins/labeling_tool/core/{name}"
     digest = files[f"core/{name}"]
     shared[canonical] = digest
@@ -314,6 +314,7 @@ payload = {
 echo "Validated ${PLUGIN_NAME} 1.0.0"
 echo "  platform: ${PLATFORM}"
 echo "  QGIS: ${qgis_version}"
+echo "  plugin directory: ${DEST_PLUGIN}"
 echo "  Git SHA: ${GIT_SHA}"
 echo "  source bundle: $(
   "${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["source_bundle_sha256"])' \

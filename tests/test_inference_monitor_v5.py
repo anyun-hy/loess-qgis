@@ -1,8 +1,8 @@
 """Source-level contracts for the schema-v2 inference monitor.
 
 These tests intentionally avoid importing QGIS.  They protect the monitor's
-control-plane semantics on both QGIS 3/Qt5 and QGIS 4/Qt6 while the live UI is
-covered separately by platform acceptance.
+control-plane semantics on QGIS 4.2 / PyQt6 / Qt6 while the live UI is covered
+separately by platform acceptance.
 """
 
 from __future__ import annotations
@@ -10,14 +10,20 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import importlib.util
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_TIME_SPEC = importlib.util.spec_from_file_location(
+    "monitor_time_contract", ROOT / "qgis_plugins/labeling_tool/gui/monitor_time.py"
+)
+_TIME_MODULE = importlib.util.module_from_spec(_TIME_SPEC)
+_TIME_SPEC.loader.exec_module(_TIME_MODULE)
 MONITOR_PATH = (
     ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "inference_monitor.py"
 )
@@ -26,6 +32,7 @@ RUNNER_PATH = ROOT / "qgis_plugins" / "labeling_tool" / "core" / "v5_async_runne
 SOURCE = MONITOR_PATH.read_text(encoding="utf-8")
 LOG_PANEL_SOURCE = LOG_PANEL_PATH.read_text(encoding="utf-8")
 RUNNER_SOURCE = RUNNER_PATH.read_text(encoding="utf-8")
+WIDGET_SOURCE = (MONITOR_PATH.parent / "monitor_widgets.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 LOG_PANEL_TREE = ast.parse(LOG_PANEL_SOURCE)
 
@@ -104,6 +111,7 @@ def _execute_method(name: str, instance, *args):
         "_assembly_fraction": lambda _status, _progress: 0.5,
         "ASSEMBLY_PROGRESS_SCALE": 1000,
         "time": time,
+        "json": json,
     }
     exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
     return namespace[name](instance, *args)
@@ -112,7 +120,14 @@ def _execute_method(name: str, instance, *args):
 def _execute_log_panel_method(name: str, instance, *args, **kwargs):
     function = copy.deepcopy(_log_panel_method(name))
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {"datetime": datetime, "time": time}
+    namespace = {
+        "datetime": datetime,
+        "timezone": timezone,
+        "parse_monitor_timestamp": _TIME_MODULE.parse_monitor_timestamp,
+        "time": time,
+        "MAX_RAW_RECORDS": 20000,
+        "MAX_EVENT_DETAIL_RECORDS": 200,
+    }
     exec(compile(module, str(LOG_PANEL_PATH), "exec"), namespace)
     return namespace[name](instance, *args, **kwargs)
 
@@ -144,18 +159,28 @@ def _called_method_updates_phase_and_title(method_name: str) -> bool:
 
 
 def test_left_monitor_uses_run_package_and_unit_layers():
-    build_ui = _method_source("_build_ui")
+    build_ui = "\n".join(
+        _method_source(name)
+        for name in (
+            "_build_ui",
+            "_build_overview_page",
+            "_build_detail_page",
+            "_build_results_page",
+            "_build_events_page",
+        )
+    )
 
-    assert "self._run_overview = QLabel(" in build_ui
-    assert "self._package_overview = QLabel(" in build_ui
-    assert "self._unit_overview = QLabel(" in build_ui
+    assert "self._run_overview = _muted_label(" in build_ui
+    assert "self._package_overview = _muted_label(" in build_ui
+    assert "self._unit_overview = _muted_label(" in build_ui
 
     table_calls = [
         node
-        for node in ast.walk(_method("_build_ui"))
+        for method_name in ("_build_overview_page", "_build_detail_page", "_build_results_page", "_build_events_page")
+        for node in ast.walk(_method(method_name))
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "QTableWidget"
+        and node.func.id in {"QTableWidget", "AdaptiveTable"}
     ]
     assert any(
         len(call.args) >= 2
@@ -175,13 +200,13 @@ def test_left_monitor_uses_run_package_and_unit_layers():
         "阶段耗时",
     ):
         assert label in build_ui
-    assert "self._assembly_overview = QLabel(" in build_ui
-    assert "self._coverage_overview = QLabel(" in build_ui
+    assert "self._assembly_overview = _muted_label(" in build_ui
+    assert "self._coverage_overview = _muted_label(" in build_ui
     assert "空白/重叠验收" in build_ui
 
 
 def test_result_stream_table_is_compact_and_scrollable():
-    build_ui = _method_source("_build_ui")
+    build_ui = _method_source("_build_results_page")
 
     assert "STREAM_TABLE_VISIBLE_ROWS = 5" in SOURCE
     assert (
@@ -192,10 +217,37 @@ def test_result_stream_table_is_compact_and_scrollable():
         "self._streams.setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)"
         in build_ui
     )
-    assert "* STREAM_TABLE_VISIBLE_ROWS" in build_ui
-    assert "self._streams.setFixedHeight(stream_table_height)" in build_ui
-    assert "left_layout.addWidget(self._streams)" in build_ui
-    assert "left_layout.addWidget(self._streams, stretch=2)" not in build_ui
+    assert "self._streams.setFixedHeight" not in build_ui
+    assert "streams_layout.addWidget(self._streams)" in build_ui
+    assert "configure_adaptive_columns" in build_ui
+    assert "INTERACTIVE" in WIDGET_SOURCE
+
+
+def test_monitor_uses_four_linked_native_pages_and_scoped_responsive_theme():
+    build = _method_source("_build_ui")
+    overview = _method_source("_build_overview_page")
+    overview_update = _method_source("_update_database_overviews")
+    detail = _method_source("_build_detail_page")
+    results = _method_source("_build_results_page")
+    events = _method_source("_build_events_page")
+    responsive = _method_source("_apply_responsive_layout")
+    theme = _method_source("_apply_theme")
+
+    for label in ("总览", "详细进度", "结果与验收", "事件与日志"):
+        assert label in build
+    assert "并行执行" in overview
+    assert "模型与融合结果" in overview
+    # The action guidance is populated from the live snapshot, rather than
+    # being hard-coded while the overview page is constructed.
+    assert "当前无需人工处理" in overview_update
+    assert "历史尝试" in detail
+    assert "ASSEMBLY_PHASES" in results
+    assert "加载更早记录" in events
+    assert "恢复上次运行" not in build + overview + detail + results + events
+    assert "重做失败包" not in build + overview + detail + results + events
+    assert "setOrientation(VERTICAL)" in responsive
+    assert "MONITOR_STYLE[selected]" in theme
+    assert "log_panel.set_theme(selected)" in theme
 
 
 def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
@@ -209,25 +261,16 @@ def test_database_binding_accepts_the_run_spec_for_stage_aware_monitoring():
 
 
 def test_database_poll_uses_one_snapshot_with_separate_progress_lanes():
-    poll = _method("_poll_database")
-    snapshot_calls = []
-    legacy_calls = []
-
-    for node in ast.walk(poll):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr == "monitor_snapshot":
-            snapshot_calls.append(node)
-        if node.func.attr in {
-            "job_counts",
-            "stream_unit_counts",
-            "stream_unit_type_counts",
-        }:
-            legacy_calls.append(node.func.attr)
-
-    assert len(snapshot_calls) == 1
-    assert legacy_calls == []
     poll_source = _method_source("_poll_database")
+    apply_source = _method_source("_apply_database_snapshot")
+    assert "monitor_snapshot" not in poll_source
+    assert "self._pending_snapshot_query" in poll_source
+    assert "self._dispatch_next_query()" in poll_source
+    assert "database.monitor_snapshot(run_id)" in SOURCE
+    assert "database.job_counts(" not in SOURCE.split(
+        "class _MonitorQueryWorker", 1
+    )[1].split("class InferenceMonitorDialog", 1)[0]
+    poll_source = apply_source
     assert 'job_counts.get("work_package")' in poll_source
     assert 'job_counts.get("unit_fit")' in poll_source
     assert 'snapshot.get("stream_unit_type_counts")' in poll_source
@@ -307,7 +350,7 @@ def test_database_phase_terminal_states_are_unambiguous():
         nonterminal_counts,
         nonterminal_counts,
         [{"status": "pending"}],
-    ) == ("stopped", "已停止，可安全恢复", 0, 1)
+        ) == ("stopped", "已停止；恢复操作位于主界面", 0, 1)
     assert _execute_method(
         "_database_phase",
         monitor,
@@ -367,7 +410,7 @@ def test_package_failure_marks_open_streams_failed_before_run_poll_catches_up():
         _log_panel=SimpleNamespace(append_system=errors.append),
     )
 
-    _execute_method("_poll_database", monitor)
+    _execute_method("_apply_database_snapshot", monitor, snapshot)
 
     assert errors == []
     assert rows["model:test"]["stage"] == "上游 Work Package 失败"
@@ -414,7 +457,7 @@ def test_same_package_new_attempt_resets_transient_monitor_activity():
         _log_panel=SimpleNamespace(append_system=errors.append),
     )
 
-    _execute_method("_poll_database", monitor)
+    _execute_method("_apply_database_snapshot", monitor, snapshot)
 
     assert errors == []
     assert monitor._package_activity["package_id"] == "package_00000"
@@ -464,7 +507,7 @@ def test_poll_uses_unit_fit_jobs_instead_of_stale_stream_unit_activity():
         _log_panel=SimpleNamespace(append_system=errors.append),
     )
 
-    _execute_method("_poll_database", monitor)
+    _execute_method("_apply_database_snapshot", monitor, snapshot)
 
     assert errors == []
     assert rows["model:test"]["unit_progress"] == "0/1"
@@ -478,7 +521,7 @@ def test_poll_uses_unit_fit_jobs_instead_of_stale_stream_unit_activity():
 def test_active_package_inference_is_not_overwritten_by_queued_units():
     event_handler = _method_source("_on_stream_progress")
     package_handler = _method_source("_update_package_activity")
-    poll = _method_source("_poll_database")
+    poll = _method_source("_apply_database_snapshot")
 
     assert "work_package" in event_handler
     assert "_active_inference_stream" in package_handler
@@ -498,11 +541,13 @@ def test_package_events_without_stream_id_are_processed_before_the_guard():
 
 
 def test_title_and_phase_follow_the_current_database_stage():
-    assert _called_method_updates_phase_and_title("_poll_database")
+    poll = _method_source("_apply_database_snapshot")
+    assert 'getattr(self, "_update_database_overviews", None)' in poll
+    assert _called_method_updates_phase_and_title("_update_database_overviews")
 
 
 def test_terminal_snapshot_does_not_disable_a_subsequent_resume():
-    poll = _method_source("_poll_database")
+    poll = _method_source("_apply_database_snapshot")
     finished = _method_source("_on_finished")
 
     # bind_state_database polls before runner.resume changes failed/stopped back
@@ -514,9 +559,9 @@ def test_terminal_snapshot_does_not_disable_a_subsequent_resume():
 
 
 def test_elapsed_column_tracks_the_current_persisted_assembly_phase():
-    build_ui = _method_source("_build_ui")
+    build_ui = _method_source("_build_results_page")
     step_finished = _method_source("_on_step_finished")
-    poll = _method_source("_poll_database")
+    poll = _method_source("_apply_database_snapshot")
 
     assert "阶段耗时" in build_ui
     assert "elapsed" in step_finished
@@ -561,7 +606,7 @@ def test_persisted_assembly_progress_replaces_completed_unit_counts():
         _log_panel=SimpleNamespace(append_system=errors.append),
     )
 
-    _execute_method("_poll_database", monitor)
+    _execute_method("_apply_database_snapshot", monitor, snapshot)
 
     assert errors == []
     assert rows["model:test"]["stage"] == "写入正式 GPKG"
@@ -572,7 +617,7 @@ def test_persisted_assembly_progress_replaces_completed_unit_counts():
 
 
 def test_monitor_reads_persisted_coverage_validation_summary():
-    poll = _method_source("_poll_database")
+    poll = _method_source("_apply_database_snapshot")
     coverage = _method_source("_update_coverage_overview")
 
     assert 'snapshot.get("stream_coverage_validation")' in poll
@@ -582,12 +627,13 @@ def test_monitor_reads_persisted_coverage_validation_summary():
 
 
 def test_log_panel_is_retained_but_collapsed_by_default():
-    build_ui = _method_source("_build_ui")
+    build_ui = _method_source("_build_overview_page") + _method_source("_build_events_page")
+    theme = _method_source("_apply_theme")
     toggle = _method_source("_set_log_visible")
     quick_filter = _method_source("_show_log_severity")
-    assert 'QPushButton("显示日志")' in build_ui
-    assert 'QPushButton("Warning 0")' in build_ui
-    assert 'QPushButton("Error 0")' in build_ui
+    assert 'QPushButton("显示原始日志")' in build_ui
+    assert 'self._warning_log_button.setText(f"历史警告  {self._log_warning_count}")' in theme
+    assert 'self._error_log_button.setText(f"历史错误  {self._log_error_count}")' in theme
     assert 'self._show_log_severity("warning")' in build_ui
     assert 'self._show_log_severity("error")' in build_ui
     assert "self._log_panel.setVisible(False)" in build_ui
@@ -600,8 +646,8 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
     build_ui = _method_source("_build_ui")
     update = _method_source("_update_database_overviews")
     assert "self._overall_bar = QProgressBar()" in build_ui
-    assert "整体任务完成度" in build_ui
-    assert "不是剩余时间估算" in build_ui
+    assert "本次推理任务完成度" in build_ui
+    assert "按任务组统计，不代表剩余时间。" in build_ui
     assert "_overall_completion_fraction(" in update
 
     fraction, group_count = _execute_module_function(
@@ -686,21 +732,50 @@ def test_log_panel_separates_source_severity_and_readable_details():
         'severity: str,',
         'self._visible_severities: set[str] = {"info", "warning", "error"}',
         '("all", "全部")',
-        '("warning", "Warning")',
-        '("error", "Error")',
+        '("warning", "警告")',
+        '("error", "错误")',
         'QPushButton("技术详情")',
         '("系统处理", event["system_action"])',
         '("用户操作", event["user_action"])',
         'event["repeat_count"] = int(event["repeat_count"]) + 1',
         "self._raw_records.append(raw_record)",
         "pending_records.append(raw_record)",
-        "self.log_edit.setMaximumBlockCount(20000)",
-        "QTimer.singleShot(100, self._finish_scheduled_rebuild)",
+        "self.log_edit.setMaximumBlockCount(MAX_VISIBLE_LOG_BLOCKS)",
+        "self._coalesced_rebuild_timer.start()",
     ):
         assert contract in LOG_PANEL_SOURCE
 
     assert "self._event_index.clear()" in LOG_PANEL_SOURCE
     assert "self._raw_records.clear()" in LOG_PANEL_SOURCE
+
+
+def test_log_panel_yields_between_bounded_rebuild_batches():
+    rebuild = ast.get_source_segment(
+        LOG_PANEL_SOURCE, _log_panel_method("_rebuild")
+    )
+    batch = ast.get_source_segment(
+        LOG_PANEL_SOURCE, _log_panel_method("_render_rebuild_batch")
+    )
+    severity_filter = ast.get_source_segment(
+        LOG_PANEL_SOURCE, _log_panel_method("set_visible_severities")
+    )
+
+    assert "tuple(" in rebuild
+    assert "self._render_rebuild_batch()" in rebuild
+    assert "REBUILD_FRAME_BUDGET_SECONDS" in batch
+    assert "REBUILD_BATCH_SIZE" in batch
+    assert "self._rebuild_timer.start()" in batch
+    assert "if selected == self._visible_severities:" in severity_filter
+    assert "QApplication.processEvents" not in LOG_PANEL_SOURCE
+
+
+def test_log_panel_bounds_document_and_python_history():
+    assert "MAX_VISIBLE_LOG_BLOCKS = 4000" in LOG_PANEL_SOURCE
+    assert "MAX_CACHED_EVENTS = 5000" in LOG_PANEL_SOURCE
+    assert "MAX_RAW_RECORDS = 20000" in LOG_PANEL_SOURCE
+    assert "MAX_EVENT_DETAIL_RECORDS = 200" in LOG_PANEL_SOURCE
+    assert "QPlainTextEdit.LineWrapMode.NoWrap" in LOG_PANEL_SOURCE
+    assert "def _trim_event_cache(self)" in LOG_PANEL_SOURCE
 
 
 def test_log_panel_deduplicates_display_but_preserves_every_raw_record():
@@ -712,6 +787,9 @@ def test_log_panel_deduplicates_display_but_preserves_every_raw_record():
         _event_visible=lambda _event: False,
         _render_event=lambda _event: None,
         _rebuild=lambda: None,
+        _rebuild_in_progress=False,
+        _trim_event_cache=lambda: None,
+        _schedule_rebuild=lambda: None,
     )
     values = {
         "source": "stderr",
@@ -738,6 +816,35 @@ def test_log_panel_deduplicates_display_but_preserves_every_raw_record():
         "Core-037 timeout",
         '{"error":"Core-037 timeout"}',
     ]
+
+
+def test_log_panel_preserves_capture_time_and_labels_missing_source_time():
+    panel = SimpleNamespace(
+        _events=[], _event_index={}, _raw_records=[], _pending_stderr_records={},
+        _event_visible=lambda _event: False, _render_event=lambda _event: None,
+        _rebuild_in_progress=False, _trim_event_cache=lambda: None,
+        _schedule_rebuild=lambda: None,
+    )
+    original = "2026-09-09T10:00:00.123456Z"
+    _execute_log_panel_method("append_event", panel, "source event", source="stdout",
+                              severity="info", event_timestamp=original)
+    captured = panel._raw_records[-1]
+    assert captured["source_timestamp"] == original
+    assert captured["timestamp_kind"] == "captured"
+    assert datetime.fromisoformat(captured["timestamp"]) == datetime.fromisoformat(original)
+    assert captured["received_at"] != captured["timestamp"]
+    _execute_log_panel_method("append_event", panel, "local event", source="system", severity="info")
+    received = panel._raw_records[-1]
+    assert received["timestamp_kind"] == "received"
+    assert received["timestamp"] == received["received_at"]
+    assert datetime.fromisoformat(received["timestamp"]).tzinfo is not None
+    _execute_log_panel_method("append_event", panel, "epoch zero", source="stdout",
+                              severity="info", event_timestamp=0)
+    assert datetime.fromisoformat(panel._raw_records[-1]["timestamp"]).timestamp() == 0
+
+
+def test_monitor_forwards_existing_log_capture_time():
+    assert 'event_timestamp=context.get("timestamp")' in _method_source("_on_log")
 
 
 def test_log_fingerprint_keeps_tasks_and_attempts_separate():
@@ -767,6 +874,9 @@ def test_error_event_carries_recent_stderr_trace_as_technical_context():
         _event_visible=lambda _event: False,
         _render_event=lambda _event: None,
         _rebuild=lambda: None,
+        _rebuild_in_progress=False,
+        _trim_event_cache=lambda: None,
+        _schedule_rebuild=lambda: None,
     )
     for line in ("Traceback (most recent call last):", '  File "worker.py"'):
         assert _execute_log_panel_method(
@@ -804,6 +914,9 @@ def test_concurrent_process_traces_are_buffered_by_context_key():
         _event_visible=lambda _event: False,
         _render_event=lambda _event: None,
         _rebuild=lambda: None,
+        _rebuild_in_progress=False,
+        _trim_event_cache=lambda: None,
+        _schedule_rebuild=lambda: None,
     )
     for context_key, line in (("Core-A", "trace A"), ("Core-B", "trace B")):
         _execute_log_panel_method(
@@ -849,7 +962,7 @@ def test_runner_keeps_legacy_log_signal_and_adds_process_context_signal():
 def test_terminal_failures_are_promoted_to_single_structured_log_events():
     step_finished = _method_source("_on_step_finished")
     pipeline_finished = _method_source("_on_finished")
-    poll = _method_source("_poll_database")
+    poll = _method_source("_on_query_failed")
 
     assert '"event": "monitor_step_failed"' in step_finished
     assert '"attempt": int(self._step_attempts.get(name) or 1)' in step_finished
@@ -862,15 +975,15 @@ def test_terminal_failures_are_promoted_to_single_structured_log_events():
 def test_tile_and_spatial_unit_details_remain_bounded_and_paged():
     bind = _method_source("bind_state_database")
     page = _method_source("_render_database_page")
+    apply_page = _method_source("_apply_detail_result")
 
     assert "self._page_size = max(1, min(int(page_size), 500))" in bind
-    assert ".page_tiles(" in page
-    assert ".page_stream_units(" in page
-    assert "limit=self._page_size" in page
-    assert "offset=offset" in page
-    assert "self._tiles.setRowCount(len(values))" in page
-    assert "每页最多 {self._page_size}" in page
-    assert "{stream_id}" in page
+    assert "database.page_tiles(" in SOURCE
+    assert "database.page_stream_units(" in SOURCE
+    assert '"page_size": self._page_size' in page
+    assert "self._tiles.setRowCount(len(values))" in apply_page
+    assert "每页最多 {self._page_size}" in apply_page
+    assert "self._stream_display_name(stream_id)" in apply_page
 
 
 def test_poll_preserves_global_cpu_counts_across_multiple_streams():
@@ -913,7 +1026,7 @@ def test_poll_preserves_global_cpu_counts_across_multiple_streams():
         _log_panel=SimpleNamespace(append_system=errors.append),
     )
 
-    _execute_method("_poll_database", monitor)
+    _execute_method("_apply_database_snapshot", monitor, snapshot)
 
     assert errors == []
     assert overview["unit_job_counts"] == {"ready": 18, "running": 2}
@@ -922,12 +1035,13 @@ def test_poll_preserves_global_cpu_counts_across_multiple_streams():
 
 
 def test_detail_filters_match_tile_selection_and_unit_job_semantics():
-    build_ui = _method_source("_build_ui")
+    build_ui = _method_source("_build_detail_page")
     sync = _method_source("_sync_detail_status_options")
     reset = _method_source("_reset_detail_page")
-    page = _method_source("_render_database_page")
+    page = _method_source("_apply_detail_result")
 
-    assert 'DETAIL_STATUS_OPTIONS["unit"]' in build_ui
+    assert 'DETAIL_STATUS_OPTIONS["package"]' in build_ui
+    assert 'DETAIL_STATUS_OPTIONS["unit"]' in sync
     for label in ("等待纳入", "已纳入", "Accepted 跳过", "已排除"):
         assert label in SOURCE
     assert "blockSignals(True)" in sync
@@ -936,3 +1050,47 @@ def test_detail_filters_match_tile_selection_and_unit_job_semantics():
     assert "Tile 输入清单" in page
     assert "选择状态" in page
     assert "if signature == self._detail_signature" in page
+
+
+def test_monitor_database_reads_are_serialized_off_the_gui_thread():
+    init = _method_source("__init__")
+    poll = _method_source("_poll_database")
+    detail = _method_source("_render_database_page")
+    dispatch = _method_source("_dispatch_next_query")
+
+    assert 'QThread(self)' in init
+    assert 'moveToThread(self._query_thread)' in init
+    assert 'setObjectName("loess-monitor-postgresql")' in init
+    assert "monitor_snapshot" not in poll
+    assert "count_stream_units" not in detail
+    assert "page_stream_units" not in detail
+    assert "self._query_busy" in dispatch
+    assert "self._query_requested.emit" in dispatch
+    assert '"request_id": self._latest_snapshot_request_id' in poll
+    assert "self._latest_detail_request_id" in detail
+    result = _method_source("_on_query_result")
+    assert "active = dict(self._active_query or {})" in result
+    assert 'active.get("request_id")' in result
+    assert "self._detail_request_matches_controls(active)" in result
+    controls = _method_source("_detail_request_matches_controls")
+    for field in ("stream_id", "detail_kind", "status", "search", "page"):
+        assert field in controls
+
+
+def test_monitor_uses_batched_runner_events_and_debounced_search():
+    attach = _method_source("attach_runner")
+    build = _method_source("_build_detail_page")
+    batch = _method_source("_on_log_batch")
+    init = _method_source("__init__")
+
+    assert 'getattr(runner, "log_batch", None)' in attach
+    assert 'getattr(runner, "stream_progress_batch", None)' in attach
+    assert "self._on_log_batch" in attach
+    assert "self._on_stream_progress_batch" in attach
+    assert "self._schedule_detail_search" in build
+    assert "setInterval(300)" in init
+    assert "now - self._last_detail_requested_at < 2.0" in _method_source(
+        "_render_database_page"
+    )
+    assert "begin_batch()" in batch
+    assert "end_batch()" in batch

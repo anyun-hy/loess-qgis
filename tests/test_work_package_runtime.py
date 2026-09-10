@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import rasterio
 import assemble_stream as assemble_stream_module
+import boundary_fitting.unit_runtime as unit_runtime_module
 import work_package_runtime
 from affine import Affine
 from rasterio.transform import from_origin
@@ -23,6 +24,7 @@ from labeling_tool.core.run_spec import atomic_write_json
 from labeling_tool.core.spatial_planner import plan_spatial_units
 from boundary_fitting.unit_runtime import (
     _polygonize,
+    _unit_probabilities,
     _write_diagnostic_geoparquet,
     _write_geoparquet,
     run_unit_fit,
@@ -54,6 +56,37 @@ from storage_guard import StorageReserveError
 
 def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_unit_probabilities_accumulate_and_normalize_in_place(monkeypatch):
+    first = np.zeros((14, 2, 3), dtype=np.float32)
+    second = np.zeros((14, 2, 3), dtype=np.float32)
+    first[0, :, :] = 1.0
+    second[1, :, :] = 1.0
+    first[:, 0, 0] = 0.0
+    second[:, 0, 0] = 0.0
+    decoded = iter((first, second))
+    monkeypatch.setattr(
+        unit_runtime_module,
+        "_decode_partition_window",
+        lambda *_args, **_kwargs: next(decoded),
+    )
+
+    probabilities, valid = _unit_probabilities(
+        object(),
+        "run-1",
+        "model:test",
+        {
+            "dependency_ids": ["partition-a", "partition-b"],
+            "pixel_window": {"x0": 0, "y0": 0, "x1": 3, "y1": 2},
+        },
+    )
+
+    assert np.shares_memory(probabilities, first)
+    assert valid.tolist() == [[False, True, True], [True, True, True]]
+    assert np.all(probabilities[:, 0, 0] == 0.0)
+    assert np.all(probabilities[0, valid] == np.float32(0.5))
+    assert np.all(probabilities[1, valid] == np.float32(0.5))
 
 
 def _scaling():
@@ -686,6 +719,26 @@ def test_persistent_worker_fails_fixed_managed_budget_instead_of_waiting(
     assert database.job_counts(spec["run_id"], job_type="work_package") == {
         "failed": 1
     }
+
+
+def test_persistent_model_provider_restores_reduced_batch_after_process_restart(
+    tmp_path,
+):
+    state_path = tmp_path / "logs" / "accelerator_batch_limits.json"
+    model = {"model_id": "mambaout"}
+    first = PersistentModelProvider(batch_state_path=state_path)
+
+    assert first.effective_batch_size(model, "cuda:0", 64) == 64
+    first.remember_batch_size(model, "cuda:0", 32)
+    first.remember_batch_size(model, "cuda:0", 48)
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": 1,
+        "limits": {"mambaout@cuda:0": 32},
+    }
+    restarted = PersistentModelProvider(batch_state_path=state_path)
+    assert restarted.effective_batch_size(model, "cuda:0", 64) == 32
 
 
 def test_keep_score_cache_delays_but_does_not_accumulate_after_package_ready(

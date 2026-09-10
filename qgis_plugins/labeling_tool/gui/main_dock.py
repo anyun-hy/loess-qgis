@@ -20,15 +20,21 @@ from qgis.core import (
     Qgis,
     QgsApplication, QgsProject, QgsVectorLayer, QgsRasterLayer,
     QgsCoordinateTransform,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransformContext, QgsVectorLayerFeatureSource,
     QgsPointXY, QgsRectangle, QgsSettings,
 )
 
 from ..core.layer_names import LAYER_NAMES
-from ..qt_compat import (
+from ..qt6_api import (
     ALIGN_LEFT,
     ALIGN_VCENTER,
+    CLOSE,
+    CRITICAL,
     EXTENDED_SELECTION,
+    INFORMATION,
+    MENU_SCROLLER_HEIGHT,
     NO,
+    NON_MODAL,
     NO_EDIT_TRIGGERS,
     RESIZE_TO_CONTENTS,
     SCROLLBAR_AS_NEEDED,
@@ -37,18 +43,90 @@ from ..qt_compat import (
     TEXT_SELECTABLE_BY_MOUSE,
     USER_ROLE,
     WA_DELETE_ON_CLOSE,
+    WARNING,
     YES,
 )
 
 
-class _FixedMapLayerComboBox(QgsMapLayerComboBox):
-    """Keep the native layer popup anchored inside a macOS dock widget."""
+class _ScreenBoundMapLayerComboBox(QgsMapLayerComboBox):
+    """Keep long layer lists scrollable and inside the active screen."""
+
+    MAX_VISIBLE_ITEMS = 15
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaxVisibleItems(self.MAX_VISIBLE_ITEMS)
+        self.view().setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)
+
+    def _visible_rows_height(self):
+        view = self.view()
+        visible_rows = min(self.count(), self.MAX_VISIBLE_ITEMS)
+        if visible_rows < 1:
+            return 0
+
+        sampled_rows = list(range(visible_rows))
+        current_row = self.currentIndex()
+        if current_row >= visible_rows:
+            sampled_rows.append(current_row)
+        row_height = max(
+            (view.sizeHintForRow(row) for row in sampled_rows),
+            default=-1,
+        )
+        if row_height < 1:
+            row_height = view.fontMetrics().height() + 8
+        return row_height * visible_rows
+
+    def _popup_height_limit(self):
+        view = self.view()
+        rows_height = self._visible_rows_height()
+        if rows_height < 1:
+            return 0
+        popup = view.window()
+        margins = popup.contentsMargins()
+        menu_scroller_height = self.style().pixelMetric(
+            MENU_SCROLLER_HEIGHT, None, self
+        )
+        return (
+            rows_height
+            + 2 * view.frameWidth()
+            + margins.top()
+            + margins.bottom()
+            + 2 * menu_scroller_height
+        )
 
     def showPopup(self):
+        view = self.view()
+        popup = view.window()
+        height_limit = self._popup_height_limit()
+        if height_limit > 0:
+            popup.setMaximumHeight(height_limit)
+
+        anchor = self.mapToGlobal(self.rect().bottomLeft())
+        screen = QApplication.screenAt(anchor) or self.screen()
+        if screen is not None:
+            popup.setMaximumWidth(screen.availableGeometry().width())
+
         super().showPopup()
-        popup = self.view().window()
-        if popup:
-            popup.move(self.mapToGlobal(self.rect().bottomLeft()))
+
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        popup_size = popup.frameGeometry().size()
+        combo_top = self.mapToGlobal(self.rect().topLeft())
+        below_y = anchor.y()
+        above_y = combo_top.y() - popup_size.height()
+        if below_y + popup_size.height() <= available.bottom() + 1:
+            popup_y = below_y
+        elif above_y >= available.top():
+            popup_y = above_y
+        else:
+            popup_y = available.top()
+
+        maximum_x = available.right() - popup_size.width() + 1
+        popup_x = max(available.left(), min(anchor.x(), maximum_x))
+        maximum_y = available.bottom() - popup_size.height() + 1
+        popup_y = max(available.top(), min(popup_y, maximum_y))
+        popup.move(popup_x, popup_y)
 
 
 class RectangleMapTool(QgsMapTool):
@@ -111,8 +189,6 @@ class RectangleMapTool(QgsMapTool):
 
 from ..core import (
     tile_manager,
-    difference_filter,
-    accepted_integrity,
     class_workspace,
     manual_run_loader,
 )
@@ -122,15 +198,18 @@ from ..core.layer_manager import LayerManager
 from ..gui.inference_monitor import InferenceMonitorDialog
 from ..gui.inference_config_dialog import InferenceConfigDialog
 from ..gui.class_refinement_dialog import ClassRefinementDialog
-from ..core.v5_async_runner import V5AsyncInferenceRunner
+from ..core.v5_async_runner import (
+    ThreadedV5AsyncInferenceRunner as V5AsyncInferenceRunner,
+)
 from ..core.tile_cache_probe_runner import TileCacheProbeRunner
 from ..core.model_registry import ModelRegistry
-from ..core.run_builder_v5 import create_v5_run
+from ..core.run_builder_task import RunBuilderTask
+from ..core.run_preparation_task import RunPreparationTask
+from ..core.qt_lifecycle import retire_after
 from ..core.run_spec import (
     RESERVATION_FILE,
     reserve_run_directory,
     run_tile_cache_dir,
-    sha256_file,
 )
 from ..core import run_index
 from ..core.work_package_planner import (
@@ -141,8 +220,11 @@ from ..core.work_package_planner import (
     storage_preflight,
     unit_confidence_reserve,
 )
-from ..core.environment_report import compact_problem, format_check_details
-from ..core.run_state_db import run_state_from_spec
+from ..core.environment_report import (
+    compact_problem,
+    format_check_details,
+    format_execution_details,
+)
 from ..core.spatial_planner import plan_spatial_units
 
 logger = logging.getLogger("labeling_tool.main_dock")
@@ -200,6 +282,8 @@ class LabelingDockWidget(QgsDockWidget):
         self._pipeline_stage_total = 0
         self._tile_extractor = None
         self._tile_cache_probe = None
+        self._run_builder_task = None
+        self._run_preparation_task = None
         self._pending_run = None
         self._cleaning_up = False
         self.monitor_dialog = InferenceMonitorDialog(self)
@@ -237,6 +321,7 @@ class LabelingDockWidget(QgsDockWidget):
         self._startup_ready_candidate = None
         self._startup_recovery_status = None
         self._env_details_dialog = None
+        self._nonblocking_message_boxes = set()
         self._rect_tool = RectangleMapTool(iface.mapCanvas()) if iface else None
         if self._rect_tool:
             self._rect_tool.rect_finished.connect(self._on_rect_finished)
@@ -268,7 +353,7 @@ class LabelingDockWidget(QgsDockWidget):
         source_grid.setColumnStretch(0, 0)
         source_grid.setColumnStretch(1, 1)
 
-        self.raster_combo = _FixedMapLayerComboBox()
+        self.raster_combo = _ScreenBoundMapLayerComboBox()
         self.raster_combo.setFilters(Qgis.LayerFilter.RasterLayer)
 
         raster_label = QLabel("影像层:")
@@ -320,7 +405,7 @@ class LabelingDockWidget(QgsDockWidget):
         source_grid.addWidget(QLabel("操作:"), 2, 0)
         source_grid.addWidget(extent_actions, 2, 1)
 
-        self.vector_range_combo = _FixedMapLayerComboBox()
+        self.vector_range_combo = _ScreenBoundMapLayerComboBox()
         self.vector_range_combo.setFilters(Qgis.LayerFilter.PolygonLayer)
         self.vector_range_combo.setEnabled(False)
         self.vector_range_combo.setToolTip(
@@ -928,7 +1013,11 @@ class LabelingDockWidget(QgsDockWidget):
 
         report = self.config_manager.last_report or {}
         checks = list(report.get("checks") or []) + self._get_task_parameter_checks()
-        full_text = format_check_details(checks, report.get("stderr"))
+        full_text = (
+            format_execution_details(report)
+            + "\n\n"
+            + format_check_details(checks, report.get("stderr"))
+        )
 
         current = self._env_details_dialog
         if current is not None:
@@ -953,7 +1042,7 @@ class LabelingDockWidget(QgsDockWidget):
         summary_label = QLabel(
             f"检查项 {len(checks)}  |  正常 {counts['ready']}  |  "
             f"警告 {counts['warning']}  |  错误 {counts['error']}  |  "
-            f"语义设备 {device}"
+            f"语义设备 {device}  |  检查编号 {report.get('check_id') or '无'}"
         )
         summary_label.setStyleSheet("font-weight: bold; padding: 4px;")
         layout.addWidget(summary_label)
@@ -1341,12 +1430,8 @@ class LabelingDockWidget(QgsDockWidget):
                 "ogr",
             )
             try:
-                accepted_validation = accepted_integrity.audit_accepted_layer(
-                    target_accepted_layer,
-                    overlap_tolerance=accepted_validation["overlap_tolerance"],
-                    expected_crs=raster.crs(),
-                )
-                accepted_validation["source"] = "existing_target"
+                if not target_accepted_layer.isValid():
+                    raise ValueError("无法打开 accepted_labels")
             except Exception as exc:
                 QMessageBox.warning(
                     self,
@@ -1354,8 +1439,7 @@ class LabelingDockWidget(QgsDockWidget):
                     "本次 Run 尚未创建。请先修复 accepted_labels：\n" + str(exc),
                 )
                 return
-            if self.skip_accepted_check.isChecked():
-                accepted_layer = target_accepted_layer
+            accepted_layer = target_accepted_layer
 
         # Skip decisions are deliberately deferred until the post-probe
         # accepted snapshot has been loaded and audited.  The live layer may
@@ -1372,9 +1456,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.tile_table.setRowCount(0)
 
         self.monitor_dialog.detach()
-        if self.runner is not None:
-            self.runner.deleteLater()
-            self.runner = None
+        self._dispose_runner()
         try:
             self.runner = V5AsyncInferenceRunner(scripts_dir, parent=self)
         except FileNotFoundError as e:
@@ -1515,6 +1597,9 @@ class LabelingDockWidget(QgsDockWidget):
     def _start_inference_after_tile_cache_probe(self):
         if self._pipeline_state != "preflighting" or not self._pending_run:
             return
+        if not self._pending_run.get("inputs_prepared"):
+            self._prepare_run_inputs()
+            return
         self._pipeline_state = "inferencing"
         ctx = self._pending_run
         effective = ctx["effective"]
@@ -1606,15 +1691,9 @@ class LabelingDockWidget(QgsDockWidget):
                 for model in selected_models
             ]
             storage_batch_size = max(selected_batch_sizes, default=tile_batch_size)
-            # The real Tile probe has already succeeded.  Freeze accepted data
-            # before measuring free disk so its actual bytes are included in
-            # the same-filesystem preflight.  Any failure before run_spec.json
-            # is written removes this marker-backed reservation.
-            run_id, run_dir = reserve_run_directory(ctx["output_dir"])
-            ctx["run_id"] = run_id
-            ctx["run_dir"] = str(run_dir)
-            self._freeze_pending_range_snapshot(ctx, run_dir)
-            self._freeze_pending_accepted_snapshot(ctx, run_dir)
+            # The background input task has frozen accepted/range snapshots
+            # before this same-filesystem free-space measurement. Failure before
+            # run_spec creation only removes this marker-backed reservation.
             storage = storage_preflight(
                 ctx["output_dir"],
                 tile_count=len(ctx.get("active_tiles") or []),
@@ -1705,7 +1784,7 @@ class LabelingDockWidget(QgsDockWidget):
             processing_extent = ctx["processing_extent"]
             res_x = abs(ctx["raster"].rasterUnitsPerPixelX())
             res_y = abs(ctx["raster"].rasterUnitsPerPixelY())
-            spec, spec_path, database_path = create_v5_run(
+            builder_kwargs = dict(
                 output_root=ctx["output_dir"],
                 reserved_run_dir=ctx["run_dir"],
                 run_id=ctx["run_id"],
@@ -1749,10 +1828,130 @@ class LabelingDockWidget(QgsDockWidget):
                 range_selection=ctx.get("range_selection") or {},
                 deployment_project_root=Path(ctx["scripts_dir"]).parent,
             )
+            task = RunBuilderTask(builder_kwargs)
+            self._run_builder_task = task
+            self._pipeline_state = "planning"
+            task.progressChanged.connect(self._on_run_builder_progress)
+            task.taskCompleted.connect(self._on_run_builder_completed)
+            task.taskTerminated.connect(self._on_run_builder_terminated)
+            self._apply_stage_progress({
+                "key": "run_planning",
+                "name": "建立 Run 任务图",
+                "index": 1,
+                "stage_total": self._pipeline_stage_total,
+                "current": 0,
+                "total": 100,
+                "message": "正在后台建立 PostgreSQL 任务图，界面可以继续响应",
+            })
+            QgsApplication.taskManager().addTask(task)
+        except Exception as exc:
+            logger.exception("启动推理异常: %s", exc)
+            self._finish_before_inference("启动推理失败", str(exc))
+
+    def _prepare_run_inputs(self):
+        ctx = self._pending_run
+        try:
+            run_id, run_dir = reserve_run_directory(ctx["output_dir"])
+            ctx.update(run_id=run_id, run_dir=str(run_dir))
+            range_source = None
+            range_layer = None
+            if ctx["range_selection"].get("mode") == "vector_tile_intersection":
+                range_layer = self._get_valid_vector_range_layer()
+                range_source = QgsVectorLayerFeatureSource(range_layer)
+            # Capture edit-buffer-aware sources on the GUI thread. Workers
+            # receive independent feature sources, never QgsProject/live layers.
+            accepted = ctx.get("accepted_layer")
+            task = RunPreparationTask(
+                {**{key: ctx[key] for key in (
+                    "run_dir", "grid_tiles", "active_tiles", "range_selection",
+                    "accepted_validation", "skip_accepted",
+                )}, "accepted_source_path": accepted.source() if accepted is not None else ""},
+                range_source=range_source,
+                accepted_source=QgsVectorLayerFeatureSource(accepted) if accepted is not None else None,
+                raster_crs=QgsCoordinateReferenceSystem(ctx["raster"].crs()),
+                transform_context=QgsCoordinateTransformContext(QgsProject.instance().transformContext()),
+                range_wkb_type=range_layer.wkbType() if range_layer is not None else None,
+                accepted_wkb_type=accepted.wkbType() if accepted is not None else None,
+            )
+            self._run_preparation_task = task
+            self._pipeline_state = "preparing"
+            task.progressChanged.connect(self._on_run_preparation_progress)
+            task.taskCompleted.connect(self._on_run_preparation_completed)
+            task.taskTerminated.connect(self._on_run_preparation_terminated)
+            self._on_run_preparation_progress(0)
+            QgsApplication.taskManager().addTask(task)
+        except Exception as error:
+            self._finish_before_inference("输入准备失败", str(error))
+
+    def _on_run_preparation_progress(self, progress):
+        if self._cleaning_up or self._run_preparation_task is None:
+            return
+        self._apply_stage_progress(dict(
+            key="input_preparation", name="后台冻结与审计输入", index=1,
+            stage_total=self._pipeline_stage_total, current=int(progress), total=100,
+            message="正在冻结范围、筛选 Tile 并审计 accepted 标签；可以停止",
+        ))
+
+    def _on_run_preparation_completed(self):
+        task = self.sender()
+        if task is not self._run_preparation_task or self._cleaning_up:
+            return
+        self._run_preparation_task = None
+        if task.isCanceled() or self._pipeline_state == "stopping":
+            self._on_tile_extraction_stopped()
+            return
+        self._pending_run.update(task.result_data)
+        self._pipeline_state = "preflighting"
+        self._start_inference_after_tile_cache_probe()
+
+    def _on_run_preparation_terminated(self):
+        task = self.sender()
+        if task is not self._run_preparation_task or self._cleaning_up:
+            return
+        self._run_preparation_task = None
+        if task.isCanceled():
+            self._on_tile_extraction_stopped()
+        else:
+            self._finish_before_inference("输入准备失败", task.error_message)
+
+    def _on_run_builder_progress(self, progress):
+        task = self.sender()
+        if task is not self._run_builder_task:
+            return
+        self._apply_stage_progress({
+            "key": "run_planning",
+            "name": "建立 Run 任务图",
+            "index": 1,
+            "stage_total": self._pipeline_stage_total,
+            "current": int(progress),
+            "total": 100,
+            "message": task.progress_message,
+        })
+
+    def _on_run_builder_completed(self):
+        task = self.sender()
+        if task is not self._run_builder_task:
+            return
+        self._run_builder_task = None
+        if self._cleaning_up:
+            return
+        if task.isCanceled() or self._pipeline_state == "stopping":
+            self._on_tile_extraction_stopped()
+            return
+        result = task.result_data
+        ctx = self._pending_run
+        if result is None or ctx is None:
+            self._finish_before_inference(
+                "启动推理失败", "后台任务图建立没有返回 Run"
+            )
+            return
+        spec, spec_path, database_path = result
+        try:
+            self._pipeline_state = "inferencing"
             self.monitor_dialog.bind_state_database(
                 database_path,
                 spec["run_id"],
-                page_size=int(scaling.get("tile_page_size", 500)),
+                page_size=int((spec.get("scaling") or {}).get("tile_page_size", 500)),
                 run_spec=spec,
             )
             self.runner.run_from_spec(
@@ -1762,6 +1961,21 @@ class LabelingDockWidget(QgsDockWidget):
         except Exception as exc:
             logger.exception("启动推理异常: %s", exc)
             self._finish_before_inference("启动推理失败", str(exc))
+
+    def _on_run_builder_terminated(self):
+        task = self.sender()
+        if task is not self._run_builder_task:
+            return
+        self._run_builder_task = None
+        if self._cleaning_up:
+            return
+        if task.isCanceled():
+            self._on_tile_extraction_stopped()
+            return
+        self._finish_before_inference(
+            "启动推理失败",
+            task.error_message or "后台建立 Run 任务图失败",
+        )
 
     def _on_runner_stage_progress(self, info):
         whole = dict(info)
@@ -1892,88 +2106,6 @@ class LabelingDockWidget(QgsDockWidget):
                 probe.cleanup()
             probe.deleteLater()
 
-    def _freeze_pending_accepted_snapshot(self, ctx, run_dir):
-        """Freeze, re-audit and derive skip state from one accepted identity."""
-        live_layer = ctx.get("accepted_layer")
-        if live_layer is None:
-            ctx["accepted_snapshot"] = ""
-            ctx["skipped_tiles"] = []
-            return
-        snapshot_path = Path(run_dir) / "accepted_snapshot.gpkg"
-        ctx["accepted_snapshot"] = difference_filter.snapshot_accepted_layer(
-            live_layer,
-            snapshot_path,
-        )
-        frozen_layer = QgsVectorLayer(
-            f"{snapshot_path}|layername={LAYER_NAMES.ACCEPTED}",
-            f"{ctx.get('run_id', '')} accepted snapshot",
-            "ogr",
-        )
-        tolerance = float(
-            (ctx.get("accepted_validation") or {}).get(
-                "overlap_tolerance", 1.0e-18
-            )
-        )
-        frozen_validation = accepted_integrity.audit_accepted_layer(
-            frozen_layer,
-            overlap_tolerance=tolerance,
-            expected_crs=ctx["raster"].crs(),
-        )
-        frozen_validation["source"] = "run_snapshot"
-        skipped_tiles = []
-        for tile in ctx.get("active_tiles") or []:
-            if difference_filter.tile_is_fully_accepted(
-                tile["bounds"], frozen_layer, ctx["raster"].crs()
-            ):
-                skipped = dict(tile)
-                skipped["skip_reason"] = "fully_accepted"
-                skipped_tiles.append(skipped)
-        ctx["accepted_layer"] = frozen_layer
-        ctx["accepted_validation"] = frozen_validation
-        ctx["skipped_tiles"] = skipped_tiles
-
-    def _freeze_pending_range_snapshot(self, ctx, run_dir):
-        """Freeze the exact vector boundary used by every later runtime stage."""
-        selection = dict(ctx.get("range_selection") or {})
-        if selection.get("mode") != "vector_tile_intersection":
-            ctx["range_snapshot"] = ""
-            return
-        live_layer = self._get_valid_vector_range_layer()
-        snapshot_path = Path(run_dir) / "range_snapshot.gpkg"
-        difference_filter.snapshot_vector_layer(
-            live_layer,
-            snapshot_path,
-            layer_name="range_mask",
-        )
-        frozen_layer = QgsVectorLayer(
-            f"{snapshot_path}|layername=range_mask",
-            f"{ctx.get('run_id', '')} range snapshot",
-            "ogr",
-        )
-        if not frozen_layer.isValid() or not frozen_layer.crs().isValid():
-            raise ValueError("范围矢量快照无效或缺少可转换 CRS")
-        selected_tiles = tile_manager.select_tiles_intersecting_vector(
-            ctx.get("grid_tiles") or [],
-            frozen_layer,
-            ctx["raster"].crs(),
-        )
-        if not selected_tiles:
-            raise ValueError("冻结的范围矢量没有选中任何完整 Tile")
-        selection.update(
-            {
-                "vector_source": str(snapshot_path),
-                "vector_path": str(snapshot_path),
-                "vector_sha256": sha256_file(snapshot_path),
-                "vector_crs": frozen_layer.crs().authid(),
-                "clip_outputs": True,
-                "selected_tile_count": len(selected_tiles),
-                "excluded_tile_count": len(ctx.get("grid_tiles") or []) - len(selected_tiles),
-            }
-        )
-        ctx["range_snapshot"] = str(snapshot_path)
-        ctx["range_selection"] = selection
-        ctx["active_tiles"] = selected_tiles
-
     def _discard_pending_run_reservation(self):
         """Remove only this attempt's unused, marker-backed Run reservation."""
         ctx = self._pending_run or {}
@@ -2021,6 +2153,35 @@ class LabelingDockWidget(QgsDockWidget):
         ctx["accepted_snapshot"] = ""
         ctx["range_snapshot"] = ""
 
+    def _show_nonblocking_notice(self, icon, title, message):
+        """Show a Wayland-safe notice without locking the monitor window."""
+
+        for previous in tuple(self._nonblocking_message_boxes):
+            try:
+                previous.close()
+            except RuntimeError:
+                self._nonblocking_message_boxes.discard(previous)
+
+        monitor = self.monitor_dialog
+        parent = monitor if monitor is not None and monitor.isVisible() else self
+        dialog = QMessageBox(parent)
+        dialog.setIcon(icon)
+        dialog.setWindowTitle(str(title))
+        dialog.setText(str(message))
+        dialog.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
+        dialog.setStandardButtons(CLOSE)
+        dialog.setWindowModality(NON_MODAL)
+        dialog.setAttribute(WA_DELETE_ON_CLOSE, True)
+        self._nonblocking_message_boxes.add(dialog)
+
+        def _release_dialog(*_args):
+            self._nonblocking_message_boxes.discard(dialog)
+
+        dialog.destroyed.connect(_release_dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _finish_before_inference(self, title, message):
         self._release_tile_cache_probe(cancel=True)
         self._discard_pending_run_reservation()
@@ -2030,10 +2191,10 @@ class LabelingDockWidget(QgsDockWidget):
         self.stop_btn.setEnabled(False)
         self._set_progress_terminal(title)
         if self.monitor_dialog is not None:
-            self.monitor_dialog.mark_finished(title)
+            self.monitor_dialog.mark_finished(title, message)
         self._update_start_enabled()
         if not self._cleaning_up:
-            QMessageBox.critical(self, title, message)
+            self._show_nonblocking_notice(CRITICAL, title, message)
 
     def _set_progress_terminal(self, text, completed=False):
         """Stop indeterminate animation and display a stable terminal state."""
@@ -2043,7 +2204,7 @@ class LabelingDockWidget(QgsDockWidget):
 
     def _on_stop(self):
         if self._pipeline_state not in (
-            "extracting", "preflighting", "inferencing"
+            "extracting", "preflighting", "preparing", "planning", "inferencing"
         ):
             if self.monitor_dialog is not None:
                 self.monitor_dialog.mark_finished("无任务运行")
@@ -2058,6 +2219,13 @@ class LabelingDockWidget(QgsDockWidget):
             self._pipeline_state = "stopping"
             self._release_tile_cache_probe(cancel=True)
             self._on_tile_extraction_stopped()
+        elif self._pipeline_state == "preparing" and self._run_preparation_task:
+            self._pipeline_state = "stopping"
+            self._run_preparation_task.cancel()
+        elif self._pipeline_state == "planning" and self._run_builder_task:
+            self._pipeline_state = "stopping"
+            self.monitor_dialog.mark_stopping("正在停止后台任务图建立")
+            self._run_builder_task.cancel()
         elif self._pipeline_state == "inferencing" and self.runner:
             self._pipeline_state = "stopping"
             self.runner.stop()
@@ -2109,8 +2277,8 @@ class LabelingDockWidget(QgsDockWidget):
             self._set_progress_terminal("失败")
 
         if result.get("success"):
-            QMessageBox.information(
-                self,
+            self._show_nonblocking_notice(
+                INFORMATION,
                 "完成",
                 f"推理完成，已加载 {len(result.get('ready_streams') or [])} 个结果流",
             )
@@ -2119,39 +2287,31 @@ class LabelingDockWidget(QgsDockWidget):
             msg = result.get("error") or "推理流程失败"
             if run_report:
                 msg += f"\n\n运行报告: {run_report}"
-            QMessageBox.warning(self, "推理失败", msg)
+            self._show_nonblocking_notice(WARNING, "推理失败", msg)
 
     def _update_recovery_buttons(self, *, lightweight=False):
-        if lightweight:
-            status = str(self._startup_recovery_status or "")
-            resumable = status in run_index.RECOVERABLE_RUN_STATES
-            self.resume_btn.setEnabled(resumable and not self._pipeline_running)
-            self.retry_failed_btn.setEnabled(
-                status == "failed" and not self._pipeline_running
-            )
-            return
-        resumable = False
-        failed = False
         spec = self._recovery_run_spec or self._last_run_spec or {}
-        try:
-            if int(spec.get("schema_version") or 0) == 2:
-                database = run_state_from_spec(spec)
-                run = database.get_run(spec["run_id"]) or {}
-                status = str(run.get("status") or "")
-                resumable = status in {
-                    "planned", "stopped", "failed", "running",
-                }
-                counts = database.job_counts(spec["run_id"])
-                failed = bool(counts.get("failed"))
-                if status == "resetting":
-                    failed = True
-        except Exception:
-            resumable = False
-            failed = False
+        result = dict(self._last_run_result or {})
+        status = str(
+            self._startup_recovery_status
+            or result.get("status")
+            or ""
+        )
+        valid_spec = int(spec.get("schema_version") or 0) == 2
+        resumable = valid_spec and status in run_index.RECOVERABLE_RUN_STATES
+        failed = valid_spec and status in {"failed", "resetting"}
         self.resume_btn.setEnabled(resumable and not self._pipeline_running)
         self.retry_failed_btn.setEnabled(
             failed and not self._pipeline_running
         )
+
+    def _dispose_runner(self):
+        runner = self.runner
+        self.runner = None
+        if runner is None:
+            return
+        retire_after(runner, runner.shutdown_finished)
+        runner.shutdown()
 
     def _resume_existing_run(self, retry_failed):
         spec = self._recovery_run_spec or self._last_run_spec or {}
@@ -2173,6 +2333,7 @@ class LabelingDockWidget(QgsDockWidget):
                 return
         scripts_dir = self.script_path_edit.text().strip()
         try:
+            self._dispose_runner()
             self.runner = V5AsyncInferenceRunner(scripts_dir, parent=self)
             self.monitor_dialog.reset_run()
             self.monitor_dialog.bind_state_database(
@@ -2204,7 +2365,11 @@ class LabelingDockWidget(QgsDockWidget):
             self._pipeline_state = "finished"
             self._update_start_enabled()
             self._update_recovery_buttons()
-            QMessageBox.critical(self, "恢复运行失败", str(error))
+            if self.monitor_dialog is not None:
+                self.monitor_dialog.mark_finished("恢复运行失败", str(error))
+            self._show_nonblocking_notice(
+                CRITICAL, "恢复运行失败", str(error)
+            )
 
     def _on_open_refinement(self):
         if (
@@ -2925,12 +3090,28 @@ class LabelingDockWidget(QgsDockWidget):
 
     def cleanup(self):
         self._cleaning_up = True
+        for dialog in tuple(self._nonblocking_message_boxes):
+            try:
+                dialog.close()
+            except RuntimeError:
+                pass
+        self._nonblocking_message_boxes.clear()
         self._save_settings()
         self.config_manager.cleanup()
         self._vector_preview_timer.stop()
         if self._vector_preview_task is not None:
             self._vector_preview_task.cancel()
             self._vector_preview_task = None
+        run_builder_active = self._run_builder_task is not None or self._run_preparation_task is not None
+        if self._run_preparation_task is not None:
+            self._run_preparation_task.cancel()
+            self._run_preparation_task = None
+        if self._run_builder_task is not None:
+            # QgsTask cancellation is cooperative. Do not remove its Run
+            # reservation while the worker may still be completing a bounded
+            # PostgreSQL batch.
+            self._run_builder_task.cancel()
+            self._run_builder_task = None
         if self._observed_vector_range_layer is not None:
             try:
                 self._observed_vector_range_layer.dataChanged.disconnect(
@@ -2968,17 +3149,19 @@ class LabelingDockWidget(QgsDockWidget):
 
         # 2. 停止异步任务（runner / tile_extractor）
         if self.runner is not None:
-            self.runner.stop()
-            self.runner = None
+            self._dispose_runner()
         if self._tile_extractor is not None:
             self._tile_extractor.stop()
             self._tile_extractor = None
         if self._tile_cache_probe is not None:
             self._tile_cache_probe.cleanup()
             self._tile_cache_probe = None
-        self._discard_pending_run_reservation()
+        if not run_builder_active:
+            self._discard_pending_run_reservation()
         if self.refinement_dialog is not None:
             self.refinement_dialog.cleanup()
+        if self.monitor_dialog is not None:
+            self.monitor_dialog.shutdown()
 
         # 3. 恢复地图工具、清理 UI 状态
         self._restore_previous_map_tool()
@@ -2997,4 +3180,5 @@ class LabelingDockWidget(QgsDockWidget):
 
         # 5. 其余字段置空
         self._current_tiles = []
+        self._run_builder_task = None
         self._pending_run = None

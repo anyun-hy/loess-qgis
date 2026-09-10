@@ -8,7 +8,7 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QVariant, QDateTime
 
-from ..qt_compat import ISO_DATE
+from ..qt6_api import ISO_DATE
 from .layer_names import LAYER_NAMES
 from .qgis_writer import write_vector_layer
 from .run_spec import CLASS_NAMES, sha256_file

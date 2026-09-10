@@ -9,7 +9,9 @@ __all__ = ("V5AsyncInferenceRunner",)
 
 def __getattr__(name):
     if name == "V5AsyncInferenceRunner":
-        from .v5_async_runner import V5AsyncInferenceRunner
+        from .v5_async_runner import (
+            ThreadedV5AsyncInferenceRunner as V5AsyncInferenceRunner,
+        )
 
         return V5AsyncInferenceRunner
     raise AttributeError(name)

@@ -20,6 +20,21 @@ class _QObject:
     def __init__(self, *_args, **_kwargs):
         pass
 
+    def moveToThread(self, _thread):
+        return None
+
+    def deleteLater(self):
+        return None
+
+
+class _QThread:
+    @staticmethod
+    def currentThread():
+        return _QThread()
+
+    def quit(self):
+        return None
+
 
 class _QProcess:
     NotRunning = 0
@@ -66,8 +81,10 @@ def _load_runner_module(monkeypatch):
     qtcore_module.QObject = _QObject
     qtcore_module.QProcess = _QProcess
     qtcore_module.QProcessEnvironment = _QProcessEnvironment
+    qtcore_module.QThread = _QThread
     qtcore_module.QTimer = _QTimer
     qtcore_module.pyqtSignal = lambda *_args: _Signal()
+    qtcore_module.pyqtSlot = lambda *_args: lambda function: function
     monkeypatch.setitem(sys.modules, "qgis", qgis_module)
     monkeypatch.setitem(sys.modules, "qgis.PyQt", pyqt_module)
     monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", qtcore_module)
@@ -202,6 +219,16 @@ def _runner(module):
             "buffer_pixels": 256,
         },
     }
+    runner._pending_job_progress = {}
+    runner._pending_ui_logs = []
+    runner._pending_stream_progress = {}
+    runner._priority_stream_progress = []
+    runner._pending_pipeline_progress = None
+    runner._heartbeat_timer = _StopTimer()
+    runner._ui_flush_timer = _StopTimer()
+    runner.ui_log_batch = _Signal()
+    runner.ui_progress_batch = _Signal()
+    runner.log_run_finalized = _Signal()
     runner._processes = {}
     runner._phase = "assembly"
     runner._spec_path = "/tmp/run_spec.json"
@@ -348,6 +375,105 @@ def test_resource_budget_reduces_geometry_pool_only_while_package_is_active(monk
 
     assert module.cpu_worker_limit(spec, package_active=False) == 20
     assert module.cpu_worker_limit(spec, package_active=True) == 16
+
+
+def test_scheduler_pauses_dispatch_and_requests_load_shedding_on_pressure(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_done = False
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    progress = []
+    runner._emit_progress = lambda message: progress.append(message)
+    shed = []
+    runner._shed_geometry_to_limit = lambda limit, reason: shed.append(
+        (limit, reason)
+    )
+    runner._memory_admission_decision = lambda **_kwargs: (
+        module.MemoryAdmissionDecision(
+            geometry_slot_limit=4,
+            pause_new_work=True,
+            shed_active_work=True,
+            reason="memory_pressure",
+            worker_peak_estimate_bytes=2 * 1024**3,
+            changed=True,
+            sample=module.MemoryPressureSample(supported=True),
+        )
+    )
+    runner._start_accelerator_worker = lambda: pytest.fail(
+        "pressure must prevent a new accelerator worker"
+    )
+    runner._start_job = lambda _job: pytest.fail(
+        "pressure must prevent a new geometry job"
+    )
+    runner._database = types.SimpleNamespace(
+        job_counts=lambda _run_id, job_type="": {"queued": 2},
+    )
+
+    runner._schedule()
+
+    assert shed == [(4, "memory_pressure")]
+    assert progress == [
+        "检测到内存压力，已暂停派发并动态降低并发；现有安全任务完成后自动恢复"
+    ]
+
+
+def test_memory_shed_interrupts_job_before_nonblocking_process_termination(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    calls = []
+
+    class Process:
+        def processId(self):
+            return 0
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    process = Process()
+    entry = {
+        "token": "process-token",
+        "process": process,
+        "context": {
+            "job": {
+                "job_id": 42,
+                "job_type": "unit_fit",
+                "unit_id": "core_00000_00000",
+                "lease_token": "lease-token",
+            }
+        },
+        "forced_error": "",
+        "owns_process_group": False,
+    }
+    runner._processes = {"process-token": entry}
+    runner._database = types.SimpleNamespace(
+        interrupt_job=lambda job_id, lease: calls.append((job_id, lease)) or True
+    )
+    monkeypatch.setattr(module, "process_is_running", lambda _process: True)
+
+    assert runner._request_memory_shed(entry, "memory_pressure") is True
+
+    assert calls == [(42, "lease-token"), "terminate", "kill"]
+    assert entry["memory_shed"] is True
+    assert entry["forced_error"].startswith("memory-pressure load shedding")
 
 
 def test_shared_cpu_budget_reserves_four_v33_workers_before_unit_fit_dispatch(monkeypatch):
@@ -1424,9 +1550,127 @@ def test_resume_contract_failure_precedes_database_mutation(monkeypatch):
 
     with pytest.raises(RuntimeError, match="deployment changed"):
         runner.resume("/run/run_spec.json")
-
     assert events == ["validate"]
 
+
+def test_high_frequency_stream_progress_is_coalesced_before_the_gui(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner.ui_progress_batch = types.SimpleNamespace(emit=batches.append)
+
+    for current in range(500):
+        runner._queue_stream_progress(
+            {
+                "event": "fit_progress",
+                "stream_id": "model:a",
+                "current": current,
+                "total": 500,
+            }
+        )
+    runner._queue_stream_progress(
+        {
+            "event": "fit_failed",
+            "stream_id": "model:a",
+            "status": "failed",
+            "error": "injected",
+        }
+    )
+    runner._flush_ui_events()
+
+    assert len(batches) == 1
+    events = batches[0]["stream_events"]
+    assert len(events) == 2
+    assert events[0]["event"] == "fit_failed"
+    assert events[1]["current"] == 499
+
+
+def test_sustained_200_events_per_second_stays_at_ten_gui_batches(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner.ui_progress_batch = types.SimpleNamespace(emit=batches.append)
+
+    for window in range(10):
+        for offset in range(20):
+            current = window * 20 + offset
+            runner._queue_stream_progress(
+                {
+                    "event": "fit_progress",
+                    "stream_id": "model:a",
+                    "current": current,
+                    "total": 200,
+                }
+            )
+        runner._flush_ui_events()
+
+    assert len(batches) == 10
+    assert [batch["stream_events"][0]["current"] for batch in batches] == [
+        19,
+        39,
+        59,
+        79,
+        99,
+        119,
+        139,
+        159,
+        179,
+        199,
+    ]
+
+
+def test_process_logs_cross_the_gui_boundary_as_one_lossless_batch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner._spec = {"run_dir": "/tmp/run"}
+    runner.ui_log_batch = types.SimpleNamespace(emit=batches.append)
+
+    for index in range(500):
+        runner._record_log(
+            "stdout",
+            f"line-{index}",
+            context={"step": "worker-a"},
+        )
+    runner._flush_ui_events()
+
+    assert len(batches) == 1
+    assert len(batches[0]) == 500
+    assert batches[0][0]["message"] == "line-0"
+    assert batches[0][-1]["message"] == "line-499"
+
+
+def test_structured_progress_heartbeats_only_on_the_fixed_batch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._memory_admission = None
+    heartbeats = []
+    runner._database = types.SimpleNamespace(
+        heartbeat=lambda *args, **kwargs: heartbeats.append((args, kwargs))
+    )
+    job = {"job_id": 7, "lease_token": "lease-7"}
+    entry = {"context": {"job": job}}
+    runner._processes = {"worker": {"context": {"job": job}}}
+
+    for current in range(200):
+        runner._structured(
+            entry,
+            json.dumps(
+                {
+                    "event": "fit_progress",
+                    "stream_id": "model:a",
+                    "current": current,
+                    "total": 200,
+                }
+            ),
+        )
+
+    assert heartbeats == []
+    runner._flush_job_heartbeats()
+    assert len(heartbeats) == 1
+    assert heartbeats[0][0] == ("7", "lease-7")
+    assert heartbeats[0][1]["current"] == 199
 
 def test_unified_plugin_version_includes_startup_hardening():
     metadata = (
@@ -1438,3 +1682,21 @@ def test_unified_plugin_version_includes_startup_hardening():
 
     assert "version=1.0.0" in metadata
     assert "-linux" not in metadata
+
+
+def test_qgis_uses_the_threaded_runtime_facade_for_process_control():
+    root = Path(__file__).resolve().parents[1]
+    runner_source = (
+        root / "qgis_plugins" / "labeling_tool" / "core" / "v5_async_runner.py"
+    ).read_text(encoding="utf-8")
+    dock_source = (
+        root / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py"
+    ).read_text(encoding="utf-8")
+
+    assert "class ThreadedV5AsyncInferenceRunner(QObject):" in runner_source
+    assert "self._worker.moveToThread(self._runtime_thread)" in runner_source
+    assert 'setObjectName("loess-v5-runtime-control")' in runner_source
+    assert 'setObjectName("loess-v5-pipeline-log")' in runner_source
+    assert "self._worker.ui_log_batch.connect(self._log_writer.append_batch)" in runner_source
+    assert "ThreadedV5AsyncInferenceRunner as V5AsyncInferenceRunner" in dock_source
+    assert "def _dispose_runner" in dock_source

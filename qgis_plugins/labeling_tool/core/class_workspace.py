@@ -842,12 +842,27 @@ class ClassWorkspaceInitializeTask(QgsTask):
             return False
 
 
-def save_workspace(run_spec, workspace):
+def save_workspace(run_spec, workspace, *, changed_class_codes=None):
+    """Refresh changed files only; None retains the full validation boundary.
+
+    An empty collection is a metadata-only session transition. Callers must
+    explicitly name every class whose committed file changed (both classes
+    for reclassification); opening/recovering a workspace still verifies all
+    hashes through load_workspace/ClassWorkspaceProbeTask.
+    """
     workspace = dict(workspace)
     class_records = dict(workspace.get("classes") or {})
+    changed = set(CLASS_ORDER if changed_class_codes is None else changed_class_codes)
+    if not changed.issubset(CLASS_ORDER):
+        raise ClassWorkspaceError("unknown changed class code")
     total = 0
     for code in CLASS_ORDER:
         record = dict(class_records[str(code)])
+        if code not in changed:
+            if not record.get("sha256") or "feature_count" not in record:
+                raise ClassWorkspaceError(f"class {code} has no validated file identity")
+            total += int(record["feature_count"])
+            continue
         path = Path(record["path"])
         layer = QgsVectorLayer(
             f"{path}|layername={record['layer_name']}",

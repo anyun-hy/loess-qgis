@@ -216,13 +216,55 @@ class PersistentModelProvider:
     def __init__(
         self,
         loader: Callable[[Mapping[str, Any], str], Any] = _default_loader,
+        *,
+        batch_state_path: str | Path | None = None,
     ) -> None:
         self._loader = loader
+        self._batch_state_path = (
+            Path(batch_state_path).resolve() if batch_state_path else None
+        )
         self._verified: dict[tuple[str, str], str] = {}
         self._models: dict[tuple[str, str, str, str], Any] = {}
-        self._effective_batch_sizes: dict[tuple[str, str], int] = {}
+        self._effective_batch_sizes = self._load_batch_state()
         self.cold_load_counts: dict[str, int] = {}
         self.cache_hit_counts: dict[str, int] = {}
+
+    def _load_batch_state(self) -> dict[tuple[str, str], int]:
+        path = self._batch_state_path
+        if path is None or not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("batch state must be an object")
+            if payload.get("schema_version") != 1:
+                raise ValueError("unsupported schema_version")
+            limits = payload.get("limits")
+            if not isinstance(limits, Mapping):
+                raise ValueError("limits must be an object")
+            state = {}
+            for raw_key, raw_value in limits.items():
+                model_id, separator, device = str(raw_key).rpartition("@")
+                value = int(raw_value)
+                if not separator or not model_id or not device or value < 1:
+                    raise ValueError(f"invalid batch limit: {raw_key}")
+                state[(model_id, device)] = value
+            return state
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise WorkPackageRuntimeError(
+                f"invalid accelerator batch state {path}: {error}"
+            ) from error
+
+    def _persist_batch_state(self) -> None:
+        if self._batch_state_path is None:
+            return
+        _atomic_json(
+            self._batch_state_path,
+            {
+                "schema_version": 1,
+                "limits": self.effective_batch_sizes,
+            },
+        )
 
     def verify(self, model_entry: Mapping[str, Any]) -> str:
         path = Path(str(model_entry["artifact_path"])).resolve()
@@ -304,9 +346,13 @@ class PersistentModelProvider:
         key = (str(model_entry["model_id"]), str(device))
         value = max(1, int(effective))
         previous = self._effective_batch_sizes.get(key)
-        self._effective_batch_sizes[key] = (
+        remembered = (
             value if previous is None else min(int(previous), value)
         )
+        if previous == remembered:
+            return
+        self._effective_batch_sizes[key] = remembered
+        self._persist_batch_state()
 
     @property
     def effective_batch_sizes(self) -> dict[str, int]:
@@ -881,6 +927,41 @@ def _run_work_package_impl(
         )
     if lease_guard is not None:
         lease_guard()
+    monitor_job = database.get_job(int(job_id)) if leased_job else {}
+    monitor_context = {
+        "job_id": job_id,
+        "parent_span_id": str((monitor_job or {}).get("monitor_span_id") or ""),
+        "execution_id": str((monitor_job or {}).get("monitor_execution_id") or ""),
+        "attempt": int((monitor_job or {}).get("attempt") or 0),
+    }
+    base_emit = globals()["emit"]
+    monitor_activity = {}
+    monitor_observed = 0.0
+
+    def emit(event: str, **payload: Any) -> None:
+        nonlocal monitor_observed
+        monitor_activity["event"] = event
+        monitor_activity["effective_device"] = str(payload.get("effective_device") or device or (spec.get("runtime") or {}).get("effective_device") or "")
+        if event == "package_model_loading":
+            monitor_activity.update(stream_id=payload.get("stream_id", ""), tile_current=0, tile_total=0,
+                                    configured_batch_size=payload.get("configured_batch_size"),
+                                    effective_batch_size=payload.get("configured_batch_size"), status="模型加载 / 推理", notice="")
+        elif event == "package_tile_completed":
+            monitor_activity.update(tile_current=payload.get("current"), tile_total=payload.get("total"), status="模型推理")
+        elif event == "package_tile_batch_reduced":
+            monitor_activity.update(effective_batch_size=payload.get("effective_batch_size"), notice="内存不足，自动降低 Batch")
+        elif event == "work_package_paused_low_disk":
+            monitor_activity.update(status="资源等待：磁盘空间不足", notice=str(payload.get("error") or ""))
+        elif event == "package_tile_materialized":
+            monitor_activity.update(status="准备影像块", notice="")
+        elif event == "package_tiles_cleaned":
+            monitor_activity.update(status="提交与清理", stream_id="")
+        now = time.monotonic()
+        if monitor_context["parent_span_id"] and (now - monitor_observed >= 1.0 or event in {"package_model_loading", "package_tile_batch_reduced", "work_package_paused_low_disk"}):
+            database.update_job_monitor_runtime(int(job_id), monitor_context["parent_span_id"], monitor_activity)
+            monitor_observed = now
+        base_emit(event, **{**monitor_context, **payload})
+
     tiles = database.package_tiles(run_id, package_id)
     partitions = database.package_partitions(run_id, package_id)
     if not tiles or not partitions:
@@ -1162,6 +1243,8 @@ def _run_work_package_impl(
                 stream_id=stream_id,
                 current=model_index,
                 total=len(spec["models"]),
+                configured_batch_size=model_configured_batch_size,
+                effective_device=effective_device,
             )
             inferable_tiles = [
                 tile
@@ -1843,6 +1926,16 @@ def _run_work_package_impl(
                                     max(1, attempt_size // 2),
                                 )
                                 model_batch_reduction_count += 1
+                                if model_provider is not None:
+                                    # Save the conservative limit before CUDA
+                                    # cleanup: if the driver terminates this
+                                    # process, the replacement worker must not
+                                    # repeat the same unsafe allocation.
+                                    model_provider.remember_batch_size(
+                                        model_entry,
+                                        effective_device,
+                                        model_effective_batch_size,
+                                    )
                                 _clear_accelerator_cache(effective_device)
                                 emit(
                                     "package_tile_batch_reduced",
@@ -1948,6 +2041,9 @@ def _run_work_package_impl(
                     "cache_hit_count": model_cache_hits,
                 }
             )
+
+            emit("package_model_completed", run_id=run_id, package_id=package_id,
+                 stream_id=stream_id, status="completed", **model_summaries[-1])
 
         # Release the final model's activation cache for Fusion and the next
         # Work Package without unloading PersistentModelProvider models.
@@ -2328,6 +2424,7 @@ def _run_work_package_impl(
             message=str(error),
             payload={"package_id": package_id},
         )
+        emit("work_package_paused_low_disk", run_id=run_id, package_id=package_id, error=str(error))
         raise
     except WorkerStopRequested as error:
         for pool in partition_pools:
@@ -2352,6 +2449,7 @@ def _run_work_package_impl(
             message=str(error),
             payload={"package_id": package_id},
         )
+        emit("work_package_interrupted", run_id=run_id, package_id=package_id, error=str(error))
         raise
     except LeaseLostError as error:
         for pool in partition_pools:
@@ -2392,6 +2490,7 @@ def _run_work_package_impl(
             message=str(error),
             payload={"package_id": package_id, "transition": transition},
         )
+        emit("work_package_failed", run_id=run_id, package_id=package_id, error=str(error), status="failed")
         raise
     finally:
         package_lock.release()
@@ -2523,7 +2622,9 @@ def run_persistent_worker(
     run_dir = Path(spec["run_dir"]).resolve()
     database = run_state_from_spec(spec)
     stopper = stop_event or threading.Event()
-    provider = model_provider or PersistentModelProvider()
+    provider = model_provider or PersistentModelProvider(
+        batch_state_path=run_dir / "logs" / "accelerator_batch_limits.json"
+    )
     profile = _load_profile(spec)
     requested_device = (
         device

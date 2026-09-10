@@ -1,10 +1,12 @@
+import sys
+
 from qgis.PyQt.QtCore import QObject
 from qgis.PyQt.QtWidgets import QAction, QToolBar
-from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtGui import QGuiApplication, QIcon
 from qgis.core import QgsApplication
 
 from .gui.main_dock import LabelingDockWidget
-from .qt_compat import RIGHT_DOCK_WIDGET_AREA
+from .qt6_api import RIGHT_DOCK_WIDGET_AREA
 
 
 class LabelingTool(QObject):
@@ -18,6 +20,7 @@ class LabelingTool(QObject):
         self.action = None
 
     def initGui(self):
+        self._require_supported_qpa()
         icon = QIcon(":/images/themes/default/mAction.svg")
         self.action = QAction(icon, "标注工具", self.iface.mainWindow())
         self.action.setObjectName("labelingAction")
@@ -35,6 +38,19 @@ class LabelingTool(QObject):
         self.iface.addPluginToMenu("标注工具", self.action)
 
         self.action.triggered.connect(self.show_dock)
+
+    @staticmethod
+    def _require_supported_qpa():
+        """Reject non-Wayland Linux sessions before creating plugin widgets."""
+
+        if not sys.platform.startswith("linux"):
+            return
+        qpa = str(QGuiApplication.platformName() or "").strip().lower()
+        if qpa != "wayland":
+            raise RuntimeError(
+                "labeling_tool on Ubuntu requires the native Qt6 Wayland "
+                f"platform plugin; current QPA is {qpa or 'unknown'}"
+            )
 
     def unload(self):
         if self.dock_widget:

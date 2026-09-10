@@ -31,6 +31,7 @@ from qgis.core import (
     QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
     QgsFeature,
     QgsFeatureRequest,
     QgsGeometry,
@@ -49,12 +50,14 @@ from qgis.gui import (
 )
 from qgis.analysis import QgsZonalStatistics
 
-from ..core import accepted_writer, class_workspace, final_assembler, topology_validator
+from ..core import accepted_writer, class_workspace, topology_validator
 from ..core.layer_names import LAYER_NAMES
 from ..core.sam3_worker_runner import Sam3WorkerRunner
+from ..core.qt_lifecycle import retire_after
+from ..core.refinement_task import RefinementTask
 from ..core.style_manager import StyleManager
 from ..core.run_spec import CLASS_NAMES, CLASS_ORDER
-from ..qt_compat import (
+from ..qt6_api import (
     ALIGN_CENTER,
     DASH_LINE,
     ENSURE_VISIBLE,
@@ -87,6 +90,7 @@ class ClassRefinementDialog(QDialog):
         self._eligible_fusions = []
         self._workspace = None
         self._workspace_task = None
+        self._refinement_task = None
         self._workspace_generation = 0
         self._workspace_statistics = {}
         self._workspace_refresh = {}
@@ -124,6 +128,7 @@ class ClassRefinementDialog(QDialog):
         self._edit_buttons = {}
         self._confirm_buttons = {}
         self._snapshots = {}
+        self._commit_feature_ids = {}
         self._edit_context = {}
         self._metadata_update = False
         self._worker = None
@@ -521,6 +526,12 @@ class ClassRefinementDialog(QDialog):
 
     def set_run(self, result, run_spec, sam_config, scripts_dir):
         self._cancel_background_load(silent=True)
+        self.table.setEnabled(True)
+        self._final_path = ""
+        self._issues_path = ""
+        self._issue_count = None
+        self.topology_btn.setEnabled(False)
+        self.accept_btn.setEnabled(False)
         self._workspace_generation += 1
         self._connect_iface_layer_signal()
         self._connect_map_tool_signal()
@@ -531,6 +542,7 @@ class ClassRefinementDialog(QDialog):
         self._cancel_active_session(record=False)
         self._disconnect_layer_signals()
         self._snapshots.clear()
+        self._commit_feature_ids.clear()
         self._workspace = None
         self._workspace_statistics = {}
         self._workspace_refresh = {}
@@ -838,11 +850,15 @@ class ClassRefinementDialog(QDialog):
             started_slot = lambda c=code: self._editing_started(c)
             committed_slot = lambda c=code: self._editing_stopped(c)
             stopped_slot = lambda c=code: self._editing_stopped(c)
+            before_slot = lambda *_args, c=code: self._capture_edit_delta(c)
+            added_slot = lambda _layer_id, features, c=code: self._record_committed_additions(c, features)
             layer.editingStarted.connect(started_slot)
             layer.afterCommitChanges.connect(committed_slot)
             layer.editingStopped.connect(stopped_slot)
+            layer.beforeCommitChanges.connect(before_slot)
+            layer.committedFeaturesAdded.connect(added_slot)
             self._layer_signal_slots[layer.id()] = (
-                started_slot, committed_slot, stopped_slot
+                started_slot, committed_slot, stopped_slot, before_slot, added_slot
             )
             selection_slot = lambda *_args, c=code: self._selection_changed(c)
             layer.selectionChanged.connect(selection_slot)
@@ -880,6 +896,17 @@ class ClassRefinementDialog(QDialog):
         self._update_manual_panel()
 
     def _cancel_background_load(self, _checked=False, *, silent=False):
+        if self._refinement_task is not None:
+            task = self._refinement_task
+            task.cancel()
+            if silent:
+                # The manager owns the task until completion. An old Run must
+                # neither publish into a new Run nor retain its staged output.
+                task.taskCompleted.connect(task.discard)
+                self._refinement_task = None
+            if not silent:
+                self.baseline_label.setText("正在取消组装/拓扑检查；现有结果不会被覆盖")
+                return
         task = self._workspace_task
         if task is not None:
             task.cancel()
@@ -906,6 +933,8 @@ class ClassRefinementDialog(QDialog):
                     layer.editingStarted,
                     layer.afterCommitChanges,
                     layer.editingStopped,
+                    layer.beforeCommitChanges,
+                    layer.committedFeaturesAdded,
                 ),
                 slots,
             ):
@@ -1366,6 +1395,8 @@ class ClassRefinementDialog(QDialog):
         self._update_manual_panel()
 
     def _layer_edit_changed(self, class_code):
+        if self._metadata_update:
+            return
         preview = self._qgis_smooth_preview
         if preview and int(preview["class_code"]) == int(class_code):
             self._clear_qgis_smooth_preview(
@@ -2348,7 +2379,9 @@ class ClassRefinementDialog(QDialog):
         if target_code != source_code:
             self._set_class_modified(target_code)
             self._visibility_checks[target_code].setChecked(True)
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes={source_code, target_code}
+        )
         self._refresh_class_display(source_code, target_code)
         task["submitted_batch_count"] += 1
         task["modified_old_count"] += len(matched_records)
@@ -2539,7 +2572,9 @@ class ClassRefinementDialog(QDialog):
                 )
         batch_size = len(prepared)
         self._set_class_modified(target_code)
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes={target_code}
+        )
         self._visibility_checks[target_code].setChecked(True)
         self._refresh_class_display(target_code)
         task["added_count"] += batch_size
@@ -3108,9 +3143,14 @@ class ClassRefinementDialog(QDialog):
         self._update_qgis_smoothing_controls()
         self._update_actions()
 
-    def _snapshot(self, layer):
+    def _snapshot(self, layer, feature_ids=None):
         snapshot = {}
-        for feature in layer.getFeatures():
+        request = QgsFeatureRequest()
+        if feature_ids is not None:
+            if not feature_ids:
+                return snapshot
+            request.setFilterFids(list(feature_ids))
+        for feature in layer.getFeatures(request):
             snapshot[feature.id()] = {
                 "object_id": str(feature.attribute("object_id") or ""),
                 "geometry_hash": class_workspace.geometry_hash(feature.geometry()),
@@ -3128,12 +3168,51 @@ class ClassRefinementDialog(QDialog):
         persisted = class_workspace.working_layer(
             record, f"class_{class_code}_persisted_snapshot"
         )
-        return self._snapshot(persisted)
+        layer = self._layer(class_code)
+        ids = None if self._uses_provider_transaction(layer) else self._edited_existing_ids(layer)
+        return self._snapshot(persisted, ids)
+
+    @staticmethod
+    def _uses_provider_transaction(layer):
+        return layer.dataProvider().transaction() is not None
+
+    def _baseline_for_edit(self, layer):
+        # Transaction pass-through providers do not emit committedFeaturesAdded
+        # and can write before beforeCommitChanges. Preserve full tracking only
+        # in this exceptional mode; ordinary GPKG edit buffers stay incremental.
+        return self._snapshot(layer) if self._uses_provider_transaction(layer) else {}
+
+    @staticmethod
+    def _edited_existing_ids(layer):
+        buffer = layer.editBuffer()
+        if buffer is None:
+            return set()
+        return (set(buffer.changedGeometries()) | set(buffer.changedAttributeValues())
+                | set(buffer.deletedFeatureIds())) - set(buffer.addedFeatures())
+
+    def _capture_edit_delta(self, class_code):
+        if self._metadata_update:
+            return
+        layer = self._layer(class_code)
+        if self._uses_provider_transaction(layer):
+            return
+        ids = self._edited_existing_ids(layer)
+        # Read pre-commit values from the provider, not the edited layer view.
+        before = self._snapshot(layer.dataProvider(), ids)
+        before.update(self._snapshots.get(class_code) or {})
+        self._snapshots[class_code] = before
+        self._commit_feature_ids[class_code] = set(ids) | set(before)
+
+    def _record_committed_additions(self, class_code, features):
+        if not self._metadata_update:
+            self._commit_feature_ids.setdefault(class_code, set()).update(
+                feature.id() for feature in features
+            )
 
     def _editing_started(self, class_code):
         if self._metadata_update:
             return
-        self._snapshots[class_code] = self._snapshot(self._layer(class_code))
+        self._snapshots[class_code] = self._baseline_for_edit(self._layer(class_code))
         self._update_manual_panel()
         self._update_actions()
 
@@ -3145,7 +3224,15 @@ class ClassRefinementDialog(QDialog):
             return
         layer = self._layer(class_code)
         before = self._snapshots[class_code]
-        after_features = {feature.id(): feature for feature in layer.getFeatures()}
+        affected_ids = self._commit_feature_ids.pop(class_code, set()) | set(before)
+        request = QgsFeatureRequest().setFilterFids(list(affected_ids))
+        if self._uses_provider_transaction(layer):
+            after_features = {feature.id(): feature for feature in layer.getFeatures()}
+        else:
+            after_features = (
+                {feature.id(): feature for feature in layer.getFeatures(request)}
+                if affected_ids else {}
+            )
         changed = []
         deleted = sorted(set(before) - set(after_features))
         added = sorted(set(after_features) - set(before))
@@ -3155,7 +3242,7 @@ class ClassRefinementDialog(QDialog):
                 changed.append(feature_id)
         if not changed and not deleted and not added:
             if layer.isEditable():
-                self._snapshots[class_code] = self._snapshot(layer)
+                self._snapshots[class_code] = self._baseline_for_edit(layer)
             else:
                 self._snapshots.pop(class_code, None)
             self._edit_context.pop(class_code, None)
@@ -3247,7 +3334,7 @@ class ClassRefinementDialog(QDialog):
         finally:
             self._metadata_update = False
         if layer.isEditable():
-            self._snapshots[class_code] = self._snapshot(layer)
+            self._snapshots[class_code] = self._baseline_for_edit(layer)
         else:
             self._snapshots.pop(class_code, None)
         for object_id, warning in confidence_warnings:
@@ -3281,7 +3368,10 @@ class ClassRefinementDialog(QDialog):
     @staticmethod
     def _feature_by_object_id(layer, object_id):
         wanted = str(object_id or "")
-        for feature in layer.getFeatures():
+        request = QgsFeatureRequest().setFilterExpression(
+            '"object_id" = \'' + wanted.replace("'", "''") + "'"
+        ).setLimit(1)
+        for feature in layer.getFeatures(request):
             if str(feature.attribute("object_id") or "") == wanted:
                 return feature
         raise RuntimeError(f"cannot reload persisted object: {wanted}")
@@ -3325,6 +3415,8 @@ class ClassRefinementDialog(QDialog):
             return None, None, str(exc)
 
     def _set_class_modified(self, class_code):
+        self._issue_count = None
+        self._update_accept_enabled()
         record = self._workspace["classes"][str(class_code)]
         record["modified"] = True
         record["confirmed"] = False
@@ -3335,7 +3427,9 @@ class ClassRefinementDialog(QDialog):
 
     def _mark_class_modified(self, class_code):
         self._set_class_modified(class_code)
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes={class_code}
+        )
         self._refresh_table()
 
     @staticmethod
@@ -3390,10 +3484,10 @@ class ClassRefinementDialog(QDialog):
     @staticmethod
     def _object_id_exists(layer, object_id):
         wanted = str(object_id or "")
-        return any(
-            str(feature.attribute("object_id") or "") == wanted
-            for feature in layer.getFeatures()
-        )
+        request = QgsFeatureRequest().setFilterExpression(
+            '"object_id" = \'' + wanted.replace("'", "''") + "'"
+        ).setLimit(1)
+        return any(layer.getFeatures(request))
 
     def _sam_available(self):
         return bool(
@@ -3431,7 +3525,9 @@ class ClassRefinementDialog(QDialog):
             "started_at": class_workspace._now(),
         }
         self._workspace["active_sam_session_id"] = self._active_session["session_id"]
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes=()
+        )
         self.session_group.show()
         self.session_label.setText(
             f"当前类别: {class_code} {CLASS_NAMES[class_code]} | "
@@ -3752,7 +3848,9 @@ class ClassRefinementDialog(QDialog):
         session["started_at"] = class_workspace._now()
         session.pop("error", None)
         self._workspace["active_sam_session_id"] = session["session_id"]
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes=()
+        )
         self.session_error.hide()
         self.session_error.clear()
         self._set_decision_state("inference")
@@ -3788,7 +3886,9 @@ class ClassRefinementDialog(QDialog):
     def _adopt_candidate(self, session, edit):
         layer = self._layer(session["class_code"])
         self.iface.setActiveLayer(layer)
-        before_snapshot = self._snapshot(layer)
+        before_snapshot = self._snapshot(
+            layer, {session["feature_id"]} if session["mode"] == "existing" else set()
+        )
         confidence_mean, confidence_std, confidence_warning = (
             self._optional_confidence_statistics(
                 layer, session["candidate_geometry"]
@@ -3946,7 +4046,7 @@ class ClassRefinementDialog(QDialog):
         if self._workspace is not None:
             self._workspace["active_sam_session_id"] = ""
             self._workspace = class_workspace.save_workspace(
-                self._run_spec, self._workspace
+                self._run_spec, self._workspace, changed_class_codes=()
             )
         self.session_group.hide()
         self.local_topology_label.setText("局部拓扑提示: -")
@@ -4005,7 +4105,9 @@ class ClassRefinementDialog(QDialog):
             self._run_spec, "class_confirmed" if checked else "class_reopened",
             class_code=class_code, feature_count=layer.featureCount(),
         )
-        self._workspace = class_workspace.save_workspace(self._run_spec, self._workspace)
+        self._workspace = class_workspace.save_workspace(
+            self._run_spec, self._workspace, changed_class_codes={class_code}
+        )
         self._refresh_table()
 
     def _refresh_table(self):
@@ -4111,6 +4213,7 @@ class ClassRefinementDialog(QDialog):
             and not modified
             and not self._active_session
             and not self._manual_task
+            and self._refinement_task is None
         )
         self.assemble_btn.setEnabled(can_assemble)
         issue_text = "-" if self._issue_count is None else str(self._issue_count)
@@ -4120,18 +4223,85 @@ class ClassRefinementDialog(QDialog):
         )
 
     def _assemble_final(self):
+        self._start_refinement_task(assemble=True)
+
+    def _start_refinement_task(self, *, assemble):
+        if self._refinement_task is not None or not self._workspace:
+            return
+        if self._editable_modified_layers() or self._active_session or self._manual_task:
+            QMessageBox.warning(self, "后台检查", "请先保存编辑并结束当前人工/SAM3 操作")
+            return
+        self._issue_count = None
+        self._update_accept_enabled()
         try:
-            path, count = final_assembler.assemble_final(
-                self._run_spec, self._workspace
+            task = RefinementTask(
+                self._run_spec, self._workspace, final_path=self._final_path,
+                assemble=assemble,
+                transform_context=QgsCoordinateTransformContext(QgsProject.instance().transformContext()),
             )
-            self._final_path = path
-            self.allow_issues_check.setChecked(False)
-            self.layer_manager.load_final_composite(self._run_spec["run_id"], path)
-            self.topology_btn.setEnabled(True)
-            self.baseline_label.setText(f"final_composite 已组装，共 {count} 个面")
-            self._check_topology()
+            self._refinement_task = task
+            task.taskCompleted.connect(self._refinement_completed)
+            task.taskTerminated.connect(self._refinement_terminated)
+            self.table.setEnabled(False)
+            self.fusion_combo.setEnabled(False)
+            self.initialize_btn.setEnabled(False)
+            self.topology_btn.setEnabled(False)
+            self.cancel_load_btn.setText("取消组装/检查")
+            self.cancel_load_btn.show()
+            self.baseline_label.setText("正在后台组装/检查；地图仍可浏览，完成前请勿修改输入")
+            self._update_actions()
+            QgsApplication.taskManager().addTask(task)
         except Exception as exc:
-            QMessageBox.warning(self, "组装失败", str(exc))
+            QMessageBox.warning(self, "后台检查失败", str(exc))
+
+    def _refinement_completed(self):
+        task = self.sender()
+        if task is not self._refinement_task:
+            return
+        try:
+            if task.isCanceled():
+                self.baseline_label.setText("后台组装/检查已取消；现有结果未改变")
+                return
+            if not task.inputs_unchanged() or self._editable_modified_layers():
+                raise RuntimeError("计算期间输入或编辑缓冲已变化，请保存后重新检查")
+            result = task.result_data
+            published = task.publish()
+            if task.assemble:
+                self._final_path = published["final_path"]
+            issues_path = published["issues_path"]
+            self._issues_path = issues_path
+            self._issue_count = int(result["issue_count"])
+            self.allow_issues_check.setChecked(False)
+            if task.assemble:
+                self.layer_manager.load_final_composite(self._run_spec["run_id"], self._final_path)
+            self.layer_manager.load_topology_issues(self._run_spec["run_id"], issues_path)
+            self.baseline_label.setText(f"后台组装/拓扑检查完成；问题数 {self._issue_count}")
+        except Exception as exc:
+            self._issue_count = None
+            QMessageBox.warning(self, "结果未发布", str(exc))
+        finally:
+            task.discard()
+            self._finish_refinement_task()
+
+    def _refinement_terminated(self):
+        task = self.sender()
+        if task is not self._refinement_task:
+            return
+        if task.isCanceled():
+            self.baseline_label.setText("后台组装/检查已取消；现有结果未改变")
+        else:
+            QMessageBox.warning(self, "后台检查失败", task.error_message)
+        self._finish_refinement_task()
+
+    def _finish_refinement_task(self):
+        self._refinement_task = None
+        self.table.setEnabled(True)
+        self.fusion_combo.setEnabled(self._workspace is None and bool(self._eligible_fusions))
+        self.cancel_load_btn.setText("取消后台加载")
+        self.cancel_load_btn.hide()
+        self.topology_btn.setEnabled(bool(self._final_path))
+        self._update_actions()
+        self._update_accept_enabled()
 
     def _accepted_layer_for_check(self):
         path = str(self._run_spec.get("accepted_target_gpkg") or "")
@@ -4147,22 +4317,7 @@ class ClassRefinementDialog(QDialog):
     def _check_topology(self):
         if not self._final_path:
             return
-        try:
-            path, count, counts = topology_validator.validate_topology(
-                self._run_spec, self._final_path, self._accepted_layer_for_check()
-            )
-            self._issues_path = path
-            self._issue_count = count
-            self.layer_manager.load_topology_issues(self._run_spec["run_id"], path)
-            self._update_accept_enabled()
-            self.baseline_label.setText(
-                "拓扑检查完成: " + (", ".join(f"{key}={value}" for key, value in counts.items()) or "无问题")
-            )
-            self._update_actions()
-        except Exception as exc:
-            self._issue_count = None
-            self.accept_btn.setEnabled(False)
-            QMessageBox.warning(self, "拓扑检查失败", str(exc))
+        self._start_refinement_task(assemble=False)
 
     def _write_accepted(self):
         if self._issue_count is None:
@@ -4188,6 +4343,7 @@ class ClassRefinementDialog(QDialog):
         self.accept_btn.setEnabled(
             bool(
                 self._final_path
+                and self._refinement_task is None
                 and self._issue_count is not None
                 and (
                     self._issue_count == 0
@@ -4208,9 +4364,11 @@ class ClassRefinementDialog(QDialog):
         self._disconnect_iface_layer_signal()
         self._disconnect_map_tool_signal()
         self._snapshots.clear()
+        self._commit_feature_ids.clear()
         self._manual_capture_retire_timer.stop()
         self._manual_retired_capture_tools = []
         if self._worker is not None:
+            retire_after(self._worker, self._worker.stopped)
             self._worker.stop()
             self._worker = None
 
@@ -4250,6 +4408,7 @@ class ClassRefinementDialog(QDialog):
         self._cancel_active_session(record=True)
         self._cancel_background_load(silent=True)
         if self._worker is not None:
+            retire_after(self._worker, self._worker.stopped)
             self._worker.stop()
             self._worker = None
         self._clear_qgis_smooth_preview()

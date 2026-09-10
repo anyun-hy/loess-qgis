@@ -65,7 +65,7 @@ def pixel_area_tolerance(run_spec):
     return 0.0
 
 
-def _selected_tile_target(run_spec, target_crs=None):
+def _selected_tile_target(run_spec, target_crs=None, *, transform_context=None):
     selection = run_spec.get("range_selection") or {}
     if selection.get("mode") != "vector_tile_intersection":
         extent = run_spec["requested_extent"]
@@ -116,7 +116,7 @@ def _selected_tile_target(run_spec, target_crs=None):
         raise RuntimeError("cannot transform range target: source CRS is invalid")
     resolved_target = target_crs or source
     if source != resolved_target:
-        transform = QgsCoordinateTransform(source, resolved_target, QgsProject.instance())
+        transform = QgsCoordinateTransform(source, resolved_target, transform_context if transform_context is not None else QgsProject.instance())
         try:
             geometry.transform(transform)
         except Exception as error:
@@ -142,7 +142,7 @@ def _selected_tile_target(run_spec, target_crs=None):
             extent_transform = QgsCoordinateTransform(
                 raster_crs,
                 resolved_target,
-                QgsProject.instance(),
+                transform_context if transform_context is not None else QgsProject.instance(),
             )
             extent_geometry.transform(extent_transform)
         geometry = geometry.intersection(extent_geometry)
@@ -153,7 +153,7 @@ def _selected_tile_target(run_spec, target_crs=None):
     return geometry
 
 
-def validate_topology(run_spec, final_path, accepted_layer=None):
+def validate_topology(run_spec, final_path, accepted_layer=None, *, output_path=None, transform_context=None, is_canceled=None):
     final = QgsVectorLayer(
         f"{final_path}|layername={LAYER_NAMES.FINAL_COMPOSITE}", "final", "ogr"
     )
@@ -192,6 +192,8 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
     features = list(final.getFeatures())
     valid_geometries = []
     for feature in features:
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("拓扑检查已取消")
         geometry = feature.geometry()
         if geometry is None or geometry.isNull() or geometry.isEmpty():
             add_issue("empty_geometry", None, feature, severity="high", message="Feature geometry is empty")
@@ -209,6 +211,8 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
     seen = set()
     for feature in features:
         geometry = feature.geometry()
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("拓扑检查已取消")
         if geometry is None or geometry.isNull() or geometry.isEmpty():
             continue
         for other_id in index.intersects(geometry.boundingBox()):
@@ -235,13 +239,14 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
                 message="Confirmed class polygons overlap beyond one-pixel tolerance",
             )
 
-    target = _selected_tile_target(run_spec, final.crs())
+    target = _selected_tile_target(run_spec, final.crs(), transform_context=transform_context)
     if accepted_layer is not None and accepted_layer.isValid():
         accepted_tolerance = accepted_integrity.strict_overlap_tolerance(run_spec)
         accepted_integrity.audit_accepted_layer(
             accepted_layer,
             overlap_tolerance=accepted_tolerance,
             expected_crs=final.crs(),
+            is_canceled=is_canceled,
         )
         for final_feature, accepted_feature, intersection in (
             accepted_integrity.assert_no_accepted_overlap(
@@ -249,6 +254,8 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
                 accepted_layer,
                 overlap_tolerance=accepted_tolerance,
                 raise_on_overlap=False,
+                transform_context=transform_context,
+                is_canceled=is_canceled,
             )
         ):
             add_issue(
@@ -265,7 +272,7 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
         accepted_geometries = []
         transform = None
         if accepted_layer.crs() != final.crs():
-            transform = QgsCoordinateTransform(accepted_layer.crs(), final.crs(), QgsProject.instance())
+            transform = QgsCoordinateTransform(accepted_layer.crs(), final.crs(), transform_context if transform_context is not None else QgsProject.instance())
         for feature in accepted_layer.getFeatures():
             geometry = QgsGeometry(feature.geometry())
             if transform is not None:
@@ -275,6 +282,8 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
         if accepted_geometries:
             target = target.difference(QgsGeometry.unaryUnion(accepted_geometries))
     if valid_geometries:
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("拓扑检查已取消")
         gap = target.difference(QgsGeometry.unaryUnion(valid_geometries))
     else:
         gap = target
@@ -283,14 +292,16 @@ def validate_topology(run_spec, final_path, accepted_layer=None):
 
     issues.dataProvider().addFeatures(issue_features)
     issues.updateExtents()
-    output = Path(run_spec["run_dir"]) / "final" / "topology_issues.gpkg"
+    output = Path(output_path) if output_path is not None else Path(run_spec["run_dir"]) / "final" / "topology_issues.gpkg"
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = "GPKG"
     options.layerName = LAYER_NAMES.TOPOLOGY_ISSUES
     options.actionOnExistingFile = (
         QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
     )
-    error, message = write_vector_layer(issues, output, options)
+    if is_canceled is not None and is_canceled():
+        raise RuntimeError("拓扑检查已取消")
+    error, message = write_vector_layer(issues, output, options, transform_context=transform_context)
     if error != QgsVectorFileWriter.WriterError.NoError:
         raise RuntimeError(f"cannot write topology issues: {message}")
     counts = {}

@@ -9,7 +9,7 @@ SOURCE = (
 
 def _format_observation(observation):
     start = SOURCE.index("def _final_artifact_size_observation_log_message")
-    end = SOURCE.index("\n\nclass V5AsyncInferenceRunner", start)
+    end = SOURCE.index("\n\nclass _BatchedPipelineLogWriter", start)
     namespace = {}
     exec(SOURCE[start:end], namespace)
     return namespace["_final_artifact_size_observation_log_message"](observation)

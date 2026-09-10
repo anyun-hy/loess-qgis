@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: run_env_check.sh [output_dir]
+# Usage: run_env_check.sh [output_dir] [report_json]
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
@@ -11,6 +11,7 @@ fi
 
 ARGS=(--scripts-dir "$SCRIPT_DIR" --conda-env "$CONDA_ENV")
 [ -n "${1:-}" ] && ARGS+=(--output-dir "$1")
+[ -n "${2:-}" ] && ARGS+=(--report-json "$2")
 
 exec "$CONDA_EXE" run --no-capture-output -n "$CONDA_ENV" \
   python "$SCRIPT_DIR/check_environment.py" "${ARGS[@]}"

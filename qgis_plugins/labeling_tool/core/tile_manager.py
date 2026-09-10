@@ -174,7 +174,7 @@ def get_grid_extent(tiles):
     )
 
 
-def snapshot_vector_geometries(vector_layer, target_crs):
+def snapshot_vector_geometries(vector_layer, target_crs, *, transform_context=None, is_canceled=None):
     """Copy valid polygon geometries into the raster CRS on the main thread."""
     if vector_layer is None or not vector_layer.isValid():
         raise ValueError("请选择有效的已加载矢量面图层")
@@ -188,11 +188,14 @@ def snapshot_vector_geometries(vector_layer, target_crs):
     transform = None
     if vector_layer.crs() != target_crs:
         transform = QgsCoordinateTransform(
-            vector_layer.crs(), target_crs, QgsProject.instance()
+            vector_layer.crs(), target_crs,
+            transform_context if transform_context is not None else QgsProject.instance()
         )
 
     geometries = []
     for source_feature in vector_layer.getFeatures():
+        if is_canceled is not None and is_canceled():
+            raise RuntimeError("范围几何校验已取消")
         geometry = QgsGeometry(source_feature.geometry())
         if geometry.isNull() or geometry.isEmpty():
             continue

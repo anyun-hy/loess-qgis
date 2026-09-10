@@ -56,14 +56,19 @@ def test_public_tree_excludes_internal_and_runtime_material() -> None:
     assert not [
         path for path in tracked if path.startswith(forbidden_prefixes)
     ]
+    public_text_paths = [
+        ROOT / "README.md",
+        *(ROOT / "docs").rglob("*.md"),
+        *(ROOT / "visualizations").glob("*.json"),
+    ]
+    local_agents = ROOT / "AGENTS.md"
+    # AGENTS.md is an intentionally local Codex instruction file.  A public
+    # release audit may inspect it only if Git actually tracks it.
+    if "AGENTS.md" in tracked:
+        public_text_paths.append(local_agents)
     tracked_text = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
-        for path in (
-            ROOT / "README.md",
-            ROOT / "AGENTS.md",
-            *(ROOT / "docs").rglob("*.md"),
-            *(ROOT / "visualizations").glob("*.json"),
-        )
+        for path in public_text_paths
     )
     assert not re.search(r"/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+", tracked_text)
 

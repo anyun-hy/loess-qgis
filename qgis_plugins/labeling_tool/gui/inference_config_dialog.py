@@ -25,7 +25,7 @@ from qgis.PyQt.QtWidgets import (
 
 from ..core.fusion_profile import profile_summary
 from ..core.model_registry import ModelRegistry
-from ..qt_compat import (
+from ..qt6_api import (
     APPLY,
     CANCEL,
     CHECKED,

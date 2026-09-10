@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from check_environment import _fingerprint as environment_fingerprint
 from labeling_tool.core.deployment_contract import (
+    SHARED_RUNTIME_FILES,
     deployment_fingerprint,
     verify_project_runtime,
 )
@@ -27,6 +29,7 @@ SHARED_NAMES = (
     "run_state_db.py",
     "postgres_state.py",
     "ownership_neighbors.py",
+    "work_package_planner.py",
 )
 
 
@@ -66,6 +69,51 @@ def _fake_qgis(path: Path):
         encoding="utf-8",
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def test_every_inference_core_import_is_in_the_shared_runtime_contract():
+    imported_modules = set()
+    for path in (ROOT / "inference_scripts").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            module = str(node.module or "")
+            prefix = "labeling_tool.core."
+            if module.startswith(prefix):
+                imported_modules.add(module.removeprefix(prefix).split(".", 1)[0])
+
+    deployed_modules = {
+        Path(canonical).stem for canonical in SHARED_RUNTIME_FILES
+    }
+    assert imported_modules <= deployed_modules
+
+
+def test_ubuntu_plugin_install_targets_the_qgis4_profile(tmp_path):
+    fake_qgis = tmp_path / "qgis_process"
+    _fake_qgis(fake_qgis)
+    env = _environment(fake_qgis)
+    home = tmp_path / "home"
+    env["HOME"] = str(home)
+
+    result = _run(
+        [
+            str(ROOT / "bash" / "install_plugin.sh"),
+            "--platform",
+            "ubuntu",
+            "--profile",
+            "qgis42-test",
+            "--check-only",
+        ],
+        env=env,
+    )
+
+    expected = (
+        home
+        / ".local/share/QGIS/QGIS4/profiles/qgis42-test/python/plugins/labeling_tool"
+    )
+    assert f"plugin directory: {expected}" in result.stdout
+    assert "QGIS: QGIS 4.2.0" in result.stdout
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
@@ -185,12 +233,15 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
                 "from labeling_tool.core.run_spec import CLASS_ORDER;"
                 "from labeling_tool.core.ownership_neighbors import "
                 "ownership_neighbors;"
-                "print(SCHEMA_VERSION, CLASS_ORDER[0], ownership_neighbors([]))"
+                "from labeling_tool.core.work_package_planner import "
+                "unit_confidence_write_reserve;"
+                "print(SCHEMA_VERSION, CLASS_ORDER[0], ownership_neighbors([]), "
+                "unit_confidence_write_reserve(1))"
             ),
         ],
         env={**env, "PYTHONPATH": str(project_root / "runtime")},
     )
-    assert import_check.stdout.strip() == "2 12 []"
+    assert import_check.stdout.strip().startswith("2 12 [] ")
 
 
 def test_runtime_contract_rejects_invalid_or_mismatched_platforms(tmp_path):

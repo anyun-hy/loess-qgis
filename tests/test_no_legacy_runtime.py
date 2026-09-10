@@ -143,7 +143,12 @@ def test_accepted_labels_are_audited_and_snapshot_is_not_the_write_target():
         / "gui"
         / "class_refinement_dialog.py"
     ).read_text(encoding="utf-8")
-    assert "audit_accepted_layer(" in dock
+    preparation = (
+        ROOT / "qgis_plugins" / "labeling_tool" / "core" / "run_preparation_task.py"
+    ).read_text(encoding="utf-8")
+    assert "RunPreparationTask(" in dock
+    assert "audit_accepted_layer(" in preparation
+    assert "expected_crs=self.raster_crs" in preparation
     assert '"accepted_validation":' in builder
     assert '"accepted_target_gpkg":' in builder
     assert 'get("accepted_target_gpkg")' in dialog

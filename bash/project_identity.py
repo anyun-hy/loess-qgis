@@ -30,7 +30,9 @@ SHARED_FILES = {
     "qgis_plugins/labeling_tool/core/run_spec.py",
     "qgis_plugins/labeling_tool/core/run_state_db.py",
     "qgis_plugins/labeling_tool/core/postgres_state.py",
+    "qgis_plugins/labeling_tool/core/monitor_contract.py",
     "qgis_plugins/labeling_tool/core/ownership_neighbors.py",
+    "qgis_plugins/labeling_tool/core/work_package_planner.py",
 }
 
 

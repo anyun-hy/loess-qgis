@@ -7,9 +7,9 @@ import os
 import shlex
 import signal
 
-from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
-from .process_compat import configure_process, process_is_running
+from .process_runtime import configure_process, process_is_running
 
 
 class Sam3WorkerRunner(QObject):
@@ -28,6 +28,10 @@ class Sam3WorkerRunner(QObject):
         self._stderr_pending = bytearray()
         self._ready = False
         self._stopping = False
+        self._stop_stage = ""
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setSingleShot(True)
+        self._stop_timer.timeout.connect(self._advance_stop)
 
     @property
     def is_running(self):
@@ -113,40 +117,47 @@ class Sam3WorkerRunner(QObject):
             raise RuntimeError("cannot write to the SAM3 worker")
 
     def stop(self):
+        """Shutdown, TERM, then KILL without blocking the GUI event loop."""
         process = self._process
-        if process is None:
+        if self._stopping:
             return
         self._stopping = True
+        self._ready = False
+        if process is None:
+            self.stopped.emit({"expected": True})
+            return
         if process_is_running(process):
             try:
                 self._write({"command": "shutdown"})
-                process.waitForBytesWritten(1000)
             except Exception:
                 pass
-            if not process.waitForFinished(8000):
-                pid = int(process.processId())
-                if pid > 0 and self._owns_process_group:
-                    try:
-                        os.killpg(pid, signal.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        process.terminate()
-                else:
-                    process.terminate()
-                if not process.waitForFinished(4000):
-                    if pid > 0 and self._owns_process_group:
-                        try:
-                            os.killpg(pid, signal.SIGKILL)
-                        except (ProcessLookupError, OSError):
-                            process.kill()
-                    else:
-                        process.kill()
-                    process.waitForFinished(3000)
-        if self._process is process:
-            self._process = None
-        self._ready = False
-        self._owns_process_group = False
-        process.deleteLater()
-        self.stopped.emit({"expected": True})
+            self._stop_stage = "shutdown"
+            self._stop_timer.start(8000)
+        else:
+            self._finished(process.exitCode(), process.exitStatus())
+
+    def _advance_stop(self):
+        process = self._process
+        if process is None:
+            return
+        if not process_is_running(process):
+            self._finished(process.exitCode(), process.exitStatus())
+            return
+        terminate = self._stop_stage == "shutdown"
+        self._stop_stage = "terminate" if terminate else "kill"
+        pid = int(process.processId())
+        sent = False
+        if pid > 0 and self._owns_process_group:
+            try:
+                os.killpg(pid, signal.SIGTERM if terminate else signal.SIGKILL)
+                sent = True
+            except (ProcessLookupError, OSError):
+                pass
+        if not sent:
+            process.terminate() if terminate else process.kill()
+        # A stuck process must remain owned until finished, not be destroyed
+        # after an arbitrary timeout while it is still running.
+        self._stop_timer.start(4000 if terminate else 3000)
 
     def _read_stdout(self):
         if self._process is None:
@@ -187,6 +198,7 @@ class Sam3WorkerRunner(QObject):
         process = self._process
         if process is None:
             return
+        self._stop_timer.stop()
         self._read_stdout()
         self._read_stderr()
         self._flush(self._stdout_pending, "stdout", final=True)

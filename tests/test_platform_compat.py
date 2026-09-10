@@ -33,10 +33,12 @@ DIRECT_PLATFORM_ENUM_PATTERNS = (
 )
 
 
-def test_plugin_targets_qgis3_and_qgis4_from_one_release():
+def test_plugin_targets_qgis42_pyqt6_qt6_from_one_release():
     metadata = (PLUGIN_ROOT / "metadata.txt").read_text(encoding="utf-8")
-    assert "qgisMinimumVersion=3.44" in metadata
+    assert "qgisMinimumVersion=4.2" in metadata
     assert "qgisMaximumVersion=4.99" in metadata
+    assert "PyQt6" in metadata
+    assert "Qt5" not in metadata
     assert "version=1.0.0" in metadata
     assert "author=anyun-hy" in metadata
     assert "repository=https://github.com/anyun-hy/loess-qgis" in metadata
@@ -45,10 +47,110 @@ def test_plugin_targets_qgis3_and_qgis4_from_one_release():
     assert "-linux" not in metadata
 
 
-def test_business_modules_use_the_shared_qt_compatibility_facade():
+def test_ubuntu_plugin_requires_native_qt6_wayland_qpa():
+    plugin = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
+    assert "self._require_supported_qpa()" in plugin
+    assert 'sys.platform.startswith("linux")' in plugin
+    assert "QGuiApplication.platformName()" in plugin
+    assert 'qpa != "wayland"' in plugin
+    assert "native Qt6 Wayland" in plugin
+
+    active_roots = (PLUGIN_ROOT, ROOT / "inference_scripts", ROOT / "bash")
+    forbidden_launch_overrides = (
+        "QT_QPA_PLATFORM=xcb",
+        "-platform xcb",
+    )
+    offenders = []
+    for active_root in active_roots:
+        for path in active_root.rglob("*"):
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for override in forbidden_launch_overrides:
+                if override in text:
+                    offenders.append(f"{path.relative_to(ROOT)}: {override}")
+    assert offenders == []
+
+
+def test_layer_combo_popup_caps_rows_and_anchors_inside_active_screen():
+    source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(encoding="utf-8")
+    popup_class = source.split(
+        "class _ScreenBoundMapLayerComboBox", 1
+    )[1].split("class RectangleMapTool", 1)[0]
+    assert "MAX_VISIBLE_ITEMS = 15" in popup_class
+    assert "setMaxVisibleItems(self.MAX_VISIBLE_ITEMS)" in popup_class
+    assert "setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)" in popup_class
+    assert "def _visible_rows_height(self):" in popup_class
+    assert "def _popup_height_limit(self):" in popup_class
+    assert "return row_height * visible_rows" in popup_class
+    assert "self.style().pixelMetric(" in popup_class
+    assert "MENU_SCROLLER_HEIGHT" in popup_class
+    assert "+ 2 * menu_scroller_height" in popup_class
+    assert "popup.setMaximumHeight(height_limit)" in popup_class
+    assert "def showPopup(self):" in popup_class
+    assert "super().showPopup()" in popup_class
+    assert "QApplication.screenAt(anchor)" in popup_class
+    assert "screen.availableGeometry()" in popup_class
+    assert "popup.move(popup_x, popup_y)" in popup_class
+    assert source.count("_ScreenBoundMapLayerComboBox()") == 2
+
+
+def test_inference_terminal_notices_do_not_block_wayland_monitor():
+    source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(encoding="utf-8")
+    helper = source.split("def _show_nonblocking_notice", 1)[1].split(
+        "def _finish_before_inference", 1
+    )[0]
+    finish = source.split("def _finish_before_inference", 1)[1].split(
+        "def _set_progress_terminal", 1
+    )[0]
+
+    assert "monitor.isVisible()" in helper
+    assert "QMessageBox(parent)" in helper
+    assert "dialog.setWindowModality(NON_MODAL)" in helper
+    assert "dialog.setAttribute(WA_DELETE_ON_CLOSE, True)" in helper
+    assert "dialog.show()" in helper
+    assert "dialog.raise_()" in helper
+    assert "dialog.activateWindow()" in helper
+    assert ".exec(" not in helper
+    assert "monitor_dialog.mark_finished(title, message)" in finish
+    assert "_show_nonblocking_notice(CRITICAL, title, message)" in finish
+    assert "QMessageBox.critical(self, title, message)" not in source
+
+
+def test_retired_qgis3_qt5_runtime_code_is_absent():
+    assert not (PLUGIN_ROOT / "qt_compat.py").exists()
+    assert not (PLUGIN_ROOT / "core" / "process_compat.py").exists()
+
+    retired_patterns = (
+        "PyQt5",
+        "QGIS/QGIS3",
+        'EXPECTED_QGIS="3.',
+        "qgisMinimumVersion=3",
+        "(3, 44)",
+        "(3, 5, 5)",
+    )
+    active_roots = (
+        PLUGIN_ROOT,
+        ROOT / "inference_scripts",
+        ROOT / "bash",
+        ROOT / ".github",
+    )
+    offenders = []
+    for active_root in active_roots:
+        for path in active_root.rglob("*"):
+            if not path.is_file() or path.suffix in {".pyc", ".png"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for pattern in retired_patterns:
+                if pattern in text:
+                    offenders.append(f"{path.relative_to(ROOT)}: {pattern}")
+    assert offenders == []
+
+
+def test_business_modules_use_the_shared_qt6_enum_api():
     offenders = []
     for path in PLUGIN_ROOT.rglob("*.py"):
-        if path.name == "qt_compat.py":
+        if path.name in {"qt6_api.py", "process_runtime.py"}:
             continue
         text = path.read_text(encoding="utf-8")
         for pattern in DIRECT_PLATFORM_ENUM_PATTERNS:
@@ -64,8 +166,9 @@ def test_plugin_install_and_project_initialization_are_independent():
     assert "--profile" in installer
     assert "--plugin-dir" in installer
     assert "--check-only" in installer
-    assert "QGIS/QGIS3/profiles/${PROFILE}/python/plugins" in installer
     assert "QGIS/QGIS4/profiles/${PROFILE}/python/plugins" in installer
+    assert "QGIS/QGIS3/profiles/${PROFILE}/python/plugins" not in installer
+    assert 'EXPECTED_QGIS="4.2."' in installer
     assert "deployment_manifest.json" in installer
     assert 'mv "${STAGED_DEST}" "${DEST_PLUGIN}"' in installer
     assert "--project-root" not in installer
@@ -96,6 +199,12 @@ def test_inference_environment_contract_has_two_minimal_platform_locks():
     assert 'LOESS_ENV_LOCK="environment-ubuntu-cu124.yml"' in config_sh
     assert 'LOESS_ENV_LOCK="environment-macos-qgis4.yml"' in config_sh
     assert "export PYTHONNOUSERSITE=1" in config_sh
+    assert "expandable_segments:True,garbage_collection_threshold:0.8" in config_sh
+
+    checker = (ROOT / "inference_scripts" / "check_environment.py").read_text(
+        encoding="utf-8"
+    )
+    assert "maximum_batch_size=int(runtime.get(\"tile_batch_size\") or 1)" in checker
 
     ubuntu = yaml.safe_load(
         (ROOT / "inference_scripts" / "environment-ubuntu-cu124.yml").read_text(
@@ -172,14 +281,14 @@ def test_environment_check_owns_and_terminates_its_process_group():
     manager = (PLUGIN_ROOT / "core" / "inference_config.py").read_text(
         encoding="utf-8"
     )
-    compat = (PLUGIN_ROOT / "core" / "process_compat.py").read_text(
+    runtime = (PLUGIN_ROOT / "core" / "process_runtime.py").read_text(
         encoding="utf-8"
     )
     assert "configure_process(" in manager
-    assert '"UnixProcessParameters"' in compat
-    assert '"CreateNewSession"' in compat
-    assert '"setChildProcessModifier"' in compat
-    assert 'shutil.which("setsid")' in compat
+    assert "QProcess.UnixProcessParameters()" in runtime
+    assert "QProcess.UnixProcessFlag.CreateNewSession" in runtime
+    assert "process.setUnixProcessParameters(parameters)" in runtime
+    assert "getattr(" not in runtime
     assert "os.killpg(pid, signal.SIGTERM)" in manager
     assert "os.killpg(pid, signal.SIGKILL)" in manager
 
@@ -260,7 +369,8 @@ def test_main_dock_can_start_a_prepared_v5_run_without_hiding_ready_results():
     source = (PLUGIN_ROOT / "gui" / "main_dock.py").read_text(encoding="utf-8")
 
     assert "self._recovery_run_spec = None" in source
-    assert '"planned", "stopped", "failed", "running"' in source
+    assert "run_index.RECOVERABLE_RUN_STATES" in source
+    assert "run_state_from_spec" not in source
     assert "self._recovery_run_spec or self._last_run_spec" in source
 
 
@@ -435,7 +545,8 @@ def test_workspace_edit_tracking_survives_project_restored_edit_mode():
     )[1].split("def _set_attributes", 1)[0]
     assert "keep_editing = layer.isEditable()" in committed
     assert "layer.commitChanges(not keep_editing)" in committed
-    assert "self._snapshots[class_code] = self._snapshot(layer)" in committed
+    assert "self._snapshots[class_code] = self._baseline_for_edit(layer)" in committed
+    assert "self._commit_feature_ids.pop" in committed
 
 
 def test_refinement_disconnects_layer_callbacks_before_qt_widgets_are_destroyed():
@@ -936,7 +1047,7 @@ def test_digitize_completion_defers_map_tool_replacement_until_next_qt_turn():
         PLUGIN_ROOT / "gui" / "class_refinement_dialog.py"
     ).read_text(encoding="utf-8")
     assert "from qgis.PyQt.QtCore import QTimer, pyqtSignal" in source
-    assert "from ..qt_compat import (" in source
+    assert "from ..qt6_api import (" in source
     assert "self._manual_capture_transition_timer = QTimer(self)" in source
     assert "self._manual_capture_transition_timer.setSingleShot(True)" in source
 
@@ -1043,20 +1154,14 @@ def test_monitor_tables_use_stable_user_resizable_columns():
     ).read_text(encoding="utf-8")
     stream_header = source.split(
         "header = self._streams.horizontalHeader()", 1
-    )[1].split("left_layout.addWidget(self._streams", 1)[0]
-    for expected_width in (
-            "(0, 180)",
-            "(1, 220)",
-            "(2, 120)",
-            "(3, 100)",
-            "(4, 100)",
-            "(5, 64)",
-            "(6, 110)",
-    ):
-        assert expected_width in stream_header
+    )[1].split("streams_layout.addWidget(self._streams", 1)[0]
+    widgets = (PLUGIN_ROOT / "gui" / "monitor_widgets.py").read_text(encoding="utf-8")
+    assert "self._streams.configure_adaptive_columns(" in stream_header
+    assert "self._tiles.configure_adaptive_columns(" in source
     assert "header.setSectionResizeMode(0, STRETCH)" not in stream_header
-    assert "header.setSectionResizeMode(column, INTERACTIVE)" in stream_header
-    assert "((0, 96), (1, 72), (2, 88))" in source
+    assert "header.setSectionResizeMode(column, INTERACTIVE)" in widgets
+    assert "_adaptive_user_columns" in widgets
+    assert "column not in self._adaptive_user_columns" in widgets
     assert "self._splitter.setSizes([1180, 0])" in source
     assert "self._splitter.setSizes([720, 460] if shown else [1180, 0])" in source
 

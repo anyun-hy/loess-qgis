@@ -161,28 +161,28 @@ def _discard_pending_reservation_function():
     return namespace["_discard_pending_run_reservation"]
 
 
-def _freeze_accepted_function(namespace):
+def _prepare_inputs_function(namespace):
     tree = ast.parse(
-        (ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py").read_text(
+        (ROOT / "qgis_plugins" / "labeling_tool" / "core" / "run_preparation_task.py").read_text(
             encoding="utf-8"
         )
     )
     class_node = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "LabelingDockWidget"
+        if isinstance(node, ast.ClassDef) and node.name == "RunPreparationTask"
     )
     function_node = next(
         node
         for node in class_node.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_freeze_pending_accepted_snapshot"
+        and node.name == "run"
     )
     module = ast.Module(body=[function_node], type_ignores=[])
     ast.fix_missing_locations(module)
     values = {"Path": Path, **namespace}
-    exec(compile(module, "main_dock.py", "exec"), values)
-    return values["_freeze_pending_accepted_snapshot"]
+    exec(compile(module, "run_preparation_task.py", "exec"), values)
+    return values["run"]
 
 
 def _compressed_uint16_source(path, *, bands=3):
@@ -314,12 +314,15 @@ def test_main_dock_blocks_on_real_probe_and_freezes_measurement():
         "def _start_inference_after_tile_cache_probe", 1
     )[1].split("def _on_runner_stage_progress", 1)[0]
     assert "storage_preflight(" in inference_block
-    assert inference_block.index("reserve_run_directory(") < inference_block.index(
+    assert inference_block.index('if not self._pending_run.get("inputs_prepared"):') < inference_block.index(
         "storage_preflight("
     )
-    assert inference_block.index("_freeze_pending_accepted_snapshot(") < inference_block.index(
-        "storage_preflight("
-    )
+    assert 'self._prepare_run_inputs()' in preflight_block
+    prepare = source.split("def _prepare_run_inputs", 1)[1].split("def _on_run_preparation_progress", 1)[0]
+    assert prepare.index("reserve_run_directory(") < prepare.index("RunPreparationTask(")
+    assert "QgsApplication.taskManager().addTask(task)" in prepare
+    completed = source.split("def _on_run_preparation_completed", 1)[1].split("def _on_run_preparation_terminated", 1)[0]
+    assert completed.index("self._pending_run.update(task.result_data)") < completed.index("self._start_inference_after_tile_cache_probe()")
     assert "_discard_pending_run_reservation()" in source
 
 
@@ -388,7 +391,7 @@ def test_snapshot_time_accepted_identity_replaces_start_time_audit_and_skips(
 
     class DifferenceFilter:
         @staticmethod
-        def snapshot_accepted_layer(layer, output_path):
+        def write_source_snapshot(layer, _wkb, output_path, _name, _context, _cancel):
             assert layer is live_layer
             Path(output_path).write_bytes(b"frozen accepted")
             snapshot_calls.append(Path(output_path))
@@ -403,7 +406,7 @@ def test_snapshot_time_accepted_identity_replaces_start_time_audit_and_skips(
 
     class AcceptedIntegrity:
         @staticmethod
-        def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs):
+        def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs, is_canceled):
             assert layer is frozen_layer
             assert overlap_tolerance == pytest.approx(0.25)
             assert expected_crs == "EPSG:3857"
@@ -414,29 +417,26 @@ def test_snapshot_time_accepted_identity_replaces_start_time_audit_and_skips(
                 "identity": "snapshot-time",
             }
 
-    class Raster:
-        @staticmethod
-        def crs():
-            return "EPSG:3857"
-
     def vector_layer(uri, name, provider):
         assert uri.endswith("accepted_snapshot.gpkg|layername=accepted_labels")
-        assert name == "run-test accepted snapshot"
+        assert name == "accepted_audit"
         assert provider == "ogr"
         return frozen_layer
 
-    function = _freeze_accepted_function(
+    function = _prepare_inputs_function(
         {
             "difference_filter": DifferenceFilter,
             "accepted_integrity": AcceptedIntegrity,
             "QgsVectorLayer": vector_layer,
+            "write_source_snapshot": DifferenceFilter.write_source_snapshot,
             "LAYER_NAMES": types.SimpleNamespace(ACCEPTED="accepted_labels"),
         }
     )
     ctx = {
         "run_id": "run-test",
-        "raster": Raster(),
-        "accepted_layer": live_layer,
+        "run_dir": str(tmp_path),
+        "range_selection": {},
+        "skip_accepted": True,
         "accepted_validation": {
             "status": "passed",
             "overlap_tolerance": 0.25,
@@ -453,11 +453,17 @@ def test_snapshot_time_accepted_identity_replaces_start_time_audit_and_skips(
         ],
     }
 
-    function(types.SimpleNamespace(), ctx, tmp_path)
+    task = types.SimpleNamespace(
+        request=ctx, range_source=None, accepted_source=live_layer,
+        accepted_wkb_type="polygon", raster_crs="EPSG:3857", transform_context=None,
+        isCanceled=lambda: False, setProgress=lambda _value: None,
+    )
+    assert function(task) is True, getattr(task, "error_message", "")
+    ctx = task.result_data
 
     assert snapshot_calls == [tmp_path / "accepted_snapshot.gpkg"]
     assert tile_checks == ["covered_at_start_time", "covered_at_snapshot_time"]
-    assert ctx["accepted_layer"] is frozen_layer
+    assert ctx["accepted_snapshot"] == str(tmp_path / "accepted_snapshot.gpkg")
     assert ctx["accepted_validation"]["identity"] == "snapshot-time"
     assert ctx["accepted_validation"]["source"] == "run_snapshot"
     assert [(tile["row"], tile["col"]) for tile in ctx["skipped_tiles"]] == [
@@ -485,7 +491,8 @@ def test_probe_and_run_use_start_time_frozen_paths_tiles_and_skip_setting():
     assert '"skip_accepted": bool(self.skip_accepted_check.isChecked())' in start_block
     assert 'ctx.get("active_tiles") or []' in probe_block
     assert 'ctx["scripts_dir"]' in probe_block
-    assert "self._freeze_pending_accepted_snapshot(ctx, run_dir)" in inference_block
+    assert "RunPreparationTask(" in inference_block
+    assert "self._pending_run.update(task.result_data)" in inference_block
     assert 'for tile in ctx.get("active_tiles") or []' in inference_block
     assert 'skip_accepted=bool(ctx.get("skip_accepted", False))' in inference_block
     assert 'accepted_layer=ctx["accepted_layer"]' in inference_block

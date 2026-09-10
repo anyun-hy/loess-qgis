@@ -1,4 +1,6 @@
 import contextlib
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,13 +100,13 @@ def test_no_runnable_model_or_core_error_blocks():
     ]) == "error"
 
 
-def test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility(monkeypatch):
+def test_runtime_boundary_checks_accept_qgis_42_pyqt6_qt6(monkeypatch):
     checks = []
-    monkeypatch.setenv("LOESS_QGIS_VERSION", "3.44.7-Solothurn")
-    monkeypatch.setenv("LOESS_QGIS_PYTHON_VERSION", "3.12.5")
-    monkeypatch.setenv("LOESS_PYQT_VERSION", "5.15.10")
-    monkeypatch.setenv("LOESS_QT_VERSION", "5.15.13")
-    monkeypatch.setenv("LOESS_QGIS_PYTHON_EXECUTABLE", "/opt/qgis3/bin/python3")
+    monkeypatch.setenv("LOESS_QGIS_VERSION", "4.2.2-Belem do Para")
+    monkeypatch.setenv("LOESS_QGIS_PYTHON_VERSION", "3.14.4")
+    monkeypatch.setenv("LOESS_PYQT_VERSION", "6.10.2")
+    monkeypatch.setenv("LOESS_QT_VERSION", "6.10.2")
+    monkeypatch.setenv("LOESS_QGIS_PYTHON_EXECUTABLE", "/usr/bin/python3")
     monkeypatch.setattr(
         check_environment.sys,
         "executable",
@@ -119,6 +121,22 @@ def test_runtime_boundary_checks_accept_qgis_344_qt5_compatibility(monkeypatch):
     assert by_id["pyqt_version"]["status"] == "ready"
     assert by_id["qt_version"]["status"] == "ready"
     assert "compatibility" in by_id["qgis_version"]["message"].lower()
+
+
+def test_runtime_boundary_checks_reject_the_retired_qgis3_qt5_profile(monkeypatch):
+    checks = []
+    monkeypatch.setenv("LOESS_QGIS_VERSION", "3.44.7-Solothurn")
+    monkeypatch.setenv("LOESS_QGIS_PYTHON_VERSION", "3.12.5")
+    monkeypatch.setenv("LOESS_PYQT_VERSION", "5.15.10")
+    monkeypatch.setenv("LOESS_QT_VERSION", "5.15.13")
+
+    add_runtime_boundary_checks(checks, "qgis")
+
+    by_id = {item["id"]: item for item in checks}
+    assert by_id["qgis_version"]["status"] == "error"
+    assert by_id["pyqt_version"]["status"] == "error"
+    assert by_id["qt_version"]["status"] == "error"
+    assert by_id["qgis_qt_profile"]["status"] == "error"
 
 
 def test_mps_contract_check_releases_allocator_cache(monkeypatch):
@@ -274,6 +292,62 @@ def test_batch_probe_rejects_a_success_that_consumes_safety_headroom(monkeypatch
     assert result["stop_reason"] == "safety_reserve"
 
 
+def test_batch_probe_stops_before_a_projected_candidate_breaks_headroom(
+    monkeypatch,
+):
+    class Input:
+        def __init__(self, batch_size):
+            self.batch_size = batch_size
+
+    class Output:
+        dtype = "float32"
+
+        def __init__(self, batch_size):
+            self.shape = (batch_size, 14, 512, 512)
+
+    attempted = []
+    free_values = iter((12 * 1024**3, 10 * 1024**3))
+
+    def model(sample):
+        attempted.append(sample.batch_size)
+        return Output(sample.batch_size)
+
+    monkeypatch.setattr(
+        check_environment,
+        "load_torchscript_model",
+        lambda _path, _device: (model, {"mode": "cuda"}),
+    )
+    fake_torch = SimpleNamespace(
+        float32="float32",
+        zeros=lambda batch_size, *_args, **_kwargs: Input(batch_size),
+        inference_mode=contextlib.nullcontext,
+        is_tensor=lambda value: isinstance(value, Output),
+        cuda=SimpleNamespace(
+            OutOfMemoryError=RuntimeError,
+            is_available=lambda: True,
+            empty_cache=lambda: None,
+            mem_get_info=lambda _index=0: (next(free_values), 24 * 1024**3),
+            synchronize=lambda _index=0: None,
+        ),
+        backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
+    )
+
+    result = probe_torchscript_batches(
+        fake_torch,
+        "formal.pt",
+        "cuda:0",
+        [1, 2, 4],
+        reserve_bytes=5 * 1024**3,
+    )
+
+    assert attempted == [1, 2]
+    assert result["safe_batch_size"] == 2
+    assert result["max_successful_batch"] == 2
+    assert result["stop_reason"] == "safety_projection"
+    assert result["probes"][-1]["status"] == "skipped_safety_projection"
+    assert result["probes"][-1]["batch_size"] == 4
+
+
 def test_batch_probe_rejects_generic_runtime_error_after_batch_one(monkeypatch):
     class FakeOutOfMemoryError(RuntimeError):
         pass
@@ -426,6 +500,57 @@ def test_isolated_model_set_probe_rejects_partial_progress_after_worker_crash(
     assert all(item["safe_batch_size"] == 0 for item in result["results"].values())
 
 
+def test_isolated_model_set_probe_recovers_all_completed_models_after_cleanup_crash(
+    monkeypatch,
+):
+    completed = {
+        model_id: {
+            "ok": True,
+            "safe_batch_size": batch_size,
+            "model_set_complete": True,
+        }
+        for model_id, batch_size in (("a", 4), ("b", 8))
+    }
+
+    class Result:
+        returncode = -11
+        stderr = ""
+        stdout = "\n".join(
+            [
+                '{"event":"model_set_load_completed","model_id":"a"}',
+                '{"event":"model_set_load_completed","model_id":"b"}',
+                json.dumps({
+                    "event": "model_set_probe_completed",
+                    "model_id": "a",
+                    "result": completed["a"],
+                }),
+                json.dumps({
+                    "event": "model_set_probe_completed",
+                    "model_id": "b",
+                    "result": completed["b"],
+                }),
+            ]
+        )
+
+    monkeypatch.setattr(
+        check_environment.subprocess,
+        "run",
+        lambda *_args, **_kwargs: Result(),
+    )
+
+    result = verify_torchscript_model_set_batch_probe_isolated(
+        [{"model_id": "a", "path": "a.pt"}, {"model_id": "b", "path": "b.pt"}],
+        "cuda:0",
+        [1, 2, 4, 8],
+    )
+
+    assert result["ok"] is True
+    assert result["model_set_complete"] is True
+    assert result["results"] == completed
+    assert result["worker_exit_code"] == -11
+    assert "completed" in result["worker_cleanup_warning"]
+
+
 def test_isolated_batch_probe_preserves_last_safe_result_after_worker_crash(monkeypatch):
     class Result:
         returncode = -9
@@ -455,3 +580,48 @@ def test_isolated_batch_probe_preserves_last_safe_result_after_worker_crash(monk
     assert result["safe_batch_size"] == 1
     assert result["first_failed_batch"] == 2
     assert result["stop_reason"] == "worker_crash"
+
+
+def test_main_persists_current_check_identity_before_stdout(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    report_path = tmp_path / "environment-check.json"
+    monkeypatch.setenv("LOESS_ENV_CHECK_ID", "check-123")
+    monkeypatch.setenv(
+        "LOESS_ENV_CHECK_STARTED_AT",
+        "2026-09-04T01:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        check_environment,
+        "build_report",
+        lambda _args: {
+            "schema_version": 1,
+            "status": "ready",
+            "config_fingerprint": "abc",
+            "effective": {},
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_environment.py",
+            "--scripts-dir",
+            str(tmp_path),
+            "--conda-env",
+            "qgis",
+            "--report-json",
+            str(report_path),
+        ],
+    )
+
+    assert check_environment.main() == 0
+
+    stdout_report = json.loads(capsys.readouterr().out)
+    disk_report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert stdout_report == disk_report
+    assert disk_report["check_id"] == "check-123"
+    assert disk_report["started_at"] == "2026-09-04T01:00:00+00:00"

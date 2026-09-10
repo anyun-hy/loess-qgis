@@ -33,6 +33,7 @@ if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
 from labeling_tool.core.ownership_neighbors import ownership_neighbors
+from labeling_tool.core.monitor_contract import ASSEMBLY_PHASES as MONITOR_ASSEMBLY_PHASES
 from labeling_tool.core.run_state_db import RunStateDB, run_state_from_spec
 from labeling_tool.core.run_spec import sha256_file
 
@@ -58,17 +59,8 @@ class StreamAssemblyError(RuntimeError):
     pass
 
 
-ASSEMBLY_PHASES = (
-    ("validate_inputs", "校验单元产物"),
-    ("register_objects", "登记对象部件"),
-    ("link_objects", "连接跨单元对象"),
-    ("write_raw", "写入 Raw GPKG"),
-    ("write_formal", "写入正式 GPKG"),
-    ("aggregate_reports", "汇总拟合边界"),
-    ("range_clip", "精确范围裁剪"),
-    ("coverage_validation", "空白/重叠验收"),
-    ("accepted_difference", "Accepted 差分"),
-    ("publish_cleanup", "提交产物并清理中间文件"),
+ASSEMBLY_PHASES = tuple(
+    (phase, name) for phase, name, _unit in MONITOR_ASSEMBLY_PHASES
 )
 ASSEMBLY_PHASE_INDEX = {
     phase: index
@@ -1527,7 +1519,7 @@ def _assemble_stream_impl(
             "publish_cleanup",
             current=1,
             total=1,
-            status="completed",
+            status="reused",
             message="已复用完整组装产物",
             force=True,
         )
@@ -1650,13 +1642,6 @@ def _assemble_stream_impl(
             message="校验单元报告和拟合边界分片",
         ),
     )
-    progress.emit(
-        "validate_inputs",
-        current=int(summary_validation["artifact_count"]),
-        total=int(summary_validation["artifact_count"]),
-        message="单元产物校验完成",
-        force=True,
-    )
     summary_aggregate = database.unit_report_summary_aggregate(
         run_id,
         stream_id,
@@ -1665,6 +1650,11 @@ def _assemble_stream_impl(
         raise StreamAssemblyError(
             "run-state report aggregate does not cover every ready unit"
         )
+    progress.emit(
+        "validate_inputs", current=int(summary_validation["artifact_count"]),
+        total=int(summary_validation["artifact_count"]), status="completed",
+        message="单元产物校验完成", force=True,
+    )
     model_id = str(stream.get("model_id") or "")
     profile_id = str(stream.get("profile_id") or "")
     version = str(stream.get("version") or "")
@@ -1741,6 +1731,7 @@ def _assemble_stream_impl(
                 phase,
                 current=1,
                 total=1,
+                status="reused",
                 message=message,
                 force=True,
             )
@@ -1764,6 +1755,11 @@ def _assemble_stream_impl(
                 feature_count=registered_part_count,
                 message=f"已读取 {registered_part_count} 个列式多边形部件",
             )
+        progress.emit(
+            "register_objects", current=len(formal_artifacts), total=len(formal_artifacts),
+            feature_count=registered_part_count, status="completed",
+            message="列式多边形部件身份读取完成", force=True,
+        )
         pixel_tolerance = 1e-9
         progress.emit(
             "link_objects",
@@ -1803,6 +1799,7 @@ def _assemble_stream_impl(
             total=1,
             feature_count=registered_part_count,
             message=f"对象连接完成，共 {object_count} 个对象",
+            status="completed",
             force=True,
         )
         class_snapshot = load_json(Path(spec["class_mapping_snapshot"]))
@@ -1857,6 +1854,11 @@ def _assemble_stream_impl(
                 tuple(raw_by_unit.values())
             ),
             operation=f"stream_raw:{stream_id}",
+        )
+        progress.emit(
+            "write_raw", current=len(units), total=len(units),
+            feature_count=raw_feature_count, status="completed",
+            message="Raw GPKG 已成功写入并提交", force=True,
         )
 
         def write_formal(destination):
@@ -1971,6 +1973,11 @@ def _assemble_stream_impl(
                 tuple(formal_by_unit.values())
             ),
             operation=f"stream_formal:{stream_id}",
+        )
+        progress.emit(
+            "write_formal", current=len(units), total=len(units),
+            feature_count=formal_feature_count, status="completed",
+            message="正式 GPKG 已成功写入并提交", force=True,
         )
 
     aggregate = {
@@ -2189,6 +2196,11 @@ def _assemble_stream_impl(
             if not fitting_passed:
                 raise StreamAssemblyError("boundary fitting contains failed units")
             progress.emit(
+                "aggregate_reports", current=max(1, len(edge_artifacts)),
+                total=max(1, len(edge_artifacts)), feature_count=edge_feature_count,
+                status="completed", message="拟合报告与公共边界汇总校验完成", force=True,
+            )
+            progress.emit(
                 "range_clip",
                 current=0,
                 total=1,
@@ -2224,6 +2236,7 @@ def _assemble_stream_impl(
                 total=1,
                 feature_count=formal_feature_count,
                 message="研究范围裁剪完成",
+                status="reused" if resume_from_reports else "completed",
                 force=True,
             )
             progress.emit(
@@ -2276,6 +2289,7 @@ def _assemble_stream_impl(
                 total=1,
                 feature_count=formal_feature_count,
                 message=coverage_message,
+                status="completed" if coverage["status"] == "passed" else "skipped",
                 force=True,
             )
             if resume_from_reports:
@@ -2322,6 +2336,7 @@ def _assemble_stream_impl(
                 total=1,
                 feature_count=formal_feature_count,
                 message="Accepted 标签差分完成",
+                status="skipped" if difference.get("status") == "skipped" else "completed",
                 force=True,
             )
             _write_json(

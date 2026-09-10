@@ -63,7 +63,7 @@ def strict_overlap_tolerance(run_spec):
     return max(pixel_area * 1.0e-6, 1.0e-18)
 
 
-def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs=None):
+def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs=None, is_canceled=None):
     """Validate the complete accepted store before it can affect a Run or write."""
     if layer is None or not layer.isValid():
         raise AcceptedIntegrityError("accepted_labels 图层无效或无法打开")
@@ -90,6 +90,8 @@ def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs=None):
     index = QgsSpatialIndex()
     feature_count = 0
     for feature in layer.getFeatures():
+        if is_canceled is not None and is_canceled():
+            raise AcceptedIntegrityError("accepted_labels 审计已取消")
         feature_count += 1
         geometry = feature.geometry()
         if (
@@ -139,6 +141,8 @@ def audit_accepted_layer(layer, *, overlap_tolerance, expected_crs=None):
     overlap_errors = []
     seen_pairs = set()
     for feature in layer.getFeatures():
+        if is_canceled is not None and is_canceled():
+            raise AcceptedIntegrityError("accepted_labels 审计已取消")
         geometry = feature.geometry()
         for other_id in index.intersects(geometry.boundingBox()):
             pair = tuple(sorted((int(feature.id()), int(other_id))))
@@ -194,6 +198,8 @@ def assert_no_accepted_overlap(
     *,
     overlap_tolerance,
     raise_on_overlap=True,
+    transform_context=None,
+    is_canceled=None,
 ):
     """Find candidate/accepted intersections and optionally raise immediately."""
     if (
@@ -207,20 +213,26 @@ def assert_no_accepted_overlap(
 
     accepted_index = QgsSpatialIndex()
     for accepted_feature in accepted_layer.getFeatures():
+        if is_canceled is not None and is_canceled():
+            raise AcceptedIntegrityError("accepted overlap 检查已取消")
         accepted_index.addFeature(accepted_feature)
 
     to_accepted = None
     to_candidate = None
     if candidate_layer.crs() != accepted_layer.crs():
         to_accepted = QgsCoordinateTransform(
-            candidate_layer.crs(), accepted_layer.crs(), QgsProject.instance()
+            candidate_layer.crs(), accepted_layer.crs(),
+            transform_context if transform_context is not None else QgsProject.instance()
         )
         to_candidate = QgsCoordinateTransform(
-            accepted_layer.crs(), candidate_layer.crs(), QgsProject.instance()
+            accepted_layer.crs(), candidate_layer.crs(),
+            transform_context if transform_context is not None else QgsProject.instance()
         )
 
     overlaps = []
     for candidate in candidate_layer.getFeatures():
+        if is_canceled is not None and is_canceled():
+            raise AcceptedIntegrityError("accepted overlap 检查已取消")
         candidate_geometry = QgsGeometry(candidate.geometry())
         if (
             candidate_geometry is None

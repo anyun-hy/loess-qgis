@@ -13,7 +13,7 @@ import signal
 
 from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, pyqtSignal
 
-from .process_compat import configure_process, process_is_running
+from .process_runtime import configure_process, process_is_running
 
 
 class TileCacheProbeRunner(QObject):

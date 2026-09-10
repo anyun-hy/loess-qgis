@@ -56,6 +56,8 @@ FINGERPRINT_FILES = (
     "../.loess-project-id",
     "../runtime/loess_launcher.sh",
 )
+BATCH_PROBE_GROWTH_MARGIN_NUMERATOR = 3
+BATCH_PROBE_GROWTH_MARGIN_DENOMINATOR = 2
 REQUIRED_VECTOR_DEPENDENCY_VERSIONS = {
     "pyarrow": "25.0.1",
     "pyogrio": "0.13.0",
@@ -273,6 +275,7 @@ def _probe_loaded_torchscript_batches(
     safe_candidates = []
     stop_reason = "ceiling_reached"
     first_failed_batch = None
+    previous_observation = None
 
     def publish(payload):
         if progress is not None:
@@ -283,6 +286,30 @@ def _probe_loaded_torchscript_batches(
 
     try:
         for batch_size in normalized_candidates:
+            if previous_observation is not None and int(reserve_bytes) > 0:
+                previous_batch, previous_free, bytes_per_item = previous_observation
+                if bytes_per_item > 0 and batch_size > previous_batch:
+                    projected_growth = (
+                        bytes_per_item
+                        * (batch_size - previous_batch)
+                        * BATCH_PROBE_GROWTH_MARGIN_NUMERATOR
+                        + BATCH_PROBE_GROWTH_MARGIN_DENOMINATOR
+                        - 1
+                    ) // BATCH_PROBE_GROWTH_MARGIN_DENOMINATOR
+                    projected_free = previous_free - projected_growth
+                    if projected_free < int(reserve_bytes):
+                        stop_reason = "safety_projection"
+                        record = {
+                            "batch_size": batch_size,
+                            "status": "skipped_safety_projection",
+                            "accelerator_free_bytes": previous_free,
+                            "projected_free_bytes": projected_free,
+                            "reserve_bytes": int(reserve_bytes),
+                            "projection_from_batch_size": previous_batch,
+                        }
+                        records.append(record)
+                        publish({"event": "batch_probe_result", **record})
+                        break
             publish({"event": "batch_probe_started", "batch_size": batch_size})
             try:
                 sample = torch_module.zeros(
@@ -333,6 +360,23 @@ def _probe_loaded_torchscript_batches(
                 publish({"event": "batch_probe_result", **record})
                 if not enough_headroom:
                     break
+                if free_bytes is not None:
+                    if previous_observation is None:
+                        bytes_per_item = 0
+                    else:
+                        old_batch, old_free, _old_bytes_per_item = previous_observation
+                        batch_delta = batch_size - old_batch
+                        observed_growth = max(0, old_free - free_bytes)
+                        bytes_per_item = (
+                            (observed_growth + batch_delta - 1) // batch_delta
+                            if batch_delta > 0
+                            else 0
+                        )
+                    previous_observation = (
+                        batch_size,
+                        free_bytes,
+                        bytes_per_item,
+                    )
             except Exception as error:
                 first_failed_batch = batch_size
                 stop_reason = _batch_probe_error_kind(torch_module, error)
@@ -522,6 +566,11 @@ def probe_torchscript_model_set_batches(
                 }
             )
             results[model_id] = result
+            publish({
+                "event": "model_set_probe_completed",
+                "model_id": model_id,
+                "result": result,
+            })
 
         ok = all(bool(results[model_id].get("ok")) for model_id in model_ids)
         return {
@@ -699,6 +748,7 @@ def verify_torchscript_model_set_batch_probe_isolated(
 
     final_payload = None
     loaded_ids = []
+    completed_results = {}
     for line in (process.stdout or "").splitlines():
         try:
             payload = json.loads(line)
@@ -706,6 +756,11 @@ def verify_torchscript_model_set_batch_probe_isolated(
             continue
         if payload.get("event") == "model_set_load_completed":
             loaded_ids.append(str(payload.get("model_id") or ""))
+        elif payload.get("event") == "model_set_probe_completed":
+            model_id = str(payload.get("model_id") or "")
+            result = payload.get("result")
+            if model_id in expected_ids and isinstance(result, dict):
+                completed_results[model_id] = result
         elif payload.get("batch_probe_set") is True:
             final_payload = {
                 key: value
@@ -722,6 +777,30 @@ def verify_torchscript_model_set_batch_probe_isolated(
             and resident_ids == expected_ids
         ):
             return final_payload
+
+    if loaded_ids == expected_ids and list(completed_results) == expected_ids:
+        recovered = {
+            "ok": all(
+                bool(completed_results[model_id].get("ok"))
+                for model_id in expected_ids
+            ),
+            "expected_model_ids": list(expected_ids),
+            "resident_model_ids": list(loaded_ids),
+            "resident_model_count": len(loaded_ids),
+            "model_set_complete": True,
+            "results": completed_results,
+            "worker_exit_code": int(process.returncode),
+            "worker_cleanup_warning": (
+                "model probes completed before the isolated worker exited "
+                f"without its final envelope (exit={process.returncode})"
+            ),
+            "message": (
+                f"probed {len(expected_ids)} models while the complete set "
+                "remained resident; recovered completed probe records after "
+                f"worker exit {process.returncode}"
+            ),
+        }
+        return recovered
 
     detail = (process.stderr or "").strip() or "worker exited without a complete result"
     message = (
@@ -890,7 +969,7 @@ def add_runtime_boundary_checks(checks, conda_env):
             "qgis_version",
             "LOESS_QGIS_VERSION",
             "QGIS",
-            lambda value: _version_tuple(value)[:2] in {(3, 44), (4, 2)},
+            lambda value: _version_tuple(value)[:2] == (4, 2),
         ),
         (
             "qgis_python",
@@ -902,13 +981,13 @@ def add_runtime_boundary_checks(checks, conda_env):
             "pyqt_version",
             "LOESS_PYQT_VERSION",
             "PyQt",
-            lambda value: _version_tuple(value)[:1] in {(5,), (6,)},
+            lambda value: _version_tuple(value)[:1] == (6,),
         ),
         (
             "qt_version",
             "LOESS_QT_VERSION",
             "Qt",
-            lambda value: _version_tuple(value)[:1] in {(5,), (6,)},
+            lambda value: _version_tuple(value)[:1] == (6,),
         ),
     )
     for check_id, env_name, label, validator in host_fields:
@@ -927,7 +1006,7 @@ def add_runtime_boundary_checks(checks, conda_env):
             value,
             "QGIS plugin host runtime",
             message,
-            "use QGIS 3.44/PyQt5/Qt5 or QGIS 4.2/PyQt6/Qt6",
+            "use QGIS 4.2/PyQt6/Qt6",
         )
 
     qgis_major = _version_tuple(
@@ -941,7 +1020,7 @@ def add_runtime_boundary_checks(checks, conda_env):
     )[:1]
     if qgis_major and pyqt_major and qt_major:
         pair = (qgis_major[0], pyqt_major[0], qt_major[0])
-        pair_ok = pair in {(3, 5, 5), (4, 6, 6)}
+        pair_ok = pair == (4, 6, 6)
         pair_status = "ready" if pair_ok else "error"
         pair_value = f"QGIS {pair[0]} / PyQt {pair[1]} / Qt {pair[2]}"
         pair_message = (
@@ -960,7 +1039,7 @@ def add_runtime_boundary_checks(checks, conda_env):
         pair_value,
         "QGIS plugin host runtime",
         pair_message,
-        "use QGIS 3.44 with Qt5 or QGIS 4.2 with Qt6",
+        "use QGIS 4.2 with PyQt6 and Qt6",
     )
 
     host_executable = str(
@@ -1369,7 +1448,10 @@ def build_report(args):
     batch_auto = "tile_batch_size" in set(
         resource_tuning.get("automatic_fields") or []
     )
-    probe_candidates = model_batch_probe_candidates(hardware)
+    probe_candidates = model_batch_probe_candidates(
+        hardware,
+        maximum_batch_size=int(runtime.get("tile_batch_size") or 1),
+    )
     probe_reserve_bytes = batch_probe_safety_reserve_bytes(hardware)
     model_batch_probes = {}
     if (
@@ -1399,6 +1481,19 @@ def build_report(args):
                 reserve_bytes=probe_reserve_bytes,
             )
             model_batch_probes.update(model_set_probe.get("results") or {})
+            cleanup_warning = str(
+                model_set_probe.get("worker_cleanup_warning") or ""
+            ).strip()
+            if cleanup_warning:
+                add_check(
+                    checks,
+                    "model_batch_probe_worker_cleanup",
+                    "warning",
+                    f"exit={model_set_probe.get('worker_exit_code')}",
+                    "isolated complete model-set Batch probe",
+                    cleanup_warning,
+                    "inspect the NVIDIA driver log before a production Run",
+                )
 
     for index, model in enumerate(effective.get("semantic_models") or []):
         model_id = model["model_id"]
@@ -1791,11 +1886,21 @@ def main():
                 "fix": "inspect the detailed environment log",
             }],
         }
+    check_id = str(os.environ.get("LOESS_ENV_CHECK_ID") or "").strip()
+    started_at = str(
+        os.environ.get("LOESS_ENV_CHECK_STARTED_AT") or ""
+    ).strip()
+    if check_id:
+        report["check_id"] = check_id
+    if started_at:
+        report["started_at"] = started_at
     serialized = json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
     if args.report_json:
         report_path = Path(args.report_json).expanduser().resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = report_path.with_name(report_path.name + ".tmp")
+        temporary_path = report_path.with_name(
+            f".{report_path.name}.tmp.{os.getpid()}"
+        )
         temporary_path.write_text(serialized, encoding="utf-8")
         os.replace(temporary_path, report_path)
     sys.stdout.write(serialized)
