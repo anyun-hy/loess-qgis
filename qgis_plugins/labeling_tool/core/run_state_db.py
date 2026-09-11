@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as _datetime
 import json
 import os
@@ -144,6 +145,9 @@ class RunStateDB:
     @contextlib.contextmanager
     def _connection(self) -> Iterator[Any]:
         """Yield one short-lived connection and always close its file handles."""
+        if getattr(self, "_unit_commit_connection", None) is not None:
+            yield self._unit_commit_connection
+            return
         connection = self._connect()
         try:
             yield connection
@@ -152,6 +156,9 @@ class RunStateDB:
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[Any]:
+        if getattr(self, "_unit_commit_connection", None) is not None:
+            yield self._unit_commit_connection
+            return
         connection = self._connect(autocommit=False)
         try:
             yield connection
@@ -161,6 +168,42 @@ class RunStateDB:
             raise
         finally:
             connection.close()
+
+    @contextlib.contextmanager
+    def unit_attempt_commit(self, job_id: int, lease_token: str):
+        """Fence one unit publication and reuse its transaction on a private facade.
+
+        Files must already live in an immutable attempt directory. An exception
+        rolls back every metadata write; no other thread shares this facade.
+        """
+        with self.transaction() as connection:
+            job = connection.execute(
+                """SELECT * FROM jobs WHERE job_id=%s AND job_type='unit_fit'
+                   AND status='running' AND lease_token=%s
+                   AND lease_expires>=%s FOR UPDATE""",
+                (int(job_id), str(lease_token), time.time()),
+            ).fetchone()
+            if job is None:
+                raise RunStateError("unit attempt no longer owns its lease")
+            scoped = copy.copy(self)
+            scoped._unit_commit_connection = connection
+            scoped._unit_commit_identity = (str(job["run_id"]), str(job["stream_id"]), str(job["unit_id"]))
+            yield scoped
+
+    def supersede_unit_attempt_artifacts(self, run_id, stream_id, unit_id):
+        """Hide partial older publications, without deleting files or audit rows."""
+        if getattr(self, "_unit_commit_connection", None) is None:
+            raise RunStateError("unit artifacts can only be superseded inside a fenced commit")
+        if self._unit_commit_identity != (str(run_id), str(stream_id), str(unit_id)):
+            raise RunStateError("unit publication identity differs from leased job")
+        self._unit_commit_connection.execute(
+            """UPDATE artifacts SET status='superseded', updated_at=%s
+               WHERE run_id=%s AND stream_id=%s AND unit_id=%s
+                 AND kind IN ('unit_raw_geoparquet','unit_formal_geoparquet',
+                              'unit_boundary_report','unit_boundary_signatures',
+                              'unit_fitted_edges_geoparquet') AND status='ready'""",
+            (_now(), str(run_id), str(stream_id), str(unit_id)),
+        )
 
     def initialize(self) -> None:
         initialize_postgres(
@@ -3692,7 +3735,9 @@ class RunStateDB:
             return connection.execute(
                 """UPDATE jobs SET status='interrupted', worker_id='', lease_token='',
                    lease_expires=NULL, updated_at=%s, attempt=GREATEST(0, attempt-1)
-                   WHERE job_id=%s AND status='running' AND lease_token=%s""",
+                   WHERE job_id IN (SELECT job_id FROM jobs WHERE job_id=%s
+                     AND status='running' AND lease_token=%s
+                     FOR UPDATE SKIP LOCKED)""",
                 (_now(), int(job_id), str(lease_token)),
             ).rowcount == 1
 

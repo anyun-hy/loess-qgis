@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -362,8 +363,13 @@ def _cleanup_stream_unit_artifacts_locked(
             str(artifact["unit_id"]), label="unit_id"
         )
         path = Path(str(artifact["path"]))
-        expected = unit_root / f"{unit_id}{UNIT_INTERMEDIATE_SUFFIXES[kind]}"
-        if not path.is_absolute() or path != expected or path.parent != unit_root:
+        owner = unit_root
+        if path.parent.parent == unit_root and re.fullmatch(r"attempt_[0-9a-f]{32}", path.parent.name):
+            owner = path.parent
+            if owner.is_symlink():
+                raise StreamAssemblyError(f"refusing symlinked attempt directory: {owner}")
+        expected = owner / f"{unit_id}{UNIT_INTERMEDIATE_SUFFIXES[kind]}"
+        if not path.is_absolute() or path != expected or path.parent != owner:
             raise StreamAssemblyError(
                 "unit intermediate cleanup path is not an exact direct child "
                 f"of the owned Stream directory: {path}"

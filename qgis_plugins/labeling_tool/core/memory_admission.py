@@ -23,6 +23,7 @@ DEFAULT_MEMORY_ADMISSION_POLICY = {
     "mode": "adaptive_psi_aimd_v1",
     "sample_interval_sec": 1.0,
     "stable_growth_sec": 5.0,
+    "pressure_cooldown_sec": 5.0,
     "initial_geometry_slots_with_package": 4,
     "initial_geometry_slots_without_package": 8,
     "default_worker_peak_bytes": int(2.5 * GIB),
@@ -252,6 +253,9 @@ class AdaptiveMemoryAdmissionController:
         self._last_sample = MemoryPressureSample()
         self._last_sample_at = float("-inf")
         self._last_growth_at = 0.0
+        self._last_reduction_at = float("-inf")
+        self._last_reduction_sample_at = float("-inf")
+        self._last_reduction_severe = False
         self._worker_peaks: list[int] = []
         self._completed_observation_count = 0
         self._completed_observation_count_at_growth = 0
@@ -308,6 +312,8 @@ class AdaptiveMemoryAdmissionController:
         ceiling = max(1, int(static_limit))
         active = max(0, int(active_slots))
         current_sample = sample if sample is not None else self._sample(observed_at)
+        sample_at = observed_at if sample is not None else self._last_sample_at
+        fresh_reduction_sample = sample_at > self._last_reduction_sample_at
         worker_estimate = self._worker_peak_estimate()
 
         if not current_sample.supported:
@@ -360,16 +366,29 @@ class AdaptiveMemoryAdmissionController:
             memory_ceiling = max(active, active + headroom // worker_estimate)
 
             pause = shed = False
+            reduction_cooled = observed_at - self._last_reduction_at >= float(
+                self._policy["pressure_cooldown_sec"]
+            )
             if severe:
-                self._limit = max(1, min(self._limit, math.ceil(max(active, 1) / 4)))
+                if fresh_reduction_sample and (not self._last_reduction_severe or reduction_cooled):
+                    self._limit = max(1, min(self._limit, math.ceil(max(active, 1) / 4)))
+                    self._last_reduction_at = observed_at
+                    self._last_reduction_sample_at = sample_at
+                    self._last_reduction_severe = True
                 pause = True
                 shed = active > self._limit
                 reason = "severe_memory_pressure"
                 self._last_growth_at = observed_at
             elif pressured:
-                self._limit = max(1, min(self._limit, math.ceil(max(active, 1) / 2)))
+                if fresh_reduction_sample and reduction_cooled:
+                    self._limit = max(1, min(self._limit, math.ceil(max(active, 1) / 2)))
+                    self._last_reduction_at = observed_at
+                    self._last_reduction_sample_at = sample_at
+                    self._last_reduction_severe = False
                 pause = True
-                shed = active > self._limit
+                # Backpressure first: transient PSI must not kill writers that
+                # are draining the queue. Only severe pressure permits shedding.
+                shed = False
                 reason = "memory_pressure"
                 self._last_growth_at = observed_at
             elif (

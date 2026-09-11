@@ -143,12 +143,46 @@ def test_controller_halves_early_pressure_and_quarters_severe_pressure():
 
     assert pressured.geometry_slot_limit == 8
     assert pressured.pause_new_work is True
-    assert pressured.shed_active_work is True
+    assert pressured.shed_active_work is False
     assert pressured.reason == "memory_pressure"
     assert severe.geometry_slot_limit == 2
     assert severe.pause_new_work is True
     assert severe.shed_active_work is True
     assert severe.reason == "severe_memory_pressure"
+
+
+def test_repeated_pressure_sample_drains_queue_without_cascading_shed():
+    controller = AdaptiveMemoryAdmissionController({"initial_geometry_slots_with_package": 16})
+    for now, active in [(0.0, 16), (0.2, 14), (0.6, 8), (1.0, 4)]:
+        result = controller.decide(static_limit=16, active_slots=active,
+                                   package_active=True, now=now, sample=_sample(full=1.08))
+        assert result.geometry_slot_limit == 8
+        assert result.pause_new_work
+        assert not result.shed_active_work
+    later = controller.decide(static_limit=16, active_slots=8, package_active=True,
+                              now=5.0, sample=_sample(full=1.08))
+    assert later.geometry_slot_limit == 4
+
+
+def test_severe_pressure_can_escalate_once_but_not_on_every_callback():
+    controller = AdaptiveMemoryAdmissionController({"initial_geometry_slots_with_package": 16})
+    first = controller.decide(static_limit=16, active_slots=16, package_active=True,
+                              now=0, sample=_sample(available_gib=5))
+    assert first.geometry_slot_limit == 4
+    for now, active in [(0.1, 12), (0.4, 5), (0.8, 4)]:
+        result = controller.decide(static_limit=16, active_slots=active, package_active=True,
+                                   now=now, sample=_sample(available_gib=5))
+        assert result.geometry_slot_limit == 4
+
+
+def test_cached_sample_cannot_reduce_again_even_after_cooldown():
+    controller = AdaptiveMemoryAdmissionController(
+        {"sample_interval_sec": 60, "initial_geometry_slots_with_package": 16},
+        sampler=lambda: _sample(full=1.08),
+    )
+    first = controller.decide(static_limit=16, active_slots=16, package_active=True, now=0)
+    second = controller.decide(static_limit=16, active_slots=8, package_active=True, now=10)
+    assert first.geometry_slot_limit == second.geometry_slot_limit == 8
 
 
 def test_controller_recovers_only_after_a_new_stable_growth_window():

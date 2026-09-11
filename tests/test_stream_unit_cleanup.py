@@ -10,6 +10,22 @@ RUN_ID = "cleanup-recovery-run"
 STREAM_ID = "model:test"
 
 
+def test_cleanup_accepts_only_exact_attempt_directory(tmp_path, postgres_database):
+    db = postgres_database
+    db.create_run(RUN_ID, "a" * 64)
+    run_dir = tmp_path / "run"
+    attempt_dir = run_dir / "tmp/unit_outputs/model_test" / ("attempt_" + "a" * 32)
+    attempt_dir.mkdir(parents=True)
+    path = attempt_dir / "core_00000_report.json"
+    path.write_bytes(b"{}")
+    aid = db.register_artifact(RUN_ID, "unit_boundary_report", path, stream_id=STREAM_ID, unit_id="core_00000")
+    db.mark_artifact_ready(aid, byte_count=2, sha256=hashlib.sha256(b"{}").hexdigest())
+    report = assemble_stream._cleanup_stream_unit_artifacts({"run_id": RUN_ID, "run_dir": str(run_dir)}, db, STREAM_ID)
+    assert report["artifact_count"] == 1
+    assert not path.exists()
+    assert db.get_artifact(aid)["status"] == "cleaned"
+
+
 def _ready_unit_artifact(
     tmp_path: Path,
     database,

@@ -465,6 +465,17 @@ class _LeaseHeartbeat:
             self._thread = None
 
 
+HOST_PIPELINE_BUDGET_BYTES = 1024**3
+# Conservative host-side allowance: read futures and stacked inputs (up to
+# 64-bit integers), float32 output/copy, half output and one writer batch.
+# Model activations and partition geometry have separate resource budgets.
+HOST_PIPELINE_BYTES_PER_TILE = 64 * 1024**2
+
+
+def _host_pipeline_batch_limit(configured: int) -> int:
+    return max(1, min(int(configured), HOST_PIPELINE_BUDGET_BYTES // HOST_PIPELINE_BYTES_PER_TILE))
+
+
 def _default_infer(model: Any, tile_path: Path, device: str) -> np.ndarray:
     image, _profile = _read_tile(tile_path)
     _mask, _confidence, probabilities = _run_model(model, image, device)
@@ -1451,13 +1462,20 @@ def _run_work_package_impl(
                 (
                     sequence,
                     inferable_items[
-                        offset : offset + model_configured_batch_size
+                        offset : offset + _host_pipeline_batch_limit(model_configured_batch_size)
                     ],
                 )
                 for sequence, offset in enumerate(
-                    range(0, len(inferable_items), model_configured_batch_size)
+                    range(0, len(inferable_items), _host_pipeline_batch_limit(model_configured_batch_size))
                 )
             ]
+            host_batch_limit = _host_pipeline_batch_limit(model_configured_batch_size)
+            if model_effective_batch_size > host_batch_limit:
+                emit("package_tile_batch_reduced", run_id=run_id, package_id=package_id,
+                     stream_id=stream_id, attempted_batch_size=model_effective_batch_size,
+                     effective_batch_size=host_batch_limit,
+                     reason="bounded host pipeline byte budget; not a CUDA allocation failure")
+                model_effective_batch_size = host_batch_limit
             missing_groups: list[tuple[int, list[dict[str, Any]]]] = []
             for sequence, group in groups:
                 records = (
@@ -1860,11 +1878,14 @@ def _run_work_package_impl(
                     fill_input_queue()
                     while queued_reads:
                         sequence, group, read_futures = queued_reads.popleft()
-                        fill_input_queue()
                         read_started = time.monotonic()
                         images = np.stack(
                             [future.result()[0] for future in read_futures], axis=0
                         )
+                        # Release completed Future results before refilling;
+                        # otherwise the consumed group remains an extra cache.
+                        read_futures.clear()
+                        fill_input_queue()
                         input_wait_sec += time.monotonic() - read_started
                         group_outputs: list[np.ndarray] = []
                         cursor = 0
@@ -1979,6 +2000,7 @@ def _run_work_package_impl(
                             managed_score_cache_bytes,
                         )
                         result_queue_peak_batches = 1
+                        del images, group_outputs, probabilities_batch, output, probabilities
                     drain_writer()
             while partition_cursor < len(partition_requirements):
                 schedule_ready_partition()

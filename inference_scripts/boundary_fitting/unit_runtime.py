@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -1000,7 +1001,8 @@ def run_unit_fit(
         raise UnitRuntimeError("unit job identity does not match database state")
     if job["status"] != "running" or job["lease_token"] != lease_token:
         raise UnitRuntimeError("unit job does not hold the supplied lease")
-    database.set_stream_unit_status(run_id, stream_id, unit_id, "running")
+    with database.unit_attempt_commit(job_id, lease_token) as publication:
+        publication.set_stream_unit_status(run_id, stream_id, unit_id, "running")
     try:
         boundary = spec.get("boundary_fitting") or {}
         if (
@@ -1098,7 +1100,9 @@ def run_unit_fit(
             current=report["chain_count"],
             total=report["chain_count"],
         )
-        output_root = run_dir / "tmp" / "unit_outputs" / stream_id.replace(":", "_")
+        # Never overwrite an earlier attempt's files, including a partially
+        # published pre-upgrade attempt. Lease tokens are not filesystem IDs.
+        output_root = run_dir / "tmp" / "unit_outputs" / stream_id.replace(":", "_") / ("attempt_" + uuid.uuid4().hex)
         raw_path = output_root / f"{unit_id}_raw.parquet"
         formal_path = output_root / f"{unit_id}_formal.parquet"
         report_path = output_root / f"{unit_id}_report.json"
@@ -1201,26 +1205,28 @@ def run_unit_fit(
         ]
         if fitted_edge_count:
             artifacts.append(("unit_fitted_edges_geoparquet", fitted_edges_path))
-        for kind, path in artifacts:
-            _commit_artifact(
-                database,
+        with database.unit_attempt_commit(job_id, lease_token) as publication:
+            publication.supersede_unit_attempt_artifacts(run_id, stream_id, unit_id)
+            for kind, path in artifacts:
+                _commit_artifact(
+                    publication,
+                    run_id,
+                    path=path,
+                    kind=kind,
+                    stream_id=stream_id,
+                    unit_id=unit_id,
+                )
+            publication.upsert_unit_report_summary(
                 run_id,
-                path=path,
-                kind=kind,
-                stream_id=stream_id,
-                unit_id=unit_id,
+                stream_id,
+                unit_id,
+                report,
+                fitted_edge_count=fitted_edge_count,
             )
-        database.upsert_unit_report_summary(
-            run_id,
-            stream_id,
-            unit_id,
-            report,
-            fitted_edge_count=fitted_edge_count,
-        )
-        database.set_stream_unit_status(run_id, stream_id, unit_id, "ready")
-        if not database.finish_job(job_id, lease_token, status="ready"):
-            raise UnitRuntimeError("unit job lease expired before commit")
-        database.release_job_artifacts(job_id)
+            publication.set_stream_unit_status(run_id, stream_id, unit_id, "ready")
+            if not publication.finish_job(job_id, lease_token, status="ready"):
+                raise UnitRuntimeError("unit job lease expired before commit")
+            publication.release_job_artifacts(job_id)
         emit(
             "validation_finished",
             run_id=run_id,
@@ -1231,8 +1237,14 @@ def run_unit_fit(
         )
         return report
     except Exception as error:
-        database.set_stream_unit_status(run_id, stream_id, unit_id, "failed", error=str(error))
-        database.finish_job(job_id, lease_token, status="failed", error=str(error))
+        # A cancelled/expired writer must not fail a newer owner's unit.
+        try:
+            with database.unit_attempt_commit(job_id, lease_token) as publication:
+                if publication.finish_job(job_id, lease_token, status="failed", error=str(error)):
+                    publication.set_stream_unit_status(run_id, stream_id, unit_id, "failed", error=str(error))
+        except Exception as publication_error:
+            emit("unit_failure_record_rejected", run_id=run_id, stream_id=stream_id,
+                 unit_id=unit_id, error=str(publication_error))
         raise
 
 

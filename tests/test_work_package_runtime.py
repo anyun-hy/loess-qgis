@@ -54,6 +54,14 @@ from work_package_runtime import (
 from storage_guard import StorageReserveError
 
 
+def test_host_pipeline_budget_caps_large_batches_without_changing_small_batches():
+    limit = work_package_runtime._host_pipeline_batch_limit
+    assert limit(1) == 1
+    assert limit(8) == 8
+    assert limit(16) == 16
+    assert limit(4096) * work_package_runtime.HOST_PIPELINE_BYTES_PER_TILE <= work_package_runtime.HOST_PIPELINE_BUDGET_BYTES
+
+
 def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

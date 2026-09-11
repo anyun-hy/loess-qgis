@@ -3,6 +3,78 @@
 RUN = "monitor-integrity"
 
 
+def test_unit_commit_rolls_back_partial_artifacts_and_fences_old_owner(postgres_database, tmp_path):
+    import pytest
+    from labeling_tool.core.run_state_db import RunStateError
+    db = postgres_database
+    start(db)
+    db.insert_jobs(RUN, [{"job_type": "unit_fit", "stream_id": "model:a", "unit_id": "core:1"}])
+    first = db.lease_next_job(RUN, "first")
+    path = tmp_path / "attempt_report.json"
+    path.write_text("{}")
+    with pytest.raises(RuntimeError, match="injected"):
+        with db.unit_attempt_commit(first["job_id"], first["lease_token"]) as tx:
+            aid = tx.register_artifact(RUN, "unit_boundary_report", path, stream_id="model:a", unit_id="core:1")
+            assert tx.mark_artifact_ready(aid, byte_count=2, sha256="a" * 64)
+            # Another connection sees no partial ready publication.
+            assert db.artifact_for_stream_unit(RUN, "model:a", "core:1", "unit_boundary_report") is None
+            # Memory shedding must skip a writer holding the commit lock.
+            assert not db.interrupt_job(first["job_id"], first["lease_token"])
+            raise RuntimeError("injected publication failure")
+    assert db.artifact_for_stream_unit(RUN, "model:a", "core:1", "unit_boundary_report") is None
+    assert db.interrupt_job(first["job_id"], first["lease_token"])
+    second = db.lease_next_job(RUN, "second")
+    with pytest.raises(RunStateError, match="lease"):
+        with db.unit_attempt_commit(first["job_id"], first["lease_token"]):
+            raise AssertionError("old writer acquired publication rights")
+    with db.unit_attempt_commit(second["job_id"], second["lease_token"]) as tx:
+        aid = tx.register_artifact(RUN, "unit_boundary_report", path, stream_id="model:a", unit_id="core:1")
+        assert tx.mark_artifact_ready(aid, byte_count=2, sha256="b" * 64)
+        assert tx.finish_job(second["job_id"], second["lease_token"])
+    assert db.get_job(second["job_id"])["status"] == "ready"
+    assert db.artifact_for_stream_unit(RUN, "model:a", "core:1", "unit_boundary_report")["sha256"] == "b" * 64
+
+
+def test_unit_superseding_is_atomic_and_does_not_overwrite_old_file(postgres_database, tmp_path):
+    import pytest
+    db = postgres_database
+    start(db)
+    old = tmp_path / "old.json"
+    old.write_text("old evidence")
+    aid = db.register_artifact(RUN, "unit_boundary_report", old, stream_id="model:a", unit_id="core:1")
+    db.mark_artifact_ready(aid, byte_count=12, sha256="a" * 64)
+    db.insert_jobs(RUN, [{"job_type": "unit_fit", "stream_id": "model:a", "unit_id": "core:1"}])
+    job = db.lease_next_job(RUN, "worker")
+    with pytest.raises(RuntimeError):
+        with db.unit_attempt_commit(job["job_id"], job["lease_token"]) as tx:
+            tx.supersede_unit_attempt_artifacts(RUN, "model:a", "core:1")
+            raise RuntimeError("publication failed")
+    assert db.get_artifact(aid)["status"] == "ready"
+    with db.unit_attempt_commit(job["job_id"], job["lease_token"]) as tx:
+        tx.supersede_unit_attempt_artifacts(RUN, "model:a", "core:1")
+        tx.finish_job(job["job_id"], job["lease_token"])
+    assert db.get_artifact(aid)["status"] == "superseded"
+    assert old.read_text() == "old evidence"
+
+
+def test_unit_lease_expiry_at_final_commit_rolls_back_ready_artifact(postgres_database, tmp_path):
+    import pytest
+    db = postgres_database
+    start(db)
+    db.insert_jobs(RUN, [{"job_type": "unit_fit", "stream_id": "model:a", "unit_id": "core:1"}])
+    job = db.lease_next_job(RUN, "worker")
+    with pytest.raises(RuntimeError, match="expired"):
+        with db.unit_attempt_commit(job["job_id"], job["lease_token"]) as tx:
+            aid = tx.register_artifact(RUN, "unit_boundary_report", tmp_path / "report.json", stream_id="model:a", unit_id="core:1")
+            tx.mark_artifact_ready(aid, byte_count=2, sha256="a" * 64)
+            with tx.transaction() as connection:
+                connection.execute("UPDATE jobs SET lease_expires=0 WHERE job_id=%s", (job["job_id"],))
+            if not tx.finish_job(job["job_id"], job["lease_token"]):
+                raise RuntimeError("expired at final fence")
+    assert db.artifact_for_stream_unit(RUN, "model:a", "core:1", "unit_boundary_report") is None
+    assert db.get_job(job["job_id"])["status"] == "running"
+
+
 def start(database):
     database.create_run(RUN, "a" * 64)
     return database.begin_monitor_execution(RUN, "start")
