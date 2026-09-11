@@ -58,6 +58,87 @@ def _module_function(name: str) -> ast.FunctionDef:
     raise AssertionError(f"module function {name} is missing")
 
 
+def _disk_reader():
+    names = ("_log_payload", "_log_severity", "_read_persisted_log_page")
+    module = ast.Module(body=[copy.deepcopy(_module_function(name)) for name in names], type_ignores=[])
+    namespace = {"json": json, "re": re, "Path": Path}
+    exec(compile(ast.fix_missing_locations(module), "monitor-reader", "exec"), namespace)
+    return namespace["_read_persisted_log_page"]
+
+
+def test_disk_log_pagination_finds_errors_older_than_memory_cache(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    records = [{"timestamp": 1, "level": "system", "message": "[accelerator-restart] failed (rc=139)"}]
+    records += [{"timestamp": index + 2, "level": "stdout", "message": "ordinary progress"} for index in range(5100)]
+    records.append({"timestamp": 6000, "level": "stderr", "message": "Warning: old warning"})
+    (log_dir / "pipeline.jsonl").write_text("".join(json.dumps(row) + "\n" for row in records))
+    read = _disk_reader()
+    cursor = None
+    errors = []
+    empty_nonterminal = False
+    for _ in range(500):
+        page = read({"run_dir": str(tmp_path)}, "error", cursor, byte_budget=2048)
+        errors.extend(page["rows"])
+        empty_nonterminal |= not page["rows"] and page["has_more"]
+        if cursor is not None:
+            assert page["next_cursor"] < cursor
+        cursor = page["next_cursor"]
+        if not page["has_more"]:
+            break
+    else:
+        raise AssertionError("cursor never reached the beginning")
+    assert empty_nonterminal
+    assert len(errors) == 1
+    assert "rc=139" in errors[0]["payload"]["message"]
+    assert errors[0]["monitor_event_id"] == 0
+    warnings = read({"run_dir": str(tmp_path)}, "warning")
+    assert len(warnings["rows"]) == 1
+
+
+def test_disk_log_limit_search_and_corruption_are_explicit(tmp_path):
+    import pytest
+    (tmp_path / "logs").mkdir()
+    path = tmp_path / "logs/pipeline.jsonl"
+    path.write_text("".join(json.dumps({"level": "system", "message": f"[error] 失败 {i}"}) + "\n" for i in range(7)) + "{broken\n")
+    read = _disk_reader()
+    first = read({"run_dir": str(tmp_path)}, "error", limit=3)
+    second = read({"run_dir": str(tmp_path)}, "error", first["next_cursor"], limit=3)
+    assert first["skipped_records"] == 1
+    assert len(first["rows"]) == len(second["rows"]) == 3
+    assert not ({r["monitor_event_id"] for r in first["rows"]} & {r["monitor_event_id"] for r in second["rows"]})
+    assert len(read({"run_dir": str(tmp_path)}, "error", search="失败 2")["rows"]) == 1
+    with pytest.raises(ValueError, match="截断"):
+        read({"run_dir": str(tmp_path)}, "error", path.stat().st_size + 1)
+    with pytest.raises(FileNotFoundError):
+        read({"run_dir": str(tmp_path / "missing")}, "error")
+
+
+def test_history_buttons_query_disk_instead_of_only_evicted_memory():
+    source = _method_source("_show_log_severity")
+    assert 'findData("raw_"' in source
+    assert source.index('findData("raw_"') < source.index("set_visible_severities")
+    assert "_on_log_severity_selected" in SOURCE
+    continuation = _method_source("_continue_raw_log_scan")
+    for guard in ("self.isVisible()", "self._pages.currentIndex() == 3", "self._latest_history_request_id", "self._query_generation", "self._history_cursor"):
+        assert guard in continuation
+
+
+def test_overview_work_uses_plain_language_without_losing_detail_states():
+    examples = {
+        "Core/Seam/Junction 拟合": "正在处理边界",
+        "推理 + Core 拟合": "识别地物，同时处理边界",
+        "Work Package 推理": "正在识别地物",
+        "写入正式 GPKG": "正在保存正式结果",
+        "Accepted 差分": "正在排除已确认的区域",
+        "组装失败：写入正式 GPKG": "结果合并失败，请查看详情",
+        "Run 已停止；恢复入口位于主界面": "已停止，可在主界面恢复",
+        "future_unknown_stage": "当前步骤待确认，请查看详情",
+    }
+    for stage, expected in examples.items():
+        assert _execute_module_function("_overview_work_label", stage) == expected
+
+
 def _log_panel_method(name: str) -> ast.FunctionDef:
     for node in LOG_PANEL_TREE.body:
         if not isinstance(node, ast.ClassDef) or node.name != "LogPanel":
@@ -632,8 +713,10 @@ def test_log_panel_is_retained_but_collapsed_by_default():
     toggle = _method_source("_set_log_visible")
     quick_filter = _method_source("_show_log_severity")
     assert 'QPushButton("显示原始日志")' in build_ui
-    assert 'self._warning_log_button.setText(f"历史警告  {self._log_warning_count}")' in theme
-    assert 'self._error_log_button.setText(f"历史错误  {self._log_error_count}")' in theme
+    assert 'self._update_log_toggle()' in theme
+    labels = _method_source("_update_log_toggle")
+    assert 'setText("查看历史警告")' in labels
+    assert 'setText("查看历史错误")' in labels
     assert 'self._show_log_severity("warning")' in build_ui
     assert 'self._show_log_severity("error")' in build_ui
     assert "self._log_panel.setVisible(False)" in build_ui
@@ -645,7 +728,7 @@ def test_log_panel_is_retained_but_collapsed_by_default():
 def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
     build_ui = _method_source("_build_ui")
     update = _method_source("_update_database_overviews")
-    assert "self._overall_bar = QProgressBar()" in build_ui
+    assert "self._overall_bar = OverallProgressTrack()" in build_ui
     assert "本次推理任务完成度" in build_ui
     assert "按任务组统计，不代表剩余时间。" in build_ui
     assert "_overall_completion_fraction(" in update

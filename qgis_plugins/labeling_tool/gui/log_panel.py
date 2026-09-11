@@ -113,6 +113,7 @@ class LogPanel(QWidget):
     """
 
     cleared = pyqtSignal()
+    severity_selected = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -727,6 +728,7 @@ class LogPanel(QWidget):
             self.set_visible_severities({"info", "warning", "error"})
         else:
             self.set_visible_severities({severity})
+        self.severity_selected.emit(severity)
 
     def _sync_severity_buttons(self) -> None:
         if not hasattr(self, "_severity_buttons"):

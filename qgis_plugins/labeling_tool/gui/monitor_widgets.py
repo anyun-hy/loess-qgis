@@ -1,10 +1,11 @@
 """Small native presentation primitives for the inference instrument panel."""
 
 from functools import lru_cache
+import time
 
 from qgis.PyQt.QtCore import QByteArray, QEvent, QRectF, QSize, QTimer
 from qgis.PyQt.QtGui import (
-    QColor, QIcon, QLinearGradient, QPainter, QPixmap, QTextBlockFormat, QTextCursor,
+    QColor, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap, QTextBlockFormat, QTextCursor,
 )
 from qgis.PyQt.QtSvg import QSvgRenderer
 from qgis.PyQt.QtWidgets import (
@@ -146,6 +147,99 @@ class ProgressTrack(QProgressBar):
             value = f"{fraction:.0%}" if known else "—"
             painter.drawText(QRectF(self.width() - label_width, 0, label_width, self.height()),
                              ALIGN_RIGHT | ALIGN_VCENTER, value)
+        painter.end()
+
+
+class OverallProgressTrack(ProgressTrack):
+    """Animate paint only; the QProgressBar value remains authoritative."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, percentage=False)
+        self.setFixedHeight(14)
+        self._running = False
+        self._reduced = False
+        self._shown = 0.0
+        self._origin = 0.0
+        self._changed_at = time.monotonic()
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self.update)
+        self.valueChanged.connect(self._value_changed)
+
+    def _fraction(self):
+        span = self.maximum() - self.minimum()
+        return max(0.0, min(1.0, (self.value() - self.minimum()) / span)) if span > 0 else 0.0
+
+    def _value_changed(self, *_args):
+        target = self._fraction()
+        self._origin = min(self._shown, target)
+        self._changed_at = time.monotonic()
+        if not self._running or self._reduced or not self.isVisible():
+            self._shown = target
+        self.update()
+
+    def set_running(self, running):
+        self._running = bool(running)
+        self._sync_motion()
+
+    def set_reduced_motion(self, reduced):
+        self._reduced = bool(reduced)
+        self._sync_motion()
+
+    def _sync_motion(self):
+        if self._running and not self._reduced and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._shown = self._fraction()
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_motion()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        colors = PALETTES.get(str(self.property("theme") or "dark"), PALETTES["dark"])
+        target = self._fraction()
+        moving = self._timer.isActive()
+        elapsed = min(1.0, (time.monotonic() - self._changed_at) / 0.22)
+        self._shown = self._origin + (target - self._origin) * (1 - (1 - elapsed) ** 3) if moving else target
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(NO_PEN)
+        rect = QRectF(self.rect())
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 7, 7)
+        painter.setClipPath(clip)
+        painter.fillRect(rect, QColor(colors["track"]))
+        if self.maximum() == self.minimum():
+            if moving:
+                width = rect.width() * 0.2
+                offset = (time.monotonic() % 1.8) / 1.8 * (rect.width() + width) - width
+                painter.setBrush(QColor(colors["accent"]))
+                painter.drawRoundedRect(QRectF(offset, 0, width, rect.height()), 7, 7)
+            painter.end()
+            return
+        fill = QRectF(rect)
+        fill.setWidth(rect.width() * self._shown)
+        fill_clip = QPainterPath()
+        fill_clip.addRoundedRect(fill, min(7, fill.width() / 2), 7)
+        painter.setClipPath(clip.intersected(fill_clip))
+        gradient = QLinearGradient(rect.topLeft(), rect.topRight())
+        gradient.setColorAt(0, QColor(colors["accent"]))
+        gradient.setColorAt(1, QColor(colors["accent_end"]))
+        painter.fillRect(fill, gradient)
+        if moving and 0 < target < 1:
+            center = ((time.monotonic() % 2.8) / 2.8) * (rect.width() + 160) - 80
+            glow = QLinearGradient(center - 80, 0, center + 80, 0)
+            glow.setColorAt(0, QColor(255, 255, 255, 0))
+            glow.setColorAt(0.5, QColor(255, 255, 255, 45))
+            glow.setColorAt(1, QColor(255, 255, 255, 0))
+            painter.fillRect(fill, glow)
         painter.end()
 
 

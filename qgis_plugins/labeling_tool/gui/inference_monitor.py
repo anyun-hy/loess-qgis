@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from html import escape
 import re
 import time
@@ -12,6 +13,7 @@ from qgis.PyQt.QtCore import QObject, QThread, QTimer, QSize, pyqtSignal, pyqtSl
 from qgis.PyQt.QtGui import QColor, QFont, QFontDatabase
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -20,7 +22,6 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -123,6 +124,63 @@ def _log_severity(level, message):
     ):
         return "warning"
     return "info"
+
+
+def _read_persisted_log_page(run_spec, severity, before=None, *, search="", limit=200, byte_budget=2 * 1024 * 1024):
+    """Read one bounded reverse page on the query worker, not the GUI thread.
+
+    The byte cursor advances even through pages with no severity matches.
+    A raw log is evidence of an occurrence, not evidence of current recovery.
+    """
+    run_dir = str(run_spec.get("run_dir") or "")
+    if not run_dir:
+        raise ValueError("当前 Run 未提供日志目录")
+    path = Path(run_dir) / "logs" / "pipeline.jsonl"
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        end = size if before is None else int(before)
+        if end > size or end < 0:
+            raise ValueError("日志文件已截断，请重新查询")
+        start = max(0, end - byte_budget)
+        handle.seek(start)
+        data = handle.read(end - start)
+    if start:
+        boundary = data.find(b"\n")
+        if boundary < 0:
+            raise ValueError("单条日志超过读取上限，无法安全分页")
+        start += boundary + 1
+        data = data[boundary + 1:]
+    lines = data.splitlines(keepends=True)
+    cursor = start + len(data)
+    rows = []
+    skipped = 0
+    for line in reversed(lines):
+        cursor -= len(line)
+        try:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("not a log record")
+        except (ValueError, UnicodeError):
+            skipped += 1
+            continue
+        message = str(record.get("message") or "")
+        source = str(record.get("level") or "system")
+        level = _log_severity(source, message)
+        if level != severity or (search and search.casefold() not in message.casefold()):
+            continue
+        rows.append({
+            "monitor_event_id": cursor, "timestamp": record.get("timestamp"),
+            "object_type": "原始日志", "object_id": "pipeline.jsonl",
+            "event_type": "原始日志 · " + level, "level": level,
+            "message": message[:240], "raw_log": True,
+            "payload": {"source": source, "message": message[:16000],
+                        "truncated": len(message) > 16000, "byte_offset": cursor},
+        })
+        if len(rows) >= limit:
+            break
+    return {"rows": rows, "next_cursor": cursor, "has_more": cursor > 0,
+            "raw_log": True, "skipped_records": skipped}
 
 
 def _log_fingerprint(severity, error, affected, attempt=0):
@@ -332,7 +390,7 @@ from .monitor_theme import (
     TABLE_ROW_MIN_HEIGHT,
     status_color,
 )
-from .monitor_widgets import AdaptiveTable, MonitorComboBox, MonitorTextBrowser, ProgressTrack, monitor_icon
+from .monitor_widgets import AdaptiveTable, MonitorComboBox, MonitorTextBrowser, ProgressTrack, OverallProgressTrack, monitor_icon
 
 
 def _monitor_panel(*, secondary=False):
@@ -515,6 +573,50 @@ def _overall_completion_fraction(
     return sum(groups) / len(groups), len(groups)
 
 
+def _overview_work_label(stage) -> str:
+    """Plain-language overview; retain technical stages in the detail table."""
+    value = str(stage or "等待计划")
+    labels = {
+        "等待计划": "等待开始",
+        "Work Package 推理": "正在识别地物",
+        "等待上游 Work Package": "等待识别结果",
+        "上游 Work Package 失败": "地物识别失败",
+        "Run 失败": "任务失败",
+        "组装完成 / Run 已停止": "结果已合并，任务已停止",
+        "Run 已停止；恢复入口位于主界面": "已停止，可在主界面恢复",
+        "组装完成 / Run 未通过": "结果已合并，任务未通过检查",
+        "组装完成 / 上游 Package 失败": "结果已合并，部分识别失败",
+        "空间单元任务失败": "边界处理失败",
+        "空间单元拟合 / 等待依赖": "等待前一步结果",
+        "等待分区栅格收口": "等待整理识别结果",
+        "分区概率栅格收口": "正在整理识别结果",
+        "等待并行组装": "等待合并结果",
+        "并行组装": "正在合并结果",
+        "已组装 / 等待整体验收": "已合并，等待检查",
+        "整体验收": "正在检查结果",
+        "完成": "已完成",
+        "概率拼接": "正在拼接识别结果",
+        "边界矢量化": "正在生成地物边界",
+        "校验单元产物": "正在检查各部分结果",
+        "登记对象部件": "正在整理地物",
+        "连接跨单元对象": "正在连接相邻地物",
+        "写入 Raw GPKG": "正在保存初步结果",
+        "写入正式 GPKG": "正在保存正式结果",
+        "汇总拟合边界": "正在汇总边界结果",
+        "精确范围裁剪": "正在保留选定范围内的结果",
+        "空白/重叠验收": "正在检查遗漏和重叠",
+        "Accepted 差分": "正在排除已确认的区域",
+        "提交产物并清理中间文件": "正在保存结果并清理临时文件",
+    }
+    if value.startswith("组装失败："):
+        return "结果合并失败，请查看详情"
+    if value in labels:
+        return labels[value]
+    if value.endswith("拟合"):
+        return "识别地物，同时处理边界" if value.startswith("推理 + ") else "正在处理边界"
+    return "当前步骤待确认，请查看详情"
+
+
 def _unit_stage_label(type_counts) -> str:
     running_types = {
         unit_type
@@ -557,9 +659,22 @@ class _MonitorQueryWorker(QObject):
     def execute(self, request):
         value = dict(request or {})
         try:
-            database = self._database_for(value)
             kind = str(value.get("kind") or "")
             run_id = str(value.get("run_id") or "")
+            scope = str(value.get("scope") or "all")
+            if kind == "history" and scope in {"raw_warning", "raw_error"}:
+                page = _read_persisted_log_page(
+                    dict(value.get("run_spec") or {}), scope.removeprefix("raw_"),
+                    value.get("before_event_id"), search=str(value.get("search") or ""),
+                )
+                self.result_ready.emit({
+                    "kind": kind, "run_id": run_id,
+                    "generation": int(value.get("generation") or 0),
+                    "request_id": int(value.get("request_id") or 0),
+                    "append": bool(value.get("append")), **page,
+                })
+                return
+            database = self._database_for(value)
             if kind == "snapshot":
                 payload = {
                     "kind": kind,
@@ -804,6 +919,9 @@ class InferenceMonitorDialog(QDialog):
         self._page = 0
         self._page_size = 500
         self._build_ui()
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(1000)
+        self._sync_timer.timeout.connect(self._refresh_sync_status)
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._poll_database)
@@ -904,6 +1022,9 @@ class InferenceMonitorDialog(QDialog):
         self._run_id_label = _muted_label("任务：准备创建")
         header_text.addWidget(self._phase)
         header_text.addWidget(self._run_id_label)
+        self._monitor_sync = QLabel("○ 等待同步")
+        self._monitor_sync.setWordWrap(True)
+        header_text.addWidget(self._monitor_sync)
         state_row.addLayout(header_text, stretch=1)
         self._stop = QPushButton("停止任务")
         self._stop.setObjectName("StopButton")
@@ -928,30 +1049,37 @@ class InferenceMonitorDialog(QDialog):
         self._pages.addTab(self._build_events_page(), "事件与日志")
         root.addWidget(self._pages, stretch=1)
 
-        footer = QHBoxLayout()
-        footer.setSpacing(14)
-        footer.addWidget(_section_label("本次推理完成度"))
+        progress_panel, progress_layout = _monitor_panel()
+        progress_layout.setContentsMargins(16, 10, 16, 12)
+        progress_layout.setSpacing(8)
+        progress_header = QHBoxLayout()
+        self._progress_title = _section_label("启动准备")
+        progress_header.addWidget(self._progress_title)
         self._completion_value = QLabel("—")
         self._completion_value.setProperty("value", True)
         self._completion_value.setProperty("accent", True)
-        footer.addWidget(self._completion_value)
-        self._overall_bar = QProgressBar()
-        self._overall_bar.setTextVisible(False)
-        self._overall_bar.setFixedHeight(8)
-        self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+        progress_header.addWidget(self._completion_value)
+        progress_header.addStretch()
+        self._reduce_motion = QCheckBox("减少动态效果")
+        self._reduce_motion.setChecked(bool(QgsSettings().value("labeling_tool/monitor_reduce_motion", False, type=bool)))
+        progress_header.addWidget(self._reduce_motion)
+        progress_layout.addLayout(progress_header)
+        self._overall_bar = OverallProgressTrack()
+        self._overall_bar.setRange(0, 0)
         self._overall_bar.setValue(0)
         self._overall_bar.setFormat("本次推理任务完成度：等待任务图")
         self._overall_bar.setToolTip("按任务组统计，不代表剩余时间。")
+        self._overall_bar.set_reduced_motion(self._reduce_motion.isChecked())
+        self._reduce_motion.toggled.connect(self._set_reduced_motion)
         self._overall_bar.valueChanged.connect(self._refresh_completion_label)
-        footer.addWidget(self._overall_bar, stretch=1)
-        footer_hint = _muted_label("按任务组统计，不代表剩余时间")
-        footer_hint.setWordWrap(False)
-        footer_hint.setMinimumWidth(178)
-        footer.addWidget(footer_hint)
-        root.addLayout(footer)
+        progress_layout.addWidget(self._overall_bar)
+        self._progress_hint = _muted_label("等待准备进度；不代表整个任务完成度")
+        self._progress_hint.setWordWrap(True)
+        progress_layout.addWidget(self._progress_hint)
+        root.addWidget(progress_panel)
+        self._progress_panel = progress_panel
+
         status_row = QHBoxLayout()
-        self._monitor_sync = _muted_label("监控：等待连接")
-        status_row.addWidget(self._monitor_sync)
         status_row.addStretch()
         self._history_completeness = _muted_label("历史：等待正式 Run")
         status_row.addWidget(self._history_completeness)
@@ -965,10 +1093,32 @@ class InferenceMonitorDialog(QDialog):
         self._apply_theme(self._theme, persist=False)
         self._apply_responsive_layout(self.width())
 
+    def _set_reduced_motion(self, reduced):
+        self._overall_bar.set_reduced_motion(reduced)
+        QgsSettings().setValue("labeling_tool/monitor_reduce_motion", bool(reduced))
+
+    def _refresh_sync_status(self):
+        colors = PALETTES[self._theme]
+        age = max(0, int(time.time() - self._last_snapshot_at)) if self._last_snapshot_at else None
+        if self._last_snapshot_error:
+            text, tone = "⚠ 同步失败 · 显示上次数据", "warning"
+        elif age is None and self._progress_title.text().startswith("启动准备"):
+            text, tone = "○ 启动准备 · 正式运行尚未建立", "muted"
+        elif age is None:
+            text, tone = "○ 等待同步", "muted"
+        elif age > 10:
+            text, tone = f"⚠ 数据暂未更新 · {age}秒前同步", "warning"
+        else:
+            text, tone = f"● 数据同步正常 · {age}秒前更新", "success"
+        self._monitor_sync.setText(text)
+        self._monitor_sync.setStyleSheet(f"color: {colors[tone]}; font-weight: 600;")
+        if tone != "success" and not self._progress_title.text().startswith("启动准备"):
+            self._overall_bar.set_running(False)
+
     def _refresh_completion_label(self, *_args):
         total = self._overall_bar.maximum()
         self._completion_value.setText(
-            f"{self._overall_bar.value() / total:.0%}" if total > 1 else "—"
+            f"{max(0, self._overall_bar.value()) / total:.0%}" if total > 0 else "—"
         )
         self._overall_bar.setToolTip(self._overall_bar.format())
 
@@ -1159,10 +1309,8 @@ class InferenceMonitorDialog(QDialog):
         for label in (self._assembly_overview, self._coverage_overview):
             label.setParent(result_panel)
             label.hide()
-        main_layout.addWidget(result_panel)
-        # Keep the result card at its compact table height.  Extra splitter
-        # height belongs to the main column, not a second empty-looking card.
-        main_layout.addStretch(1)
+        main_layout.addWidget(result_panel, stretch=1)
+        result_layout.addStretch(1)
         body.addWidget(main)
 
         activity, activity_layout = _monitor_panel()
@@ -1410,6 +1558,8 @@ class InferenceMonitorDialog(QDialog):
         self._history_scope.addItem("当前问题", "issues")
         self._history_scope.addItem("自动恢复", "recovery")
         self._history_scope.addItem("历史警告/失败", "warnings")
+        self._history_scope.addItem("磁盘原始日志 · Warning", "raw_warning")
+        self._history_scope.addItem("磁盘原始日志 · Error", "raw_error")
         self._history_execution = MonitorComboBox()
         self._history_execution.addItem("全部执行", "")
         self._history_target = MonitorComboBox()
@@ -1459,6 +1609,8 @@ class InferenceMonitorDialog(QDialog):
         history_layout.addWidget(self._history_load_older)
         self._splitter.addWidget(history_panel)
         self._log_panel = LogPanel(self)
+        self._log_panel.severity_selected.connect(self._on_log_severity_selected)
+        self._log_panel.setToolTip("此区域显示当前窗口缓存；Warning / Error 同时查询左侧磁盘历史。")
         self._log_panel.cleared.connect(self._reset_log_counts)
         self._splitter.addWidget(self._log_panel)
         self._splitter.setStretchFactor(0, 5)
@@ -1478,6 +1630,7 @@ class InferenceMonitorDialog(QDialog):
         if selected not in MONITOR_STYLE:
             selected = "dark"
         self._theme = selected
+        self._refresh_sync_status()
         families = set(QFontDatabase.families())
         body_family = next((name for name in ("PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC") if name in families), self.font().family())
         self.setFont(QFont(body_family, BODY_FONT_PT))
@@ -1535,8 +1688,7 @@ class InferenceMonitorDialog(QDialog):
         self._style_recent_events()
         for stream_id in self._stream_state:
             self._write_stream_row(stream_id)
-        self._warning_log_button.setText(f"历史警告  {self._log_warning_count}")
-        self._error_log_button.setText(f"历史错误  {self._log_error_count}")
+        self._update_log_toggle()
         theme_action = "切换浅色主题" if selected == "dark" else "切换深蓝主题"
         self._theme_toggle.setIcon(monitor_icon(
             "sun" if selected == "dark" else "moon", palette["muted"], 22
@@ -1685,11 +1837,42 @@ class InferenceMonitorDialog(QDialog):
         self._recent_events_label.setToolTip(monitor_timezone_label())
 
     def _show_run_information(self):
-        box = QMessageBox(self)
-        box.setWindowTitle("运行信息")
-        box.setText("\n\n".join(label.text().replace(" | ", "\n") for label in (self._run_overview, self._assembly_overview, self._coverage_overview)))
-        box.setInformativeText("创建年龄与本次观察时长不是实际执行耗时。恢复与重做失败包仍位于主界面。")
+        box = self._build_run_information_dialog()
         box.exec()
+        box.deleteLater()
+
+    def _build_run_information_dialog(self):
+        """Use the monitor theme and readable dimensions for run metadata."""
+        box = QDialog(self)
+        box.setObjectName("InferenceMonitor")
+        box.setWindowTitle("LOESS / 运行信息")
+        box.setStyleSheet(MONITOR_STYLE[self._theme])
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+        layout.addWidget(_section_label("运行信息"))
+        details = MonitorTextBrowser(box)
+        details.setPlainText("\n\n".join(
+            label.text().replace(" | ", "\n")
+            for label in (self._run_overview, self._assembly_overview, self._coverage_overview)
+        ))
+        layout.addWidget(details, stretch=1)
+        hint = _muted_label("创建年龄与本次观察时长不是实际执行耗时。恢复与重做失败包仍位于主界面。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close = QPushButton("关闭")
+        close.clicked.connect(box.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        screen = self.screen()
+        available = screen.availableGeometry() if screen else self.geometry()
+        width = max(1, available.width() - 40)
+        height = max(1, available.height() - 60)
+        box.setMinimumSize(min(560, width), min(400, height))
+        box.resize(min(880, width), min(640, height))
+        return box
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1698,6 +1881,9 @@ class InferenceMonitorDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "_sync_timer"):
+            self._sync_timer.start()
+            self._refresh_sync_status()
         timer = getattr(self, "_poll_timer", None)
         if timer is not None:
             timer.setInterval(1000)
@@ -1707,6 +1893,8 @@ class InferenceMonitorDialog(QDialog):
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        if hasattr(self, "_sync_timer"):
+            self._sync_timer.stop()
         timer = getattr(self, "_poll_timer", None)
         if timer is not None and timer.isActive():
             timer.setInterval(5000)
@@ -1993,10 +2181,14 @@ class InferenceMonitorDialog(QDialog):
         self._history_search_timer.start()
 
     def _reset_history_page(self, *_args):
+        raw = str(self._history_scope.currentData() or "").startswith("raw_")
+        self._history_execution.setEnabled(not raw)
+        self._history_target.setEnabled(not raw)
         self._history_rows = []
         self._history_cursor = None
         self._history_exhausted = False
         self._history_table.setRowCount(0)
+        self._history_detail.setPlainText("正在查询磁盘日志；这里只表示曾经发生，恢复状态请查看结构化历史。" if raw else "选择一条事件查看详情。")
         if self._database_bound and self._run_id:
             self._request_history_page(append=False)
 
@@ -2026,6 +2218,8 @@ class InferenceMonitorDialog(QDialog):
         }
         self._history_context_label.setText("范围：" + self._history_target.currentText() + "  " +
                                            " · ".join(str(value) for value in self._history_filter_context().values() if value is not None) + " · " + monitor_timezone_label())
+        if str(self._history_scope.currentData()).startswith("raw_"):
+            self._history_context_label.setText("范围：整个 Run 的磁盘原始日志 · 每页最多扫描 2 MiB／显示 200 条；不判定当前恢复状态")
         self._dispatch_next_query()
 
     def _apply_history_result(self, payload):
@@ -2041,6 +2235,14 @@ class InferenceMonitorDialog(QDialog):
         self._history_exhausted = len(rows) < int(
             payload.get("page_size") or MONITOR_EVENT_PAGE_SIZE
         )
+        if payload.get("raw_log"):
+            self._history_cursor = payload["next_cursor"]
+            self._history_exhausted = not payload["has_more"]
+            self._history_detail.setPlainText(
+                f"本段找到 {len(rows)} 条匹配日志。" +
+                ("可继续加载更早记录；本段无匹配不代表整个 Run 没有错误。" if payload["has_more"] else "已读取到文件开头。") +
+                f"\n无法解析的记录：{payload.get('skipped_records', 0)}。选择一行查看原始信息。"
+            )
         self._history_load_older.setEnabled(not self._history_exhausted)
         self._history_load_older.setText(
             "没有更早记录" if self._history_exhausted else "加载更早记录"
@@ -2055,7 +2257,7 @@ class InferenceMonitorDialog(QDialog):
                     str(event.get("object_id") or event.get("object_type") or "Run"),
                     str(event.get("message") or event.get("event_type") or "—"),
                     execution[:12] + ("…" if len(execution) > 12 else ""),
-                    "已恢复" if event.get("recovered_by_span_id") else str(event.get("level") or "信息"),
+                    "仅记录发生" if event.get("raw_log") else "已恢复" if event.get("recovered_by_span_id") else str(event.get("level") or "信息"),
                 )
                 for column, value in enumerate(values):
                     item = self._history_table.item(row_index, column)
@@ -2071,6 +2273,26 @@ class InferenceMonitorDialog(QDialog):
         finally:
             self._history_table.setUpdatesEnabled(True)
         self._history_table.request_adaptive_layout()
+        if payload.get("raw_log") and not rows and payload["has_more"] and self.isVisible():
+            # Keep scanning sparse logs in bounded worker slices. Yield between
+            # slices so summary polling and UI input can run; switching pages,
+            # filters or Runs cancels this continuation.
+            request_id = self._latest_history_request_id
+            generation = self._query_generation
+            cursor = self._history_cursor
+            QTimer.singleShot(50, lambda: self._continue_raw_log_scan(request_id, generation, cursor))
+
+    def _continue_raw_log_scan(self, request_id, generation, cursor):
+        if (
+            self.isVisible() and self._pages.currentIndex() == 3
+            and request_id == self._latest_history_request_id
+            and generation == self._query_generation
+            and cursor == self._history_cursor
+            and str(self._history_scope.currentData() or "").startswith("raw_")
+            and not self._history_exhausted
+        ):
+            self._history_detail.setPlainText("正在后台查找更早的匹配日志；切换页面或筛选即可停止查找。")
+            self._load_older_history()
 
     def _render_history_detail(self):
         row = self._history_table.currentRow()
@@ -2080,8 +2302,8 @@ class InferenceMonitorDialog(QDialog):
         payload = json.dumps(
             event.get("payload") or {}, ensure_ascii=False, indent=2
         )
-        current = "已恢复" if event.get("recovered_by_span_id") else "未记录后续恢复"
-        self._history_detail.setText(
+        current = "原始日志不判定恢复状态，请查看结构化历史" if event.get("raw_log") else "已恢复" if event.get("recovered_by_span_id") else "未记录后续恢复"
+        self._history_detail.setPlainText(
             f"事件：{event.get('event_type') or '—'}\n"
             f"时间：{format_monitor_timestamp(event.get('timestamp'))}\n"
             f"对象：{event.get('object_type') or '—'} / {event.get('object_id') or '—'}\n"
@@ -2231,6 +2453,7 @@ class InferenceMonitorDialog(QDialog):
         self._terminal_run_status = ""
         self._run_id = str(run_id)
         self._run_spec = dict(run_spec or {})
+        self._update_log_toggle()
         self._page_size = max(1, min(int(page_size), 500))
         self._page = 0
         self._last_detail_requested_at = 0.0
@@ -2248,6 +2471,12 @@ class InferenceMonitorDialog(QDialog):
         self._stage_key = ""
         self._stage_started_at = time.monotonic()
         self._poll_timer.start()
+        self._progress_title.setText("本次推理完成度")
+        self._progress_hint.setText("按任务组统计，不代表剩余时间")
+        self._overall_bar.set_running(False)
+        self._overall_bar.setRange(0, 0)
+        self._overall_bar.setFormat("等待正式运行进度")
+        self._refresh_completion_label()
         self._poll_database()
 
     def unbind_state_database(self):
@@ -2292,10 +2521,21 @@ class InferenceMonitorDialog(QDialog):
 
     def _show_log_severity(self, severity):
         self._pages.setCurrentIndex(3)
+        if self._database_bound and self._run_id:
+            index = self._history_scope.findData("raw_" + str(severity))
+            if self._history_scope.currentIndex() == index:
+                self._reset_history_page()
+            else:
+                self._history_scope.setCurrentIndex(index)
+            return
         if not self._log_toggle.isChecked():
             self._log_toggle.setChecked(True)
         self._log_panel.set_visible_severities({str(severity)})
         self._log_panel.scroll_to_latest()
+
+    def _on_log_severity_selected(self, severity):
+        if severity in {"warning", "error"} and self._database_bound and self._run_id:
+            self._show_log_severity(severity)
 
     def _reset_log_counts(self):
         self._log_error_count = 0
@@ -2307,8 +2547,12 @@ class InferenceMonitorDialog(QDialog):
         self._log_toggle.setText(action)
         self._warning_log_button.setText(f"历史警告  {self._log_warning_count}")
         self._error_log_button.setText(f"历史错误  {self._log_error_count}")
-        self._warning_log_button.setEnabled(self._log_warning_count > 0)
-        self._error_log_button.setEnabled(self._log_error_count > 0)
+        bound = bool(self._database_bound and self._run_id)
+        if bound:
+            self._warning_log_button.setText("查看历史警告")
+            self._error_log_button.setText("查看历史错误")
+        self._warning_log_button.setEnabled(bound or self._log_warning_count > 0)
+        self._error_log_button.setEnabled(bound or self._log_error_count > 0)
 
     def _update_coverage_overview(self):
         values = [
@@ -2400,7 +2644,8 @@ class InferenceMonitorDialog(QDialog):
         self._status_badge.setText("准备中")
         self._set_status_badge("neutral")
         self._run_id_label.setText("Run：准备创建")
-        self._monitor_sync.setText("监控：等待连接")
+        self._monitor_sync.setText("○ 等待同步")
+        self._overall_bar.set_running(False)
         self._run_overview.setText("Run：准备中")
         self._package_overview.setText("Work Package：等待计划")
         self._unit_overview.setText("空间单元拟合：等待计划")
@@ -2412,6 +2657,14 @@ class InferenceMonitorDialog(QDialog):
         self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
         self._overall_bar.setValue(0)
         self._overall_bar.setFormat("整体任务完成度：等待任务图")
+        self._progress_title.setText("启动准备")
+        self._progress_hint.setText("等待准备进度；不代表整个任务完成度")
+        self._last_snapshot_at = None
+        self._last_snapshot_error = ""
+        self._overall_bar.setRange(0, 0)
+        self._overall_bar.setFormat("等待准备进度")
+        self._refresh_completion_label()
+        self._refresh_sync_status()
         self._bar.setRange(0, 0)
         self._bar.setFormat("准备中")
         self._stop.setEnabled(True)
@@ -2419,6 +2672,8 @@ class InferenceMonitorDialog(QDialog):
         self.setWindowTitle("推理监控 - 准备中")
 
     def set_stage_progress(self, info):
+        if self._control_state or self._terminal_run_status:
+            return
         name = str(info.get("name") or "处理中")
         stream_id = str(info.get("stream_id") or "")
         current = int(info.get("current") or 0)
@@ -2434,6 +2689,14 @@ class InferenceMonitorDialog(QDialog):
         if message:
             text += f" | {message}"
         self._phase.setText(text)
+        self._progress_title.setText(f"启动准备 · {name}")
+        self._progress_hint.setText("仅表示当前准备步骤，不代表整个任务完成度")
+        self._overall_bar.set_running(False)
+        self._overall_bar.setRange(0, max(0, total))
+        self._overall_bar.setValue(max(0, min(current, total)) if total > 0 else 0)
+        self._overall_bar.setFormat(f"{name}：{current}/{total}" if total > 0 else f"{name}：处理中，总量尚未确定")
+        self._overall_bar.set_running(True)
+        self._refresh_completion_label()
         if total > 0:
             self._bar.setRange(0, total)
             self._bar.setValue(min(current, total))
@@ -2446,6 +2709,7 @@ class InferenceMonitorDialog(QDialog):
 
     def mark_stopping(self, text="正在停止当前子进程组"):
         self._control_state = "stopping"
+        self._overall_bar.set_running(False)
         self._stop.setEnabled(False)
         self._stop.setText("正在停止…")
         self._phase.setText(str(text))
@@ -2453,6 +2717,7 @@ class InferenceMonitorDialog(QDialog):
         self._set_status_badge("warning")
 
     def mark_finished(self, text="已完成", detail=""):
+        self._overall_bar.set_running(False)
         self._control_state = ""
         self._terminal_run_status = {"已完成": "ready", "失败": "failed", "已停止": "stopped"}.get(text, "")
         # Fence callbacks dispatched before this authoritative runner result.
@@ -2570,7 +2835,7 @@ class InferenceMonitorDialog(QDialog):
         )
         overview_values = (
             self._stream_display_name(stream_id),
-            str(state.get("stage") or "等待计划").replace("Core 拟合", "内部区域边界拟合").replace("Seam 拟合", "接缝边界拟合").replace("Junction 拟合", "交汇区域边界拟合").replace("Work Package", "推理包"),
+            _overview_work_label(state.get("stage")),
             assembly_state,
             {"passed": "验收通过", "failed": "验收失败", "skipped": "未执行"}.get(coverage_state, coverage_state),
         )
@@ -2581,6 +2846,8 @@ class InferenceMonitorDialog(QDialog):
                 self._overview_results.setItem(row, column, item)
             if item.text() != str(value):
                 item.setText(str(value))
+            if column == 1:
+                item.setToolTip(str(state.get("stage") or "尚无阶段记录"))
             item.setTextAlignment(ALIGN_LEFT | ALIGN_VCENTER)
             if column == 0:
                 item.setToolTip(stream_id)
@@ -3121,6 +3388,11 @@ class InferenceMonitorDialog(QDialog):
 
     def _history_request_matches_controls(self, request):
         value = dict(request or {})
+        if str(value.get("scope") or "").startswith("raw_"):
+            return (
+                value.get("scope") == self._history_scope.currentData()
+                and str(value.get("search") or "") == self._history_search.text().strip()
+            )
         return (
             str(value.get("scope") or "all")
             == str(self._history_scope.currentData() or "all")
@@ -3181,10 +3453,17 @@ class InferenceMonitorDialog(QDialog):
             current = self._object_request_matches_controls(active)
         if current:
             error = str(value.get("error") or "unknown monitor query error")
+            if value.get("kind") == "history" and str(active.get("scope") or "").startswith("raw_"):
+                self._history_detail.setPlainText(
+                    "原始日志读取失败，不代表没有错误，也不改变任务或数据库连接状态。\n" + error
+                )
+                self._dispatch_next_query()
+                return
             self._last_snapshot_error = error
             self._monitor_sync.setText(
-                "监控：读取失败；保留最后一次有效状态"
+                "⚠ 同步失败 · 显示上次数据"
             )
+            self._overall_bar.set_running(False)
             self._on_log("system", f"[monitor-db] {error}")
             if value.get("kind") == "detail":
                 self._detail_signature = None
@@ -3355,7 +3634,7 @@ class InferenceMonitorDialog(QDialog):
             self._last_snapshot_error = ""
             monitor_sync = getattr(self, "_monitor_sync", None)
             if monitor_sync is not None:
-                monitor_sync.setText("监控：已连接，刚刚同步")
+                monitor_sync.setText("● 数据同步正常 · 刚刚更新")
             run_row = snapshot.get("run") or {}
             if getattr(self, "_run_created_epoch", None) is None:
                 self._run_created_epoch = _timestamp_epoch(
@@ -3731,13 +4010,17 @@ class InferenceMonitorDialog(QDialog):
             stream_runtime_progress,
         )
         overall_value = round(overall_fraction * ASSEMBLY_PROGRESS_SCALE)
+        self._progress_title.setText("本次推理完成度")
+        self._progress_hint.setText("按任务组统计，不代表剩余时间")
         overall_percent = round(overall_fraction * 100)
         self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
+        self._overall_bar.set_running(run_status == "running" and not self._control_state and not self._terminal_run_status)
         self._overall_bar.setValue(overall_value)
         self._overall_bar.setFormat(
             f"本次推理任务完成度：{overall_percent}% | "
             f"按 {overall_group_count} 类任务计算，不代表剩余时间"
         )
+        self._refresh_completion_label()
 
         if stage_key == "assembly" and streams:
             assembly_units = round(

@@ -22,10 +22,10 @@ class LabelingTool(QObject):
     def initGui(self):
         self._require_supported_qpa()
         icon = QIcon(":/images/themes/default/mAction.svg")
-        self.action = QAction(icon, "标注工具", self.iface.mainWindow())
+        self.action = QAction(icon, "地物标注工具", self.iface.mainWindow())
         self.action.setObjectName("labelingAction")
-        self.action.setWhatsThis("半自动标注工具")
-        self.toolbar = self.iface.addToolBar("标注工具")
+        self.action.setWhatsThis("地物标注工具")
+        self.toolbar = self.iface.addToolBar("地物标注工具")
         self.toolbar.setObjectName("labelingToolBar")
         self.toolbar.addAction(self.action)
 
@@ -35,7 +35,7 @@ class LabelingTool(QObject):
             self.dock_widget,
         )
 
-        self.iface.addPluginToMenu("标注工具", self.action)
+        self.iface.addPluginToMenu("地物标注工具", self.action)
 
         self.action.triggered.connect(self.show_dock)
 
@@ -62,7 +62,7 @@ class LabelingTool(QObject):
             del self.toolbar
             self.toolbar = None
         if self.action:
-            self.iface.removePluginMenu("标注工具", self.action)
+            self.iface.removePluginMenu("地物标注工具", self.action)
             self.action.deleteLater()
             self.action = None
 

@@ -634,6 +634,52 @@ def monitor(app, root):
     dialog = InferenceMonitorDialog(screen_parent)
     _ACTIVE_MONITOR_DIALOG = dialog
     default_size = dialog.size()
+    # Disk-history navigation must work even with no retained warning/error
+    # cache and must not dispatch a database query in this isolated UI probe.
+    original_dispatch = dialog._dispatch_next_query
+    dialog._dispatch_next_query = lambda: None
+    dialog._database_bound = True
+    dialog._run_id = "history-probe"
+    dialog._update_log_toggle()
+    assert dialog._error_log_button.isEnabled()
+    dialog._error_log_button.click()
+    assert dialog._history_scope.currentData() == "raw_error"
+    assert dialog._pending_history_query["scope"] == "raw_error"
+    assert not dialog._history_execution.isEnabled()
+    dialog._log_panel._select_severity("warning")
+    assert dialog._pending_history_query["scope"] == "raw_warning"
+    dialog._apply_history_result({"raw_log": True, "rows": [], "next_cursor": 123, "has_more": True})
+    assert dialog._history_cursor == 123
+    assert dialog._history_load_older.isEnabled()
+    assert "不代表整个 Run" in dialog._history_detail.toPlainText()
+    dialog._load_older_history()
+    assert dialog._pending_history_query["before_event_id"] == 123
+    dialog._active_query = dict(dialog._pending_history_query)
+    previous_sync_error = dialog._last_snapshot_error
+    dialog._on_query_failed({**dialog._active_query, "error": "log file missing"})
+    assert dialog._last_snapshot_error == previous_sync_error
+    assert "不改变任务或数据库连接状态" in dialog._history_detail.toPlainText()
+    dialog._history_scope.setCurrentIndex(0)
+    dialog._database_bound = False
+    dialog._run_id = ""
+    dialog._pending_history_query = None
+    dialog._dispatch_next_query = original_dispatch
+    dialog._pages.setCurrentIndex(0)
+    dialog.set_stage_progress({"name": "准备影像", "current": 1, "total": 4})
+    assert dialog._completion_value.text() == "25%"
+    assert dialog._progress_title.text() == "启动准备 · 准备影像"
+    dialog.set_stage_progress({"name": "检查输入", "current": 1, "total": 1})
+    assert dialog._completion_value.text() == "100%"
+    assert "当前准备步骤" in dialog._progress_hint.text()
+    dialog.set_stage_progress({"name": "准备运行"})
+    assert dialog._completion_value.text() == "—"
+    assert dialog._overall_bar.maximum() == 0
+    dialog.mark_stopping()
+    dialog.set_stage_progress({"name": "迟到的进度", "current": 1, "total": 2})
+    assert dialog._completion_value.text() == "—"
+    dialog._control_state = ""
+    dialog._stop.setEnabled(True)
+    dialog._stop.setText("停止任务")
     dialog._run_id = "DEMO-001"
     dialog._run_spec = {
         "runtime": {"effective_device": "mps"},
@@ -888,6 +934,46 @@ def monitor(app, root):
         assert settings.return_value.setValue.call_args.args[1] == "dark"
     settle()
 
+    # Overall progress is shared across all pages, with opt-out motion.
+    assert not dialog._overview_results_panel.isAncestorOf(dialog._overall_bar)
+    assert dialog._overall_bar.height() == 14
+    for page_index in range(4):
+        dialog._pages.setCurrentIndex(page_index)
+        settle()
+        assert dialog._overall_bar.isVisible()
+    dialog._pages.setCurrentIndex(0)
+    dialog._overall_bar.set_running(True)
+    assert dialog._overall_bar._timer.isActive()
+    dialog._overall_bar.set_reduced_motion(True)
+    assert not dialog._overall_bar._timer.isActive()
+    dialog._overall_bar.set_reduced_motion(False)
+    dialog._overall_bar.set_running(False)
+    assert not dialog._overall_bar._timer.isActive()
+    dialog._last_snapshot_at = time.time() - 20
+    dialog._refresh_sync_status()
+    assert "数据暂未更新" in dialog._monitor_sync.text()
+    dialog._last_snapshot_error = "fixture read failure"
+    dialog._refresh_sync_status()
+    assert "同步失败" in dialog._monitor_sync.text()
+    dialog._last_snapshot_error = ""
+    dialog._last_snapshot_at = time.time()
+    dialog._refresh_sync_status()
+    assert "数据同步正常" in dialog._monitor_sync.text()
+    from qgis.PyQt.QtGui import QPalette
+    from labeling_tool.gui.monitor_theme import PALETTES
+    for theme in ("dark", "light"):
+        dialog._apply_theme(theme, persist=False)
+        info = dialog._build_run_information_dialog()
+        info.show()
+        settle()
+        assert info.width() >= min(800, info.screen().availableGeometry().width() - 40)
+        assert info.palette().color(QPalette.ColorRole.Window).name() == PALETTES[theme]["background"].lower()
+        grab_widget(info, f"monitor-run-information-{theme}.png")
+        info.close()
+        info.deleteLater()
+    dialog._apply_theme("dark", persist=False)
+    settle()
+
     # A known one-tile workload must render as complete; an unknown total must
     # remain the empty sentinel rather than a false 100%.
     dialog._package_activity.update({"tile_current": 1, "tile_total": 1})
@@ -942,7 +1028,8 @@ def monitor(app, root):
         activity_panel = dialog._overview_activity_panel
         for panel in (parallel_panel, results_panel, activity_panel):
             assert_inside(panel, viewport)
-            assert global_rect(dialog._overall_bar).top() - global_rect(panel).bottom() >= 12
+        assert abs(global_rect(results_panel).bottom() - global_rect(activity_panel).bottom()) <= 2
+        assert global_rect(dialog._overall_bar).top() > global_rect(results_panel).bottom()
         assert not global_rect(results_panel).intersects(global_rect(activity_panel))
         assert global_rect(results_panel).top() - global_rect(parallel_panel).bottom() >= 16
         assert dialog._pages.widget(0).verticalScrollBar().maximum() == 0

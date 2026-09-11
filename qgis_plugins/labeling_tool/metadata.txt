@@ -1,5 +1,5 @@
 [general]
-name=半自动标注工具
+name=地物标注工具
 qgisMinimumVersion=4.2
 qgisMaximumVersion=4.99
 description=Ubuntu 与 macOS 共用的半自动矢量标注插件，支持 QGIS 4.2 / PyQt6 / Qt6、CUDA 与 MPS。

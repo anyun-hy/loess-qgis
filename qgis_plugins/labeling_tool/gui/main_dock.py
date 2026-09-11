@@ -326,7 +326,7 @@ class LabelingDockWidget(QgsDockWidget):
         if self._rect_tool:
             self._rect_tool.rect_finished.connect(self._on_rect_finished)
 
-        self.setWindowTitle("半自动标注工具")
+        self.setWindowTitle("地物标注工具")
         self.setObjectName("labelingDock")
 
         self._build_ui()
@@ -342,7 +342,7 @@ class LabelingDockWidget(QgsDockWidget):
         layout.setSpacing(6)
 
         # ── Header ──
-        header = QLabel("半自动标注工具 v5")
+        header = QLabel("地物标注工具 v5")
         header.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(header)
 
