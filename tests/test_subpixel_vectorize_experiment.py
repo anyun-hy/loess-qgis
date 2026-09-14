@@ -1,6 +1,6 @@
 import numpy as np
 
-import subpixel_vectorize_experiment as experiment
+from tools.experiments import subpixel_vectorize_experiment as experiment
 
 
 def _diagonal_probabilities(size=64):

@@ -16,12 +16,12 @@ import numpy as np
 import rasterio
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-for plugin_root in (ROOT / "qgis_plugins", ROOT / "runtime"):
-    if plugin_root.is_dir() and str(plugin_root) not in sys.path:
-        sys.path.insert(0, str(plugin_root))
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
+QGIS_PLUGINS_ROOT = REPOSITORY_ROOT / "qgis_plugins"
+for source_root in (INFERENCE_SCRIPTS_ROOT, QGIS_PLUGINS_ROOT):
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
 
 from deployment_config import CLASS_ORDER
 from labeling_tool.core.run_spec import sha256_file

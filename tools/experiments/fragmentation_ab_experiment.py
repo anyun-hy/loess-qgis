@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 from affine import Affine
@@ -27,6 +28,11 @@ from rasterio.warp import transform_bounds, transform_geom
 from scipy import ndimage
 import shapely
 from shapely.geometry import box, mapping, shape
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
+if str(INFERENCE_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(INFERENCE_SCRIPTS_ROOT))
 
 from deployment_config import CLASS_NAMES, CLASS_ORDER
 from small_component_regularizer import (

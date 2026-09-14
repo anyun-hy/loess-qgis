@@ -6,16 +6,23 @@ import argparse
 import datetime
 import json
 from pathlib import Path
+import sys
 
 import fiona
 import numpy as np
 import rasterio
 import shapely
 from rasterio import features
-from rasterio_compat import quiet_deprecated_memory_driver
 from scipy.ndimage import gaussian_filter, map_coordinates
 from shapely import affinity
 from shapely.geometry import LineString, box, shape
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
+if str(INFERENCE_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(INFERENCE_SCRIPTS_ROOT))
+
+from rasterio_compat import quiet_deprecated_memory_driver
 
 
 CLASS_CODES = (12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71)

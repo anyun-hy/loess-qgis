@@ -32,9 +32,15 @@ GitHub `anyun-hy/loess-qgis` 的受保护 `main` 是 macOS 与 Ubuntu 的权威�
 |---|---|
 | `qgis_plugins/labeling_tool/` | QGIS UI、地图交互、运行编排、监控、人工修整 |
 | `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3/V3.3、组装和验收 |
+| `tools/experiments/` | 从源码运行的隔离实验与回放评估入口，不进入生产部署 |
 | `bash/` | 插件安装、部署项目初始化、可选 SSH 入口 |
 | `tests/` | 契约、恢复、故障、规模和平台兼容测试 |
 | `docs/` | 当前架构、状态、操作和长期决策 |
+
+实验工具复用仓库内的生产模块，不复制算法；工具代码位置与被评估的 Run 输入
+位置分开。部署源码指纹覆盖 `bash/`、`inference_scripts/` 和插件目录，不覆盖
+`tools/`；因此只修改实验工具不会改变生产源码指纹。命令与输入输出边界见
+[实验工具](operations/EXPERIMENT_TOOLS.md)。
 
 QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和其他推理
 任务只使用当前平台的 `qgis` Conda 子进程，禁止混用两边 `site-packages`。
