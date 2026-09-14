@@ -74,7 +74,9 @@ QTableWidget, QListWidget, QTextBrowser, QLineEdit, QComboBox, QPlainTextEdit {{
   border: 1px solid {p['border']}; border-radius: 5px; selection-background-color: {p['selected']}; selection-color: {p['text']};
 }}
 QLineEdit, QComboBox {{ padding: 7px 8px; min-height: 20px; }}
-QComboBox {{ padding-right: 30px; border-radius: 7px; }}
+/* Use the bounded list popup, not native menu scrollers whose background can
+   bypass the list theme (and whose height ignores maxVisibleItems). */
+QComboBox {{ padding-right: 30px; border-radius: 7px; combobox-popup: 0; }}
 QComboBox:hover, QComboBox:on {{ border-color: {p['accent']}; }}
 QComboBox:disabled {{ color: {p['muted']}; background: {p['panel']}; }}
 QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right;
@@ -111,6 +113,9 @@ def combo_popup_style(theme):
     """Style the separate native popup explicitly, not the application's menus."""
     p = PALETTES.get(theme, PALETTES["dark"])
     return f"""
+QFrame#MonitorComboPopup {{ background: {p['field']}; color: {p['text']};
+  border: 0; padding: 0;
+}}
 QListView {{ background: {p['field']}; color: {p['text']};
   border: 1px solid {p['border']}; border-radius: 7px; padding: 4px;
   outline: 0; font-size: {BODY_FONT_PT}pt;

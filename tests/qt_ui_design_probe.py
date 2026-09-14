@@ -651,11 +651,15 @@ def monitor_typography(app, root):
 
 def monitor_combos(app, root):
     from qgis.PyQt.QtCore import Qt
-    from qgis.PyQt.QtGui import QPalette
+    from qgis.PyQt.QtGui import QColor, QPalette
     from qgis.PyQt.QtTest import QTest
-    from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout
+    from qgis.PyQt.QtWidgets import QComboBox, QDialog, QVBoxLayout
     from labeling_tool.gui.monitor_widgets import MonitorComboBox
     from labeling_tool.gui.monitor_theme import MONITOR_STYLE, PALETTES
+    application_style = app.styleSheet()
+    application_palette = QPalette(app.palette())
+    unrelated = QComboBox()
+    unrelated_palette = QPalette(unrelated.palette())
     dialog = QDialog()
     dialog.setObjectName("InferenceMonitor")
     layout = QVBoxLayout(dialog)
@@ -668,6 +672,24 @@ def monitor_combos(app, root):
     dialog.show()
     output = Path(os.environ.get("LOESS_MONITOR_SCREENSHOT_DIR", root))
     output.mkdir(parents=True, exist_ok=True)
+
+    def check_popup(theme, name):
+        view = combo.view()
+        popup = view.window()
+        assert popup is not dialog
+        assert popup.palette().color(QPalette.ColorRole.Window).name() == PALETTES[theme]["field"].lower()
+        assert view.viewport().palette().color(QPalette.ColorRole.Base).name() == PALETTES[theme]["field"].lower()
+        screenshot = popup.grab()
+        assert screenshot.save(str(output / name))
+        image = screenshot.toImage()
+        colors = [QColor(PALETTES[theme][key]).getRgb()[:3] for key in ("field", "border")]
+        edge_pixels = [(x, y) for x in range(image.width()) for y in (0, image.height() - 1)]
+        edge_pixels += [(x, y) for y in range(image.height()) for x in (0, image.width() - 1)]
+        for x, y in edge_pixels:
+            actual = image.pixelColor(x, y).getRgb()[:3]
+            assert all(min(a, b) - 2 <= value <= max(a, b) + 2
+                       for value, a, b in zip(actual, *colors)), (theme, x, y, actual)
+
     for theme in ("dark", "light"):
         dialog.setStyleSheet(MONITOR_STYLE[theme])
         combo.apply_theme(theme)
@@ -680,7 +702,7 @@ def monitor_combos(app, root):
         assert view.palette().color(QPalette.ColorRole.Base).name() == PALETTES[theme]["field"].lower()
         assert view.palette().color(QPalette.ColorRole.Text).name() == PALETTES[theme]["text"].lower()
         assert view.visualRect(view.model().index(0, 0)).height() >= 34
-        assert view.grab().save(str(output / f"dropdown-{theme}.png"))
+        check_popup(theme, f"dropdown-{theme}.png")
         QTest.keyClick(view, Qt.Key.Key_Escape)
         assert not view.isVisible()
         assert combo.currentData() == before
@@ -690,8 +712,31 @@ def monitor_combos(app, root):
         app.processEvents()
         assert combo.currentData() != before
         assert combo.currentData() in {"issues", "recovery", "warnings"}
+    # Inspect the whole native popup, not just the list: its parent frame and
+    # margins previously stayed white even though the list palette was dark.
+    for index in range(30):
+        combo.addItem(f"历史执行 {index + 1} / 长列表滚动检查", f"execution-{index}")
+    for theme in ("dark", "light", "dark"):
+        dialog.setStyleSheet(MONITOR_STYLE[theme])
+        combo.apply_theme(theme)
+        combo.showPopup()
+        QTest.qWait(40)
+        view = combo.view()
+        assert view.verticalScrollBar().maximum() > 0
+        assert view.verticalScrollBar().isVisible()
+        assert view.height() <= view.sizeHintForRow(0) * combo.maxVisibleItems() + 20
+        view.scrollToBottom()
+        app.processEvents()
+        check_popup(theme, f"dropdown-long-{theme}.png")
+        combo.hidePopup()
+    assert app.styleSheet() == application_style
+    assert app.palette() == application_palette
+    assert unrelated.palette() == unrelated_palette
+    assert not unrelated.styleSheet()
+    unrelated.close()
     dialog.close()
-    return {"popup_theme_colors": True, "keyboard_selection": True, "escape_preserves_filter": True}
+    return {"popup_theme_colors": True, "popup_edges": True, "long_list": True,
+            "keyboard_selection": True, "escape_preserves_filter": True}
 
 
 def monitor(app, root):

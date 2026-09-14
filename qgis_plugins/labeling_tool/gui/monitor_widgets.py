@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import (
 
 from .monitor_theme import DETAIL_LINE_HEIGHT, PALETTES, combo_popup_style
 from ..qt6_api import (
-    ALIGN_RIGHT, ALIGN_VCENTER, INTERACTIVE, NO_PEN, TEXT_CURSOR_DOCUMENT,
+    ALIGN_RIGHT, ALIGN_VCENTER, INTERACTIVE, NO_PEN, SCROLLBAR_AS_NEEDED, TEXT_CURSOR_DOCUMENT,
     TEXT_LINE_PROPORTIONAL, TRANSPARENT,
 )
 
@@ -61,13 +61,26 @@ class MonitorComboBox(QComboBox):
         view.setUniformItemSizes(True)
         view.setMouseTracking(True)
         self.setView(view)
+        view.setVerticalScrollBarPolicy(SCROLLBAR_AS_NEEDED)
         # The default combo menu delegate can bypass QListView item padding.
         self.setItemDelegate(QStyledItemDelegate(view))
         self.setMaxVisibleItems(10)
 
     def apply_theme(self, theme):
-        self.view().setFont(self.font())
-        self.view().setStyleSheet(combo_popup_style(theme))
+        view = self.view()
+        view.setFont(self.font())
+        style = combo_popup_style(theme)
+        view.setStyleSheet(style)
+        # setView creates a separate native popup. Styling only the list leaves
+        # the container's frame/margins in the system's (often light) palette.
+        # Target this combo's popup, never the enclosing monitor or QGIS menus.
+        popup = view.window()
+        if popup is not self.window():
+            popup.setObjectName("MonitorComboPopup")
+            popup.setStyleSheet(style)
+            if popup.layout() is not None:
+                popup.layout().setContentsMargins(0, 0, 0, 0)
+                popup.layout().setSpacing(0)
 
 
 class MonitorTextBrowser(QTextBrowser):
