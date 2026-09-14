@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize(
     "scenario",
-    ["shutdown", "sam_shutdown", "preparation", "workspace", "edits", "refinement", "monitor", "monitor_tables", "monitor_typography", "monitor_combos"],
+    ["shutdown", "sam_shutdown", "preparation", "workspace", "edits", "manual_candidates", "refinement", "monitor", "monitor_tables", "monitor_typography", "monitor_combos"],
 )
 def test_native_ui_design(scenario):
     environment = os.environ.copy()

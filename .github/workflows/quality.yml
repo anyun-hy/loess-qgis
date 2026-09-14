@@ -20,7 +20,7 @@ jobs:
       - name: Install lightweight test dependencies
         run: python -m pip install --disable-pip-version-check pytest==9.1.1 pyyaml==6.0.3
       - name: Compile Python sources
-        run: python -m compileall -q bash qgis_plugins inference_scripts tests
+        run: python -m compileall -q bash qgis_plugins inference_scripts tools tests
       - name: Validate shell entry points
         run: find bash inference_scripts -type f -name '*.sh' -exec bash -n {} +
       - name: Run public source contracts
@@ -30,6 +30,8 @@ jobs:
           tests/test_public_release.py
           tests/test_ssh_tencent.py
           tests/test_postgres_state_contract.py
+          tests/test_monitor_progress.py
+          tests/test_monitor_logs.py
           tests/test_v5_runner_thread_affinity.py
           tests/test_ui_design_regressions.py
           tests/test_platform_compat.py::test_plugin_targets_qgis42_pyqt6_qt6_from_one_release

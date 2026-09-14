@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from html import escape
 import re
 import time
@@ -22,7 +21,6 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -40,13 +38,11 @@ from ..qt6_api import (
     ALIGN_TOP,
     ALIGN_VCENTER,
     HORIZONTAL,
-    INTERACTIVE,
     NO_EDIT_TRIGGERS,
     SCROLLBAR_AS_NEEDED,
     RICH_TEXT,
     SELECT_ROWS,
     SINGLE_SELECTION,
-    STRETCH,
     USER_ROLE,
     VERTICAL,
     WINDOW,
@@ -56,265 +52,28 @@ from .log_panel import LogPanel
 from .monitor_time import format_monitor_timestamp, monitor_timezone_label
 from ..core.monitor_contract import (
     ASSEMBLY_PHASES,
-    ASSEMBLY_PHASE_NAMES,
-    ASSEMBLY_PHASE_UNITS,
     MONITOR_EVENT_PAGE_SIZE,
     SPAN_STATUS_LABELS,
     effective_device_text,
     execution_trigger_label,
 )
-
-
-def _log_payload(message):
-    text = str(message).strip()
-    if not (text.startswith("{") and text.endswith("}")):
-        return {}
-    try:
-        value = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _log_severity(level, message):
-    """Separate semantic severity from the stdout/stderr/system source."""
-
-    lowered = str(message).lower()
-    if lowered.startswith("[resource-tuning] "):
-        return "info"
-    payload = _log_payload(message)
-    event = str(payload.get("event") or "").lower()
-    status = str(payload.get("status") or "").lower()
-    if (
-        event.endswith("failed")
-        or status in {"failed", "error"}
-        or payload.get("success") is False
-    ):
-        return "error"
-    if any(
-        token in event
-        for token in ("warning", "retry", "reduced", "paused_low_disk")
-    ) or status == "warning":
-        return "warning"
-    explicit_failure = any(
-        marker in lowered
-        for marker in (
-            " failed (rc=",
-            "[scheduler-error]",
-            "[accelerator-restart]",
-            " timed out after ",
-            " process error:",
-            "exhausted retries",
-            "crashed repeatedly",
-            "[monitor-db]",
-            "fatal error",
-        )
-    )
-    named_exception = (
-        lowered.startswith(("error:", "[error]", "fatal:"))
-        or re.search(r"\b[a-z_][\w.]*?(?:error|exception):", lowered)
-    )
-    if explicit_failure or (str(level) != "stderr" and named_exception):
-        return "error"
-    if any(
-        token in lowered for token in ("warning", "warn", "警告")
-    ) or any(
-        marker in lowered
-        for marker in ("[retry]", "fallback", "降档", "自动重试")
-    ):
-        return "warning"
-    return "info"
-
-
-def _read_persisted_log_page(run_spec, severity, before=None, *, search="", limit=200, byte_budget=2 * 1024 * 1024):
-    """Read one bounded reverse page on the query worker, not the GUI thread.
-
-    The byte cursor advances even through pages with no severity matches.
-    A raw log is evidence of an occurrence, not evidence of current recovery.
-    """
-    run_dir = str(run_spec.get("run_dir") or "")
-    if not run_dir:
-        raise ValueError("当前 Run 未提供日志目录")
-    path = Path(run_dir) / "logs" / "pipeline.jsonl"
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        end = size if before is None else int(before)
-        if end > size or end < 0:
-            raise ValueError("日志文件已截断，请重新查询")
-        start = max(0, end - byte_budget)
-        handle.seek(start)
-        data = handle.read(end - start)
-    if start:
-        boundary = data.find(b"\n")
-        if boundary < 0:
-            raise ValueError("单条日志超过读取上限，无法安全分页")
-        start += boundary + 1
-        data = data[boundary + 1:]
-    lines = data.splitlines(keepends=True)
-    cursor = start + len(data)
-    rows = []
-    skipped = 0
-    for line in reversed(lines):
-        cursor -= len(line)
-        try:
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError("not a log record")
-        except (ValueError, UnicodeError):
-            skipped += 1
-            continue
-        message = str(record.get("message") or "")
-        source = str(record.get("level") or "system")
-        level = _log_severity(source, message)
-        if level != severity or (search and search.casefold() not in message.casefold()):
-            continue
-        rows.append({
-            "monitor_event_id": cursor, "timestamp": record.get("timestamp"),
-            "object_type": "原始日志", "object_id": "pipeline.jsonl",
-            "event_type": "原始日志 · " + level, "level": level,
-            "message": message[:240], "raw_log": True,
-            "payload": {"source": source, "message": message[:16000],
-                        "truncated": len(message) > 16000, "byte_offset": cursor},
-        })
-        if len(rows) >= limit:
-            break
-    return {"rows": rows, "next_cursor": cursor, "has_more": cursor > 0,
-            "raw_log": True, "skipped_records": skipped}
-
-
-def _log_fingerprint(severity, error, affected, attempt=0):
-    if severity not in {"warning", "error"} or not str(affected).strip():
-        return ""
-    normalized_error = re.sub(r"\s+", " ", str(error)).strip().lower()
-    normalized_target = re.sub(r"\s+", " ", str(affected)).strip().lower()
-    return (
-        f"{severity}:{normalized_target}:attempt={int(attempt or 0)}:"
-        f"{normalized_error}"
-    )
-
-
-def _log_presentation(level, message):
-    """Build a stable, readable summary while retaining the raw message."""
-
-    source = str(level) if str(level) in {"stdout", "stderr", "system"} else "system"
-    raw = str(message)
-    lowered = raw.lower()
-    payload = _log_payload(raw)
-    severity = _log_severity(source, raw)
-    event = str(payload.get("event") or "")
-    error = str(payload.get("error") or raw)
-    affected = str(
-        payload.get("step")
-        or payload.get("label")
-        or payload.get("unit_id")
-        or payload.get("stream_id")
-        or event
-        or ""
-    )
-    if not affected and " timed out after " in lowered:
-        affected = raw[: lowered.index(" timed out after ")].strip()
-    if not affected and " failed (rc=" in lowered:
-        affected = raw[: lowered.index(" failed (rc=")].strip()
-    if not affected and "scheduler-error" in lowered:
-        affected = "调度器"
-    if not affected and "monitor-db" in lowered:
-        affected = "监控数据库"
-    if not affected and "accelerator-restart" in lowered:
-        affected = "加速器进程"
-    attempt = int(payload.get("attempt") or 0)
-
-    if severity == "warning":
-        if "retry" in lowered or "重试" in raw or "reduced" in lowered or "降档" in raw:
-            title = "任务正在自动重试"
-            system_action = "系统已调整本次执行并继续运行"
-            user_action = "通常不需要处理；重复出现时再查看技术详情"
-        elif "paused_low_disk" in lowered or "低磁盘" in raw:
-            title = "磁盘空间不足，任务已暂停"
-            system_action = "系统保留当前进度，等待空间恢复"
-            user_action = "释放磁盘空间后恢复任务"
-        else:
-            title = "运行警告"
-            system_action = "系统继续运行并保留该警告"
-            user_action = "通常不需要处理；重复出现时再检查"
-    elif severity == "error":
-        if "timed out after" in lowered or "超时" in raw:
-            title = "任务处理超时"
-            system_action = "进程已终止，系统将按恢复规则处理"
-            user_action = "等待自动重试；若再次失败，再查看技术详情"
-        elif "scheduler-error" in lowered:
-            title = "任务调度异常"
-            system_action = "系统已停止本次调度操作"
-            user_action = "查看技术详情，修复后恢复任务"
-        elif "monitor-db" in lowered:
-            title = "监控状态读取失败"
-            system_action = "推理任务不受影响，监控稍后会再次读取"
-            user_action = "若持续出现，再检查 PostgreSQL 连接"
-        elif "process error" in lowered:
-            title = "进程启动失败"
-            system_action = "本次进程没有继续执行"
-            user_action = "查看技术详情并检查运行环境"
-        elif "assembly" in event.lower() or "assemble" in lowered:
-            title = "结果流组装失败"
-            system_action = "本次结果流已标记为失败"
-            user_action = "查看技术详情，修复后恢复该结果流"
-        elif "coverage" in event.lower():
-            title = "结果完整性验收失败"
-            system_action = "结果未被发布为权威版本"
-            user_action = "检查空白、重叠和范围外统计"
-        elif "failed (rc=" in lowered:
-            title = "进程异常退出"
-            system_action = "本次任务已标记为失败"
-            user_action = "查看技术详情中的返回码和原始输出"
-        else:
-            title = "任务执行失败"
-            system_action = "本次任务已记录为失败"
-            user_action = "查看技术详情，修复后再恢复任务"
-    else:
-        title = ""
-        system_action = ""
-        user_action = ""
-
-    fingerprint = _log_fingerprint(severity, error, affected, attempt)
-    return {
-        "source": source,
-        "severity": severity,
-        "title": title,
-        "affected": affected,
-        "system_action": system_action,
-        "user_action": user_action,
-        "error": error,
-        "attempt": attempt,
-        "fingerprint": fingerprint,
-    }
-
-
-def _log_indicators(level, message):
-    """Compatibility helper used by existing monitor tests."""
-
-    severity = _log_severity(level, message)
-    return severity == "warning", severity == "error"
+from ..core.monitor_progress import (
+    overall_completion_fraction,
+    overview_work_label,
+    stage_from_step,
+    stream_from_step,
+    unit_stage_label,
+    waiting_count,
+)
 from ..core.run_state_db import run_state_from_spec
+from ..core.monitor_logs import (
+    log_fingerprint,
+    log_presentation,
+    read_persisted_log_page,
+)
 
-
-STATUS_COLORS = {
-    "等待": "#777777",
-    "运行中": "#1565c0",
-    "成功": "#2e7d32",
-    "失败": "#c62828",
-    "跳过": "#777777",
-    "已停止": "#9a6700",
-}
 
 ASSEMBLY_PROGRESS_SCALE = 1000
-STREAM_TABLE_VISIBLE_ROWS = 5
-PIPELINE_STAGES = (
-    ("compute", "推理与拟合"),
-    ("finalize", "栅格收口"),
-    ("assembly", "并行组装"),
-    ("acceptance", "整体验收"),
-    ("ready", "完成"),
-)
 
 RUN_STATUS_LABELS = {
     "preflight": "预检",
@@ -439,43 +198,6 @@ def _left_align_table_headers(table):
             item.setTextAlignment(alignment)
 
 
-def _stream_from_step(name: str) -> str:
-    if name.startswith("model_batch:"):
-        return "model:" + name.split(":", 1)[1]
-    if name.startswith("fusion_batch:"):
-        return "fusion:" + name.split(":", 1)[1]
-    for prefix in ("mosaic:", "polygonize:", "subpixel_vectorize:", "difference:"):
-        if name.startswith(prefix):
-            return name[len(prefix):]
-    if name.startswith("unit_fit:"):
-        return name[len("unit_fit:"):].rsplit(":", 1)[0]
-    if name.startswith("assemble_stream:"):
-        return name[len("assemble_stream:"):]
-    return ""
-
-
-def _stage_from_step(name: str) -> str:
-    if name.startswith("unit_fit:"):
-        return "空间单元拟合"
-    if name.startswith("assemble_stream:"):
-        return "并行组装"
-    if name.startswith("model_batch:") or name.startswith("fusion_batch:"):
-        return "Work Package 推理"
-    if name.startswith("mosaic:"):
-        return "概率拼接"
-    if name.startswith(("polygonize:", "subpixel_vectorize:")):
-        return "边界矢量化"
-    if name.startswith("difference:"):
-        return "Accepted 差分"
-    if name == "finalize_partition_rasters":
-        return "分区概率栅格收口"
-    if name == "scale_acceptance":
-        return "整体验收"
-    if name == "accelerator_worker":
-        return "Work Package 推理"
-    return name.split(":", 1)[0]
-
-
 def _tile_sort_key(tile_id: str):
     return tuple(
         int(part) if part.isdigit() else part
@@ -500,137 +222,6 @@ def _timestamp_epoch(value: str) -> float | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.timestamp()
-
-
-def _waiting_count(counts) -> int:
-    return sum(
-        int(counts.get(key, 0))
-        for key in ("queued", "interrupted", "resetting")
-    )
-
-
-def _assembly_fraction(stream_status, progress) -> float:
-    if str(stream_status) == "ready" or str(progress.get("status") or "") == "completed":
-        return 1.0
-    phase_total = int(progress.get("phase_total") or 0)
-    phase_index = int(progress.get("phase_index") or 0)
-    if phase_total < 1 or phase_index < 1:
-        return 0.0
-    current = int(progress.get("progress_current") or 0)
-    total = int(progress.get("progress_total") or 0)
-    within_phase = min(1.0, max(0.0, current / total)) if total else 0.0
-    return min(1.0, max(0.0, (phase_index - 1 + within_phase) / phase_total))
-
-
-def _overall_completion_fraction(
-    run_status,
-    job_counts,
-    job_progress,
-    streams,
-    stream_runtime_progress,
-):
-    """Return completion across planned task groups, not estimated time."""
-
-    if str(run_status) == "ready":
-        return 1.0, 1
-    groups = []
-    for job_type in (
-        "work_package",
-        "fragmentation_v33",
-        "unit_confidence",
-        "unit_fit",
-    ):
-        counts = job_counts.get(job_type) or {}
-        progress = job_progress.get(job_type) or {}
-        total = int(progress.get("total") or sum(int(v) for v in counts.values()))
-        if total < 1:
-            continue
-        completed = float(
-            progress.get("completed")
-            if progress.get("completed") is not None
-            else counts.get("ready", 0)
-        )
-        groups.append(min(1.0, max(0.0, completed / total)))
-    if streams:
-        raster_finalized = all(
-            str(stream.get("status") or "") in {"raster_ready", "assembling", "ready"}
-            for stream in streams
-        )
-        groups.append(1.0 if raster_finalized else 0.0)
-        groups.append(
-            sum(
-                _assembly_fraction(
-                    stream.get("status"),
-                    stream_runtime_progress.get(str(stream["stream_id"])) or {},
-                )
-                for stream in streams
-            )
-            / len(streams)
-        )
-        groups.append(0.0)
-    if not groups:
-        return 0.0, 0
-    return sum(groups) / len(groups), len(groups)
-
-
-def _overview_work_label(stage) -> str:
-    """Plain-language overview; retain technical stages in the detail table."""
-    value = str(stage or "等待计划")
-    labels = {
-        "等待计划": "等待开始",
-        "Work Package 推理": "正在识别地物",
-        "等待上游 Work Package": "等待识别结果",
-        "上游 Work Package 失败": "地物识别失败",
-        "Run 失败": "任务失败",
-        "组装完成 / Run 已停止": "结果已合并，任务已停止",
-        "Run 已停止；恢复入口位于主界面": "已停止，可在主界面恢复",
-        "组装完成 / Run 未通过": "结果已合并，任务未通过检查",
-        "组装完成 / 上游 Package 失败": "结果已合并，部分识别失败",
-        "空间单元任务失败": "边界处理失败",
-        "空间单元拟合 / 等待依赖": "等待前一步结果",
-        "等待分区栅格收口": "等待整理识别结果",
-        "分区概率栅格收口": "正在整理识别结果",
-        "等待并行组装": "等待合并结果",
-        "并行组装": "正在合并结果",
-        "已组装 / 等待整体验收": "已合并，等待检查",
-        "整体验收": "正在检查结果",
-        "完成": "已完成",
-        "概率拼接": "正在拼接识别结果",
-        "边界矢量化": "正在生成地物边界",
-        "校验单元产物": "正在检查各部分结果",
-        "登记对象部件": "正在整理地物",
-        "连接跨单元对象": "正在连接相邻地物",
-        "写入 Raw GPKG": "正在保存初步结果",
-        "写入正式 GPKG": "正在保存正式结果",
-        "汇总拟合边界": "正在汇总边界结果",
-        "精确范围裁剪": "正在保留选定范围内的结果",
-        "空白/重叠验收": "正在检查遗漏和重叠",
-        "Accepted 差分": "正在排除已确认的区域",
-        "提交产物并清理中间文件": "正在保存结果并清理临时文件",
-    }
-    if value.startswith("组装失败："):
-        return "结果合并失败，请查看详情"
-    if value in labels:
-        return labels[value]
-    if value.endswith("拟合"):
-        return "识别地物，同时处理边界" if value.startswith("推理 + ") else "正在处理边界"
-    return "当前步骤待确认，请查看详情"
-
-
-def _unit_stage_label(type_counts) -> str:
-    running_types = {
-        unit_type
-        for unit_type, counts in type_counts.items()
-        if int(counts.get("running", 0)) > 0
-    }
-    labels = []
-    if "core" in running_types:
-        labels.append("Core")
-    if running_types.intersection({"seam_horizontal", "seam_vertical"}):
-        labels.append("Seam")
-    if "junction" in running_types:
-        labels.append("Junction")
-    return "/".join(labels) + " 拟合" if labels else "空间单元拟合"
 
 
 class _MonitorQueryWorker(QObject):
@@ -663,7 +254,7 @@ class _MonitorQueryWorker(QObject):
             run_id = str(value.get("run_id") or "")
             scope = str(value.get("scope") or "all")
             if kind == "history" and scope in {"raw_warning", "raw_error"}:
-                page = _read_persisted_log_page(
+                page = read_persisted_log_page(
                     dict(value.get("run_spec") or {}), scope.removeprefix("raw_"),
                     value.get("before_event_id"), search=str(value.get("search") or ""),
                 )
@@ -1032,12 +623,9 @@ class InferenceMonitorDialog(QDialog):
         self._stop.clicked.connect(self._request_stop)
         state_row.addWidget(self._stop)
         root.addLayout(state_row)
-        self._run_overview = _muted_label("Run：准备中")
-        self._run_overview.setParent(self)
-        self._run_overview.hide()
-        self._stage_rail = QLabel("", self)
-        self._stage_rail.hide()
-        self._update_stage_rail("compute")
+        self._run_information = "Run：准备中"
+        self._assembly_information = "结果流组装：等待上游计算"
+        self._coverage_information = "空白/重叠验收：等待组装"
 
         self._pages = QTabWidget()
         self._pages.setDocumentMode(True)
@@ -1084,12 +672,6 @@ class InferenceMonitorDialog(QDialog):
         self._history_completeness = _muted_label("历史：等待正式 Run")
         status_row.addWidget(self._history_completeness)
         root.addLayout(status_row)
-        self._summary = _muted_label("结果流：等待任务")
-        self._summary.setParent(self)
-        self._summary.hide()
-        self._bar = QProgressBar(self)
-        self._bar.setRange(0, 0)
-        self._bar.hide()
         self._apply_theme(self._theme, persist=False)
         self._apply_responsive_layout(self.width())
 
@@ -1205,9 +787,6 @@ class InferenceMonitorDialog(QDialog):
         package_button.clicked.connect(lambda: self._open_detail_kind("package"))
         model_footer.addWidget(package_button)
         model_layout.addLayout(model_footer)
-        self._package_overview = _muted_label("等待计划")
-        self._package_overview.setParent(model_card)
-        self._package_overview.hide()
         cards.addWidget(model_card, 0, 0)
 
         spatial_card, spatial_layout = _monitor_panel(secondary=True)
@@ -1268,9 +847,6 @@ class InferenceMonitorDialog(QDialog):
         spatial_button.clicked.connect(lambda: self._open_detail_kind("unit_fit"))
         spatial_footer.addWidget(spatial_button)
         spatial_layout.addLayout(spatial_footer)
-        self._fit_label = _muted_label("")
-        self._fit_label.setParent(spatial_card)
-        self._fit_label.hide()
         cards.addWidget(spatial_card, 0, 1)
         cards.setColumnStretch(0, 1)
         cards.setColumnStretch(1, 1)
@@ -1304,11 +880,6 @@ class InferenceMonitorDialog(QDialog):
         self._overview_results.fit_rows_to_content(max_rows=5)
         self._overview_results.itemSelectionChanged.connect(self._sync_overview_stream_selection)
         result_layout.addWidget(self._overview_results)
-        self._assembly_overview = _muted_label("结果流组装：等待上游计算")
-        self._coverage_overview = _muted_label("空白/重叠验收：等待组装")
-        for label in (self._assembly_overview, self._coverage_overview):
-            label.setParent(result_panel)
-            label.hide()
         main_layout.addWidget(result_panel, stretch=1)
         result_layout.addStretch(1)
         body.addWidget(main)
@@ -1853,8 +1424,8 @@ class InferenceMonitorDialog(QDialog):
         layout.addWidget(_section_label("运行信息"))
         details = MonitorTextBrowser(box)
         details.setPlainText("\n\n".join(
-            label.text().replace(" | ", "\n")
-            for label in (self._run_overview, self._assembly_overview, self._coverage_overview)
+            text.replace(" | ", "\n")
+            for text in (self._run_information, self._assembly_information, self._coverage_information)
         ))
         layout.addWidget(details, stretch=1)
         hint = _muted_label("创建年龄与本次观察时长不是实际执行耗时。恢复与重做失败包仍位于主界面。")
@@ -2337,21 +1908,24 @@ class InferenceMonitorDialog(QDialog):
         total = sum(int(value) for value in values.values())
         ready = int(values.get("ready", 0))
         running = int(values.get("running", 0))
-        waiting = _waiting_count(values)
+        waiting = waiting_count(values)
         failed = int(values.get("failed", 0))
         if not enabled:
-            label.setText(f"{title}：未启用")
+            text = f"{title}：未启用"
+            tooltip = text
             self._set_progress_bar(bar, 0, 0)
-            return
-        if total < 1:
-            label.setText(f"{title}：等待计划")
+        elif total < 1:
+            text = f"{title}：等待计划"
+            tooltip = text
             self._set_progress_bar(bar, 0, 0)
-            return
-        label.setText(
-            f"{title}  {ready:,} / {total:,} 项"
-        )
-        label.setToolTip(f"{title}：完成 {ready}/{total}；运行 {running}；等待 {waiting}；失败 {failed}。按任务计数。")
-        self._set_progress_bar(bar, ready, total)
+        else:
+            text = f"{title}  {ready:,} / {total:,} 项"
+            tooltip = f"{title}：完成 {ready}/{total}；运行 {running}；等待 {waiting}；失败 {failed}。按任务计数。"
+            self._set_progress_bar(bar, ready, total)
+        if label is not None:
+            label.setText(text)
+            label.setToolTip(tooltip)
+        bar.setToolTip(tooltip)
 
     def _apply_monitor_history(self, history):
         value = dict(history or {})
@@ -2561,7 +2135,7 @@ class InferenceMonitorDialog(QDialog):
             if isinstance(value, dict)
         ]
         if not values:
-            self._coverage_overview.setText("空白/重叠验收：等待组装")
+            self._coverage_information = "空白/重叠验收：等待组装"
             return
         gap_area_m2 = sum(
             float(value.get("gap_area_m2") or 0.0) for value in values
@@ -2581,33 +2155,12 @@ class InferenceMonitorDialog(QDialog):
             state = f"通过 {passed}，未验证 {skipped}"
         else:
             state = "通过"
-        self._coverage_overview.setText(
+        self._coverage_information = (
             f"空白/重叠验收：{state} {passed}/{len(values)} | "
             f"空白 {gap_area_m2:.6g} m² | "
             f"重叠 {overlap_area_m2:.6g} m² | "
             f"范围外 {outside_area_m2:.6g} m²"
         )
-
-    def _update_stage_rail(self, active_key):
-        order = [key for key, _name in PIPELINE_STAGES]
-        active = str(active_key or "compute")
-        active_index = order.index(active) if active in order else 0
-        parts = []
-        for index, (key, name) in enumerate(PIPELINE_STAGES):
-            if index < active_index or active == "ready":
-                color = "#2d7a52"
-                marker = "✓"
-            elif key == active:
-                color = "#2f6f9f"
-                marker = "●"
-            else:
-                color = "#7b8794"
-                marker = "○"
-            parts.append(
-                f'<span style="color:{color}; font-weight:600">'
-                f"{marker} {name}</span>"
-            )
-        self._stage_rail.setText("&nbsp;&nbsp;→&nbsp;&nbsp;".join(parts))
 
     def reset_run(self, tiles=None):
         self._terminal_run_status = ""
@@ -2646,14 +2199,11 @@ class InferenceMonitorDialog(QDialog):
         self._run_id_label.setText("Run：准备创建")
         self._monitor_sync.setText("○ 等待同步")
         self._overall_bar.set_running(False)
-        self._run_overview.setText("Run：准备中")
-        self._package_overview.setText("Work Package：等待计划")
+        self._run_information = "Run：准备中"
         self._unit_overview.setText("空间单元拟合：等待计划")
-        self._assembly_overview.setText("结果流组装：等待上游计算")
-        self._coverage_overview.setText("空白/重叠验收：等待组装")
-        self._update_stage_rail("compute")
+        self._assembly_information = "结果流组装：等待上游计算"
+        self._coverage_information = "空白/重叠验收：等待组装"
         self._tile_detail_title.setText("选中结果流：未选择 | 空间单元详情")
-        self._summary.setText("结果流: 0  |  完成: 0  |  运行: 0  |  等待: 0  |  停止: 0  |  失败: 0")
         self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
         self._overall_bar.setValue(0)
         self._overall_bar.setFormat("整体任务完成度：等待任务图")
@@ -2665,8 +2215,6 @@ class InferenceMonitorDialog(QDialog):
         self._overall_bar.setFormat("等待准备进度")
         self._refresh_completion_label()
         self._refresh_sync_status()
-        self._bar.setRange(0, 0)
-        self._bar.setFormat("准备中")
         self._stop.setEnabled(True)
         self._stop.setText("停止任务")
         self.setWindowTitle("推理监控 - 准备中")
@@ -2697,13 +2245,6 @@ class InferenceMonitorDialog(QDialog):
         self._overall_bar.setFormat(f"{name}：{current}/{total}" if total > 0 else f"{name}：处理中，总量尚未确定")
         self._overall_bar.set_running(True)
         self._refresh_completion_label()
-        if total > 0:
-            self._bar.setRange(0, total)
-            self._bar.setValue(min(current, total))
-            self._bar.setFormat(f"{text}  {current}/{total}")
-        else:
-            self._bar.setRange(0, 0)
-            self._bar.setFormat(text)
         if stream_id:
             self._set_stream(stream_id, stage=name, progress=f"{current}/{total}" if total else "-")
 
@@ -2741,11 +2282,6 @@ class InferenceMonitorDialog(QDialog):
             self._overall_bar.setRange(0, ASSEMBLY_PROGRESS_SCALE)
             self._overall_bar.setValue(ASSEMBLY_PROGRESS_SCALE)
             self._overall_bar.setFormat("整体任务完成度：100%（已完成）")
-        self._bar.setRange(0, 1)
-        self._bar.setValue(1)
-        self._bar.setFormat(text)
-        if text == "已完成":
-            self._update_stage_rail("ready")
         self.setWindowTitle(f"推理监控 - {text}")
 
     def _ensure_stream(self, stream_id):
@@ -2784,7 +2320,6 @@ class InferenceMonitorDialog(QDialog):
             return
         state.update(changed)
         self._write_stream_row(stream_id)
-        self._update_summary()
 
     def _write_stream_row(self, stream_id):
         row = self._stream_rows[stream_id]
@@ -2835,7 +2370,7 @@ class InferenceMonitorDialog(QDialog):
         )
         overview_values = (
             self._stream_display_name(stream_id),
-            _overview_work_label(state.get("stage")),
+            overview_work_label(state.get("stage")),
             assembly_state,
             {"passed": "验收通过", "failed": "验收失败", "skipped": "未执行"}.get(coverage_state, coverage_state),
         )
@@ -2899,7 +2434,7 @@ class InferenceMonitorDialog(QDialog):
                         suppression_count - 1
                     )
                 return
-        presentation = _log_presentation(level, message)
+        presentation = log_presentation(level, message)
         context = dict(log_context or {})
         affected = str(
             context.get("step")
@@ -2917,7 +2452,7 @@ class InferenceMonitorDialog(QDialog):
             if affected
             else "unscoped"
         )
-        presentation["fingerprint"] = _log_fingerprint(
+        presentation["fingerprint"] = log_fingerprint(
             presentation["severity"],
             presentation["error"],
             affected,
@@ -2949,8 +2484,8 @@ class InferenceMonitorDialog(QDialog):
             self._update_log_toggle()
 
     def _on_step_started(self, name):
-        stream_id = _stream_from_step(name)
-        stage = _stage_from_step(name)
+        stream_id = stream_from_step(name)
+        stage = stage_from_step(name)
         self._step_started_at[name] = time.time()
         self._step_attempts[name] = int(self._step_attempts.get(name) or 0) + 1
         self._active_global_stage = stage
@@ -2969,7 +2504,7 @@ class InferenceMonitorDialog(QDialog):
                         "event": "monitor_step_failed",
                         "step": str(name),
                         "stream_id": str(
-                            result.get("stream_id") or _stream_from_step(name)
+                            result.get("stream_id") or stream_from_step(name)
                         ),
                         "attempt": int(self._step_attempts.get(name) or 1),
                         "return_code": int(return_code),
@@ -2979,8 +2514,8 @@ class InferenceMonitorDialog(QDialog):
                     separators=(",", ":"),
                 ),
             )
-        stream_id = str(result.get("stream_id") or _stream_from_step(name))
-        stage = _stage_from_step(name)
+        stream_id = str(result.get("stream_id") or stream_from_step(name))
+        stage = stage_from_step(name)
         started = self._step_started_at.pop(name, None)
         elapsed = time.time() - started if started else float(result.get("elapsed_sec") or 0)
         if self._active_global_stage == stage:
@@ -3731,7 +3266,7 @@ class InferenceMonitorDialog(QDialog):
                 total = sum(int(value) for value in durable_counts.values())
                 ready = int(durable_counts.get("ready", 0))
                 running = int(stream_unit_job_counts.get("running", 0))
-                waiting = _waiting_count(stream_unit_job_counts)
+                waiting = waiting_count(stream_unit_job_counts)
                 failed = int(stream_unit_job_counts.get("failed", 0))
                 stream_status = str(stream.get("status") or "pending")
                 assembly_info = all_runtime_progress.get(stream_id) or {}
@@ -3775,17 +3310,17 @@ class InferenceMonitorDialog(QDialog):
                 elif stream_status == "raster_ready":
                     stage, status = "等待并行组装", "等待"
                 elif inference_active and running:
-                    stage = f"推理 + {_unit_stage_label(job_type_counts)}"
+                    stage = f"推理 + {unit_stage_label(job_type_counts)}"
                     status = "运行中"
                 elif inference_active:
                     stage, status = "Work Package 推理", "运行中"
                 elif running:
-                    stage, status = _unit_stage_label(job_type_counts), "运行中"
+                    stage, status = unit_stage_label(job_type_counts), "运行中"
                 elif active_stage:
                     stage, status = active_stage, "运行中"
                 elif waiting:
                     stage, status = "空间单元拟合 / 等待依赖", "等待"
-                elif _waiting_count(package_counts):
+                elif waiting_count(package_counts):
                     stage, status = "等待上游 Work Package", "等待"
                 elif total and ready == total:
                     stage, status = "等待分区栅格收口", "等待"
@@ -3876,11 +3411,11 @@ class InferenceMonitorDialog(QDialog):
         package_total = sum(int(value) for value in package_counts.values())
         package_ready = int(package_counts.get("ready", 0))
         package_active = int(package_counts.get("running", 0))
-        package_waiting = _waiting_count(package_counts)
+        package_waiting = waiting_count(package_counts)
         unit_total = sum(int(value) for value in unit_job_counts.values())
         unit_ready = int(unit_job_counts.get("ready", 0))
         unit_active = int(unit_job_counts.get("running", 0))
-        unit_waiting = _waiting_count(unit_job_counts)
+        unit_waiting = waiting_count(unit_job_counts)
         stream_total = len(streams)
         stream_ready = sum(
             1 for stream in streams if str(stream.get("status")) == "ready"
@@ -3951,7 +3486,7 @@ class InferenceMonitorDialog(QDialog):
         streams,
         stream_runtime_progress,
     ):
-        stage_key, stage, current, total = self._database_phase(
+        stage_key, stage, _current, _total = self._database_phase(
             run_status, package_counts, unit_job_counts, streams
         )
         if stage_key != self._stage_key:
@@ -3970,23 +3505,6 @@ class InferenceMonitorDialog(QDialog):
             self._phase.setText(display_stage)
             self._phase.setToolTip(f"{stage} · 当前阶段观察 {stage_elapsed}")
         self.setWindowTitle(f"推理监控 - {stage}")
-        rail_key = {
-            "packages": "compute",
-            "units": "compute",
-            "unit_failed": "compute",
-            "package_failed": "compute",
-            "resetting": "compute",
-            "stopped": "compute",
-            "failed": (
-                "assembly"
-                if any(
-                    str(item.get("status") or "") == "failed"
-                    for item in stream_runtime_progress.values()
-                )
-                else "compute"
-            ),
-        }.get(stage_key, stage_key)
-        self._update_stage_rail(rail_key)
         status_text = RUN_STATUS_LABELS.get(run_status, run_status)
         if not self._control_state:
             self._status_badge.setText(status_text)
@@ -4002,7 +3520,7 @@ class InferenceMonitorDialog(QDialog):
             f"执行：{str((getattr(self, '_latest_execution', {}) or {}).get('execution_id') or '—')[:12]}"
         )
 
-        overall_fraction, overall_group_count = _overall_completion_fraction(
+        overall_fraction, overall_group_count = overall_completion_fraction(
             run_status,
             job_counts,
             job_progress,
@@ -4022,43 +3540,6 @@ class InferenceMonitorDialog(QDialog):
         )
         self._refresh_completion_label()
 
-        if stage_key == "assembly" and streams:
-            assembly_units = round(
-                sum(
-                    _assembly_fraction(
-                        stream.get("status"),
-                        stream_runtime_progress.get(str(stream["stream_id"])) or {},
-                    )
-                    for stream in streams
-                )
-                * ASSEMBLY_PROGRESS_SCALE
-            )
-            stream_ready = sum(
-                1 for stream in streams if str(stream.get("status")) == "ready"
-            )
-            stream_running = sum(
-                1
-                for stream in streams
-                if str(stream.get("status")) == "assembling"
-            )
-            self._bar.setRange(0, len(streams) * ASSEMBLY_PROGRESS_SCALE)
-            self._bar.setValue(assembly_units)
-            self._bar.setFormat(
-                f"{stage} | 完成 {stream_ready}/{len(streams)} | "
-                f"运行 {stream_running}"
-            )
-        elif total > 0:
-            self._bar.setRange(0, total)
-            self._bar.setValue(min(current, total))
-            self._bar.setFormat(f"{stage}  {current}/{total}")
-        elif run_status in {"ready", "failed", "stopped"}:
-            self._bar.setRange(0, 1)
-            self._bar.setValue(1 if run_status == "ready" else 0)
-            self._bar.setFormat(stage)
-        else:
-            self._bar.setRange(0, 0)
-            self._bar.setFormat(stage)
-
         backend, device_name = effective_device_text(self._run_spec)
         device = f"{backend} · {device_name}"
         monitor_elapsed = _elapsed_text(
@@ -4069,7 +3550,7 @@ class InferenceMonitorDialog(QDialog):
             if self._run_created_epoch is not None
             else "—"
         )
-        self._run_overview.setText(
+        self._run_information = (
             f"Run：{self._run_id} | 状态："
             f"{RUN_STATUS_LABELS.get(run_status, run_status)} | "
             f"设备：{device} | 创建至今：{run_age} | "
@@ -4082,13 +3563,14 @@ class InferenceMonitorDialog(QDialog):
         package_total = sum(int(value) for value in package_counts.values())
         package_ready = int(package_counts.get("ready", 0))
         package_running = int(package_counts.get("running", 0))
-        package_waiting = _waiting_count(package_counts)
+        package_waiting = waiting_count(package_counts)
         package_failed = int(package_counts.get("failed", 0))
-        current_text = "当前包：—\n当前模型：—\n影像块：—  ·  Batch：—"
         self._current_package.setText("—")
+        self._current_package.setToolTip("")
         self._current_model.setText("—")
         self._tile_count.setText("— / —")
         self._batch_value.setText("批量大小：—")
+        self._batch_value.setToolTip("")
         self._set_progress_bar(self._tile_card_bar, 0, 0)
         if active_package is not None:
             activity = self._package_activity
@@ -4127,21 +3609,15 @@ class InferenceMonitorDialog(QDialog):
                 package_elapsed = 0
             tile_text = f"{tile_current}/{tile_total}" if tile_total else "—"
             self._current_package.setText(f"第 {sequence} 包")
-            self._current_package.setToolTip(package_id)
+            self._current_package.setToolTip(
+                f"{package_id}\n配置/有效 Batch：{batch_text}\n"
+                f"包耗时：{_elapsed_text(package_elapsed)}\n{activity.get('notice') or ''}"
+            )
             self._current_model.setText(model_text)
             self._tile_count.setText(tile_text.replace("/", " / "))
             self._batch_value.setText(f"批量大小：{batch_text}")
             self._batch_value.setToolTip("配置 → 当前有效 Batch；" + str(activity.get("notice") or "未记录降档"))
-            current_text = (
-                f"当前包：第 {sequence} 包  ·  {activity.get('status') or '运行中'}\n"
-                f"当前模型：{model_text}\n"
-                f"影像块：{tile_text}  ·  Batch：{batch_text}"
-            )
-            self._package_overview.setToolTip(f"{package_id}\n配置/有效 Batch：{batch_text}\n包耗时：{_elapsed_text(package_elapsed)}\n{activity.get('notice') or ''}")
             self._set_progress_bar(self._tile_card_bar, tile_current, tile_total)
-        self._package_overview.setText(
-            current_text
-        )
         self._package_metric.setText(f"{package_ready:,} / {package_total:,}")
         self._badge(self._model_badge,
                     "失败" if package_failed else "运行中" if package_running and run_status == "running" else "已完成" if package_total and package_ready == package_total else "已停止" if run_status == "stopped" else "等待",
@@ -4155,7 +3631,7 @@ class InferenceMonitorDialog(QDialog):
         unit_total = sum(int(value) for value in unit_job_counts.values())
         unit_ready = int(unit_job_counts.get("ready", 0))
         unit_running = int(unit_job_counts.get("running", 0))
-        unit_waiting = _waiting_count(unit_job_counts)
+        unit_waiting = waiting_count(unit_job_counts)
         unit_failed = int(unit_job_counts.get("failed", 0))
         blocker_text = (
             f"阻塞（上游 Work Package 失败 {package_failed}） | "
@@ -4211,7 +3687,7 @@ class InferenceMonitorDialog(QDialog):
             enabled=fragmentation_enabled,
         )
         self._update_task_lane(
-            self._fit_label,
+            None,
             self._fit_bar,
             "边界拟合" if boundary_enabled else "原始边界处理",
             job_counts.get("unit_fit") or {},
@@ -4280,7 +3756,7 @@ class InferenceMonitorDialog(QDialog):
                 f"{info.get('phase_name') or '并行组装'}"
             )
         active_text = " | 当前 " + "；".join(active_phases) if active_phases else ""
-        self._assembly_overview.setText(
+        self._assembly_information = (
             f"结果流组装：完成 {stream_ready}/{len(streams)} | "
             f"运行 {assembly_running} | 等待 {assembly_waiting} | "
             f"失败 {assembly_failed} | 并发 {assembly_running}/{assembly_limit}"
@@ -4346,15 +3822,6 @@ class InferenceMonitorDialog(QDialog):
         if self._database_bound and self._run_id:
             self._poll_database()
             self._poll_timer.stop()
-
-    def _update_summary(self):
-        states = [value["status"] for value in self._stream_state.values()]
-        waiting = states.count("等待") + states.count("跳过")
-        self._summary.setText(
-            f"结果流: {len(states)}  |  完成: {states.count('成功')}  |  "
-            f"运行: {states.count('运行中')}  |  等待: {waiting}  |  "
-            f"停止: {states.count('已停止')}  |  失败: {states.count('失败')}"
-        )
 
     def _request_stop(self):
         self.stop_requested.emit()

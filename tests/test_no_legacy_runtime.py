@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 
@@ -159,6 +160,43 @@ def test_accepted_labels_are_audited_and_snapshot_is_not_the_write_target():
     assert "accepted_write_run_spec.json" in manual_loader
     assert "accepted_write_run_manifest.json" in manual_loader
     assert 'spec["accepted_write_manifest"]' in manual_loader
+
+
+def test_refinement_dialog_cleanup_preserves_async_topology_and_accepted_gate():
+    dialog = (
+        ROOT
+        / "qgis_plugins"
+        / "labeling_tool"
+        / "gui"
+        / "class_refinement_dialog.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(dialog)
+    refinement = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ClassRefinementDialog"
+    )
+    obsolete = {
+        "_accepted_layer_for_check",
+        "_manual_candidate_band",
+        "_show_manual_candidate",
+        "_clear_manual_candidate_band",
+    }
+    members = {
+        node.name for node in refinement.body if isinstance(node, ast.FunctionDef)
+    } | {
+        node.attr for node in ast.walk(refinement) if isinstance(node, ast.Attribute)
+    }
+    assert not obsolete & members
+    topology = dialog.split("def _check_topology", 1)[1].split(
+        "def _write_accepted", 1
+    )[0]
+    accepted = dialog.split("def _write_accepted", 1)[1].split(
+        "def _update_accept_enabled", 1
+    )[0]
+    assert "self._start_refinement_task(assemble=False)" in topology
+    assert "self._issue_count is None" in accepted
+    assert "self._issue_count != 0" in accepted
+    assert "accepted_writer.append_final_to_accepted(" in accepted
 
 
 def test_final_overlap_with_accepted_is_blocked_twice():

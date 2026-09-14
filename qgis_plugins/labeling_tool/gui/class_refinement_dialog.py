@@ -142,7 +142,6 @@ class ClassRefinementDialog(QDialog):
         self._manual_capture_tool = None
         self._manual_previous_map_tool = None
         self._manual_reference_band = None
-        self._manual_candidate_band = None
         self._manual_add_candidate_bands = []
         self._manual_capture_transition_action = None
         self._manual_capture_transition_task = None
@@ -1860,12 +1859,6 @@ class ClassRefinementDialog(QDialog):
             band.addGeometry(feature.geometry(), layer)
         self._manual_reference_band = band
 
-    def _show_manual_candidate(self, geometry, class_code, error=""):
-        self._clear_manual_candidate_band()
-        self._manual_candidate_band = self._new_manual_candidate_band(
-            geometry, class_code, error
-        )
-
     def _new_manual_candidate_band(
         self, geometry, class_code, error="", smooth_preview=False
     ):
@@ -1906,13 +1899,6 @@ class ClassRefinementDialog(QDialog):
                 )
             )
 
-    def _clear_manual_candidate_band(self):
-        band = self._manual_candidate_band
-        if band is not None:
-            band.reset(Qgis.GeometryType.Polygon)
-            self.iface.mapCanvas().scene().removeItem(band)
-        self._manual_candidate_band = None
-
     def _clear_manual_add_candidate_bands(self):
         for band in self._manual_add_candidate_bands:
             band.reset(Qgis.GeometryType.Polygon)
@@ -1927,7 +1913,6 @@ class ClassRefinementDialog(QDialog):
         self._manual_reference_band = None
 
     def _clear_manual_bands(self):
-        self._clear_manual_candidate_band()
         self._clear_manual_add_candidate_bands()
         self._clear_manual_reference_band()
 
@@ -4302,17 +4287,6 @@ class ClassRefinementDialog(QDialog):
         self.topology_btn.setEnabled(bool(self._final_path))
         self._update_actions()
         self._update_accept_enabled()
-
-    def _accepted_layer_for_check(self):
-        path = str(self._run_spec.get("accepted_target_gpkg") or "")
-        if not path or not Path(path).is_file():
-            return None
-        layer = QgsVectorLayer(
-            f"{path}|layername={LAYER_NAMES.ACCEPTED}", "accepted_for_topology", "ogr"
-        )
-        if not layer.isValid():
-            raise ValueError(f"无法打开长期 accepted_labels: {path}")
-        return layer
 
     def _check_topology(self):
         if not self._final_path:

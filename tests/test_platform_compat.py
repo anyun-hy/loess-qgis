@@ -892,9 +892,13 @@ def test_guided_modify_batches_old_selection_and_polybezier_replacements():
     assert "digitizingCompleted.connect" in capture
     assert "layer.startEditing()" in capture
 
-    reference = source.split(
-        "def _refresh_manual_modify_reference", 1
-    )[1].split("def _show_manual_candidate", 1)[0]
+    tree = ast.parse(source)
+    reference = next(
+        ast.get_source_segment(source, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_refresh_manual_modify_reference"
+    )
     assert "QColor(105, 105, 105, 230)" in reference
     assert "QColor(105, 105, 105, 55)" in reference
     assert "band.addGeometry(feature.geometry(), layer)" in reference
@@ -1177,7 +1181,10 @@ def test_monitor_updates_large_tile_tables_incrementally_and_names_selected_stre
     assert "_render_selected_tiles()" not in progress_block
     assert 'self._tile_rows = {}' in source
     assert 'f"选中结果流：{stream_id} | Tile 详情（已记录 {len(values)} 个）"' in source
-    assert '"subpixel_vectorize:"' in source
+    from labeling_tool.core.monitor_progress import stage_from_step, stream_from_step
+
+    assert stream_from_step("subpixel_vectorize:model:alpha") == "model:alpha"
+    assert stage_from_step("subpixel_vectorize:model:alpha") == "边界矢量化"
 
 
 def test_legacy_annotation_group_is_not_left_empty():

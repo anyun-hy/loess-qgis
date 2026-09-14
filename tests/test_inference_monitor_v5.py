@@ -17,6 +17,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from labeling_tool.core.monitor_progress import (
+    overall_completion_fraction,
+    overview_work_label,
+)
+from labeling_tool.core.monitor_logs import (
+    log_fingerprint,
+    log_presentation,
+    log_severity,
+    read_persisted_log_page,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 _TIME_SPEC = importlib.util.spec_from_file_location(
@@ -32,7 +43,6 @@ RUNNER_PATH = ROOT / "qgis_plugins" / "labeling_tool" / "core" / "v5_async_runne
 SOURCE = MONITOR_PATH.read_text(encoding="utf-8")
 LOG_PANEL_SOURCE = LOG_PANEL_PATH.read_text(encoding="utf-8")
 RUNNER_SOURCE = RUNNER_PATH.read_text(encoding="utf-8")
-WIDGET_SOURCE = (MONITOR_PATH.parent / "monitor_widgets.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 LOG_PANEL_TREE = ast.parse(LOG_PANEL_SOURCE)
 
@@ -51,21 +61,6 @@ def _method(name: str) -> ast.FunctionDef:
     raise AssertionError(f"InferenceMonitorDialog.{name} is missing")
 
 
-def _module_function(name: str) -> ast.FunctionDef:
-    for node in TREE.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    raise AssertionError(f"module function {name} is missing")
-
-
-def _disk_reader():
-    names = ("_log_payload", "_log_severity", "_read_persisted_log_page")
-    module = ast.Module(body=[copy.deepcopy(_module_function(name)) for name in names], type_ignores=[])
-    namespace = {"json": json, "re": re, "Path": Path}
-    exec(compile(ast.fix_missing_locations(module), "monitor-reader", "exec"), namespace)
-    return namespace["_read_persisted_log_page"]
-
-
 def test_disk_log_pagination_finds_errors_older_than_memory_cache(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -73,12 +68,13 @@ def test_disk_log_pagination_finds_errors_older_than_memory_cache(tmp_path):
     records += [{"timestamp": index + 2, "level": "stdout", "message": "ordinary progress"} for index in range(5100)]
     records.append({"timestamp": 6000, "level": "stderr", "message": "Warning: old warning"})
     (log_dir / "pipeline.jsonl").write_text("".join(json.dumps(row) + "\n" for row in records))
-    read = _disk_reader()
     cursor = None
     errors = []
     empty_nonterminal = False
     for _ in range(500):
-        page = read({"run_dir": str(tmp_path)}, "error", cursor, byte_budget=2048)
+        page = read_persisted_log_page(
+            {"run_dir": str(tmp_path)}, "error", cursor, byte_budget=2048
+        )
         errors.extend(page["rows"])
         empty_nonterminal |= not page["rows"] and page["has_more"]
         if cursor is not None:
@@ -92,7 +88,7 @@ def test_disk_log_pagination_finds_errors_older_than_memory_cache(tmp_path):
     assert len(errors) == 1
     assert "rc=139" in errors[0]["payload"]["message"]
     assert errors[0]["monitor_event_id"] == 0
-    warnings = read({"run_dir": str(tmp_path)}, "warning")
+    warnings = read_persisted_log_page({"run_dir": str(tmp_path)}, "warning")
     assert len(warnings["rows"]) == 1
 
 
@@ -101,17 +97,22 @@ def test_disk_log_limit_search_and_corruption_are_explicit(tmp_path):
     (tmp_path / "logs").mkdir()
     path = tmp_path / "logs/pipeline.jsonl"
     path.write_text("".join(json.dumps({"level": "system", "message": f"[error] 失败 {i}"}) + "\n" for i in range(7)) + "{broken\n")
-    read = _disk_reader()
-    first = read({"run_dir": str(tmp_path)}, "error", limit=3)
-    second = read({"run_dir": str(tmp_path)}, "error", first["next_cursor"], limit=3)
+    first = read_persisted_log_page({"run_dir": str(tmp_path)}, "error", limit=3)
+    second = read_persisted_log_page(
+        {"run_dir": str(tmp_path)}, "error", first["next_cursor"], limit=3
+    )
     assert first["skipped_records"] == 1
     assert len(first["rows"]) == len(second["rows"]) == 3
     assert not ({r["monitor_event_id"] for r in first["rows"]} & {r["monitor_event_id"] for r in second["rows"]})
-    assert len(read({"run_dir": str(tmp_path)}, "error", search="失败 2")["rows"]) == 1
+    assert len(read_persisted_log_page(
+        {"run_dir": str(tmp_path)}, "error", search="失败 2"
+    )["rows"]) == 1
     with pytest.raises(ValueError, match="截断"):
-        read({"run_dir": str(tmp_path)}, "error", path.stat().st_size + 1)
+        read_persisted_log_page(
+            {"run_dir": str(tmp_path)}, "error", path.stat().st_size + 1
+        )
     with pytest.raises(FileNotFoundError):
-        read({"run_dir": str(tmp_path / "missing")}, "error")
+        read_persisted_log_page({"run_dir": str(tmp_path / "missing")}, "error")
 
 
 def test_history_buttons_query_disk_instead_of_only_evicted_memory():
@@ -122,6 +123,34 @@ def test_history_buttons_query_disk_instead_of_only_evicted_memory():
     continuation = _method_source("_continue_raw_log_scan")
     for guard in ("self.isVisible()", "self._pages.currentIndex() == 3", "self._latest_history_request_id", "self._query_generation", "self._history_cursor"):
         assert guard in continuation
+
+
+def test_persisted_log_reads_stay_in_query_worker_raw_history_branch():
+    worker = next(
+        node for node in TREE.body
+        if isinstance(node, ast.ClassDef) and node.name == "_MonitorQueryWorker"
+    )
+    execute = next(
+        node for node in worker.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute"
+    )
+    calls = [
+        node for node in ast.walk(TREE)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "read_persisted_log_page"
+    ]
+    assert len(calls) == 1
+    assert calls[0] in ast.walk(execute)
+    assert "raw_warning" in (ast.get_source_segment(SOURCE, execute) or "")
+    assert "raw_error" in (ast.get_source_segment(SOURCE, execute) or "")
+    execute_source = ast.get_source_segment(SOURCE, execute) or ""
+    for value in ("generation", "request_id"):
+        assert value in execute_source
+    assert "query_failed" in (ast.get_source_segment(SOURCE, worker) or "")
+    for method in _monitor_class().body:
+        if isinstance(method, ast.FunctionDef):
+            assert "read_persisted_log_page" not in (ast.get_source_segment(SOURCE, method) or "")
 
 
 def test_overview_work_uses_plain_language_without_losing_detail_states():
@@ -136,7 +165,37 @@ def test_overview_work_uses_plain_language_without_losing_detail_states():
         "future_unknown_stage": "当前步骤待确认，请查看详情",
     }
     for stage, expected in examples.items():
-        assert _execute_module_function("_overview_work_label", stage) == expected
+        assert overview_work_label(stage) == expected
+
+
+def test_monitor_imports_progress_helpers_without_legacy_local_aliases():
+    expected = {
+        "stream_from_step",
+        "stage_from_step",
+        "waiting_count",
+        "overall_completion_fraction",
+        "overview_work_label",
+        "unit_stage_label",
+    }
+    imports = [
+        node
+        for node in TREE.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 2
+        and node.module == "core.monitor_progress"
+    ]
+    assert len(imports) == 1
+    assert {name.name for name in imports[0].names} == expected
+    assert all(name.asname is None for name in imports[0].names)
+    local_progress_names = expected | {"assembly_fraction"}
+    assert not any(
+        isinstance(node, ast.FunctionDef)
+        and node.name in (
+            local_progress_names
+            | {"_" + name for name in local_progress_names}
+        )
+        for node in TREE.body
+    )
 
 
 def _log_panel_method(name: str) -> ast.FunctionDef:
@@ -147,26 +206,6 @@ def _log_panel_method(name: str) -> ast.FunctionDef:
             if isinstance(child, ast.FunctionDef) and child.name == name:
                 return child
     raise AssertionError(f"LogPanel.{name} is missing")
-
-
-def _execute_module_function(name: str, *args):
-    function_names = []
-    if name == "_overall_completion_fraction":
-        function_names.append("_assembly_fraction")
-    if name in {"_log_severity", "_log_presentation", "_log_indicators"}:
-        function_names.append("_log_payload")
-    if name in {"_log_presentation", "_log_indicators"}:
-        function_names.append("_log_severity")
-    if name == "_log_presentation":
-        function_names.append("_log_fingerprint")
-    function_names.append(name)
-    functions = [copy.deepcopy(_module_function(item)) for item in function_names]
-    module = ast.fix_missing_locations(
-        ast.Module(body=functions, type_ignores=[])
-    )
-    namespace = {"json": json, "re": re}
-    exec(compile(module, str(MONITOR_PATH), "exec"), namespace)
-    return namespace[name](*args)
 
 
 def _method_source(name: str) -> str:
@@ -182,14 +221,13 @@ def _execute_method(name: str, instance, *args):
         ast.Module(body=[function], type_ignores=[])
     )
     namespace = {
-        "_waiting_count": lambda counts: sum(
+        "waiting_count": lambda counts: sum(
             int(counts.get(key, 0))
             for key in ("queued", "interrupted", "resetting")
         ),
-        "_unit_stage_label": lambda _counts: "空间单元拟合",
+        "unit_stage_label": lambda _counts: "空间单元拟合",
         "_timestamp_epoch": lambda _value: 123.0,
         "_elapsed_text": lambda seconds: f"elapsed:{int(seconds)}",
-        "_assembly_fraction": lambda _status, _progress: 0.5,
         "ASSEMBLY_PROGRESS_SCALE": 1000,
         "time": time,
         "json": json,
@@ -251,8 +289,8 @@ def test_left_monitor_uses_run_package_and_unit_layers():
         )
     )
 
-    assert "self._run_overview = _muted_label(" in build_ui
-    assert "self._package_overview = _muted_label(" in build_ui
+    assert 'self._run_information = "Run：准备中"' in build_ui
+    assert "self._current_package =" in build_ui
     assert "self._unit_overview = _muted_label(" in build_ui
 
     table_calls = [
@@ -281,15 +319,15 @@ def test_left_monitor_uses_run_package_and_unit_layers():
         "阶段耗时",
     ):
         assert label in build_ui
-    assert "self._assembly_overview = _muted_label(" in build_ui
-    assert "self._coverage_overview = _muted_label(" in build_ui
+    assert 'self._assembly_information = "结果流组装：等待上游计算"' in build_ui
+    assert 'self._coverage_information = "空白/重叠验收：等待组装"' in build_ui
     assert "空白/重叠验收" in build_ui
 
 
 def test_result_stream_table_is_compact_and_scrollable():
     build_ui = _method_source("_build_results_page")
 
-    assert "STREAM_TABLE_VISIBLE_ROWS = 5" in SOURCE
+    assert "self._streams.fit_rows_to_content(max_rows=5)" in build_ui
     assert (
         "self._streams.setHorizontalScrollBarPolicy(SCROLLBAR_AS_NEEDED)"
         in build_ui
@@ -301,7 +339,8 @@ def test_result_stream_table_is_compact_and_scrollable():
     assert "self._streams.setFixedHeight" not in build_ui
     assert "streams_layout.addWidget(self._streams)" in build_ui
     assert "configure_adaptive_columns" in build_ui
-    assert "INTERACTIVE" in WIDGET_SOURCE
+    assert "STATUS_COLORS" not in SOURCE
+    assert "STREAM_TABLE_VISIBLE_ROWS" not in SOURCE
 
 
 def test_monitor_uses_four_linked_native_pages_and_scoped_responsive_theme():
@@ -367,8 +406,40 @@ def test_mixed_v5_job_total_is_not_used_as_the_monitor_progress_bar():
     # aggregate and render a phase-specific Package or unit denominator.
     database_guard = stage_progress.index("if self._database")
     guarded_return = stage_progress.index("return", database_guard)
-    progress_bar_write = stage_progress.index("self._bar.setRange")
+    progress_bar_write = stage_progress.index("self._overall_bar.setRange")
     assert database_guard < guarded_return < progress_bar_write
+
+
+def test_monitor_has_no_hidden_legacy_presentation_state():
+    obsolete = {
+        "_bar", "_summary", "_stage_rail", "_package_overview", "_fit_label",
+        "_run_overview", "_assembly_overview", "_coverage_overview",
+        "_update_summary", "_update_stage_rail",
+    }
+    attributes = {node.attr for node in ast.walk(_monitor_class())
+                  if isinstance(node, ast.Attribute)}
+    methods = {node.name for node in _monitor_class().body
+               if isinstance(node, ast.FunctionDef)}
+    assert not obsolete & (attributes | methods)
+    assert "PIPELINE_STAGES" not in SOURCE
+    information = _method_source("_build_run_information_dialog")
+    for field in ("_run_information", "_assembly_information", "_coverage_information"):
+        assert field in information
+    assert "label.text()" not in information
+
+
+def test_coverage_information_is_plain_data_and_resets_when_empty():
+    monitor = SimpleNamespace(_coverage_state={
+        "model:a": {"status": "passed", "gap_area_m2": 0,
+                    "overlap_area_m2": 0, "outside_area_m2": 0},
+    })
+    _execute_method("_update_coverage_overview", monitor)
+    assert isinstance(monitor._coverage_information, str)
+    assert "通过 1/1" in monitor._coverage_information
+    assert "空白 0 m²" in monitor._coverage_information
+    monitor._coverage_state = {}
+    _execute_method("_update_coverage_overview", monitor)
+    assert monitor._coverage_information == "空白/重叠验收：等待组装"
 
 
 def test_database_phase_uses_only_the_current_lane_denominator():
@@ -731,10 +802,9 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
     assert "self._overall_bar = OverallProgressTrack()" in build_ui
     assert "本次推理任务完成度" in build_ui
     assert "按任务组统计，不代表剩余时间。" in build_ui
-    assert "_overall_completion_fraction(" in update
+    assert "overall_completion_fraction(" in update
 
-    fraction, group_count = _execute_module_function(
-        "_overall_completion_fraction",
+    fraction, group_count = overall_completion_fraction(
         "running",
         {
             "work_package": {"ready": 1},
@@ -756,9 +826,7 @@ def test_overall_progress_bar_uses_task_groups_instead_of_time_estimates():
     )
     assert group_count == 7
     assert fraction == 0.5
-    assert _execute_module_function(
-        "_overall_completion_fraction", "ready", {}, {}, [], {}
-    ) == (1.0, 1)
+    assert overall_completion_fraction("ready", {}, {}, [], {}) == (1.0, 1)
 
 
 def test_log_count_separates_raw_stderr_from_confirmed_failures():
@@ -767,34 +835,17 @@ def test_log_count_separates_raw_stderr_from_confirmed_failures():
         '"probes":[{"status":"failed","error":"CUDA out of memory"}],'
         '"status":"completed"}'
     )
-    assert _execute_module_function(
-        "_log_indicators", "system", resource_tuning
-    ) == (False, False)
-    assert _execute_module_function(
-        "_log_indicators",
-        "stderr",
-        "TypeError: unexpected keyword argument 'run_id'",
-    ) == (False, False)
-    assert _execute_module_function(
-        "_log_severity", "stderr", "GDAL diagnostic output"
-    ) == "info"
-    assert _execute_module_function(
-        "_log_severity", "stderr", "RuntimeWarning: fallback was used"
-    ) == "warning"
-    assert _execute_module_function(
-        "_log_severity", "stdout", '{"event":"probe","status":"error"}'
-    ) == "error"
-    assert _execute_module_function(
-        "_log_indicators",
-        "stdout",
-        '{"event":"stream_assembly_failed"}',
-    ) == (False, True)
-    assert "_log_presentation(level, message)" in _method_source("_on_log")
+    assert log_severity("system", resource_tuning) == "info"
+    assert log_severity("stderr", "TypeError: unexpected keyword argument 'run_id'") == "info"
+    assert log_severity("stderr", "GDAL diagnostic output") == "info"
+    assert log_severity("stderr", "RuntimeWarning: fallback was used") == "warning"
+    assert log_severity("stdout", '{"event":"probe","status":"error"}') == "error"
+    assert log_severity("stdout", '{"event":"stream_assembly_failed"}') == "error"
+    assert "log_presentation(level, message)" in _method_source("_on_log")
 
 
 def test_log_presentation_explains_timeout_without_hiding_raw_source():
-    presentation = _execute_module_function(
-        "_log_presentation",
+    presentation = log_presentation(
         "stderr",
         "Fusion Core-037 timed out after 900s",
     )
@@ -931,21 +982,13 @@ def test_monitor_forwards_existing_log_capture_time():
 
 
 def test_log_fingerprint_keeps_tasks_and_attempts_separate():
-    first = _execute_module_function(
-        "_log_fingerprint", "error", "worker failed", "Core-037", 1
-    )
-    other_task = _execute_module_function(
-        "_log_fingerprint", "error", "worker failed", "Core-038", 1
-    )
-    retry = _execute_module_function(
-        "_log_fingerprint", "error", "worker failed", "Core-037", 2
-    )
+    first = log_fingerprint("error", "worker failed", "Core-037", 1)
+    other_task = log_fingerprint("error", "worker failed", "Core-038", 1)
+    retry = log_fingerprint("error", "worker failed", "Core-037", 2)
 
     assert first
     assert len({first, other_task, retry}) == 3
-    assert _execute_module_function(
-        "_log_fingerprint", "error", "worker failed", "", 0
-    ) == ""
+    assert log_fingerprint("error", "worker failed", "", 0) == ""
 
 
 def test_error_event_carries_recent_stderr_trace_as_technical_context():

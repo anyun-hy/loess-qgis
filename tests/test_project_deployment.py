@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
+import runpy
 import shutil
 import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from check_environment import _fingerprint as environment_fingerprint
 from labeling_tool.core.deployment_contract import (
@@ -30,6 +34,11 @@ SHARED_NAMES = (
     "postgres_state.py",
     "ownership_neighbors.py",
     "work_package_planner.py",
+)
+EXPERIMENT_TOOLS = (
+    "fragmentation_ab_experiment.py",
+    "subpixel_vectorize_experiment.py",
+    "evaluate_fragmentation_v33_replay.py",
 )
 
 
@@ -128,7 +137,8 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
     return snapshot
 
 
-def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
+@pytest.mark.parametrize("platform", ["macos", "ubuntu"])
+def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path, platform):
     fake_qgis = tmp_path / "qgis_process"
     _fake_qgis(fake_qgis)
     env = _environment(fake_qgis)
@@ -139,7 +149,7 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
         [
             str(ROOT / "bash" / "install_plugin.sh"),
             "--platform",
-            "macos",
+            platform,
             "--profile",
             "test-profile",
             "--plugin-dir",
@@ -156,7 +166,7 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
         [
             str(ROOT / "bash" / "init_project.sh"),
             "--platform",
-            "macos",
+            platform,
             "--project-root",
             str(project_root),
         ],
@@ -188,6 +198,15 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
     project_manifest = json.loads(
         (project_root / "project_manifest.json").read_text(encoding="utf-8")
     )
+    for monitor_relative in ("core/monitor_progress.py", "core/monitor_logs.py"):
+        monitor_source = ROOT / "qgis_plugins" / "labeling_tool" / monitor_relative
+        monitor_installed = installed_plugin / monitor_relative
+        assert monitor_installed.read_bytes() == monitor_source.read_bytes()
+        assert plugin_manifest["files"][monitor_relative] == hashlib.sha256(
+            monitor_source.read_bytes()
+        ).hexdigest()
+        # Monitor helpers belong to the plugin, not the inference runtime.
+        assert not (project_root / "runtime/labeling_tool" / monitor_relative).exists()
     assert plugin_manifest["git_sha"] == project_manifest["git_sha"] == GIT_SHA
     assert (
         plugin_manifest["source"]["source_bundle_sha256"]
@@ -206,7 +225,20 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
     )
     assert plugin_manifest["deployment_kind"] == "qgis_plugin"
     assert project_manifest["deployment_kind"] == "loess_project"
-    assert plugin_manifest["platform"] == project_manifest["platform"] == "macos"
+    assert plugin_manifest["platform"] == project_manifest["platform"] == platform
+    assert not (project_root / "tools").exists()
+    for name in EXPERIMENT_TOOLS:
+        assert (ROOT / "tools" / "experiments" / name).is_file()
+        assert not (ROOT / "inference_scripts" / name).exists()
+        assert name not in project_manifest["inference_files"]
+        assert not (project_root / "inference_scripts" / name).exists()
+        assert not list(installed_plugin.rglob(name))
+    for name in (
+        "fragmentation_v3.py",
+        "fragmentation_postprocess.py",
+        "boundary_ab_validate.py",
+    ):
+        assert name in project_manifest["inference_files"]
 
     for name in SHARED_NAMES:
         source = ROOT / "qgis_plugins" / "labeling_tool" / "core" / name
@@ -242,6 +274,33 @@ def test_separate_plugin_and_project_deployments_share_exact_runtime(tmp_path):
         env={**env, "PYTHONPATH": str(project_root / "runtime")},
     )
     assert import_check.stdout.strip().startswith("2 12 [] ")
+
+
+def test_experiment_tools_do_not_change_deployable_source_fingerprint(tmp_path):
+    helper = runpy.run_path(str(ROOT / "bash" / "deployment_source.py"))
+    inventory = helper["source_inventory"]
+    digest = helper["inventory_digest"]
+    current = inventory(ROOT)
+    assert not any(path.startswith("tools/") for path in current)
+    for name in EXPERIMENT_TOOLS:
+        assert f"inference_scripts/{name}" not in current
+
+    for relative in helper["SOURCE_ROOTS"]:
+        directory = tmp_path / relative
+        directory.mkdir(parents=True)
+        (directory / "fixture.py").write_text("# production\n", encoding="utf-8")
+    before = digest(inventory(tmp_path))
+    experiments = tmp_path / "tools" / "experiments"
+    experiments.mkdir(parents=True)
+    for name in EXPERIMENT_TOOLS:
+        (experiments / name).write_text("# experiment\n", encoding="utf-8")
+    assert digest(inventory(tmp_path)) == before
+    (experiments / EXPERIMENT_TOOLS[0]).write_text("# changed\n", encoding="utf-8")
+    assert digest(inventory(tmp_path)) == before
+    (tmp_path / "inference_scripts" / "fixture.py").write_text(
+        "# production changed\n", encoding="utf-8"
+    )
+    assert digest(inventory(tmp_path)) != before
 
 
 def test_runtime_contract_rejects_invalid_or_mismatched_platforms(tmp_path):
@@ -428,6 +487,7 @@ def test_project_update_preserves_user_data_and_restores_managed_code(tmp_path):
         "input/ranges/range.shp": b"shape-data",
         "qgis/user.qgz": b"qgis-project",
         "output/runs/old-run.txt": b"run-data",
+        "output/experiments/report.json": b"experiment-result",
     }
     for relative, content in user_files.items():
         path = project_root / relative
@@ -440,6 +500,10 @@ def test_project_update_preserves_user_data_and_restores_managed_code(tmp_path):
         project_root / "runtime" / "labeling_tool" / "core" / "run_spec.py"
     )
     managed.write_text("corrupted\n", encoding="utf-8")
+    for name in EXPERIMENT_TOOLS:
+        (project_root / "inference_scripts" / name).write_text(
+            "# previous deployment experiment entry\n", encoding="utf-8"
+        )
 
     invalid_check = _run(
         [*command, "--check-only"],
@@ -454,6 +518,8 @@ def test_project_update_preserves_user_data_and_restores_managed_code(tmp_path):
     for relative, content in user_files.items():
         assert (project_root / relative).read_bytes() == content
     assert weights_readme.read_text(encoding="utf-8") == "user notes\n"
+    for name in EXPERIMENT_TOOLS:
+        assert not (project_root / "inference_scripts" / name).exists()
     assert managed.read_bytes() == (
         ROOT / "qgis_plugins" / "labeling_tool" / "core" / "run_spec.py"
     ).read_bytes()

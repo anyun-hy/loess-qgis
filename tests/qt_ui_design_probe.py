@@ -364,6 +364,92 @@ def refinement(app, root):
                 cancelled_output_preserved=True)
 
 
+def manual_candidates(app, root):
+    """Exercise temporary pending bands on a native canvas without project data."""
+    from qgis.gui import QgsMapCanvas, QgsRubberBand
+    from labeling_tool.gui.class_refinement_dialog import ClassRefinementDialog as Dialog
+
+    layer = memory_layer(1)
+    canvas = QgsMapCanvas()
+    canvas.setDestinationCrs(layer.crs())
+    canvas.resize(480, 320)
+    canvas.show()
+
+    class Interface:
+        def mapCanvas(self):
+            return canvas
+
+    class Harness:
+        _new_manual_candidate_band = Dialog._new_manual_candidate_band
+        _refresh_manual_pending_candidate_bands = Dialog._refresh_manual_pending_candidate_bands
+        _clear_manual_add_candidate_bands = Dialog._clear_manual_add_candidate_bands
+        _refresh_manual_modify_reference = Dialog._refresh_manual_modify_reference
+        _clear_manual_reference_band = Dialog._clear_manual_reference_band
+        _clear_manual_bands = Dialog._clear_manual_bands
+        _manual_modify_selected_features = Dialog._manual_modify_selected_features
+
+        def __init__(self):
+            self.iface = Interface()
+            self._manual_add_candidate_bands = []
+            self._manual_reference_band = None
+            self._manual_task = None
+
+        def _layer(self, _class_code):
+            return layer
+
+        @staticmethod
+        def _manual_smoothing_preview_is_current(_task):
+            return False
+
+    def geometry(xmin):
+        value = QgsGeometry.fromRect(QgsRectangle(xmin, 0, xmin + 1, 1))
+        value.convertToMultiType()
+        return value
+
+    owner = Harness()
+    owner._manual_task = {
+        "kind": "add",
+        "class_code": 12,
+        "target_code": 12,
+        "pending_geometries": [geometry(2), geometry(4)],
+        "pending_errors": ["topology conflict", ""],
+    }
+    owner._refresh_manual_pending_candidate_bands()
+    initial_bands = list(owner._manual_add_candidate_bands)
+    assert len(initial_bands) == 2
+    assert all(band in canvas.scene().items() for band in initial_bands)
+
+    owner._manual_task["pending_geometries"] = [geometry(6)]
+    owner._manual_task["pending_errors"] = []
+    owner._refresh_manual_pending_candidate_bands()
+    assert len(owner._manual_add_candidate_bands) == 1
+    assert all(band not in canvas.scene().items() for band in initial_bands)
+    assert owner._manual_add_candidate_bands[0] in canvas.scene().items()
+
+    feature_id = next(layer.getFeatures()).id()
+    owner._manual_task = {
+        "kind": "modify",
+        "class_code": 12,
+        "target_code": 12,
+        "selected_feature_ids": [feature_id],
+        "pending_geometries": [geometry(8)],
+    }
+    owner._refresh_manual_pending_candidate_bands()
+    owner._refresh_manual_modify_reference()
+    assert owner._manual_reference_band in canvas.scene().items()
+
+    active_bands = [*owner._manual_add_candidate_bands, owner._manual_reference_band]
+    owner._clear_manual_bands()
+    assert owner._manual_add_candidate_bands == []
+    assert owner._manual_reference_band is None
+    assert all(band not in canvas.scene().items() for band in active_bands)
+    assert not any(isinstance(item, QgsRubberBand) for item in canvas.scene().items())
+    owner._clear_manual_bands()
+    canvas.close()
+    return {"pending_bands": 2, "refresh_removes_old_scene_items": True,
+            "batch_and_reference_cleanup_is_idempotent": True}
+
+
 def monitor_tables(app, root):
     """Content fitting stays bounded and respects interactive column widths."""
     from qgis.PyQt.QtCore import QEvent
@@ -634,6 +720,11 @@ def monitor(app, root):
     dialog = InferenceMonitorDialog(screen_parent)
     _ACTIVE_MONITOR_DIALOG = dialog
     default_size = dialog.size()
+    for obsolete in ("_bar", "_summary", "_stage_rail", "_package_overview",
+                     "_fit_label", "_run_overview", "_assembly_overview", "_coverage_overview"):
+        assert not hasattr(dialog, obsolete), obsolete
+    assert dialog._run_information == "Run：准备中"
+    assert dialog._coverage_information == "空白/重叠验收：等待组装"
     # Disk-history navigation must work even with no retained warning/error
     # cache and must not dispatch a database query in this isolated UI probe.
     original_dispatch = dialog._dispatch_next_query
@@ -966,6 +1057,13 @@ def monitor(app, root):
         info = dialog._build_run_information_dialog()
         info.show()
         settle()
+        from labeling_tool.gui.monitor_widgets import MonitorTextBrowser
+        info_text = info.findChild(MonitorTextBrowser).toPlainText()
+        for text in (dialog._run_information, dialog._assembly_information, dialog._coverage_information):
+            assert isinstance(text, str)
+            assert text.replace(" | ", "\n") in info_text
+        for field in ("DEMO-001", "设备", "创建至今", "本次监控", "结果流组装", "空白/重叠验收"):
+            assert field in info_text
         assert info.width() >= min(800, info.screen().availableGeometry().width() - 40)
         assert info.palette().color(QPalette.ColorRole.Window).name() == PALETTES[theme]["background"].lower()
         grab_widget(info, f"monitor-run-information-{theme}.png")
@@ -981,6 +1079,9 @@ def monitor(app, root):
     settle()
     assert dialog._tile_card_bar.maximum() == 1000
     assert dialog._tile_card_bar.value() == 1000
+    assert "配置/有效 Batch" in dialog._current_package.toolTip()
+    assert "包耗时" in dialog._current_package.toolTip()
+    assert "按任务计数" in dialog._fit_bar.toolTip()
     dialog._package_activity.update({"tile_current": 0, "tile_total": 0})
     dialog._apply_database_snapshot(snapshot_for("running"))
     settle()
@@ -1346,6 +1447,19 @@ def monitor(app, root):
     dialog._apply_database_snapshot(snapshot_for("running"))
     settle()
     assert header.sectionSize(0) == manual_width
+    # Completed/stopped state and resetting must not depend on deleted widgets.
+    dialog.mark_finished("已完成")
+    assert dialog._completion_value.text() == "100%"
+    assert not dialog._overall_bar._timer.isActive()
+    dialog.set_stage_progress({"name": "迟到的准备进度", "current": 1, "total": 4})
+    assert dialog._completion_value.text() == "100%"
+    dialog.reset_run()
+    assert dialog._run_information == "Run：准备中"
+    assert dialog._assembly_information == "结果流组装：等待上游计算"
+    assert dialog._coverage_information == "空白/重叠验收：等待组装"
+    assert dialog._completion_value.text() == "—"
+    dialog.mark_finished("已停止")
+    assert not dialog._overall_bar._timer.isActive()
     dialog.close()
     app.processEvents()
     assert not dialog.isVisible()
