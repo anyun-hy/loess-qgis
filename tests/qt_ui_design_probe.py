@@ -236,6 +236,70 @@ def workspace(app, root):
     return dict(one_class_hashes=1, metadata_hashes=0, full_hashes=14)
 
 
+def result_layers(app, root):
+    from types import SimpleNamespace
+    from osgeo import gdal
+    from qgis.core import QgsProject
+    from labeling_tool.core.layer_manager import LayerManager, MANAGED_PROPERTY
+    from labeling_tool.core.layer_names import LAYER_NAMES
+    from labeling_tool.core.style_manager import StyleManager
+
+    gdal.UseExceptions()
+    spec, value = fixture(root)
+    record = value["classes"]["12"]
+    raster_paths = {}
+    for role, sample in (("mask_mosaic", 0), ("confidence_mosaic", 0.5)):
+        path = root / f"{role}.tif"
+        dataset = gdal.GetDriverByName("GTiff").Create(str(path), 2, 2, 1, gdal.GDT_Float32)
+        dataset.SetGeoTransform([0, 1, 0, 2, 0, -1])
+        dataset.SetProjection(memory_layer().crs().toWkt())
+        dataset.GetRasterBand(1).Fill(sample)
+        dataset = None
+        raster_paths[role] = str(path)
+    raw_path = root / "raw.gpkg"
+    options = QgsVectorFileWriter.SaveVectorOptions()
+    options.driverName = "GPKG"
+    options.layerName = LAYER_NAMES.SEMANTIC_RAW
+    assert write_vector_layer(memory_layer(), raw_path, options)[0] == 0
+    project = QgsProject.instance()
+    manager = LayerManager(SimpleNamespace(mapCanvas=lambda: None))
+    try:
+        for kind, stream_id, section in (("model", "model:probe", "Models"),
+                                         ("fusion", "fusion:probe", "Fusion")):
+            loaded = manager.load_result_stream("probe", dict(
+                kind=kind, model_id="probe", fusion_profile_id="probe", stream_id=stream_id,
+                paths={**raster_paths, "semantic_polygons_raw": str(raw_path)},
+                review_polygons=record["path"], review_layer_name=record["layer_name"],
+            ))
+            assert set(loaded) == {"mask", "confidence", "polygons", "polygons_raw"}
+            for role, layer_id in loaded.items():
+                layer = project.mapLayer(layer_id)
+                node = project.layerTreeRoot().findLayer(layer_id)
+                assert layer.customProperty(MANAGED_PROPERTY, False)
+                assert layer.customProperty("labeling_tool/stream_id") == stream_id
+                assert node.parent().name() == section
+                if role.startswith("polygons"):
+                    categories = layer.renderer().categories()
+                    assert [c.value() for c in categories] == sorted(StyleManager.CLASS_COLORS)
+                    assert categories[0].symbol().color().name() == StyleManager.CLASS_COLORS[12][1].lower()
+                if role == "polygons_raw":
+                    assert layer.readOnly() and not node.itemVisibilityChecked()
+            assert project.mapLayer(loaded["mask"]).renderer().type() == "paletted"
+            assert project.mapLayer(loaded["confidence"]).renderer().type() == "singlebandpseudocolor"
+        workspace_id = manager.load_workspace_class(spec["run_id"], record, visible=False)
+        node = project.layerTreeRoot().findLayer(workspace_id)
+        assert node.parent().name() == "Classes" and not node.itemVisibilityChecked()
+        count = len(project.mapLayers())
+        assert manager.load_workspace_class("probe", record, visible=True) == workspace_id
+        assert len(project.mapLayers()) == count and node.itemVisibilityChecked()
+        manager.set_layer_visibility(workspace_id, False)
+        assert not node.itemVisibilityChecked()
+        return dict(model_and_fusion_layers=True, shared_colors=True,
+                    raw_read_only_hidden=True, workspace_reused=True)
+    finally:
+        project.removeAllMapLayers()
+
+
 def edits(app, root):
     from labeling_tool.gui.class_refinement_dialog import ClassRefinementDialog as Dialog
     layer = memory_layer(1000)

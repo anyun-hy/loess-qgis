@@ -1,8 +1,4 @@
-import json
-import logging
 import math
-import os
-import shutil
 
 from qgis.core import (
     Qgis,
@@ -10,20 +6,10 @@ from qgis.core import (
     QgsFeature,
     QgsGeometry,
     QgsRectangle,
-    QgsRasterLayer,
-    QgsRasterPipe,
-    QgsRasterFileWriter,
-    QgsRasterDataProvider,
     QgsCoordinateTransform,
     QgsProject,
-    QgsCoordinateReferenceSystem,
     QgsSpatialIndex,
 )
-from qgis.PyQt.QtCore import QDir
-import processing
-
-logger = logging.getLogger(__name__)
-
 
 def raster_grid_info(raster_layer):
     """Copy the raster values needed by a worker without retaining the layer."""
@@ -344,123 +330,3 @@ class VectorTileSelectionTask(QgsTask):
     def _set_selection_progress(self, current, total):
         if total > 0:
             self.setProgress(100.0 * float(current) / float(total))
-
-
-def build_extract_parameters(raster_input, grid_cell, output_dir, crs_authid):
-    """Build GDAL clip parameters without retaining a QGIS layer object."""
-    os.makedirs(output_dir, exist_ok=True)
-    row = grid_cell["row"]
-    col = grid_cell["col"]
-    bounds = grid_cell["bounds"]
-    tile_path = os.path.join(output_dir, f"tile_{row}_{col}.tif")
-    extent_str = "{},{},{},{} [{}]".format(
-        bounds.xMinimum(),
-        bounds.xMaximum(),
-        bounds.yMinimum(),
-        bounds.yMaximum(),
-        crs_authid,
-    )
-    return {
-        "INPUT": raster_input,
-        "PROJWIN": extent_str,
-        "OUTPUT": tile_path,
-    }, tile_path
-
-
-def finalize_extracted_tile(output_path, grid_cell, output_dir, crs_authid):
-    """Validate an extracted tile and write its sidecar metadata."""
-    row = grid_cell["row"]
-    col = grid_cell["col"]
-    bounds = grid_cell["bounds"]
-    width = grid_cell.get("width", 512)
-    height = grid_cell.get("height", 512)
-    tile_path = output_path or os.path.join(output_dir, f"tile_{row}_{col}.tif")
-    meta_path = os.path.join(output_dir, f"tile_{row}_{col}_meta.json")
-
-    if not os.path.exists(tile_path):
-        raise RuntimeError(
-            f"Failed to extract tile ({row}, {col}); output was not created: {tile_path}"
-        )
-
-    extracted = QgsRasterLayer(tile_path, f"tile_{row}_{col}_validation")
-    if not extracted.isValid():
-        raise RuntimeError(f"切片 ({row}, {col}) 不是有效栅格: {tile_path}")
-    if extracted.width() != width or extracted.height() != height:
-        raise RuntimeError(
-            f"切片 ({row}, {col}) 实际尺寸为 "
-            f"{extracted.width()}x{extracted.height()}，预期为 {width}x{height}。"
-            "自动扩展范围没有与源影像像元正确对齐。"
-        )
-
-    res_x = (bounds.xMaximum() - bounds.xMinimum()) / width
-    res_y = (bounds.yMaximum() - bounds.yMinimum()) / height
-    meta = {
-        "row": row,
-        "col": col,
-        "bounds": {
-            "xmin": bounds.xMinimum(),
-            "ymin": bounds.yMinimum(),
-            "xmax": bounds.xMaximum(),
-            "ymax": bounds.yMaximum(),
-        },
-        "crs": crs_authid,
-        "geotransform": [
-            bounds.xMinimum(),
-            res_x,
-            0.0,
-            bounds.yMaximum(),
-            0.0,
-            -res_y,
-        ],
-        "width": width,
-        "height": height,
-        "tile_path": tile_path,
-    }
-    try:
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-    except IOError as exc:
-        logger.error("Failed to write metadata for tile (%d, %d): %s", row, col, exc)
-        raise
-
-    return {"tile_path": tile_path, "meta_path": meta_path, "meta": meta}
-
-
-def extract_tile(raster_layer, grid_cell, output_dir):
-    row = grid_cell["row"]
-    col = grid_cell["col"]
-    crs_authid = raster_layer.crs().authid()
-    params, tile_path = build_extract_parameters(
-        raster_layer, grid_cell, output_dir, crs_authid
-    )
-
-    try:
-        result = processing.run("gdal:cliprasterbyextent", params)
-    except Exception as e:
-        logger.error("Failed to extract tile (%d, %d): %s", row, col, e)
-        raise
-
-    output_path = result.get("OUTPUT", tile_path) if isinstance(result, dict) else tile_path
-    return finalize_extracted_tile(
-        output_path, grid_cell, output_dir, crs_authid
-    )
-
-
-def get_tile_paths(output_dir, row, col):
-    return {
-        "tile": os.path.join(output_dir, f"tile_{row}_{col}.tif"),
-        "meta": os.path.join(output_dir, f"tile_{row}_{col}_meta.json"),
-        "mask": os.path.join(output_dir, f"tile_{row}_{col}_mask.tif"),
-        "confidence": os.path.join(output_dir, f"tile_{row}_{col}_conf.tif"),
-    }
-
-
-def cleanup_temp_files(temp_dir):
-    if not os.path.isdir(temp_dir):
-        logger.debug("Temp dir %s does not exist, nothing to clean", temp_dir)
-        return
-    try:
-        shutil.rmtree(temp_dir)
-        logger.info("Removed temp directory: %s", temp_dir)
-    except OSError as e:
-        logger.warning("Failed to remove temp dir %s: %s", temp_dir, e)

@@ -333,44 +333,6 @@ def _read_core(
         return source.read(1, window=_raster_window(owner_core, selected))
 
 
-def _commit_output_artifact(
-    database: RunStateDB,
-    run_id: str,
-    stream_id: str,
-    partition_id: str,
-    *,
-    kind: str,
-    path: Path,
-) -> int:
-    artifact_id = database.register_artifact(
-        run_id,
-        kind,
-        path,
-        stream_id=stream_id,
-        unit_id=partition_id,
-    )
-    existing = database.get_artifact(artifact_id)
-    digest = sha256_file(path)
-    if existing and str(existing.get("status")) == "ready":
-        if (
-            int(existing.get("byte_count") or -1) == path.stat().st_size
-            and str(existing.get("sha256")) == digest
-        ):
-            return artifact_id
-        raise FragmentationV33WorkPackageError(
-            f"ready V3.3 Artifact changed: {path}"
-        )
-    if not database.mark_artifact_ready(
-        artifact_id,
-        byte_count=path.stat().st_size,
-        sha256=digest,
-    ):
-        raise FragmentationV33WorkPackageError(
-            f"cannot commit V3.3 Artifact: {path}"
-        )
-    return artifact_id
-
-
 def _run_partition(
     spec: Mapping[str, Any],
     database: RunStateDB,

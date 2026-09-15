@@ -10,6 +10,9 @@
 - PostgreSQL、文件 Artifact 和恢复机制如何配合；
 - 哪些脚本不属于当前自动生产入口。
 
+下图以三模型加 Fusion 的配置为例；实际结果流、执行设备与并发限制取本次
+Run Spec，不要求每次运行都有四条结果流或 CUDA 设备。
+
 类别规则、面积阈值和 V3.3 冲突裁决见
 [../operations/FRAGMENTATION_V3.md](../operations/FRAGMENTATION_V3.md)，本文不重复定义。
 
@@ -72,14 +75,16 @@ GPU Work Package       CPU V3.3 / confidence / unit_fit    PostgreSQL监控
 ```text
 main_dock._start_inference_after_tile_cache_probe
   │
-  ├─ ModelRegistry：冻结三个模型与 approved Fusion
+  ├─ _prepare_run_inputs：预留 Run 目录并捕获独立要素源
+  │    └─ RunPreparationTask（后台）
+  │         ├─ write_source_snapshot：冻结范围；按需冻结 Accepted
+  │         └─ 范围筛选、Accepted 审计与跳过检查
+  ├─ _on_run_preparation_completed：接收本次任务的准备结果
+  ├─ ModelRegistry：冻结选中模型与可选 Fusion
   ├─ plan_spatial_units：规划 Partition/Core/Seam/Junction
   ├─ storage_preflight：冻结缓存和永久输出预算
-  ├─ reserve_run_directory：创建 Run 专属目录
-  ├─ _freeze_pending_range_snapshot：冻结范围
-  ├─ _freeze_pending_accepted_snapshot：冻结 Accepted
-  └─ create_v5_run
-       ├─ 写快照与 run_spec.json
+  └─ RunBuilderTask → create_v5_run（后台）
+       ├─ 写 run_spec.json
        ├─ 创建 PostgreSQL 任务图
        └─ 返回 spec_path 和 state database
               │
@@ -350,11 +355,12 @@ accepted_writer.append_final_to_accepted
 
 ## 11. 当前自动入口与独立工具边界
 
-`V5AsyncInferenceRunner` 当前自动调用六个 Bash 入口：
+`V5AsyncInferenceRunner` 当前自动调用以下 Bash 入口：
 
 ```text
 run_work_package.sh
 run_fragmentation_v33_work_package.sh
+run_unit_confidence.sh
 run_unit_fit.sh
 run_finalize_partition_rasters.sh
 run_assemble_stream.sh

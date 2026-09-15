@@ -278,17 +278,6 @@ def refine_with_sam3(runtime, raster_patch, centroid_px, box_px):
         return None
 
 
-def jitter_boundary(geom, max_jitter=2.0):
-    coords = list(geom.exterior.coords)
-    n = len(coords)
-    offsets = np.random.uniform(-max_jitter, max_jitter, size=(n, 2))
-    jittered = [
-        (coords[i][0] + offsets[i, 0], coords[i][1] + offsets[i, 1])
-        for i in range(n)
-    ]
-    return Polygon(jittered)
-
-
 def refine_object(raster_path, gpkg_path, layer, object_id, part_id,
                   output_path, buffer_px, sam_version, sam_checkpoint="", device="cpu",
                   sam_runtime=None):

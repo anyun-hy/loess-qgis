@@ -1225,11 +1225,43 @@ def test_semantic_colors_have_one_qgis4_source_of_truth():
     layer_manager = (
         PLUGIN_ROOT / "core" / "layer_manager.py"
     ).read_text(encoding="utf-8")
-    sam_loader = layer_manager.split(
-        "def load_sam_refined_polygons", 1
-    )[1].split("def get_or_create_accepted_labels", 1)[0]
-    assert "StyleManager.apply_categorized_style(layer)" in sam_loader
-    assert "StyleManager.apply_outline_style(layer)" not in sam_loader
+    tree = ast.parse(layer_manager)
+    methods = {
+        node.name: ast.get_source_segment(layer_manager, node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"load_result_stream", "load_workspace_class"}
+    }
+    assert "StyleManager.apply_categorized_style(polygons)" in methods["load_result_stream"]
+    assert "StyleManager.apply_categorized_style(raw_polygons)" in methods["load_result_stream"]
+    assert "StyleManager.apply_categorized_style(layer)" in methods["load_workspace_class"]
+    assert all("load_sam_refined_polygons" not in value for value in methods.values())
+
+
+def test_layer_manager_active_loaders_keep_style_group_stream_and_visibility_contract():
+    source = (PLUGIN_ROOT / "core" / "layer_manager.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    methods = {
+        node.name: ast.get_source_segment(source, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    stream = methods["load_result_stream"]
+    assert "StyleManager.apply_semantic_raster_style(mask)" in stream
+    assert "StyleManager.apply_confidence_style(confidence)" in stream
+    assert "self._add_managed_layer(mask, run_id, section, stream_id)" in stream
+    assert "self._add_managed_layer(confidence, run_id, section, stream_id)" in stream
+    assert "self._add_managed_layer(polygons, run_id, section, stream_id)" in stream
+    assert 'loaded["mask"] = mask.id()' in stream
+    assert 'loaded["confidence"] = confidence.id()' in stream
+    assert 'loaded["polygons"] = polygons.id()' in stream
+
+    workspace = methods["load_workspace_class"]
+    assert "StyleManager.apply_categorized_style(layer)" in workspace
+    assert 'self._add_managed_layer(layer, run_id, "Classes", f"class:{class_code}")' in workspace
+    assert "setItemVisibilityChecked(bool(visible))" in workspace
+    assert "labeling_tool/workspace_path" in workspace
 
 
 def test_qgis4_rubber_bands_are_removed_from_the_canvas_scene():

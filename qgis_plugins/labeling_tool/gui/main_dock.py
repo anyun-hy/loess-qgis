@@ -2,11 +2,9 @@ import logging
 import os
 import json
 import shutil
-from datetime import datetime
 from pathlib import Path
-import re
 
-from qgis.PyQt.QtCore import QSize, QTimer, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import QTimer, QUrl, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QApplication, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QFormLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox,
@@ -14,7 +12,7 @@ from qgis.PyQt.QtWidgets import (
     QTableWidget, QTableWidgetItem,
     QWidget, QButtonGroup, QFileDialog, QMessageBox, QScrollArea,
 )
-from qgis.PyQt.QtGui import QColor, QDesktopServices
+from qgis.PyQt.QtGui import QDesktopServices
 from qgis.gui import QgsDockWidget, QgsMapLayerComboBox, QgsMapTool, QgsRubberBand
 from qgis.core import (
     Qgis,
@@ -189,7 +187,6 @@ class RectangleMapTool(QgsMapTool):
 
 from ..core import (
     tile_manager,
-    class_workspace,
     manual_run_loader,
 )
 from ..core.inference_config import InferenceConfigManager
@@ -252,9 +249,6 @@ CHECK_LABELS = {
     "output_path": "输出 GPKG",
 }
 
-_TILE_RE = re.compile(r"semantic_tile_(\d+)_(\d+)")
-
-
 def _check_label(check):
     check_id = str(check.get("id", ""))
     if check_id.startswith("dependency_"):
@@ -280,7 +274,6 @@ class LabelingDockWidget(QgsDockWidget):
         self._pipeline_running = False
         self._pipeline_state = "idle"
         self._pipeline_stage_total = 0
-        self._tile_extractor = None
         self._tile_cache_probe = None
         self._run_builder_task = None
         self._run_preparation_task = None
@@ -305,7 +298,6 @@ class LabelingDockWidget(QgsDockWidget):
         self._vector_preview_timer.timeout.connect(
             self._start_vector_tile_preview
         )
-        self._step_t0: dict = {}
         self._view_extent = None
         self._view_extent_crs = None
         self._hand_drawn_extent = None
@@ -632,13 +624,6 @@ class LabelingDockWidget(QgsDockWidget):
         )
         result_layout.addWidget(self.load_manual_run_btn)
         layout.addWidget(result_group)
-
-        self.tile_table = QTableWidget(0, 4)
-        self.tile_table.setHorizontalHeaderLabels(["Tile", "状态", "语义", "SAM3"])
-        self.tile_table.horizontalHeader().setStretchLastSection(True)
-        self.tile_table.setEditTriggers(NO_EDIT_TRIGGERS)
-        layout.addWidget(self.tile_table)
-        self.tile_table.setVisible(False)
 
         layout.addStretch()
 
@@ -1451,10 +1436,6 @@ class LabelingDockWidget(QgsDockWidget):
         self.progress_bar.setRange(0, len(self._current_tiles))
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("准备提取切片")
-        # Tile details are persisted in PostgreSQL and paged in the
-        # monitor. Never instantiate one widget row per Tile.
-        self.tile_table.setRowCount(0)
-
         self.monitor_dialog.detach()
         self._dispose_runner()
         try:
@@ -1466,7 +1447,7 @@ class LabelingDockWidget(QgsDockWidget):
             return
 
         self._pipeline_running = True
-        self._pipeline_state = "extracting"
+        self._pipeline_state = "preflighting"
         self._pipeline_stage_total = 6
         self._pending_run = {
             "raster": raster,
@@ -1503,8 +1484,6 @@ class LabelingDockWidget(QgsDockWidget):
         self.monitor_dialog.attach_runner(self.runner)
         self.runner.pipeline_finished.connect(self._on_pipeline_finished)
         self.runner.stage_progress.connect(self._on_runner_stage_progress)
-        self.runner.step_started.connect(self._on_tile_step_started)
-        self.runner.step_finished.connect(self._on_tile_step_finished)
         self.monitor_dialog.show()
         self.monitor_dialog.raise_()
         self.show_monitor_btn.setChecked(True)
@@ -1519,22 +1498,10 @@ class LabelingDockWidget(QgsDockWidget):
             "total": 1,
             "message": "不再预切全部 Tile，推理时按 Work Package 即时读取",
         })
-        QTimer.singleShot(0, lambda: self._on_tiles_extracted([]))
+        QTimer.singleShot(0, self._start_tile_cache_preflight)
 
-    def _on_tile_extraction_progress(self, current, total, message):
-        self._apply_stage_progress({
-            "key": "extraction",
-            "name": "切片提取",
-            "index": 1,
-            "stage_total": self._pipeline_stage_total,
-            "current": current,
-            "total": total,
-            "message": message,
-        })
-
-    def _on_tiles_extracted(self, tiles):
-        self._release_tile_extractor()
-        if self._pipeline_state != "extracting" or not self._pending_run:
+    def _start_tile_cache_preflight(self):
+        if self._pipeline_state != "preflighting" or not self._pending_run:
             return
         try:
             ctx = self._pending_run
@@ -1898,7 +1865,7 @@ class LabelingDockWidget(QgsDockWidget):
             return
         self._run_preparation_task = None
         if task.isCanceled() or self._pipeline_state == "stopping":
-            self._on_tile_extraction_stopped()
+            self._stop_before_inference()
             return
         self._pending_run.update(task.result_data)
         self._pipeline_state = "preflighting"
@@ -1910,7 +1877,7 @@ class LabelingDockWidget(QgsDockWidget):
             return
         self._run_preparation_task = None
         if task.isCanceled():
-            self._on_tile_extraction_stopped()
+            self._stop_before_inference()
         else:
             self._finish_before_inference("输入准备失败", task.error_message)
 
@@ -1936,7 +1903,7 @@ class LabelingDockWidget(QgsDockWidget):
         if self._cleaning_up:
             return
         if task.isCanceled() or self._pipeline_state == "stopping":
-            self._on_tile_extraction_stopped()
+            self._stop_before_inference()
             return
         result = task.result_data
         ctx = self._pending_run
@@ -1970,7 +1937,7 @@ class LabelingDockWidget(QgsDockWidget):
         if self._cleaning_up:
             return
         if task.isCanceled():
-            self._on_tile_extraction_stopped()
+            self._stop_before_inference()
             return
         self._finish_before_inference(
             "启动推理失败",
@@ -2001,68 +1968,6 @@ class LabelingDockWidget(QgsDockWidget):
             self.progress_bar.setRange(0, 0)
             self.progress_bar.setFormat(f"{name} ({index}/{stage_total})")
 
-    def _fmt_elapsed(self, name: str) -> str:
-        import time as _time
-        t0 = self._step_t0.pop(name, None)
-        if t0 is None:
-            return ""
-        secs = _time.time() - t0
-        if secs < 60:
-            return f"{secs:.1f}s"
-        m, s = divmod(secs, 60)
-        return f"{int(m)}m {int(s)}s"
-
-    def _on_tile_step_started(self, name):
-        import time as _time
-        self._step_t0[name] = _time.time()
-        m = _TILE_RE.match(name)
-        if not m:
-            return
-        rc = (int(m.group(1)), int(m.group(2)))
-        row = self._find_tile_row(*rc)
-        if row >= 0:
-            item = QTableWidgetItem("● 运行中")
-            item.setForeground(QColor("#2a82da"))
-            self.tile_table.setItem(row, 1, item)
-            self._last_tile_row = row
-
-    def _on_tile_step_finished(self, name, return_code, result):
-        m = _TILE_RE.match(name)
-        if m:
-            coords = (int(m.group(1)), int(m.group(2)))
-            row = self._find_tile_row(*coords)
-            if row < 0:
-                return
-            elapsed = self._fmt_elapsed(name)
-            if return_code == 0:
-                item = QTableWidgetItem("✓ 成功")
-                item.setForeground(QColor("#2e7d32"))
-                self.tile_table.setItem(row, 1, item)
-                elapsed_item = QTableWidgetItem(f"成功 {elapsed}" if elapsed else "✓ 成功")
-                elapsed_item.setForeground(QColor("#2e7d32"))
-                self.tile_table.setItem(row, 2, elapsed_item)
-            elif return_code == 42:
-                item = QTableWidgetItem("⊕ 跳过")
-                item.setForeground(QColor("#9e9e9e"))
-                self.tile_table.setItem(row, 1, item)
-                elapsed_item = QTableWidgetItem(f"跳过 {elapsed}" if elapsed else "⊕ 跳过")
-                elapsed_item.setForeground(QColor("#9e9e9e"))
-                self.tile_table.setItem(row, 2, elapsed_item)
-            else:
-                item = QTableWidgetItem("✗ 失败")
-                item.setForeground(QColor("#c62828"))
-                self.tile_table.setItem(row, 1, item)
-                elapsed_item = QTableWidgetItem(f"失败 {elapsed}" if elapsed else "✗ 失败")
-                elapsed_item.setForeground(QColor("#c62828"))
-                self.tile_table.setItem(row, 2, elapsed_item)
-        elif name.startswith("sam3"):
-            elapsed = self._fmt_elapsed(name)
-            ok = result.get("success", False) or (return_code == 0)
-            if hasattr(self, '_last_tile_row') and self._last_tile_row is not None:
-                elapsed_item = QTableWidgetItem(elapsed)
-                elapsed_item.setForeground(QColor("#2e7d32" if ok else "#c62828"))
-                self.tile_table.setItem(self._last_tile_row, 3, elapsed_item)
-
     def _on_toggle_monitor(self, checked):
         if self.monitor_dialog is None:
             return
@@ -2075,12 +1980,7 @@ class LabelingDockWidget(QgsDockWidget):
             self.monitor_dialog.hide()
             self.show_monitor_btn.setText("推理监控")
 
-    def _on_tile_extraction_failed(self, message):
-        self._release_tile_extractor()
-        self._finish_before_inference("切片失败", message)
-
-    def _on_tile_extraction_stopped(self):
-        self._release_tile_extractor()
+    def _stop_before_inference(self):
         self._release_tile_cache_probe(cancel=True)
         self._discard_pending_run_reservation()
         self._pipeline_running = False
@@ -2091,12 +1991,6 @@ class LabelingDockWidget(QgsDockWidget):
         if self.monitor_dialog is not None:
             self.monitor_dialog.mark_finished("已停止")
         self._update_start_enabled()
-
-    def _release_tile_extractor(self):
-        extractor = self._tile_extractor
-        self._tile_extractor = None
-        if extractor is not None:
-            extractor.deleteLater()
 
     def _release_tile_cache_probe(self, *, cancel=False):
         probe = self._tile_cache_probe
@@ -2212,13 +2106,9 @@ class LabelingDockWidget(QgsDockWidget):
         self.stop_btn.setEnabled(False)
         if self.monitor_dialog is not None:
             self.monitor_dialog.mark_stopping()
-        if self._pipeline_state == "extracting" and self._tile_extractor:
+        if self._pipeline_state == "preflighting":
             self._pipeline_state = "stopping"
-            self._tile_extractor.stop()
-        elif self._pipeline_state == "preflighting" and self._tile_cache_probe:
-            self._pipeline_state = "stopping"
-            self._release_tile_cache_probe(cancel=True)
-            self._on_tile_extraction_stopped()
+            self._stop_before_inference()
         elif self._pipeline_state == "preparing" and self._run_preparation_task:
             self._pipeline_state = "stopping"
             self._run_preparation_task.cancel()
@@ -2345,8 +2235,6 @@ class LabelingDockWidget(QgsDockWidget):
             self.monitor_dialog.attach_runner(self.runner)
             self.runner.pipeline_finished.connect(self._on_pipeline_finished)
             self.runner.stage_progress.connect(self._on_runner_stage_progress)
-            self.runner.step_started.connect(self._on_tile_step_started)
-            self.runner.step_finished.connect(self._on_tile_step_finished)
             self._pipeline_running = True
             self._pipeline_state = "inferencing"
             self._pipeline_stage_total = 6
@@ -3081,13 +2969,6 @@ class LabelingDockWidget(QgsDockWidget):
             f"{extent.xMaximum():.6f}, {extent.yMaximum():.6f}"
         )
 
-    def _find_tile_row(self, row, col):
-        for i in range(self.tile_table.rowCount()):
-            item = self.tile_table.item(i, 0)
-            if item and item.text() == f"({row},{col})":
-                return i
-        return -1
-
     def cleanup(self):
         self._cleaning_up = True
         for dialog in tuple(self._nonblocking_message_boxes):
@@ -3132,14 +3013,6 @@ class LabelingDockWidget(QgsDockWidget):
                 self.runner.stage_progress.disconnect(self._on_runner_stage_progress)
             except (TypeError, RuntimeError):
                 pass
-            try:
-                self.runner.step_started.disconnect(self._on_tile_step_started)
-            except (TypeError, RuntimeError):
-                pass
-            try:
-                self.runner.step_finished.disconnect(self._on_tile_step_finished)
-            except (TypeError, RuntimeError):
-                pass
             # 也断开 runner 到 monitor_dialog 的连接（由 monitor_dialog.detach() 完成）
             if self.monitor_dialog is not None:
                 try:
@@ -3147,12 +3020,9 @@ class LabelingDockWidget(QgsDockWidget):
                 except (TypeError, RuntimeError):
                     pass
 
-        # 2. 停止异步任务（runner / tile_extractor）
+        # 2. 停止异步任务
         if self.runner is not None:
             self._dispose_runner()
-        if self._tile_extractor is not None:
-            self._tile_extractor.stop()
-            self._tile_extractor = None
         if self._tile_cache_probe is not None:
             self._tile_cache_probe.cleanup()
             self._tile_cache_probe = None

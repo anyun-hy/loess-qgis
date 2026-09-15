@@ -1,20 +1,10 @@
-import os
-
 from qgis.core import (
-    Qgis,
-    QgsProject, QgsRasterLayer, QgsVectorLayer, QgsLayerTreeGroup,
-    QgsVectorFileWriter, QgsField, QgsFeature,
-    QgsSimpleFillSymbolLayer, QgsSymbol, QgsFillSymbol,
-    QgsSingleBandPseudoColorRenderer, QgsColorRampShader, QgsRasterShader,
-    QgsContrastEnhancement,
+    QgsProject, QgsRasterLayer, QgsVectorLayer,
 )
-from qgis.PyQt.QtCore import QVariant, QObject
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtCore import QObject
 
 from .style_manager import StyleManager
 from .layer_names import LAYER_NAMES
-from .accepted_writer import ACCEPTED_FIELDS_QGS as ACCEPTED_FIELDS
-from .qgis_writer import write_vector_layer
 
 
 ANNOTATION_LAYER_PREFIXES = (
@@ -32,13 +22,6 @@ class LayerManager(QObject):
         self.iface = iface
         self.canvas = iface.mapCanvas()
         self.project = QgsProject.instance()
-
-    def _resolve_crs(self, layer=None):
-        if layer and layer.crs().isValid():
-            return layer.crs().authid()
-        if self.project.crs().isValid():
-            return self.project.crs().authid()
-        return "EPSG:4490"
 
     # ---- Raster layers ----
 
@@ -131,18 +114,6 @@ class LayerManager(QObject):
             loaded[stream["stream_id"]] = self.load_result_stream(run_id, stream)
         return loaded
 
-    def load_class_layer(self, run_id, class_code, source_label, gpkg_path, layer_name):
-        display_name = f"{run_id} | Class | {int(class_code)} | {source_label}"
-        layer = QgsVectorLayer(f"{gpkg_path}|layername={layer_name}", display_name, "ogr")
-        if not layer.isValid():
-            raise RuntimeError(f"Failed to load class layer: {gpkg_path}")
-        StyleManager.apply_categorized_style(layer)
-        layer.setCustomProperty("labeling_tool/class_code", int(class_code))
-        layer.setCustomProperty("labeling_tool/source_label", source_label)
-        self._add_managed_layer(layer, run_id, "Classes", source_label)
-        layer.triggerRepaint()
-        return layer.id()
-
     def load_workspace_class(self, run_id, record, *, visible=False):
         class_code = int(record["class_code"])
         for layer in self.project.mapLayers().values():
@@ -206,136 +177,6 @@ class LayerManager(QObject):
         self._add_managed_layer(layer, run_id, "Final", "topology")
         layer.triggerRepaint()
         return layer.id()
-
-    def load_semantic_mask_preview(self, raster_path):
-        layer = QgsRasterLayer(raster_path, "semantic_mask_preview")
-        if not layer.isValid():
-            raise RuntimeError(f"Failed to load semantic mask raster: {raster_path}")
-        self.project.addMapLayer(layer)
-
-        StyleManager.apply_semantic_raster_style(layer)
-        layer.triggerRepaint()
-        return layer.id()
-
-    def load_confidence_mosaic(self, raster_path):
-        """Load confidence raster with RdYlGn pseudocolor ramp."""
-        layer = QgsRasterLayer(raster_path, "confidence_mosaic")
-        if not layer.isValid():
-            raise RuntimeError(f"Failed to load confidence raster: {raster_path}")
-        self.project.addMapLayer(layer)
-
-        shader = QgsColorRampShader()
-        shader.setColorRampType(Qgis.ShaderInterpolationMethod.Linear)
-        items = [
-            QgsColorRampShader.ColorRampItem(0.0, QColor("#FF0000"), "0.00"),
-            QgsColorRampShader.ColorRampItem(0.25, QColor("#FF6666"), "0.25"),
-            QgsColorRampShader.ColorRampItem(0.5, QColor("#FFFF00"), "0.50"),
-            QgsColorRampShader.ColorRampItem(0.75, QColor("#66FF66"), "0.75"),
-            QgsColorRampShader.ColorRampItem(1.0, QColor("#00FF00"), "1.00"),
-        ]
-        shader.setColorRampItemList(items)
-
-        raster_shader = QgsRasterShader()
-        raster_shader.setRasterShaderFunction(shader)
-
-        renderer = QgsSingleBandPseudoColorRenderer(layer.dataProvider(), 1, raster_shader)
-        renderer.setClassificationMin(0.0)
-        renderer.setClassificationMax(1.0)
-
-        layer.setRenderer(renderer)
-        layer.triggerRepaint()
-        return layer.id()
-
-    # ---- Vector layers ----
-
-    def load_semantic_polygons(self, gpkg_path):
-        """Load semantic_polygons layer from GPKG with 14-class style."""
-        uri = f"{gpkg_path}|layername={LAYER_NAMES.SEMANTIC}"
-        layer = QgsVectorLayer(uri, LAYER_NAMES.SEMANTIC, "ogr")
-        if not layer.isValid():
-            raise RuntimeError(f"Failed to load semantic_polygons from {gpkg_path}")
-        self.project.addMapLayer(layer)
-
-        StyleManager.apply_categorized_style(layer)
-        layer.triggerRepaint()
-        return layer.id()
-
-    def load_sam_refined_polygons(self, gpkg_path):
-        """Load SAM3 refined polygons with the shared 14-class style."""
-        uri = f"{gpkg_path}|layername={LAYER_NAMES.SAM_REFINED}"
-        layer = QgsVectorLayer(uri, LAYER_NAMES.SAM_REFINED, "ogr")
-        if not layer.isValid():
-            raise RuntimeError(f"Failed to load sam_refined_polygons from {gpkg_path}")
-        self.project.addMapLayer(layer)
-
-        StyleManager.apply_categorized_style(layer)
-        layer.triggerRepaint()
-        return layer.id()
-
-    def get_or_create_accepted_labels(self, gpkg_path):
-        """Load or create the accepted_labels layer (editable final labels)."""
-        # Try loading existing GPKG layer
-        uri = f"{gpkg_path}|layername={LAYER_NAMES.ACCEPTED}"
-        layer = QgsVectorLayer(uri, LAYER_NAMES.ACCEPTED, "ogr")
-        if layer.isValid():
-            self.project.addMapLayer(layer)
-            StyleManager.apply_accepted_style(layer)
-            layer.triggerRepaint()
-            return layer.id()
-
-        # Create in-memory layer
-        project_crs = self._resolve_crs()
-        mem_layer = QgsVectorLayer(
-            f"Polygon?crs={project_crs}", LAYER_NAMES.ACCEPTED, "memory"
-        )
-        mem_layer.dataProvider().addAttributes(ACCEPTED_FIELDS)
-        mem_layer.updateFields()
-
-        self.project.addMapLayer(mem_layer)
-        mem_layer_id = mem_layer.id()
-        StyleManager.apply_accepted_style(layer=mem_layer)
-
-        # Save to GPKG
-        save_options = QgsVectorFileWriter.SaveVectorOptions()
-        save_options.driverName = "GPKG"
-        save_options.layerName = LAYER_NAMES.ACCEPTED
-        save_options.actionOnExistingFile = (
-            QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteLayer
-        )
-        if not os.path.exists(gpkg_path):
-            save_options.actionOnExistingFile = (
-                QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
-            )
-
-        error, err_msg = write_vector_layer(mem_layer, gpkg_path, save_options)
-        if error != QgsVectorFileWriter.WriterError.NoError:
-            raise RuntimeError(f"Failed to save accepted_labels to GPKG: {err_msg}")
-
-        # Remove memory layer, load GPKG layer instead
-        self.project.removeMapLayer(mem_layer_id)
-        gpkg_layer = QgsVectorLayer(uri, LAYER_NAMES.ACCEPTED, "ogr")
-        if gpkg_layer.isValid():
-            self.project.addMapLayer(gpkg_layer)
-            StyleManager.apply_accepted_style(gpkg_layer)
-            gpkg_layer.triggerRepaint()
-            return gpkg_layer.id()
-        return mem_layer_id  # fallback if GPKG load fails
-
-    # ---- Bulk operations ----
-
-    def remove_annotation_layers(self):
-        """Remove all annotation layers managed by this tool."""
-        to_remove = []
-        for layer in self.project.mapLayers().values():
-            if bool(layer.customProperty(MANAGED_PROPERTY, False)):
-                to_remove.append(layer.id())
-                continue
-            for prefix in ANNOTATION_LAYER_PREFIXES:
-                if layer.name().startswith(prefix):
-                    to_remove.append(layer.id())
-                    break
-        for lid in to_remove:
-            self.project.removeMapLayer(lid)
 
     def set_layer_visibility(self, layer_id, visible):
         """Show or hide a layer by ID."""

@@ -132,21 +132,6 @@ def _deviation(
     return maximum, mean
 
 
-def _point_to_chord_distances(points: np.ndarray) -> np.ndarray:
-    values = points[1:-1]
-    if not len(values):
-        return np.empty(0, dtype=np.float64)
-    start = points[0]
-    stop = points[-1]
-    vector = stop - start
-    squared = float(np.dot(vector, vector))
-    if squared <= 1e-24:
-        return np.linalg.norm(values - start, axis=1)
-    factors = np.clip(((values - start) @ vector) / squared, 0.0, 1.0)
-    projections = start + factors[:, None] * vector
-    return np.linalg.norm(values - projections, axis=1)
-
-
 def _power_to_bernstein_controls(
     power_coefficients: np.ndarray,
 ) -> np.ndarray:

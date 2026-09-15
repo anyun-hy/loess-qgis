@@ -185,6 +185,33 @@ def _prepare_inputs_function(namespace):
     return values["run"]
 
 
+def _main_dock_methods():
+    tree = ast.parse(
+        (ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LabelingDockWidget"
+    )
+    return class_node, {
+        node.name: node
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+def _compiled_main_dock_method(name):
+    _class_node, methods = _main_dock_methods()
+    module = ast.Module(body=[methods[name]], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {}
+    exec(compile(module, "main_dock.py", "exec"), namespace)
+    return namespace[name]
+
+
 def _compressed_uint16_source(path, *, bands=3):
     with rasterio.open(
         path,
@@ -288,7 +315,7 @@ def test_main_dock_blocks_on_real_probe_and_freezes_measurement():
     source = (
         ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py"
     ).read_text(encoding="utf-8")
-    probe_block = source.split("def _on_tiles_extracted", 1)[1].split(
+    probe_block = source.split("def _start_tile_cache_preflight", 1)[1].split(
         "def _start_inference_after_tile_cache_probe", 1
     )[0]
     preflight_block = source.split(
@@ -305,7 +332,7 @@ def test_main_dock_blocks_on_real_probe_and_freezes_measurement():
     assert "source_bytes * pixel_count / raster_pixels" not in source
     assert "_finish_before_inference(\"Tile 存储预检失败\"" in source
     start_block = source.split("def _on_start", 1)[1].split(
-        "def _on_tile_extraction_progress", 1
+        "def _start_tile_cache_preflight", 1
     )[0]
     assert "reserve_run_directory" not in start_block
     assert "snapshot_accepted_layer" not in start_block
@@ -477,9 +504,9 @@ def test_probe_and_run_use_start_time_frozen_paths_tiles_and_skip_setting():
         ROOT / "qgis_plugins" / "labeling_tool" / "gui" / "main_dock.py"
     ).read_text(encoding="utf-8")
     start_block = source.split("def _on_start", 1)[1].split(
-        "def _on_tile_extraction_progress", 1
+        "def _start_tile_cache_preflight", 1
     )[0]
-    probe_block = source.split("def _on_tiles_extracted", 1)[1].split(
+    probe_block = source.split("def _start_tile_cache_preflight", 1)[1].split(
         "def _start_inference_after_tile_cache_probe", 1
     )[0]
     inference_block = source.split(
@@ -496,6 +523,153 @@ def test_probe_and_run_use_start_time_frozen_paths_tiles_and_skip_setting():
     assert 'for tile in ctx.get("active_tiles") or []' in inference_block
     assert 'skip_accepted=bool(ctx.get("skip_accepted", False))' in inference_block
     assert 'accepted_layer=ctx["accepted_layer"]' in inference_block
+
+
+@pytest.mark.parametrize("probe_started", [False, True])
+def test_main_dock_preflight_and_stop_paths_do_not_retain_legacy_tile_state(probe_started):
+    class_node, methods = _main_dock_methods()
+    attribute_names = {
+        node.attr
+        for node in ast.walk(class_node)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+    assert {"tile_table", "_tile_extractor", "_step_t0"}.isdisjoint(attribute_names)
+    assert "_start_tile_cache_preflight" in methods
+    assert "_stop_before_inference" in methods
+
+    start_assignments = [
+        node
+        for node in ast.walk(methods["_on_start"])
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            and target.attr == "_pipeline_state"
+            for target in node.targets
+        )
+    ]
+    assert any(
+        isinstance(node.value, ast.Constant) and node.value.value == "preflighting"
+        for node in start_assignments
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "singleShot"
+        and len(node.args) == 2
+        and isinstance(node.args[1], ast.Attribute)
+        and isinstance(node.args[1].value, ast.Name)
+        and node.args[1].value.id == "self"
+        and node.args[1].attr == "_start_tile_cache_preflight"
+        for node in ast.walk(methods["_on_start"])
+    )
+
+    legacy_signal_connections = [
+        node
+        for node in ast.walk(class_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"connect", "disconnect"}
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr in {"step_started", "step_finished"}
+    ]
+    assert legacy_signal_connections == []
+    assert not (ROOT / "qgis_plugins" / "labeling_tool" / "core" / "tile_extraction_runner.py").exists()
+
+    on_stop = _compiled_main_dock_method("_on_stop")
+    stop_before_inference = _compiled_main_dock_method("_stop_before_inference")
+    release_probe = _compiled_main_dock_method("_release_tile_cache_probe")
+    start_preflight = _compiled_main_dock_method("_start_tile_cache_preflight")
+    on_preparation_completed = _compiled_main_dock_method(
+        "_on_run_preparation_completed"
+    )
+
+    class _Task:
+        canceled = False
+
+        def cancel(self):
+            self.canceled = True
+
+        def isCanceled(self):
+            return self.canceled
+
+    class _Dock:
+        pass
+
+    class _Probe:
+        def __init__(self):
+            self.cleaned = 0
+            self.deleted = 0
+
+        def cleanup(self):
+            self.cleaned += 1
+
+        def deleteLater(self):
+            self.deleted += 1
+
+    class _Monitor:
+        def __init__(self):
+            self.events = []
+
+        def mark_stopping(self):
+            self.events.append(("stopping",))
+
+        def mark_finished(self, text):
+            self.events.append(("finished", text))
+
+    dock = _Dock()
+    terminal = []
+    probe = _Probe()
+    dock._pipeline_state = "preflighting"
+    dock._pipeline_running = True
+    dock._pending_run = {"run_id": "attempt"}
+    dock._tile_cache_probe = probe if probe_started else None
+    dock.stop_btn = types.SimpleNamespace(
+        setEnabled=lambda value: terminal.append(("button", value))
+    )
+    dock.monitor_dialog = _Monitor()
+    dock._release_tile_cache_probe = lambda *, cancel=False: release_probe(
+        dock, cancel=cancel
+    )
+    dock._discard_pending_run_reservation = lambda: terminal.append(("discard", None))
+    dock._set_progress_terminal = lambda text: terminal.append(("terminal", text))
+    dock._update_start_enabled = lambda: terminal.append(("start", None))
+    dock._stop_before_inference = lambda: stop_before_inference(dock)
+    on_stop(dock)
+    assert dock._pipeline_state == "finished"
+    assert dock._pipeline_running is False
+    assert dock._pending_run is None
+    assert dock._tile_cache_probe is None
+    assert probe.cleaned == probe.deleted == int(probe_started)
+    assert ("discard", None) in terminal
+    assert ("terminal", "已停止") in terminal
+    assert ("finished", "已停止") in dock.monitor_dialog.events
+
+    # The QTimer callback scheduled by start may arrive after stop has
+    # completed. Its state guard must leave the stopped attempt untouched.
+    start_preflight(dock)
+    assert dock._tile_cache_probe is None
+    assert dock._pending_run is None
+
+    task = _Task()
+    dock._pipeline_state = "preparing"
+    dock._pipeline_running = True
+    dock._pending_run = {"run_id": "preparing-attempt"}
+    dock._run_preparation_task = task
+    terminal.clear()
+    on_stop(dock)
+    assert dock._pipeline_state == "stopping"
+    assert task.canceled
+    dock._cleaning_up = False
+    dock.sender = lambda: task
+    on_preparation_completed(dock)
+    assert dock._run_preparation_task is None
+    assert dock._pipeline_state == "finished"
+    assert dock._pipeline_running is False
+    assert dock._pending_run is None
+    assert ("terminal", "已停止") in terminal
 
 
 def test_probe_error_report_is_machine_readable(tmp_path, capsys):

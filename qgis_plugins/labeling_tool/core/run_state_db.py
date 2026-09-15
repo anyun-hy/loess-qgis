@@ -1798,16 +1798,6 @@ class RunStateDB:
             result.append(item)
         return result
 
-    def set_spatial_unit_status(
-        self, run_id: str, unit_id: str, status: str
-    ) -> bool:
-        with self.transaction() as connection:
-            return connection.execute(
-                """UPDATE spatial_units SET status=%s, updated_at=%s
-                   WHERE run_id=%s AND unit_id=%s""",
-                (str(status), _now(), str(run_id), str(unit_id)),
-            ).rowcount == 1
-
     def insert_stream_units(
         self,
         run_id: str,
@@ -5017,14 +5007,6 @@ class RunStateDB:
                     )
         return artifact_ids[0], artifact_ids[1]
 
-    def mark_artifact_failed(self, artifact_id: int) -> bool:
-        with self.transaction() as connection:
-            return connection.execute(
-                """UPDATE artifacts SET status='failed', updated_at=%s
-                   WHERE artifact_id=%s AND status='writing'""",
-                (_now(), int(artifact_id)),
-            ).rowcount == 1
-
     def add_artifact_dependency(self, job_id: int, artifact_id: int) -> bool:
         """Attach a ready input to a job; the trigger updates ref_count atomically."""
         with self.transaction() as connection:
@@ -5044,89 +5026,6 @@ class RunStateDB:
                 (int(job_id), int(artifact_id), _now()),
             )
             return cursor.rowcount == 1
-
-    def link_fragmentation_v33_input(
-        self,
-        run_id: str,
-        stream_id: str,
-        partition_id: str,
-        artifact_id: int,
-    ) -> int:
-        """Attach one ready owner input to every waiting V3.3 candidate."""
-
-        identifier = str(run_id)
-        stream = str(stream_id)
-        partition = str(partition_id)
-        now = _now()
-        with self.transaction() as connection:
-            artifact = connection.execute(
-                """SELECT kind FROM artifacts
-                   WHERE artifact_id=%s AND run_id=%s AND stream_id=%s
-                     AND unit_id=%s AND status='ready'
-                     AND kind IN ('partition_probability','v3_context_core',
-                                  'v3_baseline_core')""",
-                (int(artifact_id), identifier, stream, partition),
-            ).fetchone()
-            if artifact is None:
-                raise RunStateError(
-                    "V3.3 dependency Artifact is not ready or mismatched"
-                )
-            cursor = connection.execute(
-                """INSERT INTO artifact_dependencies
-                   (job_id, artifact_id, created_at)
-                   SELECT j.job_id, %s, %s FROM jobs j
-                   JOIN spatial_units u
-                     ON u.run_id=j.run_id AND u.unit_id=j.unit_id
-                   JOIN unit_dependencies d
-                     ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                   WHERE j.run_id=%s AND j.stream_id=%s
-                     AND j.job_type='fragmentation_v33'
-                     AND u.unit_type='FragmentationV33Partition'
-                     AND d.partition_id=%s
-                     AND j.status IN ('queued','interrupted','running') ON CONFLICT DO NOTHING""",
-                (int(artifact_id), now, identifier, stream, partition),
-            )
-            return cursor.rowcount
-
-    def link_partition_artifact(
-        self,
-        run_id: str,
-        stream_id: str,
-        partition_id: str,
-        artifact_id: int,
-    ) -> int:
-        """Link one ready Partition probability to every dependent unit job."""
-        with self.transaction() as connection:
-            artifact = connection.execute(
-                """SELECT 1 FROM artifacts WHERE artifact_id=%s AND run_id=%s
-                   AND stream_id=%s AND unit_id=%s AND kind='partition_probability'
-                   AND status='ready'"""
-                + " FOR UPDATE",
-                (int(artifact_id), str(run_id), str(stream_id), str(partition_id)),
-            ).fetchone()
-            if artifact is None:
-                raise RunStateError("Partition dependency Artifact is not ready or mismatched")
-            job_ids = [
-                int(row["job_id"])
-                for row in connection.execute(
-                    """SELECT j.job_id FROM jobs j
-                       JOIN unit_dependencies d
-                         ON d.run_id=j.run_id AND d.unit_id=j.unit_id
-                       WHERE j.run_id=%s AND j.stream_id=%s AND j.job_type='unit_fit'
-                         AND d.partition_id=%s""",
-                    (str(run_id), str(stream_id), str(partition_id)),
-                ).fetchall()
-            ]
-            now = _now()
-            inserted = 0
-            for job_id in job_ids:
-                cursor = connection.execute(
-                    """INSERT INTO artifact_dependencies
-                       (job_id, artifact_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING""",
-                    (job_id, int(artifact_id), now),
-                )
-                inserted += cursor.rowcount
-            return inserted
 
     def release_artifact_dependency(self, job_id: int, artifact_id: int) -> bool:
         """Release one job input; the trigger prevents a negative ref_count."""
@@ -5408,41 +5307,6 @@ class RunStateDB:
                 (str(run_id), str(stream_id)),
             ).fetchone()
         return dict(row)
-
-    def object_ids_for_parts(
-        self,
-        run_id: str,
-        stream_id: str,
-        part_ids: Sequence[str],
-    ) -> dict[str, str]:
-        """Resolve a bounded part batch using one connection, not one per feature."""
-        values = [str(part_id) for part_id in part_ids]
-        if not values:
-            return {}
-        result: dict[str, str] = {}
-        with self._connection() as connection:
-            for offset in range(0, len(values), 400):
-                batch = values[offset : offset + 400]
-                placeholders = ",".join("%s" for _ in batch)
-                rows = connection.execute(
-                    f"""SELECT part_id, object_id FROM object_nodes
-                        WHERE run_id=%s AND stream_id=%s
-                          AND part_id IN ({placeholders})""",
-                    (str(run_id), str(stream_id), *batch),
-                ).fetchall()
-                result.update(
-                    {
-                        str(row["part_id"]): str(row["object_id"])
-                        for row in rows
-                        if row["object_id"]
-                    }
-                )
-        missing = [part_id for part_id in values if part_id not in result]
-        if missing:
-            raise RunStateError(
-                f"object components are unresolved: {missing[:3]}"
-            )
-        return result
 
     def register_object_parts(
         self,
