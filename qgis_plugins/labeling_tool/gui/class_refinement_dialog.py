@@ -54,7 +54,7 @@ from ..core import accepted_writer, class_workspace, topology_validator
 from ..core.layer_names import LAYER_NAMES
 from ..core.sam3_worker_runner import Sam3WorkerRunner
 from ..core.qt_lifecycle import retire_after
-from ..core.refinement_task import RefinementTask
+from ..core.refinement_task import RefinementTask, file_identity
 from ..core.style_manager import StyleManager
 from ..core.run_spec import CLASS_NAMES, CLASS_ORDER
 from ..qt6_api import (
@@ -163,6 +163,7 @@ class ClassRefinementDialog(QDialog):
         self._candidate_band = None
         self._confidence_raster = None
         self._final_path = ""
+        self._final_input_identities = {}
         self._issues_path = ""
         self._issue_count = None
         self._build_ui()
@@ -527,6 +528,7 @@ class ClassRefinementDialog(QDialog):
         self._cancel_background_load(silent=True)
         self.table.setEnabled(True)
         self._final_path = ""
+        self._final_input_identities = {}
         self._issues_path = ""
         self._issue_count = None
         self.topology_btn.setEnabled(False)
@@ -3399,9 +3401,14 @@ class ClassRefinementDialog(QDialog):
         except RuntimeError as exc:
             return None, None, str(exc)
 
-    def _set_class_modified(self, class_code):
+    def _invalidate_final(self):
+        self._final_path = ""
+        self._final_input_identities = {}
         self._issue_count = None
         self._update_accept_enabled()
+
+    def _set_class_modified(self, class_code):
+        self._invalidate_final()
         record = self._workspace["classes"][str(class_code)]
         record["modified"] = True
         record["confirmed"] = False
@@ -4080,6 +4087,7 @@ class ClassRefinementDialog(QDialog):
         finally:
             self._metadata_update = False
         record["confirmed"] = bool(checked)
+        self._invalidate_final()
         record["state"] = (
             "confirmed_empty" if checked and layer.featureCount() == 0
             else "confirmed" if checked
@@ -4206,6 +4214,7 @@ class ClassRefinementDialog(QDialog):
             f"14 类确认: {confirmed}/14    未解决问题: {issue_text}    "
             f"未保存编辑: {len(modified)}"
         )
+        self._update_accept_enabled()
 
     def _assemble_final(self):
         self._start_refinement_task(assemble=True)
@@ -4253,6 +4262,10 @@ class ClassRefinementDialog(QDialog):
             published = task.publish()
             if task.assemble:
                 self._final_path = published["final_path"]
+                self._final_input_identities = {
+                    str(record["path"]): task.identities[str(record["path"])]
+                    for record in task.workspace["classes"].values()
+                }
             issues_path = published["issues_path"]
             self._issues_path = issues_path
             self._issue_count = int(result["issue_count"])
@@ -4284,16 +4297,21 @@ class ClassRefinementDialog(QDialog):
         self.fusion_combo.setEnabled(self._workspace is None and bool(self._eligible_fusions))
         self.cancel_load_btn.setText("取消后台加载")
         self.cancel_load_btn.hide()
-        self.topology_btn.setEnabled(bool(self._final_path))
         self._update_actions()
-        self._update_accept_enabled()
 
     def _check_topology(self):
         if not self._final_path:
             return
+        if not self._final_matches_workspace():
+            QMessageBox.warning(self, "拓扑检查", "分类工作层已变化，请先重新组装最终图层")
+            return
         self._start_refinement_task(assemble=False)
 
     def _write_accepted(self):
+        if self._refinement_task is not None or not self._final_matches_workspace():
+            self._update_accept_enabled()
+            QMessageBox.warning(self, "入库", "请保存编辑、确认全部类别并重新组装最终图层")
+            return
         if self._issue_count is None:
             QMessageBox.warning(self, "入库", "必须先完成拓扑检查")
             return
@@ -4313,11 +4331,31 @@ class ClassRefinementDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "写入 accepted_labels 失败", str(exc))
 
+    def _final_matches_workspace(self):
+        if (
+            not self._final_path or not self._workspace
+            or not self._final_input_identities
+            or self._active_session or self._manual_task
+            or self._editable_modified_layers()
+        ):
+            return False
+        classes = self._workspace["classes"]
+        if any(not classes.get(str(code), {}).get("confirmed") for code in CLASS_ORDER):
+            return False
+        try:
+            return self._final_input_identities == {
+                str(record["path"]): file_identity(record["path"])
+                for record in classes.values()
+            }
+        except OSError:
+            return False
+
     def _update_accept_enabled(self, *_args):
+        current = self._refinement_task is None and self._final_matches_workspace()
+        self.topology_btn.setEnabled(current)
         self.accept_btn.setEnabled(
             bool(
-                self._final_path
-                and self._refinement_task is None
+                current
                 and self._issue_count is not None
                 and (
                     self._issue_count == 0

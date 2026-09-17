@@ -196,6 +196,51 @@ def _database_scalar(database, statement, parameters=()):
         return connection.execute(statement, parameters).fetchone()[0]
 
 
+def test_changed_source_stops_package_before_loading_models(tmp_path, postgres_database):
+    from tile_materializer import TileMaterializationError
+
+    spec, spec_path, _database_path = _single_tile_two_model_run(
+        tmp_path, postgres_database, run_id="20260917_120000_source"
+    )
+    source = Path(spec["raster"]["path"])
+    replacement = source.with_name("replacement.tif")
+    replacement.write_bytes(source.read_bytes())
+    replacement.replace(source)
+    loaded = []
+    provider = PersistentModelProvider(lambda entry, _device: loaded.append(entry))
+
+    with pytest.raises(TileMaterializationError, match="原始影像已变更"):
+        run_work_package(
+            spec_path, "package_00000", device="cpu", model_provider=provider
+        )
+    assert loaded == []
+    assert postgres_database.get_work_package(spec["run_id"], "package_00000")["status"] == "failed"
+    assert _database_scalar(postgres_database, "SELECT COUNT(*) FROM artifacts") == 0
+
+
+def test_run_creation_rejects_source_change_before_freezing_spec(
+    tmp_path, monkeypatch, postgres_database
+):
+    from os import utime
+    from labeling_tool.core import run_builder_v5
+
+    read_identity = run_builder_v5.source_raster_identity
+
+    def change_after_snapshot(path):
+        identity = read_identity(path)
+        info = path.stat()
+        utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+        return identity
+
+    monkeypatch.setattr(run_builder_v5, "source_raster_identity", change_after_snapshot)
+    with pytest.raises(run_builder_v5.RunBuilderV5Error, match="原始影像已变更"):
+        _single_tile_two_model_run(
+            tmp_path, postgres_database, run_id="20260917_120001_source"
+        )
+    assert _database_scalar(postgres_database, "SELECT COUNT(*) FROM runs") == 0
+    assert not list(tmp_path.rglob("run_spec.json"))
+
+
 def _database_rows(database, statement, parameters=()):
     with database._connection() as connection:
         return connection.execute(statement, parameters).fetchall()

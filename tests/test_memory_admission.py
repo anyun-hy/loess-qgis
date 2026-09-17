@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from labeling_tool.core.memory_admission import (
     AdaptiveMemoryAdmissionController,
     GIB,
@@ -256,6 +258,25 @@ def test_unavailable_sensor_preserves_static_cross_platform_fallback():
     assert decision.geometry_slot_limit == 12
     assert decision.pause_new_work is False
     assert decision.reason == "pressure_sensor_unavailable_static_fallback"
+
+
+@pytest.mark.parametrize("static_limit,available_gib,expected", [(16, 80, 4), (3, 80, 3), (16, 25, 2)])
+def test_idle_recovery_fits_one_worker_without_exceeding_cpu_or_memory(
+    static_limit, available_gib, expected,
+):
+    controller = AdaptiveMemoryAdmissionController()
+    pressure = controller.decide(static_limit=static_limit, active_slots=4,
+                                 package_active=False, now=0, sample=_sample(some=10))
+    assert pressure.geometry_slot_limit == 2
+    before = controller.decide(static_limit=static_limit, active_slots=0,
+                               package_active=False, minimum_geometry_slots=4,
+                               now=4.9, sample=_sample(available_gib=available_gib))
+    assert before.geometry_slot_limit == 2
+    recovered = controller.decide(static_limit=static_limit, active_slots=0,
+                                  package_active=False, minimum_geometry_slots=4,
+                                  now=5, sample=_sample(available_gib=available_gib))
+    assert recovered.geometry_slot_limit == expected
+    assert not recovered.pause_new_work
 
 
 def test_zero_available_memory_remains_a_supported_severe_sample(tmp_path):

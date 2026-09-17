@@ -303,6 +303,7 @@ class AdaptiveMemoryAdmissionController:
         static_limit: int,
         active_slots: int,
         package_active: bool,
+        minimum_geometry_slots: int = 1,
         now: float | None = None,
         sample: MemoryPressureSample | None = None,
     ) -> MemoryAdmissionDecision:
@@ -391,6 +392,18 @@ class AdaptiveMemoryAdmissionController:
                 shed = False
                 reason = "memory_pressure"
                 self._last_growth_at = observed_at
+            elif (
+                stable and active == 0
+                and self._limit < min(ceiling, max(1, int(minimum_geometry_slots)))
+                and observed_at - self._last_growth_at
+                >= float(self._policy["stable_growth_sec"])
+            ):
+                # No completed-worker observation can arrive while the budget
+                # cannot fit even one worker. Restore that floor only when idle;
+                # the available-memory ceiling below still applies.
+                self._limit = min(ceiling, max(1, int(minimum_geometry_slots)))
+                self._last_growth_at = observed_at
+                reason = "idle_worker_recovery"
             elif (
                 stable
                 and active >= self._limit

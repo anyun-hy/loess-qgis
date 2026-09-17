@@ -108,6 +108,9 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path, postgres_database)
         run_id="20260717_210000_fixture",
         deployment_project_root=deployment_project,
     )
+    from labeling_tool.core.run_spec import source_raster_identity
+
+    assert spec["raster"]["file_identity"] == source_raster_identity(raster)
     assert spec["schema_version"] == 2
     assert spec["deployment_identity"]["status"] == "manifest_recorded"
     assert spec["deployment_identity"]["git_sha"] == "a" * 40

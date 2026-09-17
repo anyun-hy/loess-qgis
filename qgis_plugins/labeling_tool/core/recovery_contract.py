@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 from .deployment_contract import deployment_fingerprint, verify_project_runtime
 from .postgres_state import is_postgres_location
-from .run_spec import RUN_ID_PATTERN, sha256_file
+from .run_spec import RUN_ID_PATTERN, RunSpecError, sha256_file, validate_source_raster
 from .run_state_db import RunStateDB, SCHEMA_VERSION
 
 
@@ -96,6 +96,11 @@ def validate_recovery_run(
             "Run 创建时的部署指纹与当前代码/项目配置不一致；"
             "旧 Run 不能继续，请使用当前部署创建新 Run"
         )
+
+    try:
+        validate_source_raster(spec.get("raster"))
+    except RunSpecError as error:
+        raise RecoveryContractError(str(error)) from error
 
     state_backend = str(spec.get("state_backend") or "").strip().lower()
     state_location = str(spec.get("state_db") or "").strip()

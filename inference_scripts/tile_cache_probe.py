@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from labeling_tool.core.run_spec import source_raster_identity
 from tile_materializer import (
     TILE_MATERIALIZATION_METHOD_VERSION,
     _materialize_one,
@@ -85,7 +86,11 @@ def measure_tile_cache(
         temporary_path = Path(temporary_context.name)
 
     try:
-        result = _materialize_one(source, temporary_path, tile)
+        result = _materialize_one(
+            {"path": str(source), "file_identity": source_raster_identity(source)},
+            temporary_path,
+            tile,
+        )
         if result.get("reused"):
             raise TileCacheProbeError("Tile cache probe unexpectedly reused a file")
         tile_path = Path(str(result["tile_path"]))

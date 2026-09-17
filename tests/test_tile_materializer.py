@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +10,7 @@ from rasterio.transform import from_origin
 import tile_materializer
 from storage_guard import StorageGuard
 from tile_materializer import _materialize_one
+from labeling_tool.core.run_spec import reserve_run_directory, source_raster_identity
 
 
 def _source_raster(path):
@@ -23,6 +26,87 @@ def _source_raster(path):
         transform=from_origin(0, 512, 1, 1),
     ) as destination:
         destination.write(np.zeros((3, 512, 512), dtype=np.uint8))
+
+
+def _package_fixture(tmp_path):
+    output = tmp_path.resolve()
+    run_id, run_dir = reserve_run_directory(output)
+    source = output / "source.tif"
+    _source_raster(source)
+    spec = {
+        "run_id": run_id, "run_dir": str(run_dir), "output_root": str(output),
+        "cache_root": str(output / "cache" / run_id),
+        "tile_cache_dir": str(output / "cache" / run_id / "tile_cache"),
+        "raster": {"path": str(source), "file_identity": source_raster_identity(source)},
+    }
+    tiles = [{"tile_id": "tile-0-0", "row_no": 0, "col_no": 0,
+              "pixel_window": {"x0": 0, "y0": 0, "x1": 512, "y1": 512}}]
+    return source, spec, tiles
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_package_rejects_changed_source_even_with_valid_cached_tiles(tmp_path, cached):
+    source, spec, tiles = _package_fixture(tmp_path)
+    if cached:
+        first = tile_materializer.materialize_package_tiles(spec, tiles, workers=1)
+        tiles[0]["sha256"] = first[0]["sha256"]
+        assert tile_materializer.materialize_package_tiles(spec, tiles)[0]["reused"]
+    previous = source.stat()
+    with rasterio.open(source, "r+") as dataset:
+        dataset.write(np.ones((3, 512, 512), dtype=np.uint8))
+    # Same length and restored mtime must not hide an ordinary in-place edit.
+    os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    assert source.stat().st_size == previous.st_size
+
+    with pytest.raises(tile_materializer.TileMaterializationError, match="原始影像已变更"):
+        tile_materializer.materialize_package_tiles(spec, tiles, workers=1)
+
+
+def test_package_rejects_source_changed_during_read(tmp_path, monkeypatch):
+    source, spec, tiles = _package_fixture(tmp_path)
+    original_source = tile_materializer._source
+
+    def changing_source(path):
+        dataset = original_source(path)
+
+        class ChangingReader:
+            def __getattr__(self, name):
+                return getattr(dataset, name)
+
+            def read(self, *args, **kwargs):
+                image = dataset.read(*args, **kwargs)
+                info = source.stat()
+                os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                return image
+
+        return ChangingReader()
+
+    monkeypatch.setattr(tile_materializer, "_source", changing_source)
+    with pytest.raises(tile_materializer.TileMaterializationError, match="原始影像已变更"):
+        tile_materializer.materialize_package_tiles(spec, tiles, workers=1)
+    assert not list((tmp_path / "cache").rglob("*.tif"))
+
+
+def test_package_rejects_legacy_source_without_identity(tmp_path):
+    _source, spec, tiles = _package_fixture(tmp_path)
+    del spec["raster"]["file_identity"]
+    with pytest.raises(tile_materializer.TileMaterializationError, match="缺少原始影像身份记录"):
+        tile_materializer.materialize_package_tiles(spec, tiles)
+    assert not list(Path(spec["tile_cache_dir"]).iterdir())
+
+
+def test_package_checks_source_again_before_returning_cached_tiles(tmp_path):
+    source, spec, tiles = _package_fixture(tmp_path)
+    first = tile_materializer.materialize_package_tiles(spec, tiles)
+    tiles[0]["sha256"] = first[0]["sha256"]
+
+    def change_after_last_tile(_current, _total, result):
+        assert result["reused"]
+        info = source.stat()
+        os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(tile_materializer.TileMaterializationError, match="原始影像已变更"):
+        tile_materializer.materialize_package_tiles(spec, tiles, progress=change_after_last_tile)
 
 
 def test_materializer_settles_successful_write_to_actual_bytes(tmp_path):
@@ -46,7 +130,7 @@ def test_materializer_settles_successful_write_to_actual_bytes(tmp_path):
         )["reserved_growth_bytes"]
 
     result = _materialize_one(
-        source,
+        {"path": str(source), "file_identity": source_raster_identity(source)},
         output,
         {
             "tile_id": "tile-0-0",
@@ -104,7 +188,7 @@ def test_materializer_releases_failed_write_reservation(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="injected Tile writer failure"):
         _materialize_one(
-            source,
+            {"path": str(source), "file_identity": source_raster_identity(source)},
             output,
             tile,
             before_write=reserve,

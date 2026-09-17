@@ -15,10 +15,13 @@ from .run_spec import (
     CLASS_NAMES,
     CLASS_ORDER,
     RESERVATION_FILE,
+    RunSpecError,
     atomic_write_json,
     reserve_run_directory,
     run_tile_cache_dir,
     sha256_file,
+    source_raster_identity,
+    validate_source_raster,
 )
 from .postgres_state import is_postgres_location
 from .run_state_db import (
@@ -252,6 +255,11 @@ def create_v5_run(
             "no longer supported"
         )
     state_schema = production_state_schema()
+    raster_path = Path(str(raster["path"])).expanduser().resolve()
+    try:
+        raster_identity = source_raster_identity(raster_path)
+    except RunSpecError as error:
+        raise RunBuilderV5Error(str(error)) from error
     output = Path(output_root).expanduser().resolve()
     if reserved_run_dir is None:
         identifier, run_dir = reserve_run_directory(output, run_id)
@@ -594,7 +602,8 @@ def create_v5_run(
         "cache_root": str(run_tile_cache_dir(output, identifier).parent),
         "tile_cache_dir": str(run_tile_cache_dir(output, identifier)),
         "raster": {
-            "path": str(Path(str(raster["path"])).expanduser().resolve()),
+            "path": str(raster_path),
+            "file_identity": raster_identity,
             "crs": str(raster["crs"]),
             "transform": [float(value) for value in raster["transform"]],
             "nodata": raster.get("nodata"),
@@ -657,6 +666,10 @@ def create_v5_run(
         "state_db": state_location,
         "state_schema": state_schema,
     }
+    try:
+        validate_source_raster(spec["raster"])
+    except RunSpecError as error:
+        raise RunBuilderV5Error(str(error)) from error
     spec["run_spec_content_sha256"] = _json_sha(spec)
     spec_path = run_dir / "run_spec.json"
     atomic_write_json(spec_path, spec)

@@ -14,6 +14,29 @@ for path in (ROOT / "inference_scripts", ROOT / "qgis_plugins"):
 
 
 @pytest.fixture
+def run_qgis_integrity_case():
+    """Keep pytest in Conda and run QGIS-dependent assertions in its native host."""
+    import subprocess
+
+    def run(case):
+        environment = os.environ.copy()
+        if environment.get("LOESS_TEST_QGIS_PYTHONPATH"):
+            environment["PYTHONPATH"] = environment["LOESS_TEST_QGIS_PYTHONPATH"]
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+        result = subprocess.run(
+            [environment.get("LOESS_TEST_QGIS_PYTHON") or sys.executable, "-B",
+             str(ROOT / "tests/qgis_integrity_probe.py"), str(ROOT), case],
+            env=environment, capture_output=True, text=True, timeout=40,
+        )
+        if result.returncode == 77 and "LOESS_TEST_QGIS_PYTHON" not in environment:
+            pytest.skip("Native QGIS unavailable; set LOESS_TEST_QGIS_PYTHON")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().endswith(case + ": passed"), result.stdout
+
+    return run
+
+
+@pytest.fixture
 def postgres_database_factory(monkeypatch):
     """Create isolated PostgreSQL schemas and remove them after each test.
 

@@ -13,6 +13,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -66,6 +67,39 @@ APPROVAL_CRITERION = "fusion.test_miou > exported_swin_baseline.test_miou"
 
 class RunSpecError(ValueError):
     pass
+
+
+def source_raster_identity(path: os.PathLike[str] | str) -> dict[str, int]:
+    """Detect ordinary source-file edits/replacement without reading a large TIFF.
+
+    This is a filesystem identity check, not a cryptographic content digest.
+    ctime also detects writes that restore the previous size and mtime.
+    """
+    try:
+        info = Path(path).stat()
+    except OSError as error:
+        raise RunSpecError(f"原始影像缺失或无法访问，不能继续: {path}") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise RunSpecError(f"原始影像不是普通文件，不能继续: {path}")
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+
+def validate_source_raster(raster: Mapping[str, Any] | None) -> Path:
+    """Fail closed when a Run's source identity is missing or has changed."""
+    if not isinstance(raster, Mapping) or not raster.get("path") or not isinstance(
+        raster.get("file_identity"), Mapping
+    ):
+        raise RunSpecError("Run 缺少原始影像身份记录，不能继续；请创建新 Run")
+    path = Path(str(raster["path"])).expanduser()
+    if source_raster_identity(path) != raster["file_identity"]:
+        raise RunSpecError(f"原始影像已变更，不能继续当前 Run: {path}")
+    return path
 
 
 def sha256_file(path: os.PathLike[str] | str) -> str:

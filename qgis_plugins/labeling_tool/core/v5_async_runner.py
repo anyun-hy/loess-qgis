@@ -768,6 +768,7 @@ class V5AsyncInferenceRunner(QObject):
         if not self._running:
             return
         self._stopped = True
+        self._assembly_queue.clear()
         self._scheduler.stop()
         self._watchdog.stop()
         self._heartbeat_timer.stop()
@@ -820,6 +821,7 @@ class V5AsyncInferenceRunner(QObject):
         static_limit,
         active_jobs,
         package_active,
+        minimum_geometry_slots=1,
     ):
         active_slots = sum(
             self._geometry_job_threads(self._spec, job) for job in active_jobs
@@ -839,6 +841,7 @@ class V5AsyncInferenceRunner(QObject):
             static_limit=static_limit,
             active_slots=active_slots,
             package_active=package_active,
+            minimum_geometry_slots=minimum_geometry_slots,
         )
         now = time.monotonic()
         last_log = float(getattr(self, "_last_memory_admission_log_at", 0.0))
@@ -1015,6 +1018,18 @@ class V5AsyncInferenceRunner(QObject):
             accelerator_active
             or (not self._accelerator_done and package_pending)
         )
+        fragmentation = dict(self._spec.get("fragmentation_regularization") or {})
+        v33_enabled = bool(
+            fragmentation.get("enabled") is True
+            and fragmentation.get("policy_id")
+            == "fragmentation_v33_configurable_absorption_v1"
+            and fragmentation.get("publication") == "authoritative_fusion_core"
+        )
+        minimum_geometry_slots = _unit_fit_process_threads(self._spec)
+        if v33_enabled:
+            minimum_geometry_slots = max(
+                minimum_geometry_slots, _fragmentation_v33_process_threads(self._spec)
+            )
         static_geometry_limit = geometry_thread_budget(
             self._spec,
             package_active=package_expected,
@@ -1023,6 +1038,7 @@ class V5AsyncInferenceRunner(QObject):
             static_limit=static_geometry_limit,
             active_jobs=active_jobs,
             package_active=package_expected,
+            minimum_geometry_slots=minimum_geometry_slots,
         )
         if memory_decision.shed_active_work:
             self._shed_geometry_to_limit(
@@ -1043,14 +1059,6 @@ class V5AsyncInferenceRunner(QObject):
             else:
                 self._accelerator_done = True
 
-        fragmentation = dict(self._spec.get("fragmentation_regularization") or {})
-        production_v33 = bool(
-            fragmentation.get("enabled") is True
-            and fragmentation.get("policy_id")
-            == "fragmentation_v33_configurable_absorption_v1"
-            and fragmentation.get("publication") == "authoritative_fusion_core"
-        )
-        v33_enabled = production_v33
         if v33_enabled:
             candidate_counts = self._database.job_counts(
                 self._spec["run_id"], job_type="fragmentation_v33"
@@ -1129,6 +1137,11 @@ class V5AsyncInferenceRunner(QObject):
         if counts.get("failed"):
             self._finish(False, f"v5 jobs exhausted retries: {counts}")
         elif counts.get("queued") or counts.get("interrupted") or counts.get("running"):
+            if memory_decision.geometry_slot_limit < min(
+                static_geometry_limit, minimum_geometry_slots
+            ):
+                self._emit_progress("等待内存预算恢复，暂时无法容纳一个几何任务")
+                return
             self._finish(False, f"v5 job graph has blocked dependencies: {counts}")
         else:
             self._phase = "finalize"
@@ -1211,6 +1224,8 @@ class V5AsyncInferenceRunner(QObject):
         )
 
     def _start_assembly(self):
+        if not self._running or self._stopped or self._phase != "assembly":
+            return
         scaling = self._spec.get("scaling") or {}
         max_concurrent = max(
             1,
@@ -1258,6 +1273,8 @@ class V5AsyncInferenceRunner(QObject):
         standalone fragmentation script.  New v5 Runs never launch it or let
         it replace the formal assembled GPKG.
         """
+        if not self._running or self._stopped or self._phase != "assembly":
+            return
         self._phase = "acceptance"
         self._start_process(
             "scale_acceptance",

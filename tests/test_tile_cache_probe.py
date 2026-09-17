@@ -20,6 +20,7 @@ from labeling_tool.core.run_spec import (
     RESERVATION_FILE,
     reserve_run_directory,
     run_tile_cache_dir,
+    source_raster_identity,
 )
 
 
@@ -245,7 +246,11 @@ def test_probe_uses_production_materializer_and_measures_real_uint16_tile(tmp_pa
 
     report = measure_tile_cache(source, output_root, _request())
 
-    direct = _materialize_one(source, tmp_path / "direct", _request())
+    direct = _materialize_one(
+        {"path": str(source), "file_identity": source_raster_identity(source)},
+        tmp_path / "direct",
+        _request(),
+    )
     assert report["status"] == "passed"
     assert report["measurement_method"] == "tile_materializer._materialize_one"
     assert (

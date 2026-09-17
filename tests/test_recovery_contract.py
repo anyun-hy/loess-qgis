@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from labeling_tool.core import recovery_contract
-from labeling_tool.core.run_spec import sha256_file
+from labeling_tool.core.run_spec import sha256_file, source_raster_identity
 from labeling_tool.core.run_state_db import RunStateDB
 
 
@@ -29,7 +30,10 @@ def _run_fixture(tmp_path: Path, fingerprint: str, database, *, database_sha=Non
     run_dir = output_root / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
     spec_path = run_dir / "run_spec.json"
+    raster_path = tmp_path / "source.tif"
+    raster_path.write_bytes(b"source fixture")
     spec = {
+        "raster": {"path": str(raster_path), "file_identity": source_raster_identity(raster_path)},
         "schema_version": 2,
         "run_id": RUN_ID,
         "run_dir": str(run_dir),
@@ -64,6 +68,43 @@ def _ready_deployment(monkeypatch, fingerprint):
         "deployment_fingerprint",
         lambda *_args: fingerprint,
     )
+
+
+@pytest.mark.parametrize("change", ["replace", "delete", "missing_identity"])
+def test_recovery_rejects_unverified_source_before_opening_database(
+    tmp_path, monkeypatch, postgres_database, change
+):
+    fingerprint = "sha256:" + "a" * 64
+    spec_path, _database = _run_fixture(tmp_path, fingerprint, postgres_database)
+    spec = json.loads(spec_path.read_text())
+    source = Path(spec["raster"]["path"])
+    if change == "replace":
+        previous = source.stat()
+        replacement = tmp_path / "replacement.tif"
+        replacement.write_bytes(source.read_bytes())
+        os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        replacement.replace(source)
+        message = "原始影像已变更"
+    elif change == "delete":
+        source.unlink()
+        message = "原始影像缺失"
+    else:
+        del spec["raster"]["file_identity"]
+        spec.pop("run_spec_content_sha256")
+        spec["run_spec_content_sha256"] = _content_sha(spec)
+        spec_path.write_text(json.dumps(spec))
+        message = "缺少原始影像身份记录"
+    before = spec_path.read_bytes()
+    _ready_deployment(monkeypatch, fingerprint)
+    opened = []
+    monkeypatch.setattr(
+        recovery_contract, "RunStateDB", lambda *_args, **_kwargs: opened.append(True)
+    )
+
+    with pytest.raises(recovery_contract.RecoveryContractError, match=message):
+        recovery_contract.validate_recovery_run(spec_path, tmp_path / "inference_scripts")
+    assert opened == []
+    assert spec_path.read_bytes() == before
 
 
 def test_valid_recovery_contract_returns_bound_spec_and_database(

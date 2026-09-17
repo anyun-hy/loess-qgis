@@ -428,6 +428,102 @@ def refinement(app, root):
                 cancelled_output_preserved=True)
 
 
+def refinement_freshness(app, root):
+    """Reassembly is required after saved edits; the writer also fences stale input."""
+    from types import SimpleNamespace
+    from qgis.gui import QgsMapCanvas
+    from qgis.PyQt.QtCore import QEventLoop
+    from labeling_tool.gui import class_refinement_dialog as ui
+
+    spec, workspace = fixture(root)
+    canvas = QgsMapCanvas()
+    dialog = ui.ClassRefinementDialog(
+        SimpleNamespace(mapCanvas=lambda: canvas, activeLayer=lambda: None),
+        SimpleNamespace(load_final_composite=lambda *args: None,
+                        load_topology_issues=lambda *args: None),
+    )
+    layers = {int(code): QgsVectorLayer(record['path'] + '|layername=' + record['layer_name'], code, 'ogr')
+              for code, record in workspace['classes'].items()}
+    dialog._run_spec, dialog._workspace = spec, workspace
+    dialog._class_layers = {code: layer.id() for code, layer in layers.items()}
+    dialog._layer = lambda code: layers[code]
+
+    def assemble():
+        for record in workspace['classes'].values():
+            record['sha256'] = sha256_file(record['path'])
+            record['confirmed'] = True
+        dialog._assemble_final()
+        task = dialog._refinement_task
+        assert task is not None
+        loop = QEventLoop()
+        task.taskCompleted.connect(loop.quit)
+        task.taskTerminated.connect(loop.quit)
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+        deadline.timeout.connect(loop.quit)
+        deadline.start(20000)
+        loop.exec()
+        deadline.stop()
+        assert dialog._refinement_task is None, task.error_message
+        assert dialog.accept_btn.isEnabled(), task.error_message
+
+    def edit(width):
+        layer = layers[12]
+        assert layer.startEditing()
+        shape = QgsGeometry.fromRect(QgsRectangle(0, 0, width, 1))
+        shape.convertToMultiType()
+        assert layer.changeGeometry(next(layer.getFeatures()).id(), shape)
+        return layer
+
+    layer = final = None
+    try:
+        with patch.object(ui.QMessageBox, 'warning') as warning, \
+             patch.object(ui.accepted_writer, 'append_final_to_accepted', return_value=1) as write:
+            assemble()
+            dialog._write_accepted()
+            assert write.call_count == 1
+            write.reset_mock()
+            layer = edit(0.5)
+            dialog._write_accepted()
+            assert not write.called, 'unsaved edits reached accepted writer'
+            assert layer.commitChanges()
+            dialog._set_class_modified(12)
+            dialog._check_topology()
+            assert dialog._refinement_task is None, 'stale final was checked again'
+            dialog._write_accepted()
+            assert not write.called
+            assert not dialog.accept_btn.isEnabled()
+            assemble()
+            final = QgsVectorLayer(dialog._final_path + '|layername=final_composite', 'new', 'ogr')
+            assert next(final.getFeatures()).geometry().area() == 0.5
+            dialog._write_accepted()
+            assert write.call_count == 1, 'reassembled final could not be accepted'
+            write.reset_mock()
+            # A file edit without a GUI notification must also be rejected at entry.
+            layer = edit(0.75)
+            assert layer.commitChanges()
+            dialog._update_accept_enabled()
+            assert not dialog.accept_btn.isEnabled()
+            dialog._write_accepted()
+            assert not write.called
+            assert warning.called
+    finally:
+        dialog.cleanup()
+        dialog.hide()
+        canvas.hide()
+        # Drain OGR connection disposal while QGIS's provider registry is alive.
+        dialog._layer = None
+        layers.clear()
+        layer = final = None
+        dialog.deleteLater()
+        canvas.deleteLater()
+        from qgis.PyQt.QtCore import QEvent
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+    return dict(stale_final_blocked=True, reassembly_restores_acceptance=True,
+                unsaved_and_external_edits_blocked=True)
+
+
 def manual_candidates(app, root):
     """Exercise temporary pending bands on a native canvas without project data."""
     from qgis.gui import QgsMapCanvas, QgsRubberBand

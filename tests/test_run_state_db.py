@@ -99,7 +99,7 @@ def test_monitor_history_uses_independent_execution_and_attempt_ids(postgres_dat
     )
     next_execution = database.begin_monitor_execution(RUN_ID, "resume")
     assert next_execution != execution_id
-    snapshot = database.monitor_history_snapshot(RUN_ID)
+    snapshot = database.monitor_snapshot(RUN_ID)["monitor_history"]
     assert snapshot["available"] is True
     assert snapshot["latest_execution"]["execution_id"] == next_execution
     assert snapshot["span_status_counts"] == {"completed": 1}

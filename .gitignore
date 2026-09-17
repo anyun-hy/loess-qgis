@@ -12,6 +12,7 @@ htmlcov/
 
 # External agent/tool state
 /AGENTS.md
+/.agent/
 /.omo/
 /.opencode/
 

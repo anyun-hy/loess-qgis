@@ -211,6 +211,8 @@ def _runner(module):
             "profile_id": "approved",
         },
     ]
+    runner._running = True
+    runner._stopped = False
     runner._spec = {
         "streams": list(runner._assembly_queue),
         "fragmentation_regularization": {
@@ -429,6 +431,72 @@ def test_scheduler_pauses_dispatch_and_requests_load_shedding_on_pressure(
     assert progress == [
         "检测到内存压力，已暂停派发并动态降低并发；现有安全任务完成后自动恢复"
     ]
+
+
+def test_scheduler_waits_for_memory_then_dispatches_v33_after_idle_recovery(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._phase = "jobs"
+    runner._accelerator_done = True
+    runner._spec.update({
+        "run_id": "run-1",
+        "scaling": {"max_cpu_partition_workers": 16},
+        "resource_tuning": {"resolved": {"fragmentation_v33_process_threads": 4}},
+        "fragmentation_regularization": {
+            "enabled": True, "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+        },
+    })
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=25 * 1024**3, some_avg10=10)
+    now = [0.0]
+    runner._memory_admission = module.AdaptiveMemoryAdmissionController(
+        sampler=lambda: sample, clock=lambda: now[0],
+    )
+    runner._memory_admission.decide(static_limit=16, active_slots=4, package_active=False)
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._finish = lambda *args: pytest.fail(f"resource wait must not finish Run: {args}")
+    progress, leased, started = [], [], []
+    runner._emit_progress = progress.append
+    job = {"job_id": 1, "job_type": "fragmentation_v33"}
+    def lease(*args, **kwargs):
+        leased.append(True)
+        return job if len(leased) == 1 else None
+    runner._database = types.SimpleNamespace(
+        job_counts=lambda *args, job_type="": {"ready": 1} if job_type == "work_package" else {"queued": 1},
+        lease_next_job=lambda *args, **kwargs: None,
+        lease_next_fragmentation_v33=lease,
+    )
+    runner._start_job = started.append
+    # Pressure is gone, but reserve leaves room for only two slots.
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=25 * 1024**3)
+    now[0] = 6
+    runner._schedule()
+    assert not leased and not started
+    assert progress
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=80 * 1024**3)
+    now[0] = 12
+    runner._schedule()
+    assert started == [job]
+
+
+@pytest.mark.parametrize("callback", ["_start_assembly", "_start_acceptance"])
+def test_queued_phase_callback_cannot_launch_after_stop(monkeypatch, callback):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._spec["run_id"] = "run-1"
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._database = types.SimpleNamespace(set_run_status=lambda *args, **kwargs: None)
+    runner._finish = lambda *args: setattr(runner, "_running", False)
+    runner._start_process = lambda *args: pytest.fail("stopped Run started a process")
+    queued = getattr(runner, callback)
+    runner.stop()
+    queued()
+    assert not runner._assembly_queue
 
 
 def test_memory_shed_interrupts_job_before_nonblocking_process_termination(

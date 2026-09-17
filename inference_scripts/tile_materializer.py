@@ -17,6 +17,7 @@ from rasterio.windows import Window, bounds as window_bounds, from_bounds
 from labeling_tool.core.run_spec import (
     RunSpecError,
     validated_run_tile_cache_dir,
+    validate_source_raster,
 )
 
 
@@ -28,6 +29,13 @@ TILE_MATERIALIZATION_METHOD_VERSION = "gtiff-rgb-512-v1"
 
 
 _THREAD_LOCAL = threading.local()
+
+
+def _validated_source(raster: Mapping[str, Any] | None) -> Path:
+    try:
+        return validate_source_raster(raster)
+    except RunSpecError as error:
+        raise TileMaterializationError(str(error)) from error
 
 
 def _sha256(path: Path) -> str:
@@ -99,13 +107,14 @@ def _valid_existing(path: Path, expected_sha: str) -> str:
 
 
 def _materialize_one(
-    source_path: Path,
+    raster: Mapping[str, Any],
     output_dir: Path,
     tile: Mapping[str, Any],
     *,
     before_write: Callable[[str, int], int | None] | None = None,
     managed_delta: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
+    source_path = _validated_source(raster)
     tile_id = str(tile["tile_id"])
     row = int(tile.get("row_no", tile.get("row", 0)))
     col = int(tile.get("col_no", tile.get("col", 0)))
@@ -152,6 +161,7 @@ def _materialize_one(
     if int(window.width) != 512 or int(window.height) != 512:
         raise TileMaterializationError(f"Tile {tile_id} source window is {int(window.width)}x{int(window.height)}, expected 512x512")
     image = source.read((1, 2, 3), window=window, boundless=False)
+    _validated_source(raster)
     if image.shape != (3, 512, 512):
         raise TileMaterializationError(f"Tile {tile_id} read shape is {image.shape}, expected (3,512,512)")
     if before_write is not None and managed_delta is None:
@@ -246,9 +256,8 @@ def materialize_package_tiles(
     before_write: Callable[[str, int], int | None] | None = None,
     managed_delta: Callable[..., None] | None = None,
 ) -> list[dict[str, Any]]:
-    source_path = Path(str((spec.get("raster") or {}).get("path") or "")).resolve()
-    if not source_path.is_file():
-        raise TileMaterializationError(f"source image is missing: {source_path}")
+    raster = spec.get("raster")
+    _validated_source(raster)
     try:
         output_dir = validated_run_tile_cache_dir(spec)
     except RunSpecError as error:
@@ -264,7 +273,7 @@ def materialize_package_tiles(
         for current, result in enumerate(
             executor.map(
                 lambda item: _materialize_one(
-                    source_path,
+                    raster,
                     output_dir,
                     item,
                     before_write=before_write,
@@ -277,4 +286,5 @@ def materialize_package_tiles(
             results.append(result)
             if progress is not None:
                 progress(current, total, result)
+    _validated_source(raster)
     return results
