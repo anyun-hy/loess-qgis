@@ -108,7 +108,7 @@ def test_unit_fit_wrapper_uses_the_inference_scripts_directory():
     assert 'dirname "$0")/..' not in wrapper
     assert 'source "$SCRIPT_DIR/config.sh"' in wrapper
     assert (
-        "python -m "
+        "python -X faulthandler -m "
         "loess_runtime.geometry.boundary_fitting.unit_runtime"
     ) in wrapper
 

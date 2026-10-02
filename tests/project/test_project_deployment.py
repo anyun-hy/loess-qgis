@@ -583,7 +583,11 @@ exec "$@"
         source = (ROOT / "scripts" / "runtime" / wrapper).read_text(
             encoding="utf-8"
         )
-        python_entrypoint = f"python -m {module}"
+        python_entrypoint = (
+            f"python -X faulthandler -m {module}"
+            if wrapper == "run_unit_fit.sh"
+            else f"python -m {module}"
+        )
         assert python_entrypoint in source
         result = subprocess.run(
             [str(ROOT / "scripts" / "runtime" / wrapper), "--help"],
