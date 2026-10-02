@@ -305,6 +305,7 @@ class JobRepository:
         *,
         job_types: Sequence[str] = (),
         lease_seconds: float = 60.0,
+        exclude_job_ids: Sequence[int] = (),
     ) -> dict[str, Any] | None:
         token = uuid.uuid4().hex
         expires = time.time() + max(1.0, float(lease_seconds))
@@ -367,6 +368,10 @@ class JobRepository:
         if job_types:
             sql += " AND job_type IN (" + ",".join("%s" for _ in job_types) + ")"
             values.extend(str(item) for item in job_types)
+        excluded = tuple(sorted({int(item) for item in exclude_job_ids}))
+        if excluded:
+            sql += " AND job_id NOT IN (" + ",".join("%s" for _ in excluded) + ")"
+            values.extend(excluded)
         sql += " ORDER BY priority DESC, job_id LIMIT 1"
         sql += " FOR UPDATE SKIP LOCKED"
         with self._session.transaction() as connection:
@@ -439,6 +444,7 @@ class JobRepository:
         *,
         lease_seconds: float = 120.0,
         max_running: int = 4,
+        exclude_job_ids: Sequence[int] = (),
     ) -> dict[str, Any] | None:
         """Lease one V3.3 candidate only after every owner input is ready.
 
@@ -469,6 +475,14 @@ class JobRepository:
             if running >= min(4, max(1, int(max_running))):
                 return None
             lock_clause = " FOR UPDATE SKIP LOCKED"
+            excluded = tuple(sorted({int(item) for item in exclude_job_ids}))
+            exclusion_sql = ""
+            values: list[Any] = [str(run_id)]
+            if excluded:
+                exclusion_sql = (
+                    " AND j.job_id NOT IN (" + ",".join("%s" for _ in excluded) + ")"
+                )
+                values.extend(excluded)
             row = connection.execute(
                 """SELECT j.* FROM jobs j
                    JOIN spatial_units u
@@ -556,10 +570,11 @@ class JobRepository:
                                AND a.kind='v33_staged_audit' AND a.status='ready'
                            ))
                        )
-                     ))
-                   ORDER BY j.priority DESC, j.job_id LIMIT 1"""
+                     ))"""
+                + exclusion_sql
+                + " ORDER BY j.priority DESC, j.job_id LIMIT 1"
                 + lock_clause,
-                (str(run_id),),
+                values,
             ).fetchone()
             if row is None:
                 return None

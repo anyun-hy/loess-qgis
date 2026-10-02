@@ -20,6 +20,7 @@ class JobStore(Protocol):
         *,
         lease_seconds: int,
         max_running: int,
+        exclude_job_ids: tuple[int, ...] = (),
     ) -> dict[str, Any] | None: ...
 
     def lease_next_job(
@@ -29,6 +30,7 @@ class JobStore(Protocol):
         *,
         job_types: tuple[str, ...],
         lease_seconds: int,
+        exclude_job_ids: tuple[int, ...] = (),
     ) -> dict[str, Any] | None: ...
 
     def interrupt_work_package_worker(self, run_id: str, worker_id: str) -> int: ...
@@ -110,6 +112,17 @@ class JobCompletion:
     @property
     def signal_success(self) -> bool:
         return self.success or self.retried
+
+
+@dataclass(frozen=True)
+class JobHeartbeat:
+    """Observed lease state after one heartbeat attempt."""
+
+    state: str
+
+    @property
+    def lease_lost(self) -> bool:
+        return self.state == "lease_lost"
 
 
 def resource_value(spec: Mapping[str, Any], key: str, default: int) -> int:
@@ -301,6 +314,15 @@ class RunJobScheduler:
         candidate_active = sum(
             1 for job in active_jobs if job.get("job_type") == "fragmentation_v33"
         )
+        active_job_ids = tuple(
+            sorted(
+                {
+                    int(job["job_id"])
+                    for job in active_jobs
+                    if job.get("job_id") is not None
+                }
+            )
+        )
         started = False
         if not self._accelerator_done and not accelerator_active:
             if cycle.package_pending:
@@ -344,6 +366,7 @@ class RunJobScheduler:
                     self._worker_id + f"-fragmentation-v33-{candidate_active}",
                     lease_seconds=300,
                     max_running=candidate_limit,
+                    exclude_job_ids=active_job_ids,
                 )
                 if not job:
                     break
@@ -367,6 +390,7 @@ class RunJobScheduler:
                 self._worker_id + f"-geometry-{unit_active}",
                 job_types=("unit_confidence", "unit_fit"),
                 lease_seconds=300,
+                exclude_job_ids=active_job_ids,
             )
             if not job:
                 break
@@ -455,6 +479,7 @@ class RunJobScheduler:
         error: str,
         memory_shed: bool,
         timeout_count: int,
+        lease_lost: bool = False,
     ) -> JobCompletion:
         self._guard_ownership()
         current = self._jobs.get_job(job["job_id"])
@@ -481,8 +506,9 @@ class RunJobScheduler:
                 error=error,
             )
 
-        retried = bool(memory_shed)
-        if not success and not memory_shed and int(timeout_count) < 2:
+        resumable_interrupt = bool(memory_shed or lease_lost)
+        retried = resumable_interrupt
+        if not success and not resumable_interrupt and int(timeout_count) < 2:
             retried = self._jobs.requeue_failed_job(int(job["job_id"]))
         return JobCompletion(success, error, retried)
 
@@ -492,26 +518,38 @@ class RunJobScheduler:
         progress: tuple[str, int, int] | None,
         *,
         allow_database_fallback: bool,
-    ) -> None:
+    ) -> JobHeartbeat:
         self._guard_ownership()
         if progress is None:
             if not allow_database_fallback:
-                return
+                return JobHeartbeat("skipped")
             current = self._jobs.get_job(int(job["job_id"]))
-            if not current or current["status"] != "running":
-                return
+            if current and current["status"] in {"ready", "failed", "stopped"}:
+                return JobHeartbeat("terminal")
+            if (
+                not current
+                or current["status"] != "running"
+                or str(current.get("lease_token") or "") != str(job["lease_token"])
+            ):
+                return JobHeartbeat("lease_lost")
             lease_token = str(job["lease_token"])
             progress_current = int(current["progress_current"] or 0)
             progress_total = int(current["progress_total"] or 0)
         else:
             lease_token, progress_current, progress_total = progress
-        self._jobs.heartbeat(
+        renewed = self._jobs.heartbeat(
             int(job["job_id"]),
             lease_token,
             current=progress_current,
             total=progress_total,
             lease_seconds=300,
         )
+        if renewed:
+            return JobHeartbeat("renewed")
+        current = self._jobs.get_job(int(job["job_id"]))
+        if current and current["status"] in {"ready", "failed", "stopped"}:
+            return JobHeartbeat("terminal")
+        return JobHeartbeat("lease_lost")
 
     def interrupt_job(self, job: Mapping[str, Any]) -> bool:
         self._guard_ownership()

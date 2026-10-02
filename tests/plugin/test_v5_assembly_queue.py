@@ -705,6 +705,7 @@ def test_memory_shed_interrupts_job_before_nonblocking_process_termination(
             calls.append("kill")
 
     process = Process()
+    excluded_queries = []
     entry = {
         "token": "process-token",
         "process": process,
@@ -733,6 +734,10 @@ def test_memory_shed_interrupts_job_before_nonblocking_process_termination(
         def job_counts(self, _run_id, *, job_type=""):
             return {"ready": 1} if job_type == "work_package" else {"interrupted": 1}
 
+        def lease_next_job(self, *_args, **kwargs):
+            excluded_queries.append(tuple(kwargs["exclude_job_ids"]))
+            return None
+
     _set_database(
         module,
         runner,
@@ -746,12 +751,226 @@ def test_memory_shed_interrupts_job_before_nonblocking_process_termination(
     assert entry["memory_shed"] is True
     assert entry["forced_error"].startswith("memory-pressure load shedding")
 
+    runner._phase = "jobs"
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._memory_admission_decision = lambda **_kwargs: (
+        module.MemoryAdmissionDecision(
+            geometry_slot_limit=2,
+            pause_new_work=False,
+            shed_active_work=False,
+            reason="stable",
+            worker_peak_estimate_bytes=0,
+            changed=False,
+            sample=module.MemoryPressureSample(),
+        )
+    )
+    runner._start_job = lambda _job: pytest.fail(
+        "a memory-shed job must remain excluded until its process exits"
+    )
+    runner._emit_progress = lambda *_args: None
+
+    runner._schedule()
+
+    assert excluded_queries == [(42,)]
 
 
+@pytest.mark.parametrize(
+    ("database_status", "expected_stop"),
+    [("ready", False), ("failed", False), ("interrupted", True)],
+)
+def test_failed_heartbeat_distinguishes_ready_exit_from_lost_lease(
+    monkeypatch,
+    database_status,
+    expected_stop,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    calls = []
+
+    class Process:
+        def processId(self):
+            return 0
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    job = {
+        "job_id": 42,
+        "job_type": "unit_fit",
+        "lease_token": "lease-token",
+    }
+    entry = {
+        "token": "process-token",
+        "process": Process(),
+        "context": {"kind": "job", "job": job, "label": "unit_fit:test"},
+        "forced_error": "",
+        "owns_process_group": False,
+    }
+    runner._processes = {"process-token": entry}
+    runner._pending_job_progress = {
+        "42": ("lease-token", 3, 5),
+    }
+
+    class Jobs:
+        def heartbeat(self, *_args, **_kwargs):
+            calls.append("heartbeat-false")
+            return False
+
+        def get_job(self, _job_id):
+            return {"status": database_status, "lease_token": "lease-token"}
+
+        def interrupt_job(self, job_id, lease_token):
+            calls.append((job_id, lease_token))
+            return True
+
+    _set_database(module, runner, Jobs())
+    monkeypatch.setattr(module, "process_is_running", lambda _process: True)
+
+    outcome = runner._flush_one_job_heartbeat(
+        entry,
+        allow_database_fallback=True,
+    )
+
+    assert outcome.state == ("lease_lost" if expected_stop else "terminal")
+    assert (entry.get("lease_lost") is True) is expected_stop
+    assert ("terminate" in calls) is expected_stop
+    assert ("kill" in calls) is expected_stop
+    assert "process-token" in runner._processes
 
 
+def test_worker_recorded_failure_requeues_after_process_exit(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    job = {
+        "job_id": 42,
+        "job_type": "unit_fit",
+        "stream_id": "model:test",
+        "lease_token": "lease-token",
+    }
+    entry = {
+        "token": "process-token",
+        "process": _FinishedProcess(),
+        "context": {"kind": "job", "job": job, "label": "unit_fit:test"},
+        "stdout": bytearray(),
+        "stderr": bytearray(),
+        "forced_error": "",
+        "owns_process_group": False,
+    }
+    runner._processes = {"process-token": entry}
+    runner._pending_job_progress = {"42": ("lease-token", 3, 5)}
+    requeued = []
+    scheduled = []
+
+    class Jobs:
+        def heartbeat(self, *_args, **_kwargs):
+            return False
+
+        def get_job(self, _job_id):
+            return {"status": "failed", "lease_token": ""}
+
+        def interrupt_job(self, *_args, **_kwargs):
+            raise AssertionError("a worker-recorded failure is terminal, not lease loss")
+
+        def requeue_failed_job(self, job_id):
+            requeued.append(job_id)
+            return True
+
+    _set_database(module, runner, Jobs())
+    monkeypatch.setattr(module, "process_is_running", lambda _process: True)
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._emit_progress = lambda *_args: None
+    runner._schedule_safely = lambda: scheduled.append(True)
+    runner.step_finished = _CaptureSignal()
+
+    heartbeat = runner._flush_one_job_heartbeat(
+        entry,
+        allow_database_fallback=True,
+    )
+    runner._process_finished("process-token", 1, None)
+
+    assert heartbeat.state == "terminal"
+    assert not entry.get("lease_lost")
+    assert requeued == [42]
+    assert "process-token" not in runner._processes
+    assert scheduled == [True]
+    assert runner.step_finished.values[0][2]["success"] is True
 
 
+def test_lease_lost_process_exit_releases_slot_and_reschedules(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    process_signals = []
+
+    class Process:
+        def processId(self):
+            return 0
+
+        def terminate(self):
+            process_signals.append("terminate")
+
+        def kill(self):
+            process_signals.append("kill")
+
+        def deleteLater(self):
+            process_signals.append("delete")
+
+    job = {
+        "job_id": 42,
+        "job_type": "unit_fit",
+        "stream_id": "model:test",
+        "lease_token": "lease-token",
+    }
+    entry = {
+        "token": "process-token",
+        "process": Process(),
+        "context": {"kind": "job", "job": job, "label": "unit_fit:test"},
+        "stdout": bytearray(),
+        "stderr": bytearray(),
+        "forced_error": "",
+        "owns_process_group": False,
+    }
+    runner._processes = {"process-token": entry}
+    runner._pending_job_progress = {"42": ("lease-token", 3, 5)}
+    scheduled = []
+
+    class Jobs:
+        def heartbeat(self, *_args, **_kwargs):
+            return False
+
+        def get_job(self, _job_id):
+            return {"status": "interrupted", "lease_token": ""}
+
+        def interrupt_job(self, *_args, **_kwargs):
+            return False
+
+        def requeue_failed_job(self, _job_id):
+            raise AssertionError("lease loss must not consume a retry")
+
+    _set_database(module, runner, Jobs())
+    monkeypatch.setattr(module, "process_is_running", lambda _process: True)
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._emit_progress = lambda *_args: None
+    runner._schedule_safely = lambda: scheduled.append(True)
+    runner.step_finished = _CaptureSignal()
+
+    heartbeat = runner._flush_one_job_heartbeat(
+        entry,
+        allow_database_fallback=True,
+    )
+    runner._process_finished("process-token", -15, None)
+
+    assert heartbeat.state == "lease_lost"
+    assert entry["lease_lost"] is True
+    assert process_signals == ["terminate", "kill", "delete"]
+    assert "process-token" not in runner._processes
+    assert scheduled == [True]
+    assert runner.step_finished.values[0][2]["success"] is True
 
 
 def test_shared_cpu_budget_reserves_four_v33_workers_before_unit_fit_dispatch(monkeypatch):

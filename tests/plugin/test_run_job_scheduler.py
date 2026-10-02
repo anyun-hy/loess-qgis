@@ -90,6 +90,62 @@ def test_dispatch_starts_every_lease_before_requesting_the_next_one():
     ]
 
 
+def test_dispatch_excludes_active_job_ids_inside_each_lease_query():
+    active_unit = {
+        "job_id": 30,
+        "job_type": "unit_fit",
+        "lease_token": "stale-lease",
+    }
+    active_v33 = {
+        "job_id": 20,
+        "job_type": "fragmentation_v33",
+        "lease_token": "stale-v33-lease",
+    }
+    lease_queries = []
+
+    class Jobs:
+        def interrupt_expired_jobs(self, *, run_id):
+            return None
+
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 1}
+            return {"interrupted": 1}
+
+        def lease_next_fragmentation_v33(self, *_args, **kwargs):
+            excluded = tuple(kwargs["exclude_job_ids"])
+            lease_queries.append(("v33", excluded))
+            return None if active_v33["job_id"] in excluded else active_v33
+
+        def lease_next_job(self, *_args, **kwargs):
+            excluded = tuple(kwargs["exclude_job_ids"])
+            lease_queries.append(("unit", excluded))
+            return None if active_unit["job_id"] in excluded else active_unit
+
+    scheduler = RunJobScheduler(
+        _spec(),
+        Jobs(),
+        worker_id="qgis-test",
+        accelerator_worker_id="qgis-test-accelerator",
+    )
+    cycle = scheduler.begin_cycle(accelerator_active=False)
+    started = []
+
+    outcome = scheduler.dispatch(
+        cycle,
+        active_jobs=[active_unit, active_v33],
+        accelerator_active=False,
+        geometry_slot_limit=4,
+        start_accelerator=lambda: None,
+        start_job=started.append,
+    )
+
+    assert outcome.active is True
+    assert started == []
+    assert lease_queries == [
+        ("v33", (20, 30)),
+        ("unit", (20, 30)),
+    ]
 
 
 def test_accelerator_crash_state_resets_only_after_completed_package():
@@ -236,3 +292,73 @@ def test_memory_shed_is_already_resumable_and_does_not_retry():
 
     assert result.retried is True
     assert result.signal_success is True
+
+
+def test_lease_loss_is_resumable_and_does_not_consume_a_retry():
+    class Jobs:
+        def get_job(self, _job_id):
+            return {"status": "interrupted"}
+
+        def requeue_failed_job(self, _job_id):
+            raise AssertionError("lease loss must not consume a retry")
+
+    scheduler = RunJobScheduler(
+        _spec(),
+        Jobs(),
+        worker_id="qgis-test",
+        accelerator_worker_id="qgis-test-accelerator",
+    )
+    result = scheduler.complete_job(
+        {"job_id": 9, "job_type": "unit_fit", "lease_token": "lease-9"},
+        success=False,
+        error="Job lease was lost before process exit",
+        memory_shed=False,
+        timeout_count=0,
+        lease_lost=True,
+    )
+
+    assert result.retried is True
+    assert result.signal_success is True
+
+
+@pytest.mark.parametrize(
+    ("current_job", "heartbeat_result", "expected_state"),
+    [
+        ({"status": "ready"}, False, "terminal"),
+        (
+            {"status": "running", "lease_token": "lease-9"},
+            False,
+            "lease_lost",
+        ),
+        ({"status": "interrupted"}, False, "lease_lost"),
+        ({"status": "failed"}, False, "terminal"),
+        ({"status": "stopped"}, False, "terminal"),
+        ({"status": "running", "lease_token": "lease-9"}, True, "renewed"),
+    ],
+)
+def test_heartbeat_classifies_terminal_completion_and_lease_loss(
+    current_job,
+    heartbeat_result,
+    expected_state,
+):
+    class Jobs:
+        def heartbeat(self, *_args, **_kwargs):
+            return heartbeat_result
+
+        def get_job(self, _job_id):
+            return current_job
+
+    scheduler = RunJobScheduler(
+        _spec(),
+        Jobs(),
+        worker_id="qgis-test",
+        accelerator_worker_id="qgis-test-accelerator",
+    )
+
+    outcome = scheduler.heartbeat(
+        {"job_id": 9, "lease_token": "lease-9"},
+        ("lease-9", 3, 5),
+        allow_database_fallback=False,
+    )
+
+    assert outcome.state == expected_state

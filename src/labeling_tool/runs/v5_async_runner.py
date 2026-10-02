@@ -883,9 +883,9 @@ class V5AsyncInferenceRunner(QObject):
             self._last_memory_admission_log_at = now
         return decision
 
-    def _force_memory_shed(self, token):
+    def _force_interrupted_job(self, token):
         entry = self._processes.get(token)
-        if not entry or not entry.get("memory_shed"):
+        if not entry or not (entry.get("memory_shed") or entry.get("lease_lost")):
             return
         process = entry["process"]
         if not process_is_running(process):
@@ -898,6 +898,20 @@ class V5AsyncInferenceRunner(QObject):
                 process.kill()
         except (ProcessLookupError, OSError):
             process.kill()
+
+    def _signal_interrupted_job(self, entry):
+        process = entry["process"]
+        if process_is_running(process):
+            pid = int(process.processId())
+            try:
+                if pid > 0 and entry.get("owns_process_group"):
+                    os.killpg(pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except (ProcessLookupError, OSError):
+                process.terminate()
+            token = entry["token"]
+            QTimer.singleShot(3000, lambda t=token: self._force_interrupted_job(t))
 
     def _request_memory_shed(self, entry, reason):
         """Interrupt one atomic geometry job without blocking the Qt thread."""
@@ -913,18 +927,29 @@ class V5AsyncInferenceRunner(QObject):
             return False
         entry["memory_shed"] = True
         entry["forced_error"] = "memory-pressure load shedding: " + str(reason)
-        process = entry["process"]
-        if process_is_running(process):
-            pid = int(process.processId())
-            try:
-                if pid > 0 and entry.get("owns_process_group"):
-                    os.killpg(pid, signal.SIGTERM)
-                else:
-                    process.terminate()
-            except (ProcessLookupError, OSError):
-                process.terminate()
-            token = entry["token"]
-            QTimer.singleShot(3000, lambda t=token: self._force_memory_shed(t))
+        self._signal_interrupted_job(entry)
+        return True
+
+    def _request_lease_lost_stop(self, entry):
+        """Stop a stale worker while retaining its scheduler slot until exit."""
+
+        if entry.get("lease_lost"):
+            return False
+        job = (entry.get("context") or {}).get("job") or {}
+        if job.get("job_type") not in {
+            "unit_fit", "unit_confidence", "fragmentation_v33"
+        }:
+            return False
+        # The lease may already be interrupted or owned by a replacement. The
+        # old token is still the only safe identity to offer to this mutation.
+        self._job_scheduler.interrupt_job(job)
+        entry["lease_lost"] = True
+        entry["forced_error"] = "Job lease was lost before process exit"
+        self.log_line.emit(
+            "stderr",
+            "[lease-lost] " + str((entry.get("context") or {}).get("label") or "job"),
+        )
+        self._signal_interrupted_job(entry)
         return True
 
     def _shed_geometry_to_limit(self, geometry_slot_limit, reason):
@@ -1433,14 +1458,24 @@ class V5AsyncInferenceRunner(QObject):
                 {"stream_events": stream_events, "pipeline_progress": progress}
             )
 
-    def _flush_one_job_heartbeat(self, job, *, allow_database_fallback):
+    def _flush_one_job_heartbeat(self, entry, *, allow_database_fallback):
+        job = (entry.get("context") or {}).get("job")
+        if not job:
+            return None
         job_id = str(job["job_id"])
         pending = self._pending_job_progress.pop(job_id, None)
-        self._job_scheduler.heartbeat(
+        outcome = self._job_scheduler.heartbeat(
             job,
             pending,
             allow_database_fallback=allow_database_fallback,
         )
+        if (
+            outcome.lease_lost
+            and not entry.get("memory_shed")
+            and process_is_running(entry["process"])
+        ):
+            self._request_lease_lost_stop(entry)
+        return outcome
 
     @pyqtSlot()
     def _flush_job_heartbeats(self):
@@ -1451,7 +1486,7 @@ class V5AsyncInferenceRunner(QObject):
                 job = (entry.get("context") or {}).get("job")
                 if job:
                     self._flush_one_job_heartbeat(
-                        job,
+                        entry,
                         allow_database_fallback=True,
                     )
         except RunOwnershipLostError as error:
@@ -1530,7 +1565,7 @@ class V5AsyncInferenceRunner(QObject):
         if context.get("kind") == "job":
             job = context["job"]
             self._flush_one_job_heartbeat(
-                job,
+                entry,
                 allow_database_fallback=False,
             )
             completion = self._job_scheduler.complete_job(
@@ -1539,6 +1574,7 @@ class V5AsyncInferenceRunner(QObject):
                 error=error,
                 memory_shed=bool(entry.get("memory_shed")),
                 timeout_count=int(entry.get("timeout_count", 0)),
+                lease_lost=bool(entry.get("lease_lost")),
             )
             if completion.retried and not entry.get("memory_shed"):
                 self.log_line.emit("system", f"[retry] {label}")
