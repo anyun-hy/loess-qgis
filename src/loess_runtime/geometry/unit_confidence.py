@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,9 @@ def run_unit_confidence(
     if job.get("status") != "running" or job.get("lease_token") != lease_token:
         raise UnitConfidenceError("unit confidence Job does not hold its lease")
 
+    output = None
+    published = False
+    publication_uncertain = False
     try:
         probabilities, valid = read_unit_probabilities(
             database.artifacts,
@@ -93,7 +97,7 @@ def run_unit_confidence(
             / "tmp"
             / "unit_confidence"
             / str(stream_id).replace(":", "_")
-            / f"{unit_id}.tif"
+            / f"{unit_id}.{uuid.uuid4().hex}.tif"
         )
         profile = {
             "driver": "GTiff",
@@ -136,13 +140,20 @@ def run_unit_confidence(
             raise UnitConfidenceError(
                 "unit confidence exceeded its frozen lossless write reserve"
             )
-        if not database.artifacts.complete_unit_confidence_job(
+        byte_count = output.stat().st_size
+        digest = sha256_file(output)
+        # Only this attempt can write this path. A lost lease must never
+        # replace another attempt's ready (or already cleaned) confidence.
+        publication_uncertain = True
+        published = database.artifacts.complete_unit_confidence_job(
             int(job_id),
             str(lease_token),
             path=output,
-            byte_count=output.stat().st_size,
-            sha256=sha256_file(output),
-        ):
+            byte_count=byte_count,
+            sha256=digest,
+        )
+        publication_uncertain = False
+        if not published:
             raise UnitConfidenceError(
                 "unit confidence lease expired before atomic commit"
             )
@@ -151,7 +162,7 @@ def run_unit_confidence(
             "stream_id": str(stream_id),
             "unit_id": str(unit_id),
             "path": str(output),
-            "byte_count": output.stat().st_size,
+            "byte_count": byte_count,
             "valid_pixel_count": int(np.count_nonzero(valid)),
             "status": "ready",
         }
@@ -165,6 +176,12 @@ def run_unit_confidence(
             error=str(error),
         )
         raise
+    finally:
+        # A database connection error can leave commit outcome unknown. Keep
+        # that file: a committed consumer may already be reading it. Definite
+        # rejection and failures before publication only remove our own file.
+        if output is not None and not published and not publication_uncertain:
+            output.unlink(missing_ok=True)
 
 
 def main(argv=None) -> int:

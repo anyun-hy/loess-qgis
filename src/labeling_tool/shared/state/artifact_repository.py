@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from labeling_tool.shared.state.postgres_state import PostgresConnection
 from labeling_tool.shared.state.run_state_session import RunStateError, RunStateSession
 from labeling_tool.shared.state.state_values import row_dict as _row_dict
 from labeling_tool.shared.state.state_values import utc_now as _now
@@ -328,7 +329,7 @@ class ArtifactRepository:
                 """SELECT * FROM jobs WHERE job_id=%s
                    AND job_type='unit_confidence' AND status='running'
                    AND lease_token=%s AND lease_expires IS NOT NULL
-                   AND lease_expires>=%s""",
+                   AND lease_expires>=%s FOR UPDATE""",
                 (int(job_id), str(lease_token), fence_time),
             ).fetchone()
             if job is None:
@@ -406,11 +407,8 @@ class ArtifactRepository:
                 ),
             ).rowcount
             if changed != 1:
-                return False
-            connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=%s",
-                (int(job_id),),
-            )
+                raise RunStateError("unit confidence lease changed during publication")
+            self._release_job_artifacts(connection, int(job_id))
             return True
 
     def _publish_fragmentation_v33_input(
@@ -760,31 +758,36 @@ class ArtifactRepository:
 
     def release_job_artifacts(self, job_id: int) -> int:
         with self._session.transaction() as connection:
-            artifact_ids = [
-                int(row["artifact_id"])
-                for row in connection.execute(
-                    """SELECT artifact_id FROM artifact_dependencies
-                       WHERE job_id=%s ORDER BY artifact_id""",
-                    (int(job_id),),
-                ).fetchall()
-            ]
-            if artifact_ids:
-                placeholders = ",".join("%s" for _ in artifact_ids)
-                # Every releaser locks shared Artifact rows in the same order
-                # before DELETE triggers decrement ref_count.  This prevents
-                # cross-unit deadlocks without reducing worker concurrency.
-                connection.execute(
-                    f"""SELECT artifact_id FROM artifacts
-                        WHERE artifact_id IN ({placeholders})
-                        ORDER BY artifact_id FOR UPDATE""",
-                    artifact_ids,
-                ).fetchall()
-            return int(
-                connection.execute(
-                    "DELETE FROM artifact_dependencies WHERE job_id=%s",
-                    (int(job_id),),
-                ).rowcount
-            )
+            return self._release_job_artifacts(connection, int(job_id))
+
+    @staticmethod
+    def _release_job_artifacts(connection: PostgresConnection, job_id: int) -> int:
+        """Release inputs inside the caller's atomic publication transaction."""
+        artifact_ids = [
+            int(row["artifact_id"])
+            for row in connection.execute(
+                """SELECT artifact_id FROM artifact_dependencies
+                   WHERE job_id=%s ORDER BY artifact_id""",
+                (int(job_id),),
+            ).fetchall()
+        ]
+        if artifact_ids:
+            placeholders = ",".join("%s" for _ in artifact_ids)
+            # Every releaser locks shared Artifact rows in the same order
+            # before DELETE triggers decrement ref_count. This prevents
+            # cross-unit deadlocks without reducing worker concurrency.
+            connection.execute(
+                f"""SELECT artifact_id FROM artifacts
+                    WHERE artifact_id IN ({placeholders})
+                    ORDER BY artifact_id FOR UPDATE""",
+                artifact_ids,
+            ).fetchall()
+        return int(
+            connection.execute(
+                "DELETE FROM artifact_dependencies WHERE job_id=%s",
+                (int(job_id),),
+            ).rowcount
+        )
 
     def cleanup_candidates(
         self,
