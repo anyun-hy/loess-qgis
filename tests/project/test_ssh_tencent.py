@@ -6,8 +6,8 @@ import subprocess
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / "bash" / "ssh_tencent.sh"
+ROOT = Path(__file__).resolve().parents[2]
+WRAPPER = ROOT / "scripts" / "ssh_tencent.sh"
 
 
 def test_wrapper_reuses_tencent_connection_with_user_owned_socket(tmp_path):
