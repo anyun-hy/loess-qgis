@@ -30,17 +30,12 @@ import shapely
 from shapely.geometry import box, mapping, shape
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
-if str(INFERENCE_SCRIPTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(INFERENCE_SCRIPTS_ROOT))
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
-from deployment_config import CLASS_NAMES, CLASS_ORDER
-from small_component_regularizer import (
-    EIGHT_CONNECTED,
-    SmallComponentPolicy,
-    physical_pixel_area_m2,
-    regularize_small_components,
-)
+from labeling_tool.shared.contracts.run_spec import CLASS_NAMES, CLASS_ORDER
+from loess_runtime.geometry.small_component_regularizer import EIGHT_CONNECTED, SmallComponentPolicy, physical_pixel_area_m2, regularize_small_components
 
 
 PARTITION_PATTERN = re.compile(r"partition_(\d+)_(\d+)_mask\.tif$")

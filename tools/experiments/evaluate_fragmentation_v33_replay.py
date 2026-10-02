@@ -17,14 +17,12 @@ import rasterio
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
-QGIS_PLUGINS_ROOT = REPOSITORY_ROOT / "qgis_plugins"
-for source_root in (INFERENCE_SCRIPTS_ROOT, QGIS_PLUGINS_ROOT):
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+for source_root in (SOURCE_ROOT,):
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
 
-from deployment_config import CLASS_ORDER
-from labeling_tool.core.run_spec import sha256_file
+from labeling_tool.shared.contracts.run_spec import CLASS_ORDER, sha256_file
 
 
 PARTITION_COUNT = 140

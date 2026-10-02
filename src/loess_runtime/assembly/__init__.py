@@ -1,0 +1,1 @@
+"""Raster assembly runtime."""

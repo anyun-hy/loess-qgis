@@ -25,10 +25,12 @@ QGIS 3 或 Qt5 作为可部署目标。
 
 ## 代码组成
 
-- `qgis_plugins/labeling_tool/`：QGIS UI、运行编排、监控和人工修整；
-- `inference_scripts/`：Tile 推理、Fusion、V3/V3.3、矢量化和验收；
-- `bash/`：插件安装、运行项目初始化和可选 SSH 辅助脚本；
+- `src/labeling_tool/`：按主面板、Run、监控、修整、QGIS 支持和共享合同分组的插件；
+- `src/loess_runtime/`：按推理、几何、组装、SAM 和系统支持分组的独立运行时；
+- `scripts/`：插件安装、运行项目初始化、推理启动和可选 SSH 辅助脚本；
+- `configs/`：`defaults/` 保存默认配置和类别映射，`environments/` 保存两平台环境版本文件；
 - `tests/`：契约、故障注入、恢复和跨平台回归；
+- `tools/`：源码实验和手动验证工具，不进入生产部署；
 - `visualizations/`：可交互的运行时与数据库架构图。
 
 完整文档从 [`docs/README.md`](docs/README.md) 进入。
@@ -36,11 +38,14 @@ QGIS 3 或 Qt5 作为可部署目标。
 ## 模型边界
 
 仓库**不包含**语义模型 TorchScript、SAM3 checkpoint、Fusion profile、输入影像、
-范围数据、QGIS 工程、PostgreSQL 数据或 Run 输出。`inference_scripts/config.yaml`
+范围数据、QGIS 工程、PostgreSQL 数据或 Run 输出。`configs/defaults/config.yaml`
 只登记正式权重的文件名与可信 SHA-256；使用者必须自行取得有权使用的资产并放入
 部署项目的 `weights/`。
 
 ## 快速开始
+
+首次使用的 PostgreSQL、profile 选择、连接诊断和安装后核对见
+[`docs/operations/FIRST_INSTALL.md`](docs/operations/FIRST_INSTALL.md)。
 
 1. 安装 Miniconda/Anaconda、PostgreSQL 与目标版本 QGIS；
 2. 克隆仓库并初始化运行项目：
@@ -48,31 +53,32 @@ QGIS 3 或 Qt5 作为可部署目标。
    ```bash
    git clone https://github.com/anyun-hy/loess-qgis.git
    cd loess-qgis
-   bash/init_project.sh --project-root "$HOME/Desktop/loess-project" --platform auto --create-env
+   scripts/deploy/init_project.sh --project-root "$HOME/Desktop/loess-project" --platform auto --create-env
    ```
 
 3. 将有权使用的模型资产放入 `loess-project/weights/`，然后校验：
 
    ```bash
-   bash/init_project.sh --project-root "$HOME/Desktop/loess-project" --platform auto --check-only --check-assets
+   scripts/deploy/init_project.sh --project-root "$HOME/Desktop/loess-project" --platform auto --check-only --check-assets
    ```
 
-4. 安装插件到 QGIS `default` profile：
+4. 确认目标 QGIS 当前使用的 profile 名称后安装插件。下面以 `QGIS4` 为示例；若你的当前 profile 不是这个名称，替换为实际名称：
 
    ```bash
-   bash/install_plugin.sh --platform auto --profile default
+   scripts/deploy/install_plugin.sh --platform auto --profile QGIS4
    ```
 
 5. 重启 QGIS，在插件中选择影像、研究范围和输出位置后创建新 Run。
 
 PostgreSQL 默认使用当前系统用户名作为数据库名和角色名，并通过本机 Unix socket
-连接。其他配置通过 `LOESS_STATE_DB_DSN` 和 `LOESS_STATE_DB_SCHEMA` 覆盖。
+连接；这要求管理员已经准备好同名角色和数据库。连接检查、缺少角色/数据库时的处理、
+替代 DSN 和安装后版本核对见 [首次安装说明](docs/operations/FIRST_INSTALL.md)。
 
 ## 开发
 
 ```bash
 conda run -n qgis pytest -q
-conda run -n qgis python -m compileall -q qgis_plugins inference_scripts tests
+conda run -n qgis python -m compileall -q src scripts tools tests
 ```
 
 贡献必须从功能分支提交 Pull Request；详细规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

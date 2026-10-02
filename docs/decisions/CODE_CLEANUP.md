@@ -41,7 +41,7 @@
 | --- | --- | --- |
 | `fragmentation_ab_experiment.py` | 从生产模块导入 `deployment_config`、`small_component_regularizer` | 独立 CLI 导入、参数、样本选择及输出目录边界；不能复制一份生产算法到工具目录 |
 | `subpixel_vectorize_experiment.py` | `rasterio_compat`、基础及参考评估使用的 `boundary_ab_validate`、测试导入 | 迁移后导入、CLI、小型概率样本输出和既有算法测试 |
-| `evaluate_fragmentation_v33_replay.py` | 通过 `__file__` 的父目录寻找 `qgis_plugins` 或部署 `runtime` | 源码运行与部署项目输入的路径解析、历史哈希校验和 CLI |
+| `evaluate_fragmentation_v33_replay.py` | 从工具入口定位仓库 `src/` 共享模块，Run 输入位置独立解析 | 源码运行与部署项目输入的路径解析、历史哈希校验和 CLI |
 | `fragmentation_postprocess.py` | shell 入口、正式操作文档、分类工作区的产物元数据读取 | 即使以后停止提供执行工具，也不能直接删除读取既有成果所需的代码 |
 
 实验工具统一放在仓库 `tools/experiments/`，默认不进入生产部署；新命令与部署
@@ -56,12 +56,12 @@
 所有权、线程归属、状态代次和生命周期。每批提交前先通过相关行为测试，再跑
 完整回归。数据库与调度器的大规模重构需要单独提出具体设计和风险供审核。
 
-监控先拆出 `core/monitor_progress.py`：仅负责步骤归属、等待计数、辅助任务组
+监控先拆出 `src/labeling_tool/monitor/monitor_progress.py`：仅负责步骤归属、等待计数、辅助任务组
 完成度和阶段文案，不导入 Qt、不查询数据库、不保存运行状态。窗口消费其计算
 结果，仍自行处理刷新、控制过程和终态。总体比例不是组装阶段完成的证据，也
 不代表剩余时间；该模块不加入推理进程的共享运行时清单。
 
-日志解释与磁盘分页归入 `core/monitor_logs.py`，统一供实时日志呈现和历史查询
+日志解释与磁盘分页归入 `src/labeling_tool/monitor/monitor_logs.py`，统一供实时日志呈现和历史查询
 使用。解析函数不保存状态，分页读取仍仅由现有查询 worker 调用，保留字节预算、
 游标和异常合同。该模块不导入 Qt、不新增轮询、不写日志或任务状态；历史错误
 仍只证明事件发生，不能凭一条日志推断当前已恢复。只为旧测试服务的日志兼容

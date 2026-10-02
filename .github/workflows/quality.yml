@@ -18,23 +18,35 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install lightweight test dependencies
-        run: python -m pip install --disable-pip-version-check pytest==9.1.1 pyyaml==6.0.3
+        run: >-
+          python -m pip install --disable-pip-version-check
+          pytest==9.1.1 pyyaml==6.0.3 ruff==0.11.7 mypy==1.10.0
+      - name: Check refactored Python modules
+        run: |
+          ruff check
+          ruff format --check
+          mypy
       - name: Compile Python sources
-        run: python -m compileall -q bash qgis_plugins inference_scripts tools tests
+        run: python -m compileall -q src scripts tools tests
       - name: Validate shell entry points
-        run: find bash inference_scripts -type f -name '*.sh' -exec bash -n {} +
+        run: find scripts -type f -name '*.sh' -exec bash -n {} \;
       - name: Run public source contracts
         run: >-
           python -m pytest -q
-          tests/test_docs_structure.py
-          tests/test_public_release.py
+          tests/project/test_docs_structure.py
+          tests/project/test_public_release.py
           tests/project/test_ssh_tencent.py
-          tests/test_postgres_state_contract.py
-          tests/test_monitor_progress.py
-          tests/test_monitor_logs.py
-          tests/test_v5_runner_thread_affinity.py
-          tests/test_ui_design_regressions.py
-          tests/test_platform_compat.py::test_plugin_targets_qgis42_pyqt6_qt6_from_one_release
-          tests/test_platform_compat.py::test_business_modules_use_the_shared_qt6_enum_api
-          tests/test_platform_compat.py::test_plugin_install_and_project_initialization_are_independent
-          tests/test_platform_compat.py::test_inference_environment_contract_has_two_minimal_platform_locks
+          tests/shared/test_postgres_state_contract.py
+          tests/plugin/test_monitor_query.py
+          tests/plugin/test_monitor_query_io.py
+          tests/plugin/test_monitor_page_boundaries.py
+          tests/plugin/test_monitor_progress.py
+          tests/plugin/test_monitor_observations.py
+          tests/plugin/test_monitor_logs.py
+          tests/plugin/test_run_workflow.py::test_workflow_owns_runtime_without_importing_presenters
+          tests/plugin/test_v5_runner_thread_affinity.py
+          tests/plugin/test_ui_design_regressions.py
+          tests/project/test_platform_compat.py::test_plugin_targets_qgis42_pyqt6_qt6_from_one_release
+          tests/project/test_platform_compat.py::test_business_modules_use_the_shared_qt6_enum_api
+          tests/project/test_platform_compat.py::test_plugin_install_and_project_initialization_are_independent
+          tests/project/test_platform_compat.py::test_inference_environment_contract_has_two_minimal_platform_locks

@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 
@@ -28,9 +29,9 @@ htmlcov/
 .agents/plugins/qgis-mcp/mcp_config.json
 .agents/plugins/qgis-mcp/plugin.json
 *.zip
-generate_fusion_30m.py
-load_fusion_30m_to_qgis.py
-inference_scripts/manual_groundtruth_benchmarks.json
+/tools/experiments/generate_fusion_30m.py
+/tools/experiments/load_fusion_30m_to_qgis.py
+/tools/validation/manual_groundtruth_benchmarks.json
 docs/FUSION_DENOISING_PIPELINE.md
 .vscode/
 visualizations/*.visual-check.*

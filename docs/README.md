@@ -13,9 +13,13 @@
 7. [FRAGMENTATION_V33_SELECTION_20260826.md](decisions/FRAGMENTATION_V33_SELECTION_20260826.md)：V3.3 选择依据；
 8. [RUNTIME_OPTIMIZATION_DEFERRED_20260901.md](decisions/RUNTIME_OPTIMIZATION_DEFERRED_20260901.md)：暂缓优化和重评条件。
 9. [CODE_CLEANUP.md](decisions/CODE_CLEANUP.md)：代码清理顺序、兼容保留边界和验收条件。
-10. [EXPERIMENT_TOOLS.md](operations/EXPERIMENT_TOOLS.md)：源码实验工具入口、依赖和输出边界。
+10. [EXPERIMENT_TOOLS.md](operations/EXPERIMENT_TOOLS.md)：源码实验与手动验证入口、依赖和输出边界。
+11. [FIRST_INSTALL.md](operations/FIRST_INSTALL.md)：首次安装的 PostgreSQL 前置、QGIS profile 选择、连接诊断和安装后核对。
 
 ## 文档职责
+
+开发者的Python写法、类/接口约定及验证方式集中在
+[CONTRIBUTING.md](../CONTRIBUTING.md)；模块依赖与运行约束仍由架构说明维护。
 
 | 文档区域 | 内容 |
 |---|---|

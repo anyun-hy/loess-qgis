@@ -30,17 +30,28 @@ GitHub `anyun-hy/loess-qgis` 的受保护 `main` 是 macOS 与 Ubuntu 的权威�
 
 | 区域 | 职责 |
 |---|---|
-| `qgis_plugins/labeling_tool/` | QGIS UI、地图交互、运行编排、监控、人工修整 |
-| `inference_scripts/` | 环境检查、Tile 推理、Fusion、Partition、V3/V3.3、组装和验收 |
+| `src/labeling_tool/` | 主面板、Run 编排、监控、人工修整和 QGIS 支持；`shared/` 保存两进程共用的纯 Python 合同、状态存储和工作包规划 |
+| `src/loess_runtime/` | 推理、几何处理、组装、SAM 和环境/资源检查；只导入插件的 `shared/` 子包，不加载 QGIS UI |
 | `tools/experiments/` | 从源码运行的隔离实验与回放评估入口，不进入生产部署 |
-| `bash/` | 插件安装、部署项目初始化、可选 SSH 入口 |
-| `tests/` | 契约、恢复、故障、规模和平台兼容测试 |
+| `tools/validation/` | 手动创建测试 Run、原生烟雾检查和压力验证入口，不随正式部署安装 |
+| `scripts/` | `deploy/` 安装与初始化，`runtime/` 启动推理，`lib/` 部署辅助，`templates/` 生成模板，以及独立 SSH 入口 |
+| `configs/` | `defaults/` 中的默认配置与类别映射，以及 `environments/` 中的两平台环境锁；算法策略和词表随所属源码包 |
+| `tests/` | 按 `plugin/`、`runtime/`、`shared/`、`project/`、`support/` 分组的契约、恢复、故障、规模和平台兼容测试 |
 | `docs/` | 当前架构、状态、操作和长期决策 |
 
 实验工具复用仓库内的生产模块，不复制算法；工具代码位置与被评估的 Run 输入
-位置分开。部署源码指纹覆盖 `bash/`、`inference_scripts/` 和插件目录，不覆盖
+位置分开。部署源码指纹覆盖 `src/`、`scripts/` 和 `configs/`，不覆盖
 `tools/`；因此只修改实验工具不会改变生产源码指纹。命令与输入输出边界见
 [实验工具](operations/EXPERIMENT_TOOLS.md)。
+
+源码目录与生成项目分开：安装后的插件仍为 QGIS profile 下的 `labeling_tool/`；
+生成项目的 `inference_scripts/` 保存启动入口、配置和 `loess_runtime/` 包，
+`runtime/` 保存共享 `labeling_tool/shared/` 包及环境启动配置。源码迁移不移动
+已有权重、输入、人工标签或 Run 输出。共享包的初始化文件也属于部署身份检查。
+
+默认配置模板中的资产路径采用生成项目的相对约定，部署时模板内容原样复制。
+从源码检查 `configs/defaults/` 时，启动入口显式提供原有资产解析基准，避免将
+权重误定位到 `configs/weights/`；生成项目仍以自己的 `inference_scripts/` 为基准。
 
 QGIS 插件进程只使用宿主 QGIS 的 Python/Qt。TorchScript、Fusion 和其他推理
 任务只使用当前平台的 `qgis` Conda 子进程，禁止混用两边 `site-packages`。
@@ -72,6 +83,9 @@ QGIS 插件内部的线程边界也是正式合同：
   被关闭的父控件后保持存活，直到所属线程或进程实际退出才释放；
 - 运行输入冻结、范围筛选和 accepted 审计使用可取消的后台任务。GUI 只采集
   独立 feature source、CRS 和 transform context 副本，不把活动图层交给后台；
+- 已有 Run 的读取、全量哈希和元数据发布也由后台任务执行；读取时冻结文件
+  身份，完成校验和发布前再次核对。界面以任务身份和代次拒绝过期回调；取消与
+  开始提交互斥，已接受取消的任务不得发布，进入提交后明确拒绝取消；
 - 普通类别编辑依据 edit buffer 中的变化 FID 追踪；提交只更新受影响类别的
   文件哈希，纯 SAM3 会话状态更新不重算文件。恢复和最终组装仍校验全部类别；
   provider transaction 模式保留完整快照，不能假设其具有普通编辑缓冲的提交信号；
@@ -125,6 +139,17 @@ QGIS 插件内部的线程边界也是正式合同：
 - 模型空间单元的 14 波段概率以 float32 原位解码、累加和归一化；生成单波段
   confidence 后必须在矢量化前释放概率数组，不能让并行 polygonize 长期持有；
 - Tile、Partition、Stream、Job 和 Artifact 明细以 PostgreSQL 为状态真值；
+- 同一 Run 的执行者必须先取得独立 PostgreSQL 会话持有的 advisory lock，
+  才能恢复、重置或调度 Job。每次执行冻结 owner 身份；子进程继承该身份，
+  写事务核对当前执行和实际锁持有者，连接失效或执行退出后的旧回调不得降级为无主写入；
+- 正式文件发布先取得 Run 内稳定的文件锁，再进入 owner 校验事务；所有关联
+  数据库更新使用该事务提供的 facade。耗时计算和哈希在唯一 staging 中完成，
+  发布临界区内替换文件并登记状态。文件锁用于接管隔离，数据库回滚不等于文件回滚；
+  文件替换失败不得提交 ready 元数据，后续恢复按未完成状态核验并重建；
+- V3.3 Partition 暂存产物按 Job 尝试隔离，产物登记与 Job ready 在同一 lease
+  事务中提交；最终发布同时校验 Run owner 和 finalize Job lease，过期尝试不能覆盖新成果；
+- 成功、失败、停止三类终态均检查条件更新结果。未发布终态的本地执行只报告
+  本次尝试结束，监控继续同步数据库中的 Run 状态，不伪造全局终态或替换已加载成果；
 - 推理输入预读、结果写入与分区处理保持有界；Tile 主机流水线按每 Tile 64 MiB
   的保守估算受 1 GiB 预算约束（不含模型显存与分区几何），大 Batch 分组受此约束，
   已消费的预读结果及时释放；该估算不是整个进程的内存硬上限；
@@ -144,6 +169,15 @@ QGIS 插件内部的线程边界也是正式合同：
   一个有界 Work Package。所有概率 Halo 的理论全量只作为运行时托管 Artifact
   上限，不是必须同时存在的准入需求；实际增长由引用清理和运行时 backpressure
   约束。
+- Work Package 的 `storage_metrics_schema_version=1` 分别记录工作缓存峰值
+  `peak_cache_bytes` 和本包 guard 的托管峰值 `peak_package_managed_bytes`。
+  验收同时要求计量标识 `storage_metrics_measurement=package_guard_reserved_growth_v1`。
+  工作缓存包括本包 checkpoint、Fusion 累加器和共享输入 Tile；托管账本另外纳入
+  初始化时仍保留的概率、V3.3 输入和 `unit_confidence`。写入先计预计增长，落盘后
+  用实际增量结算，原子替换的物理写入另受磁盘余量保护。托管峰值是本包账本的
+  保守记录，不是跨进程、全 Run 的实际磁盘瞬时峰值。
+  两项分别按冻结的工作缓存预算、托管总上限验收；旧包报告缺少独立计量时不能
+  据此核准缓存合格，需要重新执行以取得证据，不修改旧报告补造峰值。
 - 最终成品大小预测是观察指标：新 Run 冻结单一预测值，结束后回报实际 ready
   Artifact、带符号差额和比例；不设置上下限、不生成 warning，也不参与任何
   验收或磁盘准入决策。
@@ -212,6 +246,12 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 - 所有类别确认后才生成 final、topology issues 和 accepted labels；
 - accepted labels、对象来源和 revision 必须可追溯。
 
+长期标签入库在独立后台任务中完成，后台自建图层和连接。稳定文件锁串行化
+本插件的写入；已有 GeoPackage 从完整性审计前到提交使用同一数据库写事务，
+保留文件身份和其他连接，失败时回滚。新库在独立临时文件中完成校验，再以
+不覆盖已有目标的方式发布。GUI 摘要不能替代来源、去重、重叠和目标身份检查。
+推理完成、几何验收、人工确认与正式入库是分别观察的阶段，不互相推断。
+
 ## 10. 状态、恢复与部署
 
 - Run 控制面只使用 PostgreSQL；历史文件状态库不再读取或恢复，需用当前部署创建新 Run；
@@ -223,9 +263,9 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
   有效 lease 的 Run 不参与自动归档；归档或记录失败只产生可见 warning，不阻止
   新 Run；
 - live PID 不代表 Run 成功，必须以 Job、Stream、Artifact 和 hard gate 收口；
-- `bash/install_plugin.sh` 安装共享插件；
-- `bash/init_project.sh` 初始化或更新部署项目；
-- 远程 Ubuntu 操作可通过 `bash/ssh_tencent.sh`，主机别名可由环境变量覆盖；
+- `scripts/deploy/install_plugin.sh` 安装共享插件；
+- `scripts/deploy/init_project.sh` 初始化或更新部署项目；
+- 远程 Ubuntu 操作可通过 `scripts/ssh_tencent.sh`，主机别名可由环境变量覆盖；
 - 部署成功、自动测试通过和 QGIS 实机验收是三个不同结论。
 
 ## 11. 变更原则

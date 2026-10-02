@@ -26,12 +26,14 @@ fitting pass.
 The production policy is `fragmentation_v33_configurable_absorption_v1`; its
 complete class permissions, area ceilings, enclosure routing, rarity order,
 bridge rules, budgets, conflict order, and hard gates are frozen in
-`fragmentation_policy/policies/v33.yaml`. The first-stage baseline remains
+`src/loess_runtime/geometry/fragmentation_policy/policies/v33.yaml` in the
+source checkout. The first-stage baseline remains
 `semantic_optimized_200_v3_core_bounded_v1`.
 
 ## Historical completed-Run repair
 
-The standalone command is retained only for Runs completed before the
+Run the following command from the generated deployment project. The
+standalone command is retained only for Runs completed before the
 authoritative-raster pipeline. It deliberately writes a derived result below
 `run_dir/postprocess` and does not participate in new v5 Runs.
 

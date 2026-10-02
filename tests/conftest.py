@@ -7,7 +7,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-for path in (ROOT / "inference_scripts", ROOT / "qgis_plugins"):
+for path in (ROOT / "src",):
     value = str(path)
     if value not in sys.path:
         sys.path.insert(0, value)
@@ -25,7 +25,7 @@ def run_qgis_integrity_case():
         environment["QT_QPA_PLATFORM"] = "offscreen"
         result = subprocess.run(
             [environment.get("LOESS_TEST_QGIS_PYTHON") or sys.executable, "-B",
-             str(ROOT / "tests/qgis_integrity_probe.py"), str(ROOT), case],
+             str(ROOT / "tests/support/qgis_integrity_probe.py"), str(ROOT), case],
             env=environment, capture_output=True, text=True, timeout=40,
         )
         if result.returncode == 77 and "LOESS_TEST_QGIS_PYTHON" not in environment:
@@ -45,12 +45,12 @@ def postgres_database_factory(monkeypatch):
     to the Homebrew socket by the production connector on macOS.
     """
 
-    from labeling_tool.core.postgres_state import (
+    from labeling_tool.shared.state.postgres_state import (
         DEFAULT_POSTGRES_DSN,
         DEFAULT_POSTGRES_SCHEMA,
         _resolve_postgres_dsn,
     )
-    from labeling_tool.core.run_state_db import RunStateDB
+    from labeling_tool.shared.state.run_state_db import RunStateDB
 
     dsn = str(
         os.environ.get("LOESS_TEST_POSTGRES_DSN") or DEFAULT_POSTGRES_DSN

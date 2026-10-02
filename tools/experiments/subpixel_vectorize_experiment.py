@@ -18,11 +18,11 @@ from shapely import affinity
 from shapely.geometry import LineString, box, shape
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-INFERENCE_SCRIPTS_ROOT = REPOSITORY_ROOT / "inference_scripts"
-if str(INFERENCE_SCRIPTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(INFERENCE_SCRIPTS_ROOT))
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
-from rasterio_compat import quiet_deprecated_memory_driver
+from loess_runtime.system.rasterio_compat import quiet_deprecated_memory_driver
 
 
 CLASS_CODES = (12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71)
@@ -214,7 +214,7 @@ def _simplify_records(records, tolerance):
 
 
 def _staircase_metrics(records):
-    from boundary_ab_validate import _staircase_metrics as metrics
+    from loess_runtime.geometry.boundary_ab_validate import _staircase_metrics as metrics
 
     return metrics([geometry for _class_index, geometry in records])
 
@@ -273,11 +273,7 @@ def _write_gpkg(path, records, transform, crs, method):
 
 
 def _qsdk_metrics(records, reference_path, reference_field, raster):
-    from boundary_ab_validate import (
-        REGIONS,
-        _boundary_distances,
-        _read_reference,
-    )
+    from loess_runtime.geometry.boundary_ab_validate import REGIONS, _boundary_distances, _read_reference
 
     reference = _read_reference(
         reference_path,

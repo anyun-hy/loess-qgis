@@ -1,0 +1,2259 @@
+import contextlib
+import hashlib
+import importlib
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from labeling_tool.runs.run_job_scheduler import (
+    cpu_worker_limit,
+    fragmentation_v33_worker_limit,
+)
+
+
+class _Signal:
+    def connect(self, _callback):
+        return None
+
+    def emit(self, *_args):
+        return None
+
+
+class _CaptureSignal:
+    def __init__(self):
+        self.values = []
+
+    def emit(self, *args):
+        self.values.append(args)
+
+
+class _QObject:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def moveToThread(self, _thread):
+        return None
+
+    def deleteLater(self):
+        return None
+
+
+class _QThread:
+    @staticmethod
+    def currentThread():
+        return _QThread()
+
+    def quit(self):
+        return None
+
+
+class _QProcess:
+    NotRunning = 0
+
+
+class _FinishedProcess:
+    def deleteLater(self):
+        return None
+
+
+class _HistoryRecorder:
+    """Minimal explicit recorder for runners constructed without ``__init__``."""
+
+    def record(self, _event):
+        return None
+
+    def start_process(self, _token, _label, _context):
+        return ""
+
+    def finish_process(
+        self, _span_id, _stream_id, *, success, error, exit_code
+    ):
+        del success, error, exit_code
+
+
+class _ExecutionOwner:
+    def assert_current(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class _StopTimer:
+    def __init__(self):
+        self.stop_count = 0
+
+    def stop(self):
+        self.stop_count += 1
+
+
+class _QProcessEnvironment:
+    @staticmethod
+    def systemEnvironment():
+        return _QProcessEnvironment()
+
+    def insert(self, *_args):
+        return None
+
+
+class _QTimer:
+    def __init__(self, *_args):
+        self.timeout = _Signal()
+
+    def setInterval(self, _value):
+        return None
+
+    @staticmethod
+    def singleShot(_delay, callback):
+        callback()
+
+
+def _load_runner_module(monkeypatch):
+    qgis_module = types.ModuleType("qgis")
+    pyqt_module = types.ModuleType("qgis.PyQt")
+    qtcore_module = types.ModuleType("qgis.PyQt.QtCore")
+    qtcore_module.QObject = _QObject
+    qtcore_module.QProcess = _QProcess
+    qtcore_module.QProcessEnvironment = _QProcessEnvironment
+    qtcore_module.QThread = _QThread
+    qtcore_module.QTimer = _QTimer
+    qtcore_module.pyqtSignal = lambda *_args: _Signal()
+    qtcore_module.pyqtSlot = lambda *_args: lambda function: function
+    monkeypatch.setitem(sys.modules, "qgis", qgis_module)
+    monkeypatch.setitem(sys.modules, "qgis.PyQt", pyqt_module)
+    monkeypatch.setitem(sys.modules, "qgis.PyQt.QtCore", qtcore_module)
+    sys.modules.pop('labeling_tool.runs.v5_async_runner', None)
+    return importlib.import_module('labeling_tool.runs.v5_async_runner')
+
+
+def test_phase_timing_uses_wall_clock_union_and_reports_geometry_tail(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 10.0)
+    timing.start("unit_fit", "unit-a", 12.0)
+    timing.start("unit_fit", "unit-b", 14.0)
+    timing.finish("package", 20.0)
+    timing.finish("unit-a", 22.0)
+    timing.finish("unit-b", 25.0)
+
+    summary = timing.summary(25.0)
+
+    assert summary["measurement"] == "wall_clock_union_sec"
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 10.0
+    assert summary["stages"]["unit_fit"]["wall_clock_sec"] == 13.0
+    assert summary["unit_fit_total_wall_clock_sec"] == 13.0
+    assert summary["unit_fit_tail_after_work_package_sec"] == 5.0
+
+
+def test_phase_timing_does_not_report_epoch_sized_tail_without_package_span(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("unit_fit", "unit-a", 1000.0)
+    timing.finish("unit-a", 1010.0)
+
+    assert timing.summary(1010.0)["unit_fit_tail_after_work_package_sec"] == 0.0
+
+
+def test_phase_timing_recovers_only_through_last_observation_and_marks_partial(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 100.0)
+    timing.observe_active(145.0)
+    state = timing.state(145.0)
+
+    recovered = module.PipelinePhaseTiming.from_state(state)
+    summary = recovered.summary(1000.0)
+
+    assert summary["status"] == "partial_recovered"
+    assert summary["recovered_incomplete_span_count"] == 1
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 45.0
+
+
+def test_phase_timing_preserves_recovery_history_across_later_restarts(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming()
+    timing.start("work_package", "package", 100.0)
+    timing.observe_active(145.0)
+
+    recovered = module.PipelinePhaseTiming.from_state(timing.state(145.0))
+    recovered_state = recovered.state(200.0)
+    recovered_again = module.PipelinePhaseTiming.from_state(recovered_state)
+    summary = recovered_again.summary(1000.0)
+
+    assert summary["status"] == "partial_recovered"
+    assert summary["recovered_incomplete_span_count"] == 1
+    assert summary["stages"]["work_package"]["wall_clock_sec"] == 45.0
+
+
+@pytest.mark.parametrize("recorded_count", [-1, True, "1", 1.0])
+def test_phase_timing_ignores_malformed_recovery_history(monkeypatch, recorded_count):
+    module = _load_runner_module(monkeypatch)
+    timing = module.PipelinePhaseTiming.from_state(
+        {
+            "schema_version": 1,
+            "recorded_at": 100.0,
+            "spans": [],
+            "summary": {"recovered_incomplete_span_count": recorded_count},
+        }
+    )
+
+    summary = timing.summary(100.0)
+
+    assert summary["status"] == "complete"
+    assert summary["recovered_incomplete_span_count"] == 0
+
+
+def test_phase_timing_file_is_written_inside_owner_publication(monkeypatch, tmp_path):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._spec = {"run_id": "run-1", "run_dir": str(tmp_path / "run")}
+    runner._phase_timing = module.PipelinePhaseTiming()
+    events = []
+
+    @contextlib.contextmanager
+    def owner_publication(run_id, run_dir):
+        events.append(("enter", run_id, run_dir))
+        try:
+            yield object()
+        finally:
+            events.append(("exit",))
+
+    runner._database = types.SimpleNamespace(owner_publication=owner_publication)
+
+    def write(path, _value):
+        assert events[-1][0] == "enter"
+        events.append(("write", Path(path).name))
+
+    monkeypatch.setattr(module, "atomic_write_json", write)
+
+    runner._persist_phase_timing()
+
+    assert [event[0] for event in events] == ["enter", "write", "exit"]
+
+
+def test_archived_run_resume_and_retry_stop_before_database_writes(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = False
+    runner._database = None
+    runner.scripts_dir = "/tmp/project/inference_scripts"
+    calls = []
+
+    def reject_archived(*_args, **_kwargs):
+        calls.append("validated")
+        raise RuntimeError("Run archived as non-resumable")
+
+    monkeypatch.setattr(module, "validate_recovery_run", reject_archived)
+
+    with pytest.raises(RuntimeError, match="non-resumable"):
+        runner.resume("/tmp/archived/run_spec.json")
+    with pytest.raises(RuntimeError, match="non-resumable"):
+        runner.retry_failed("/tmp/archived/run_spec.json")
+
+    assert calls == ["validated", "validated"]
+    assert runner._database is None
+    assert runner._running is False
+
+
+def _runner(module):
+    runner = module.V5AsyncInferenceRunner.__new__(
+        module.V5AsyncInferenceRunner
+    )
+    runner._assembly_queue = [
+        {"stream_id": "model:a"},
+        {"stream_id": "model:b"},
+        {"stream_id": "model:c"},
+        {
+            "stream_id": "fusion:approved",
+            "kind": "fusion",
+            "profile_id": "approved",
+        },
+    ]
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {
+        "streams": list(runner._assembly_queue),
+        "fragmentation_regularization": {
+            "enabled": True,
+            "max_workers": 4,
+            "buffer_pixels": 256,
+        },
+    }
+    runner._pending_job_progress = {}
+    runner._ui_event_buffer = module.UIEventBuffer()
+    runner._heartbeat_timer = _StopTimer()
+    runner._ui_flush_timer = _StopTimer()
+    runner.ui_log_batch = _Signal()
+    runner.ui_progress_batch = _Signal()
+    runner.log_run_finalized = _Signal()
+    runner._processes = {}
+    runner._phase = "assembly"
+    runner._spec_path = "/tmp/run_spec.json"
+    runner._worker_id = "qgis-test"
+    runner._accelerator_worker_id = "qgis-test-accelerator"
+    runner._job_scheduler = None
+    runner._run_ownership = _ExecutionOwner()
+    runner._monitor_history = _HistoryRecorder()
+    runner.log_line = _Signal()
+    return runner
+
+
+def _set_database(module, runner, database):
+    """Attach a facade plus the explicit Job repository used by Runner25."""
+
+    if not hasattr(database, "jobs"):
+        database.jobs = database
+    if not hasattr(database, "owner_publication"):
+
+        @contextlib.contextmanager
+        def owner_publication(_run_id, _run_dir):
+            yield database
+
+        database.owner_publication = owner_publication
+    runner._spec.setdefault("run_id", "run-1")
+    runner._database = database
+    runner._job_scheduler = module.RunJobScheduler(
+        runner._spec,
+        database.jobs,
+        worker_id=runner._worker_id,
+        accelerator_worker_id=runner._accelerator_worker_id,
+        ownership_guard=runner._run_ownership.assert_current,
+    )
+    return database
+
+
+def test_assembly_queue_starts_streams_then_acceptance_without_postprocess(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    starts = []
+    def fake_start_process(label, script, args, context):
+        starts.append((label, script, args, context))
+        runner._processes[label] = {
+            "context": context,
+            "token": label,
+        }
+    runner._start_process = fake_start_process
+
+    runner._start_assembly()
+    assert [item[0] for item in starts] == [
+        "assemble_stream:model:a",
+        "assemble_stream:model:b",
+        "assemble_stream:model:c",
+        "assemble_stream:fusion:approved",
+    ]
+    # Simulate all assemblies finished -> goes straight to acceptance.
+    runner._processes.clear()
+    runner._start_assembly()
+    assert runner._phase == "acceptance"
+    assert [item[0] for item in starts] == [
+        "assemble_stream:model:a",
+        "assemble_stream:model:b",
+        "assemble_stream:model:c",
+        "assemble_stream:fusion:approved",
+        "scale_acceptance",
+    ]
+
+
+def test_formal_gpkg_remains_review_source_even_when_postprocess_exists(
+    tmp_path, monkeypatch
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    run_dir = tmp_path / "run"
+    root = (
+        run_dir
+        / "postprocess"
+        / "semantic_optimized_200_v3"
+        / "fusion"
+        / "approved"
+    )
+    root.mkdir(parents=True)
+    review = root / "semantic_polygons.gpkg"
+    review.write_bytes(b"review")
+    report = root / "fragmentation_v3_report.json"
+    report.write_text('{"status":"passed"}', encoding="utf-8")
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    manifest = {
+        "status": "passed",
+        "run_id": "run-1",
+        "stream_id": "fusion:approved",
+        "policy_id": "semantic_optimized_200_v3",
+        "policy_version": "semantic_optimized_200_v3_core_bounded_v1",
+        "semantic_polygons": str(review),
+        "semantic_polygons_layer": "semantic_polygons",
+        "semantic_polygons_sha256": digest(review),
+        "report_path": str(report),
+        "report_sha256": digest(report),
+    }
+    (root / "fragmentation_v3_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    formal_root = run_dir / "fusion" / "approved"
+    formal_root.mkdir(parents=True)
+    for name in (
+        "mask_mosaic.vrt",
+        "confidence_mosaic.vrt",
+        "semantic_polygons_raw.gpkg",
+        "semantic_polygons.gpkg",
+        "boundary_fitting_report.json",
+        "fitted_edges.gpkg",
+    ):
+        (formal_root / name).write_bytes(b"formal")
+    (formal_root / "boundary_fitting_report.json").write_text(
+        '{"status":"passed","validation":{"passed":true}}', encoding="utf-8"
+    )
+    runner._spec = {"run_dir": str(run_dir), "boundary_fitting": {"enabled": True}}
+    from labeling_tool.runs.run_terminal_finalizer import build_result_stream
+
+    result = build_result_stream(
+        runner._spec,
+        {"stream_id": "fusion:approved", "kind": "fusion", "profile_id": "approved"}
+    )
+    assert result["review_polygons"] == str(formal_root / "semantic_polygons.gpkg")
+    assert result["review_layer_name"] == "semantic_polygons"
+
+
+def test_active_assembly_process_blocks_second_stream(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._spec["scaling"] = {"max_concurrent_assembly": 1}
+    runner._processes = {
+        "active": {
+            "context": {
+                "kind": "assemble",
+                "stream_id": "model:a",
+            }
+        }
+    }
+    starts = []
+    messages = []
+    runner._start_process = lambda *args: starts.append(args)
+    runner.log_line = types.SimpleNamespace(
+        emit=lambda level, message: messages.append((level, message))
+    )
+
+    runner._start_assembly()
+
+    assert starts == []
+    assert messages == [
+        (
+            "system",
+            "[assembly-queue] waiting for active stream: model:a",
+        )
+    ]
+    assert [item["stream_id"] for item in runner._assembly_queue] == [
+        "model:a",
+        "model:b",
+        "model:c",
+        "fusion:approved",
+    ]
+
+
+def test_resource_budget_reduces_geometry_pool_only_while_package_is_active(monkeypatch):
+    spec = {
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        }
+    }
+
+    assert cpu_worker_limit(spec, package_active=False) == 20
+    assert cpu_worker_limit(spec, package_active=True) == 16
+
+
+def test_scheduler_pauses_dispatch_and_requests_load_shedding_on_pressure(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    progress = []
+    runner._emit_progress = lambda message: progress.append(message)
+    shed = []
+    runner._shed_geometry_to_limit = lambda limit, reason: shed.append(
+        (limit, reason)
+    )
+    runner._memory_admission_decision = lambda **_kwargs: (
+        module.MemoryAdmissionDecision(
+            geometry_slot_limit=4,
+            pause_new_work=True,
+            shed_active_work=True,
+            reason="memory_pressure",
+            worker_peak_estimate_bytes=2 * 1024**3,
+            changed=True,
+            sample=module.MemoryPressureSample(supported=True),
+        )
+    )
+    runner._start_accelerator_worker = lambda: pytest.fail(
+        "pressure must prevent a new accelerator worker"
+    )
+    runner._start_job = lambda _job: pytest.fail(
+        "pressure must prevent a new geometry job"
+    )
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            job_counts=lambda _run_id, job_type="": {"queued": 2},
+        ),
+    )
+
+    runner._schedule()
+
+    assert shed == [(4, "memory_pressure")]
+    assert progress == [
+        "检测到内存压力，已暂停派发并动态降低并发；现有安全任务完成后自动恢复"
+    ]
+
+
+def test_scheduler_keeps_cleanup_disk_memory_before_dispatch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._phase = "jobs"
+    runner._spec.update(
+        {
+            "run_id": "run-1",
+            "scaling": {"max_cpu_partition_workers": 1},
+            "resource_tuning": {
+                "resolved": {
+                    "package_process_threads": 1,
+                    "fragmentation_v33_process_threads": 1,
+                    "unit_process_threads": 1,
+                }
+            },
+            "fragmentation_regularization": {
+                "enabled": True,
+                "policy_id": "fragmentation_v33_configurable_absorption_v1",
+                "publication": "authoritative_fusion_core",
+            },
+        }
+    )
+    events = []
+
+    class Jobs:
+        def interrupt_expired_jobs(self, *, run_id):
+            events.append(("recover", run_id))
+
+        def job_counts(self, _run_id, *, job_type=""):
+            events.append(("counts", job_type))
+            if job_type == "work_package":
+                return {"queued": 1}
+            if job_type == "fragmentation_v33":
+                return {"queued": 1}
+            return {"ready": 1}
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            events.append(("lease", "v33"))
+            return None
+
+        def lease_next_job(self, *_args, **_kwargs):
+            events.append(("lease", "unit"))
+            return None
+
+    _set_database(module, runner, Jobs())
+    runner._cleanup_released_artifacts = lambda: events.append(("gate", "cleanup"))
+    runner._disk_below_reserve = lambda: events.append(("gate", "disk")) or False
+    runner._memory_admission_decision = lambda **_kwargs: (
+        events.append(("gate", "memory"))
+        or module.MemoryAdmissionDecision(
+            geometry_slot_limit=1,
+            pause_new_work=False,
+            shed_active_work=False,
+            reason="stable",
+            worker_peak_estimate_bytes=0,
+            changed=False,
+            sample=module.MemoryPressureSample(),
+        )
+    )
+    runner._start_accelerator_worker = lambda: events.append(
+        ("start", "accelerator")
+    )
+    runner._start_job = lambda job: events.append(("start", job["job_id"]))
+    runner._emit_progress = lambda *_args: None
+
+    runner._schedule()
+
+    assert events == [
+        ("recover", "run-1"),
+        ("counts", "work_package"),
+        ("gate", "cleanup"),
+        ("gate", "disk"),
+        ("gate", "memory"),
+        ("start", "accelerator"),
+        ("counts", "fragmentation_v33"),
+        ("lease", "v33"),
+        ("lease", "unit"),
+    ]
+
+
+def test_scheduler_waits_for_memory_then_dispatches_v33_after_idle_recovery(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._phase = "jobs"
+    runner._spec.update({
+        "run_id": "run-1",
+        "scaling": {"max_cpu_partition_workers": 16},
+        "resource_tuning": {"resolved": {"fragmentation_v33_process_threads": 4}},
+        "fragmentation_regularization": {
+            "enabled": True, "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+        },
+    })
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=25 * 1024**3, some_avg10=10)
+    now = [0.0]
+    runner._memory_admission = module.AdaptiveMemoryAdmissionController(
+        sampler=lambda: sample, clock=lambda: now[0],
+    )
+    runner._memory_admission.decide(static_limit=16, active_slots=4, package_active=False)
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._finish = lambda *args: pytest.fail(f"resource wait must not finish Run: {args}")
+    progress, leased, started = [], [], []
+    runner._emit_progress = progress.append
+    job = {"job_id": 1, "job_type": "fragmentation_v33"}
+    def lease(*args, **kwargs):
+        leased.append(True)
+        return job if len(leased) == 1 else None
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            job_counts=lambda *args, job_type="": (
+                {"ready": 1} if job_type == "work_package" else {"queued": 1}
+            ),
+            lease_next_job=lambda *args, **kwargs: None,
+            lease_next_fragmentation_v33=lease,
+        ),
+    )
+    runner._start_job = started.append
+    # Pressure is gone, but reserve leaves room for only two slots.
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=25 * 1024**3)
+    now[0] = 6
+    runner._schedule()
+    assert not leased and not started
+    assert progress
+    sample = module.MemoryPressureSample(supported=True, total_bytes=100 * 1024**3,
+                                         available_bytes=80 * 1024**3)
+    now[0] = 12
+    runner._schedule()
+    assert started == [job]
+
+
+@pytest.mark.parametrize("callback", ["_start_assembly", "_start_acceptance"])
+def test_queued_phase_callback_cannot_launch_after_stop(monkeypatch, callback):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._spec["run_id"] = "run-1"
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            run_streams=types.SimpleNamespace(
+                set_run_status=lambda *args, **kwargs: None
+            )
+        ),
+    )
+    runner._finish = lambda *args: setattr(runner, "_running", False)
+    runner._start_process = lambda *args: pytest.fail("stopped Run started a process")
+    queued = getattr(runner, callback)
+    runner.stop()
+    queued()
+    assert not runner._assembly_queue
+
+
+def test_memory_shed_interrupts_job_before_nonblocking_process_termination(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    calls = []
+
+    class Process:
+        def processId(self):
+            return 0
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    process = Process()
+    entry = {
+        "token": "process-token",
+        "process": process,
+        "context": {
+            "kind": "job",
+            "job": {
+                "job_id": 42,
+                "job_type": "unit_fit",
+                "unit_id": "core_00000_00000",
+                "lease_token": "lease-token",
+            }
+        },
+        "forced_error": "",
+        "owns_process_group": False,
+    }
+    runner._processes = {"process-token": entry}
+
+    class Jobs:
+        def interrupt_job(self, job_id, lease):
+            calls.append((job_id, lease))
+            return True
+
+        def interrupt_expired_jobs(self, *, run_id):
+            return None
+
+        def job_counts(self, _run_id, *, job_type=""):
+            return {"ready": 1} if job_type == "work_package" else {"interrupted": 1}
+
+    _set_database(
+        module,
+        runner,
+        Jobs(),
+    )
+    monkeypatch.setattr(module, "process_is_running", lambda _process: True)
+
+    assert runner._request_memory_shed(entry, "memory_pressure") is True
+
+    assert calls == [(42, "lease-token"), "terminate", "kill"]
+    assert entry["memory_shed"] is True
+    assert entry["forced_error"].startswith("memory-pressure load shedding")
+
+
+
+
+
+
+
+
+
+def test_shared_cpu_budget_reserves_four_v33_workers_before_unit_fit_dispatch(monkeypatch):
+    spec = {
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+
+    assert fragmentation_v33_worker_limit(spec, package_active=False) == 5
+    assert cpu_worker_limit(
+        spec,
+        package_active=False,
+        fragmentation_v33_active=4,
+    ) == 4
+
+
+def test_shared_cpu_budget_counts_unit_fit_native_threads(monkeypatch):
+    spec = {
+        "scaling": {"max_cpu_partition_workers": 20},
+        "resource_tuning": {
+            "resolved": {
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 2,
+            }
+        },
+    }
+
+    assert cpu_worker_limit(
+        spec,
+        package_active=False,
+        fragmentation_v33_active=2,
+    ) == 6
+
+
+def test_v33_thread_environment_uses_its_frozen_reservation(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 3,
+            }
+        }
+    }
+
+    values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "fragmentation_v33"}},
+    )
+    assert values["OMP_NUM_THREADS"] == "3"
+
+
+def test_child_process_thread_limits_prevent_nested_cpu_oversubscription(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    spec = {
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "unit_process_threads": 1,
+                "assembly_process_threads": 1,
+            }
+        }
+    }
+    package_values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "work_package"}},
+    )
+    unit_values = module.process_thread_environment_values(
+        spec,
+        {"job": {"job_type": "unit_fit"}},
+    )
+    worker_values = module.process_thread_environment_values(
+        spec,
+        {"kind": "accelerator_worker"},
+    )
+
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert package_values[name] == "4"
+        assert worker_values[name] == "4"
+        assert unit_values[name] == "1"
+    assert package_values["OMP_DYNAMIC"] == "FALSE"
+    assert package_values["MKL_DYNAMIC"] == "FALSE"
+
+
+def test_scheduler_starts_one_persistent_accelerator_and_unit_jobs(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._accelerator_worker_id = "qgis-test-accelerator"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 2,
+            "max_cpu_partition_workers_with_package": 1,
+        },
+        "boundary_fitting": {"enabled": True},
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    calls = []
+    unit_jobs = [
+        {
+            "job_id": 10,
+            "job_type": "unit_fit",
+            "stream_id": "model:a",
+            "unit_id": "core_00001",
+            "lease_token": "unit-token",
+        }
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            assert job_type == "work_package"
+            return {"queued": 2}
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return unit_jobs.pop(0) if unit_jobs else None
+
+        def lease_next_work_package(self, *_args, **_kwargs):
+            raise AssertionError("QGIS must not lease Work Packages")
+
+    _set_database(module, runner, Database())
+    runner._start_accelerator_worker = lambda: calls.append("accelerator")
+    runner._start_job = lambda job: calls.append(("unit", job["job_id"]))
+
+    runner._schedule()
+
+    assert calls == ["accelerator", ("unit", 10)]
+
+
+def test_scheduler_starts_v33_before_same_fusion_unit_jobs_but_keeps_models_running(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 2,
+            "max_cpu_partition_workers_with_package": 1,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 1,
+                "fragmentation_v33_process_threads": 1,
+            }
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    candidate = {
+        "job_id": 20,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33_candidate",
+        "lease_token": "candidate-token",
+    }
+    model_unit = {
+        "job_id": 21,
+        "job_type": "unit_fit",
+        "stream_id": "model:a",
+        "unit_id": "core_00001",
+        "lease_token": "model-token",
+    }
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"queued": 1}
+            raise AssertionError(job_type)
+
+        def lease_next_job(self, *_args, **_kwargs):
+            if not hasattr(self, "leased_model"):
+                self.leased_model = True
+                return model_unit
+            return None
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            if not hasattr(self, "leased_candidate"):
+                self.leased_candidate = True
+                return candidate
+            return None
+
+    _set_database(module, runner, Database())
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert starts == [candidate, model_unit]
+
+
+def test_scheduler_streams_v33_while_accelerator_is_still_running(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._processes = {
+        "accelerator": {
+            "context": {"kind": "accelerator_worker"},
+        }
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    candidate = {
+        "job_id": 30,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33_partition:partition_00000_00000",
+        "lease_token": "candidate-token",
+    }
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"running": 1, "queued": 1}
+            if job_type == "fragmentation_v33":
+                return {"queued": 1}
+            raise AssertionError(job_type)
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            if not hasattr(self, "leased"):
+                self.leased = True
+                return candidate
+            return None
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return None
+
+    _set_database(module, runner, Database())
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert starts == [candidate]
+
+
+def test_scheduler_does_not_dispatch_twenty_unit_fits_beside_four_v33_workers(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    runner._processes = {
+        f"v33-{index}": {
+            "context": {
+                "kind": "job",
+                "job": {"job_type": "fragmentation_v33", "job_id": index},
+            }
+        }
+        for index in range(4)
+    }
+    unit_jobs = [
+        {
+            "job_id": 100 + index,
+            "job_type": "unit_fit",
+            "stream_id": "model:a",
+            "unit_id": f"core_{index:05d}",
+            "lease_token": f"unit-{index}",
+        }
+        for index in range(20)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"running": 4}
+            raise AssertionError(job_type)
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return unit_jobs.pop(0) if unit_jobs else None
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            raise AssertionError("four active V3.3 workers already fill the cap")
+
+    _set_database(module, runner, Database())
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert [job["job_id"] for job in starts] == [100, 101, 102, 103]
+
+
+def test_scheduler_starts_more_v33_workers_only_as_unit_fit_cpu_budget_frees(
+    monkeypatch,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "fragmentation_regularization": {
+            "enabled": True,
+            "policy_id": "fragmentation_v33_configurable_absorption_v1",
+            "publication": "authoritative_fusion_core",
+            "max_workers": 4,
+        },
+        "resource_tuning": {
+            "resolved": {
+                "package_process_threads": 4,
+                "fragmentation_v33_process_threads": 4,
+                "unit_process_threads": 1,
+            }
+        },
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    def unit_context(index):
+        return {
+            "context": {
+                "kind": "job",
+                "job": {"job_type": "unit_fit", "job_id": index},
+            }
+        }
+
+    runner._processes = {
+        f"unit-{index}": unit_context(index) for index in range(16)
+    }
+    candidate_jobs = [
+        {
+            "job_id": 300 + index,
+            "job_type": "fragmentation_v33",
+            "stream_id": "fusion:approved",
+            "unit_id": f"fragmentation_v33_partition:{index}",
+            "lease_token": f"candidate-{index}",
+        }
+        for index in range(3)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            if job_type == "work_package":
+                return {"ready": 2}
+            if job_type == "fragmentation_v33":
+                return {"queued": 3}
+            raise AssertionError(job_type)
+
+        def lease_next_fragmentation_v33(self, *_args, **_kwargs):
+            return candidate_jobs.pop(0) if candidate_jobs else None
+
+        def lease_next_job(self, *_args, **_kwargs):
+            raise AssertionError("active unit-fit tasks already fill their allowance")
+
+    _set_database(module, runner, Database())
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    # 16 unit threads leave capacity for exactly one four-thread V3.3 worker.
+    assert [job["job_id"] for job in starts] == [300]
+
+    # Once eight unit fits complete, the scheduler can grow from one to three
+    # V3.3 workers, but no farther: 8 + 3 * 4 == 20 frozen CPU threads.
+    runner._processes = {
+        "v33-0": {"context": {"kind": "job", "job": starts[0]}},
+        **{f"unit-{index}": unit_context(index) for index in range(8)},
+    }
+    runner._schedule()
+
+    assert [job["job_id"] for job in starts] == [300, 301, 302]
+
+
+def test_scheduler_uses_full_geometry_budget_when_v33_is_not_active(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 20,
+            "max_cpu_partition_workers_with_package": 16,
+        },
+        "boundary_fitting": {"enabled": True},
+        "resource_tuning": {"resolved": {"unit_process_threads": 1}},
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    unit_jobs = [
+        {
+            "job_id": 200 + index,
+            "job_type": "unit_fit",
+            "stream_id": "model:a",
+            "unit_id": f"core_{index:05d}",
+            "lease_token": f"unit-{index}",
+        }
+        for index in range(20)
+    ]
+
+    class Database:
+        def job_counts(self, _run_id, *, job_type=""):
+            assert job_type == "work_package"
+            return {"ready": 2}
+
+        def lease_next_job(self, *_args, **_kwargs):
+            return unit_jobs.pop(0) if unit_jobs else None
+
+    _set_database(module, runner, Database())
+    starts = []
+    runner._start_job = lambda job: starts.append(job)
+
+    runner._schedule()
+
+    assert len(starts) == 20
+
+
+def test_active_accelerator_process_prevents_a_second_worker(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {
+        "run_id": "run-1",
+        "scaling": {
+            "max_cpu_partition_workers": 1,
+            "max_cpu_partition_workers_with_package": 1,
+        },
+        "boundary_fitting": {"enabled": True},
+    }
+    runner._processes = {
+        "accelerator": {
+            "context": {
+                "kind": "accelerator_worker",
+                "worker_id": "qgis-test-accelerator",
+            }
+        }
+    }
+    runner._cleanup_released_artifacts = lambda: None
+    runner._disk_below_reserve = lambda: False
+    runner._emit_progress = lambda *_args: None
+    starts = []
+    runner._start_accelerator_worker = lambda: starts.append("duplicate")
+    runner._start_job = lambda job: starts.append(job)
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            job_counts=lambda _run_id, job_type="": {"queued": 2},
+            lease_next_job=lambda *_args, **_kwargs: None,
+        ),
+    )
+
+    runner._schedule()
+
+    assert starts == []
+
+
+def test_scheduler_stops_immediately_after_terminal_package_failure(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._phase = "jobs"
+    runner._spec = {"run_id": "run-1"}
+    cleanup_calls = []
+    finishes = []
+    runner._cleanup_released_artifacts = lambda: cleanup_calls.append("cleanup")
+    runner._finish = lambda success, error: finishes.append((success, error))
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            job_counts=lambda *_args, **_kwargs: {"failed": 1, "queued": 45},
+        ),
+    )
+
+    runner._schedule()
+
+    assert cleanup_calls == []
+    assert finishes == [
+        (
+            False,
+            "Work Package exhausted retries; remaining work was stopped: "
+            "{'failed': 1, 'queued': 45}",
+        )
+    ]
+
+
+def test_accelerator_launch_uses_worker_mode_without_package_lease(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._spec = {
+        "runtime": {"effective_device": "cuda"},
+        "scaling": {"max_open_frontier_units": 72},
+    }
+    runner._accelerator_worker_id = "qgis-test-accelerator"
+    starts = []
+    runner._start_process = lambda *args: starts.append(args)
+
+    runner._start_accelerator_worker()
+
+    assert len(starts) == 1
+    label, script, arguments, context = starts[0]
+    assert label == "accelerator_worker"
+    assert script == "run_work_package.sh"
+    assert arguments == [
+        "--run-spec",
+        "/tmp/run_spec.json",
+        "--worker-id",
+        "qgis-test-accelerator",
+        "--device",
+        "cuda",
+        "--max-open-frontier-units",
+        "72",
+        "--resume",
+    ]
+    assert "--package-id" not in arguments
+    assert "--job-id" not in arguments
+    assert "--lease-token" not in arguments
+    assert context == {
+        "kind": "accelerator_worker",
+        "worker_id": "qgis-test-accelerator",
+    }
+
+
+def test_qprocess_start_error_is_forced_through_terminal_handler(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    finished = []
+
+    class FailedProcess:
+        def errorString(self):
+            return "executable not found"
+
+    runner._processes = {
+        "failed-start": {
+            "process": FailedProcess(),
+            "context": {"kind": "assemble", "label": "assemble:model:a"},
+            "forced_error": "",
+        }
+    }
+    monkeypatch.setattr(module, "process_is_running", lambda _process: False)
+    runner._process_finished = lambda token, code, status: finished.append(
+        (token, code, status)
+    )
+
+    runner._process_error("failed-start", None)
+
+    assert runner._processes["failed-start"]["forced_error"] == (
+        "assemble:model:a process error: executable not found"
+    )
+    assert finished == [("failed-start", -1, None)]
+
+
+def test_v33_process_cannot_bypass_atomic_completion_gate(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._spec = {"run_id": "run-1"}
+    job = {
+        "job_id": 33,
+        "job_type": "fragmentation_v33",
+        "stream_id": "fusion:approved",
+        "unit_id": "fragmentation_v33_partition:partition_00000_00000",
+        "lease_token": "lease-33",
+    }
+    runner._processes = {
+        "v33": {
+            "process": _FinishedProcess(),
+            "context": {"kind": "job", "label": "fragmentation_v33", "job": job},
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+            "timeout_count": 0,
+        }
+    }
+    finished = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._emit_progress = lambda *_args: None
+    runner._schedule = lambda: None
+    runner.step_finished = _Signal()
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            get_job=lambda _job_id: {**job, "status": "running"},
+            finish_job=lambda job_id, token, **kwargs: finished.append(
+                (job_id, token, kwargs)
+            )
+            or True,
+            requeue_failed_job=lambda _job_id: False,
+        ),
+    )
+
+    runner._process_finished("v33", 0, None)
+
+    assert finished == [
+        (
+            33,
+            "lease-33",
+            {
+                "status": "failed",
+                "error": "V3.3 worker exited without its atomic output commit",
+            },
+        )
+    ]
+
+
+def test_failed_finish_kills_and_interrupts_other_active_children(
+    tmp_path, monkeypatch
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._started_at = 0.0
+    runner._manual_package_reset = {}
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text("{}", encoding="utf-8")
+    runner._spec_path = str(spec_path)
+    runner._spec = {
+        "run_id": "run-1",
+        "run_dir": str(tmp_path / "run"),
+        "output_root": str(tmp_path),
+        "streams": [],
+    }
+    job = {"job_id": 7, "lease_token": "unit-token"}
+    runner._processes = {
+        "unit": {
+            "process": object(),
+            "context": {"kind": "job", "job": job},
+        }
+    }
+    terminated = []
+    interrupted = []
+    runner._terminate_entry = lambda entry, graceful: terminated.append(
+        (entry, graceful)
+    )
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            interrupt_job=lambda job_id, token: interrupted.append((job_id, token)),
+            interrupt_work_package_worker=lambda *_args: None,
+            job_counts=lambda *_args, **_kwargs: {},
+            artifacts=types.SimpleNamespace(
+                artifact_cleanup_summary=lambda *_args: {}
+            ),
+            monitor_history=types.SimpleNamespace(),
+            run_streams=types.SimpleNamespace(
+                set_run_status=lambda *_args, **_kwargs: True,
+                fail_open_streams=lambda *_args, **_kwargs: 0,
+            ),
+        ),
+    )
+    runner._record_startup_index = lambda *_args: None
+    runner.pipeline_finished = _Signal()
+    monkeypatch.setattr(module, "atomic_write_json", lambda *_args, **_kwargs: None)
+
+    runner._finish(False, "injected crash guard")
+
+    assert len(terminated) == 1
+    assert terminated[0][1] is False
+    assert interrupted == [(7, "unit-token")]
+    assert runner._processes == {}
+    assert runner._running is False
+
+
+def test_start_owner_conflict_is_reported_as_unpublished_attempt(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = False
+    runner._run_ownership = None
+    runner._spec = {
+        "run_id": "run-1",
+        "run_dir": "/tmp/run-1",
+        "streams": [{"stream_id": "model:a"}],
+    }
+    runner.runtime_start_failed = _CaptureSignal()
+    runner.run_from_spec = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        module.RunOwnershipConflictError("already owned")
+    )
+
+    runner.execute_request({"run_spec_path": "/tmp/run-1/run_spec.json"})
+
+    assert len(runner.runtime_start_failed.values) == 1
+    result = runner.runtime_start_failed.values[0][0]
+    assert result["status"] == "ownership_conflict"
+    assert result["success"] is False
+    assert result["terminal_published"] is False
+    assert result["failed_streams"] == []
+
+
+@pytest.mark.parametrize("failure_point", ["phase", "hash"])
+def test_terminal_preparation_error_ends_local_attempt(
+    tmp_path, monkeypatch, failure_point
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._started_at = 0.0
+    runner._manual_package_reset = {}
+    runner._execution_id = "execution-1"
+    runner._phase_timing = module.PipelinePhaseTiming()
+    runner._processes = {}
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text("{}", encoding="utf-8")
+    runner._spec_path = str(spec_path)
+    runner._spec = {
+        "run_id": "run-1",
+        "run_dir": str(tmp_path / "run"),
+        "output_root": str(tmp_path),
+        "streams": [],
+    }
+    failed = []
+    sealed = []
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            monitor_history=types.SimpleNamespace(
+                finish_execution=lambda *_args, **kwargs: sealed.append(kwargs)
+                or True
+            ),
+            run_streams=types.SimpleNamespace(
+                fail_terminal_publication=lambda run_id, error: failed.append(
+                    (run_id, error)
+                )
+                or True,
+                set_run_status=lambda *_args, **_kwargs: True,
+                fail_open_streams=lambda *_args, **_kwargs: 0,
+            ),
+            job_counts=lambda *_args, **_kwargs: {},
+            artifacts=types.SimpleNamespace(
+                artifact_cleanup_summary=lambda *_args: {}
+            ),
+        ),
+    )
+    runner.pipeline_finished = _CaptureSignal()
+    runner._seal_execution_attempt_failure = lambda message: sealed.append(message)
+    if failure_point == "phase":
+        runner._persist_phase_timing = lambda: (_ for _ in ()).throw(
+            OSError("phase unavailable")
+        )
+    else:
+        runner._persist_phase_timing = lambda: None
+        monkeypatch.setattr(
+            module,
+            "build_run_result",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("hash unavailable")
+            ),
+        )
+
+    runner._finish(True, "")
+
+    assert runner._running is False
+    assert len(runner.pipeline_finished.values) == 1
+    result = runner.pipeline_finished.values[0][0]
+    assert result["status"] == "failed"
+    assert result["terminal_published"] is False
+    assert failure_point in result["error"] or "unavailable" in result["error"]
+    assert failed and "terminal publication failed" in failed[0][1]
+    assert sealed == ["phase unavailable" if failure_point == "phase" else "hash unavailable"]
+
+
+def test_released_artifact_unlink_and_cleanup_commit_share_file_barrier(
+    tmp_path, monkeypatch
+):
+    module = _load_runner_module(monkeypatch)
+    artifact = tmp_path / "attempt" / "probability.tif"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"temporary-artifact")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    events = []
+
+    class Artifacts:
+        def cleanup_candidates(self, *_args, **_kwargs):
+            return [{"artifact_id": 7}]
+
+        def claim_artifact_cleanup(self, artifact_id):
+            assert events[-1] == "enter"
+            events.append("claim")
+            return {
+                "artifact_id": artifact_id,
+                "path": str(artifact),
+                "byte_count": artifact.stat().st_size,
+                "sha256": digest,
+            }
+
+        def finish_artifact_cleanup(self, artifact_id, *, success):
+            assert artifact_id == 7
+            assert success is True
+            assert artifact.exists() is False
+            events.append("finish")
+            return True
+
+    @contextlib.contextmanager
+    def owner_publication(_run_id, _run_dir):
+        events.append("enter")
+        try:
+            yield database
+        finally:
+            assert artifact.exists() is False
+            events.append("exit")
+
+    database = types.SimpleNamespace(
+        session=types.SimpleNamespace(bind_execution_owner=lambda _identity: None),
+        artifacts=Artifacts(),
+        owner_publication=owner_publication,
+    )
+    monkeypatch.setattr(module, "run_state_from_spec", lambda _spec: database)
+    monkeypatch.setattr(
+        module.RunExecutionIdentity,
+        "from_mapping",
+        lambda value: value,
+    )
+
+    missing = module.V5AsyncInferenceRunner._perform_released_artifact_cleanup(
+        {"run_id": "run-1", "run_dir": str(tmp_path)},
+        {"identity": "test"},
+    )
+
+    assert missing == []
+    assert events == ["enter", "claim", "finish", "exit"]
+
+
+def test_terminal_fallback_database_error_still_releases_and_signals(
+    tmp_path, monkeypatch
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._started_at = 0.0
+    runner._manual_package_reset = {}
+    runner._execution_id = "execution-1"
+    runner._phase_timing = module.PipelinePhaseTiming()
+    runner._processes = {}
+    spec_path = tmp_path / "run_spec.json"
+    spec_path.write_text("{}", encoding="utf-8")
+    runner._spec_path = str(spec_path)
+    runner._spec = {
+        "run_id": "run-1",
+        "run_dir": str(tmp_path / "run"),
+        "output_root": str(tmp_path),
+        "streams": [],
+    }
+
+    def fail_terminal_publication(*_args, **_kwargs):
+        raise OSError("fallback database unavailable")
+
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            monitor_history=types.SimpleNamespace(),
+            run_streams=types.SimpleNamespace(
+                fail_terminal_publication=fail_terminal_publication,
+            ),
+        ),
+    )
+    runner.pipeline_finished = _CaptureSignal()
+    runner._persist_phase_timing = lambda: (_ for _ in ()).throw(
+        OSError("phase unavailable")
+    )
+
+    runner._finish(True, "")
+
+    assert runner._run_ownership is None
+    assert len(runner.pipeline_finished.values) == 1
+    result = runner.pipeline_finished.values[0][0]
+    assert result["status"] == "attempt_failed"
+    assert result["terminal_published"] is False
+    assert "fallback state update failed" in result["error"]
+
+
+def test_failed_stream_stops_queue_before_fusion_and_acceptance(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._processes = {
+        "failed": {
+            "process": _FinishedProcess(),
+            "context": {
+                "kind": "assemble",
+                "label": "assemble_stream:model:a",
+                "stream_id": "model:a",
+            },
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+        }
+    }
+    finishes = []
+    starts = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._finish = lambda success, error: finishes.append((success, error))
+    runner._start_assembly = lambda: starts.append("continued")
+    runner.step_finished = _Signal()
+
+    runner._process_finished("failed", 2, None)
+
+    assert starts == []
+    assert finishes == [
+        (False, "assemble_stream:model:a failed (rc=2)"),
+    ]
+    assert [item["stream_id"] for item in runner._assembly_queue] == [
+        "model:a",
+        "model:b",
+        "model:c",
+        "fusion:approved",
+    ]
+
+
+def test_user_stop_defers_terminal_status_until_fenced_publication(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._processes = {
+        "active": {
+            "context": {
+                "kind": "assemble",
+                "label": "assemble_stream:model:a",
+                "stream_id": "model:a",
+            }
+        }
+    }
+    terminated = []
+    status_updates = []
+    finishes = []
+    runner._terminate_entry = lambda entry, graceful: terminated.append(
+        (entry["context"]["stream_id"], graceful)
+    )
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            run_streams=types.SimpleNamespace(
+                set_run_status=lambda run_id, status, expected: status_updates.append(
+                    (run_id, status, expected)
+                )
+            )
+        ),
+    )
+    runner._finish = lambda success, error: finishes.append((success, error))
+
+    runner.stop()
+
+    assert runner._stopped is True
+    assert runner._processes == {}
+    assert runner._scheduler.stop_count == 1
+    assert runner._watchdog.stop_count == 1
+    assert terminated == [("model:a", True)]
+    assert status_updates == []
+    assert finishes == [(False, "Pipeline stopped by user")]
+
+
+def test_user_stop_interrupts_the_worker_owned_package(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._scheduler = _StopTimer()
+    runner._watchdog = _StopTimer()
+    runner._processes = {
+        "accelerator": {
+            "context": {
+                "kind": "accelerator_worker",
+                "label": "accelerator_worker",
+                "worker_id": "qgis-test-accelerator",
+            }
+        }
+    }
+    terminated = []
+    interrupted = []
+    runner._terminate_entry = lambda entry, graceful: terminated.append(
+        (entry["context"]["worker_id"], graceful)
+    )
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            interrupt_work_package_worker=lambda run_id, worker_id: interrupted.append(
+                (run_id, worker_id)
+            ),
+            run_streams=types.SimpleNamespace(
+                set_run_status=lambda *_args, **_kwargs: None
+            ),
+        ),
+    )
+    runner._finish = lambda *_args: None
+
+    runner.stop()
+
+    assert terminated == [("qgis-test-accelerator", True)]
+    assert interrupted == [("run-1", "qgis-test-accelerator")]
+    assert runner._processes == {}
+
+
+@pytest.mark.parametrize("exit_code", [0, 2])
+def test_accelerator_exit_with_pending_package_interrupts_and_restarts(
+    monkeypatch,
+    exit_code,
+):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._processes = {
+        "accelerator": {
+            "process": _FinishedProcess(),
+            "context": {
+                "kind": "accelerator_worker",
+                "label": "accelerator_worker",
+                "worker_id": "qgis-test-accelerator",
+            },
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+        }
+    }
+    interrupted = []
+    scheduled = []
+    finishes = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._emit_progress = lambda *_args: None
+    runner._schedule = lambda: scheduled.append("restart")
+    runner._finish = lambda success, error: finishes.append((success, error))
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            interrupt_work_package_worker=lambda run_id, worker_id: interrupted.append(
+                (run_id, worker_id)
+            ),
+            job_counts=lambda _run_id, job_type="": {"interrupted": 1},
+        ),
+    )
+    runner.step_finished = _Signal()
+
+    runner._process_finished("accelerator", exit_code, None)
+
+    assert interrupted == [("run-1", "qgis-test-accelerator")]
+    assert scheduled == ["restart"]
+    assert finishes == []
+    assert runner._job_scheduler.accelerator_done is False
+    assert runner._job_scheduler.accelerator_crash_count == 1
+
+
+def test_accelerator_terminal_package_failure_finishes_without_restart(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._stopped = False
+    runner._spec = {"run_id": "run-1"}
+    runner._processes = {
+        "accelerator": {
+            "process": _FinishedProcess(),
+            "context": {
+                "kind": "accelerator_worker",
+                "label": "accelerator_worker",
+                "worker_id": "qgis-test-accelerator",
+            },
+            "stdout": bytearray(),
+            "stderr": bytearray(),
+            "forced_error": "",
+        }
+    }
+    interrupted = []
+    finishes = []
+    runner._read = lambda *_args: None
+    runner._flush = lambda *_args, **_kwargs: None
+    runner._finish = lambda success, error: finishes.append((success, error))
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            interrupt_work_package_worker=lambda run_id, worker_id: interrupted.append(
+                (run_id, worker_id)
+            ),
+            job_counts=lambda *_args, **_kwargs: {"failed": 1, "queued": 45},
+        ),
+    )
+    runner.step_finished = _Signal()
+
+    runner._process_finished("accelerator", 2, None)
+
+    assert interrupted == [("run-1", "qgis-test-accelerator")]
+    assert finishes == [
+        (
+            False,
+            "Work Package exhausted retries; remaining work was stopped: "
+            "{'failed': 1, 'queued': 45}",
+        )
+    ]
+    assert runner._job_scheduler.accelerator_done is True
+    assert runner._job_scheduler.accelerator_crash_count == 0
+
+
+def test_graceful_worker_stop_escalates_when_sigterm_does_not_exit(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    signals = []
+
+    class Process:
+        def __init__(self):
+            self.running = True
+            self.waits = []
+            self.kill_count = 0
+
+        def processId(self):
+            return 4321
+
+        def waitForFinished(self, timeout):
+            self.waits.append(timeout)
+            return not self.running
+
+        def kill(self):
+            self.kill_count += 1
+            self.running = False
+
+    process = Process()
+    monkeypatch.setattr(
+        module,
+        "process_is_running",
+        lambda candidate: candidate.running,
+    )
+
+    def kill_group(pid, signum):
+        signals.append((pid, signum))
+        if signum == module.signal.SIGKILL:
+            process.running = False
+
+    monkeypatch.setattr(module.os, "killpg", kill_group)
+
+    runner._terminate_entry(
+        {"process": process, "owns_process_group": True},
+        graceful=True,
+    )
+
+    assert signals == [
+        (4321, module.signal.SIGTERM),
+        (4321, module.signal.SIGKILL),
+    ]
+    assert process.waits == [2500, 1000]
+    assert process.running is False
+
+
+def test_manual_retry_selects_package_reset_instead_of_job_requeue(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = module.V5AsyncInferenceRunner.__new__(
+        module.V5AsyncInferenceRunner
+    )
+    calls = []
+    runner.run_from_spec = lambda path, **kwargs: calls.append((path, kwargs))
+
+    runner.retry_failed("/tmp/run_spec.json")
+
+    assert calls == [
+        (
+            "/tmp/run_spec.json",
+            {
+                "accepted_layer": None,
+                "resume": True,
+                "reset_failed_packages": True,
+            },
+        )
+    ]
+
+
+def test_scheduler_exception_is_logged_and_finishes_the_run(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    messages = []
+    finishes = []
+    runner.log_line = types.SimpleNamespace(
+        emit=lambda level, message: messages.append((level, message))
+    )
+    runner._schedule = lambda: (_ for _ in ()).throw(
+        TypeError("unexpected keyword argument 'run_id'")
+    )
+    runner._finish = lambda success, error: finishes.append((success, error))
+
+    runner._schedule_safely()
+
+    assert messages == [
+        (
+            "stderr",
+            "[scheduler-error] TypeError: unexpected keyword argument 'run_id'",
+        )
+    ]
+    assert finishes == [(False, messages[0][1])]
+
+
+def test_resume_contract_failure_precedes_database_mutation(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = module.V5AsyncInferenceRunner.__new__(
+        module.V5AsyncInferenceRunner
+    )
+    runner._running = False
+    runner.scripts_dir = "/project/inference_scripts"
+    events = []
+
+    def reject_recovery(*_args):
+        events.append("validate")
+        raise RuntimeError("deployment changed")
+
+    monkeypatch.setattr(module, "validate_recovery_run", reject_recovery)
+    monkeypatch.setattr(
+        module,
+        "run_state_from_spec",
+        lambda *_args: events.append("database-open"),
+    )
+
+    with pytest.raises(RuntimeError, match="deployment changed"):
+        runner.resume("/run/run_spec.json")
+    assert events == ["validate"]
+
+
+def test_high_frequency_stream_progress_is_coalesced_before_the_gui(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner.ui_progress_batch = types.SimpleNamespace(emit=batches.append)
+
+    for current in range(500):
+        runner._ui_event_buffer.enqueue_stream_progress(
+            {
+                "event": "fit_progress",
+                "stream_id": "model:a",
+                "current": current,
+                "total": 500,
+            }
+        )
+    runner._ui_event_buffer.enqueue_stream_progress(
+        {
+            "event": "fit_failed",
+            "stream_id": "model:a",
+            "status": "failed",
+            "error": "injected",
+        }
+    )
+    runner._flush_ui_events()
+
+    assert len(batches) == 1
+    events = batches[0]["stream_events"]
+    assert len(events) == 2
+    assert events[0]["event"] == "fit_failed"
+    assert events[1]["current"] == 499
+
+
+def test_sustained_200_events_per_second_stays_at_ten_gui_batches(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner.ui_progress_batch = types.SimpleNamespace(emit=batches.append)
+
+    for window in range(10):
+        for offset in range(20):
+            current = window * 20 + offset
+            runner._ui_event_buffer.enqueue_stream_progress(
+                {
+                    "event": "fit_progress",
+                    "stream_id": "model:a",
+                    "current": current,
+                    "total": 200,
+                }
+            )
+        runner._flush_ui_events()
+
+    assert len(batches) == 10
+    assert [batch["stream_events"][0]["current"] for batch in batches] == [
+        19,
+        39,
+        59,
+        79,
+        99,
+        119,
+        139,
+        159,
+        179,
+        199,
+    ]
+
+
+def test_process_logs_cross_the_gui_boundary_as_one_lossless_batch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    batches = []
+    runner._spec = {"run_dir": "/tmp/run"}
+    runner.ui_log_batch = types.SimpleNamespace(emit=batches.append)
+
+    for index in range(500):
+        runner._record_log(
+            "stdout",
+            f"line-{index}",
+            context={"step": "worker-a"},
+        )
+    runner._flush_ui_events()
+
+    assert len(batches) == 1
+    assert len(batches[0]) == 500
+    assert batches[0][0]["message"] == "line-0"
+    assert batches[0][-1]["message"] == "line-499"
+
+
+def test_ui_log_signal_can_enqueue_progress_for_the_same_flush(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    progress_batches = []
+
+    def emit_logs(logs):
+        assert [record["message"] for record in logs] == ["structured log"]
+        runner._ui_event_buffer.enqueue_stream_progress(
+            {"event": "fit_progress", "stream_id": "model:a", "current": 1}
+        )
+
+    runner.ui_log_batch = types.SimpleNamespace(emit=emit_logs)
+    runner.ui_progress_batch = types.SimpleNamespace(emit=progress_batches.append)
+    runner._record_log("stdout", "structured log")
+
+    runner._flush_ui_events()
+
+    assert progress_batches == [
+        {
+            "stream_events": [
+                {"event": "fit_progress", "stream_id": "model:a", "current": 1}
+            ],
+            "pipeline_progress": None,
+        }
+    ]
+
+
+def test_structured_progress_heartbeats_only_on_the_fixed_batch(monkeypatch):
+    module = _load_runner_module(monkeypatch)
+    runner = _runner(module)
+    runner._running = True
+    runner._memory_admission = None
+    heartbeats = []
+    _set_database(
+        module,
+        runner,
+        types.SimpleNamespace(
+            heartbeat=lambda *args, **kwargs: (
+                heartbeats.append((args, kwargs)) or True
+            )
+        ),
+    )
+    job = {"job_id": 7, "lease_token": "lease-7"}
+    entry = {"context": {"job": job}}
+    runner._processes = {"worker": {"context": {"job": job}}}
+
+    for current in range(200):
+        runner._structured(
+            entry,
+            json.dumps(
+                {
+                    "event": "fit_progress",
+                    "stream_id": "model:a",
+                    "current": current,
+                    "total": 200,
+                }
+            ),
+        )
+
+    assert heartbeats == []
+    runner._flush_job_heartbeats()
+    assert len(heartbeats) == 1
+    assert heartbeats[0][0] == (7, "lease-7")
+    assert heartbeats[0][1]["current"] == 199
+
+def test_unified_plugin_version_includes_startup_hardening():
+    metadata = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "labeling_tool"
+        / "metadata.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "version=2.0.0" in metadata
+    assert "-linux" not in metadata
+
+
+def test_qgis_uses_the_threaded_runtime_facade_for_process_control():
+    root = Path(__file__).resolve().parents[2]
+    runner_source = (
+        root / "src" / "labeling_tool" / "runs" / "v5_async_runner.py"
+    ).read_text(encoding="utf-8")
+    workflow_source = (
+        root / "src" / "labeling_tool" / "runs" / "run_workflow.py"
+    ).read_text(encoding="utf-8")
+
+    assert "class ThreadedV5AsyncInferenceRunner(QObject):" in runner_source
+    assert "self._worker.moveToThread(self._runtime_thread)" in runner_source
+    assert 'setObjectName("loess-v5-runtime-control")' in runner_source
+    assert 'setObjectName("loess-v5-pipeline-log")' in runner_source
+    assert "self._worker.ui_log_batch.connect(self._log_writer.append_batch)" in runner_source
+    assert (
+        "ThreadedV5AsyncInferenceRunner as V5AsyncInferenceRunner"
+        in workflow_source
+    )
+    assert "def _retire_current_runner" in workflow_source
