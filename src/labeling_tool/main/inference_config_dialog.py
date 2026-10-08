@@ -126,6 +126,9 @@ class InferenceConfigDialog(QDialog):
         self.profile_summary_label = QLabel("无融合：只保存各模型独立结果")
         self.profile_summary_label.setWordWrap(True)
         profile_form.addRow("结果影响:", self.profile_summary_label)
+        self.profile_comparison_label = QLabel("未选择融合方案")
+        self.profile_comparison_label.setWordWrap(True)
+        profile_form.addRow("策略与对比:", self.profile_comparison_label)
         profile_action_row = QHBoxLayout()
         self.profile_path_label = QLabel("-")
         self.profile_path_label.setWordWrap(True)
@@ -149,9 +152,17 @@ class InferenceConfigDialog(QDialog):
         self.boundary_effect_label = QLabel()
         self.boundary_effect_label.setWordWrap(True)
         boundary_layout.addWidget(self.boundary_effect_label)
+        self.boundary_label = QLabel("尚未加载边界拟合参数")
+        self.boundary_label.setWordWrap(True)
+        boundary_layout.addWidget(self.boundary_label)
+        boundary_note = QLabel(
+            "以上为 config.yaml 中的平滑参数；修改数值后须重新检查环境并应用方案。"
+        )
+        boundary_note.setWordWrap(True)
+        boundary_layout.addWidget(boundary_note)
         content_layout.addWidget(boundary_group)
 
-        self.details_toggle = QPushButton("显示技术详情（路径、校验和、参数）")
+        self.details_toggle = QPushButton("显示技术详情（路径、校验和、存储参数）")
         self.details_toggle.setObjectName("inferenceConfigDetailsToggle")
         self.details_toggle.setCheckable(True)
         self.details_toggle.toggled.connect(self._set_details_visible)
@@ -166,14 +177,12 @@ class InferenceConfigDialog(QDialog):
         self.scaling_label = QLabel("尚未加载")
         self.scaling_label.setWordWrap(True)
         technical_form.addRow("分区与存储:", self.scaling_label)
-        self.boundary_label = QLabel("尚未加载")
-        self.boundary_label.setWordWrap(True)
-        technical_form.addRow("边界拟合参数:", self.boundary_label)
         for label, name in (
             (self.model_details_label, "模型版本与文件"),
             (self.profile_path_label, "Fusion 配置路径与校验"),
             (self.scaling_label, "分区与存储参数"),
             (self.boundary_label, "边界拟合参数"),
+            (self.profile_comparison_label, "Fusion 策略与评估对比"),
         ):
             label.setTextInteractionFlags(
                 TEXT_SELECTABLE_BY_MOUSE
@@ -208,7 +217,7 @@ class InferenceConfigDialog(QDialog):
     def _set_details_visible(self, visible: bool) -> None:
         self.technical_details_group.setVisible(visible)
         self.details_toggle.setText(
-            "隐藏技术详情" if visible else "显示技术详情（路径、校验和、参数）"
+            "隐藏技术详情" if visible else "显示技术详情（路径、校验和、存储参数）"
         )
 
     def _render_selected_models(self, _item=None) -> None:
@@ -310,7 +319,7 @@ class InferenceConfigDialog(QDialog):
         )
         boundary = self._registry.boundary_fitting
         self.boundary_label.setText(
-            "公共分界线单次 Cubic B-Spline；两侧 Polygon 共用稀疏拟合线；"
+            "边界拟合参数：公共分界线单次 Cubic B-Spline；两侧 Polygon 共用稀疏拟合线；"
             f"平滑因子 {boundary.get('smoothing_factor')}；"
             f"曲线采样 {boundary.get('curve_sampling_spacing_px')} px；"
             f"最大弦误差 {boundary.get('max_chord_error_px')} px；"
@@ -332,6 +341,7 @@ class InferenceConfigDialog(QDialog):
         self.profile_combo.clear()
         self.profile_combo.blockSignals(False)
         self.profile_summary_label.setText("无融合：只保存各模型独立结果")
+        self.profile_comparison_label.setText("未选择融合方案")
         self.profile_path_label.setText("-")
         self.open_profile_btn.setEnabled(False)
         self.model_details_label.setText("尚未加载")
@@ -374,7 +384,7 @@ class InferenceConfigDialog(QDialog):
                 )
             )
             values = [
-                model.display_name,
+                f"{model.display_name}\n版本：{model.version or '未提供'}",
                 availability,
                 "独立结果",
                 (self._registry.runtime or {}).get("effective_device", "未知"),
@@ -444,6 +454,16 @@ class InferenceConfigDialog(QDialog):
                 f"使用 {profile.profile_id}：将 {', '.join(model_names) or '指定模型'} 的结果融合为一份候选；"
                 "仍会保留已勾选模型的独立结果。"
             )
+            baseline_miou = summary.get("baseline_miou")
+            fusion_miou = summary.get("fusion_miou")
+            self.profile_comparison_label.setText(
+                f"融合策略：{summary.get('strategy') or profile.strategy or '未提供'}；"
+                f"状态：{profile.status}；"
+                f"配置记录的审批：{'通过' if summary.get('approval_passed') else '未通过'}\n"
+                f"基线 mIoU：{baseline_miou if baseline_miou is not None else '未提供'}；"
+                f"Fusion mIoU：{fusion_miou if fusion_miou is not None else '未提供'}\n"
+                "以上来自 Fusion 配置的评估记录，不代表本次影像的分类准确度。"
+            )
             check = self._check_map().get(f"fusion_profile_{profile_id}") or {}
             runnable = (
                 profile.enabled and profile.available and profile.status == "approved"
@@ -459,15 +479,13 @@ class InferenceConfigDialog(QDialog):
                 )
             self.profile_path_label.setText(
                 f"{profile.file_path}\nSHA256: {_file_sha256(profile.file_path)}\n{validation}"
-                f"\n融合策略: {summary.get('strategy') or profile.strategy or '未提供'}；"
-                f"\n版本状态: {profile.status}；"
-                f"配置记录的审批: {'通过' if summary.get('approval_passed') else '未通过'}；"
-                f"baseline mIoU: {summary.get('baseline_miou')}；"
-                f"fusion mIoU: {summary.get('fusion_miou')}"
             )
             self.open_profile_btn.setEnabled(os.path.isfile(profile.file_path))
         else:
             self.profile_summary_label.setText("无融合：只保存每个勾选模型的独立结果")
+            self.profile_comparison_label.setText(
+                "未选择融合方案；保留各模型独立结果，没有 Fusion 评估对比。"
+            )
             self.profile_path_label.setText("-")
             self.open_profile_btn.setEnabled(False)
         for model_id, row in self._row_by_model.items():

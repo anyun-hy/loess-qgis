@@ -425,13 +425,12 @@ class LabelingDockWidget(QgsDockWidget):
         layout.addWidget(output_group)
 
         self.environment_panel = EnvironmentPanel()
-        layout.addWidget(self.environment_panel)
+        layout.insertWidget(2, self.environment_panel)
 
         self.plan_panel = InferencePlanPanel(
             lambda: self.config_manager.last_report or {}
         )
-        layout.addWidget(self.plan_panel)
-        layout.insertWidget(2, self.plan_panel)
+        layout.insertWidget(3, self.plan_panel)
 
         # ── Action buttons ──
         run_group = QGroupBox("开始与当前状态")

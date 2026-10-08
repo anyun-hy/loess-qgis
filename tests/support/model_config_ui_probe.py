@@ -137,6 +137,7 @@ def _assert_keyboard_details(app, dialog: InferenceConfigDialog) -> None:
         dialog.profile_path_label,
         dialog.scaling_label,
         dialog.boundary_label,
+        dialog.profile_comparison_label,
     )
     remaining = set(labels)
     dialog.details_toggle.setFocus()
@@ -177,6 +178,15 @@ def main() -> None:
             assert dialog.model_table.item(1, 2).text() == "不可用"
             assert "设备检查未通过" in dialog.model_table.item(1, 2).toolTip()
             assert dialog.model_table.item(0, 4).text() == "cuda:0"
+            assert "版本：2026.09.25" in dialog.model_table.item(0, 1).text()
+            assert "equal_probability_average" in dialog.profile_comparison_label.text()
+            assert "审批：通过" in dialog.profile_comparison_label.text()
+            assert "基线 mIoU：0.7" in dialog.profile_comparison_label.text()
+            assert "Fusion mIoU：0.71" in dialog.profile_comparison_label.text()
+            assert "平滑因子 2" in dialog.boundary_label.text()
+            assert "曲线采样 4 px" in dialog.boundary_label.text()
+            assert "最大弦误差 1 px" in dialog.boundary_label.text()
+            assert "最大弧长 64 px" in dialog.boundary_label.text()
             assert dialog.model_table.item(0, 0).checkState() == CHECKED
             assert "Alpha 长模型名称" in dialog.selection_summary_label.text()
             assert "不改变模型分类" in dialog.boundary_effect_label.text()
@@ -194,6 +204,8 @@ def main() -> None:
                 assert dialog.size().height() == height
                 assert scroll.viewport().height() > 0
                 assert not dialog.technical_details_group.isVisible()
+                assert dialog.profile_comparison_label.isVisible()
+                assert dialog.boundary_label.isVisible()
                 _assert_fixed_actions(dialog)
                 screenshot = OUTPUT / f"model-config-{width}x{height}.png"
                 assert dialog.grab().save(str(screenshot))
@@ -230,6 +242,20 @@ def main() -> None:
             assert not dialog.technical_details_group.isVisible()
             assert "不可运行：合成融合资产缺失" in dialog.profile_summary_label.text()
             assert "不可运行" in dialog.profile_combo.currentText()
+            assert dialog.profile_comparison_label.isVisible()
+            assert dialog.boundary_label.isVisible()
+
+            # Missing evaluation data must clear the preceding profile's scores.
+            data["effective"]["fusion_profiles"][0]["profile"]["metrics"] = {}
+            dialog.set_environment(data, ["alpha"], "fusion-demo")
+            assert "基线 mIoU：未提供" in dialog.profile_comparison_label.text()
+            assert "Fusion mIoU：未提供" in dialog.profile_comparison_label.text()
+            dialog.profile_combo.setCurrentIndex(0)
+            assert "没有 Fusion 评估对比" in dialog.profile_comparison_label.text()
+            parameters = dialog.boundary_label.text()
+            dialog.boundary_smoothing_check.setChecked(False)
+            assert "关闭后保留原始像元边界" in dialog.boundary_effect_label.text()
+            assert dialog.boundary_label.text() == parameters
 
             # Applying a plan requires the same positive model check as launch.
             applied = []
