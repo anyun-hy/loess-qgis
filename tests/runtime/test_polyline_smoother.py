@@ -1,13 +1,17 @@
+import json
 import math
-from pathlib import Path
 import time
+from pathlib import Path
 
 import fiona
 import numpy as np
-from scipy.interpolate import splprep, splev
-from shapely import distance, points as shapely_points
+import pytest
+from scipy.interpolate import splev, splprep
+from shapely import distance, hausdorff_distance
+from shapely import points as shapely_points
 from shapely.geometry import LineString, MultiLineString, mapping, shape
 
+from loess_runtime.geometry.polyline_deviation import bounded_polyline_deviation
 from loess_runtime.geometry.polyline_smoother import (
     SmoothingConfig,
     _adaptive_sample_spline,
@@ -114,6 +118,98 @@ def test_direct_adaptive_closed_spline_remains_closed():
     assert arc_length <= 8.0 + 1e-12
 
 
+def test_compaction_removes_straight_joins_but_keeps_corner_and_arc_limit():
+    from loess_runtime.geometry.bezier_compaction import compact_bezier_spans
+
+    vertices = np.array(
+        [(x, 0.0) for x in range(11)] + [(10.0, y) for y in range(1, 11)]
+    )
+    fractions = np.linspace(0, 1, 4)[None, :, None]
+    controls = (
+        vertices[:-1, None, :] * (1 - fractions)
+        + vertices[1:, None, :] * fractions
+    )
+    compacted, error, arc = compact_bezier_spans(
+        controls, max_chord_error=0.01, max_segment_arc_length=8.0
+    )
+    assert len(compacted) < len(vertices) / 2
+    assert any(np.array_equal(point, [10.0, 0.0]) for point in compacted)
+    assert np.array_equal(compacted[[0, -1]], vertices[[0, -1]])
+    assert error <= 0.01
+    assert arc <= 8.0
+    assert LineString(vertices).hausdorff_distance(LineString(compacted)) < 1e-12
+
+
+def test_compaction_checks_curve_interiors_not_only_collinear_joins():
+    from loess_runtime.geometry.bezier_compaction import compact_bezier_spans
+
+    controls = np.array([
+        [[0.0, 0.0], [0.5, 2.0], [1.5, 2.0], [2.0, 0.0]],
+        [[2.0, 0.0], [2.5, -2.0], [3.5, -2.0], [4.0, 0.0]],
+    ])
+    # These spans first need subdivision to certify their individual chords.
+    from loess_runtime.geometry.polyline_smoother import _split_bezier_batch
+
+    for _ in range(4):
+        left, right = _split_bezier_batch(controls)
+        controls = np.stack((left, right), axis=1).reshape(-1, 4, 2)
+    compacted, error, arc = compact_bezier_spans(
+        controls, max_chord_error=0.1, max_segment_arc_length=8.0
+    )
+    assert len(compacted) < len(controls) + 1
+    assert np.max(compacted[:, 1]) > 1.0
+    assert np.min(compacted[:, 1]) < -1.0
+    assert error <= 0.1
+    assert arc <= 8.0
+
+
+def test_compaction_keeps_narrow_island_area_while_removing_straight_joins():
+    from loess_runtime.geometry.bezier_compaction import (
+        compact_bezier_spans,
+        signed_chord_area,
+    )
+
+    vertices = np.array([
+        [0, 0], [0.1, 0], [4, 0], [4, 0.1], [4, 1],
+        [3.9, 1], [0, 1], [0, 0.9], [0, 0],
+    ])
+    fractions = np.linspace(0, 1, 4)[None, :, None]
+    controls = (
+        vertices[:-1, None, :] * (1 - fractions)
+        + vertices[1:, None, :] * fractions
+    )
+    compacted, error, arc = compact_bezier_spans(
+        controls, max_chord_error=0.25, max_segment_arc_length=8.0,
+        area_change=0.0,
+    )
+    assert 4 <= len(compacted) < len(vertices)
+    assert np.array_equal(compacted[0], compacted[-1])
+    assert abs(signed_chord_area(compacted) - signed_chord_area(vertices)) < 1e-9
+    assert error <= 0.25
+    assert arc <= 8.0
+
+
+def test_compacted_spline_keeps_certified_bounds_and_closed_structure():
+    angles = np.linspace(0.0, 2.0 * math.pi, 129)
+    source = np.column_stack((20 * np.cos(angles), 20 * np.sin(angles)))
+    source[-1] = source[0]
+    spline, _ = splprep(source.T, s=0, per=True)
+    arguments = dict(
+        first_point=source[0], last_point=source[0], closed=True,
+        max_chord_error=0.25, max_segment_arc_length=8.0,
+    )
+    original, *_ = _adaptive_sample_spline(spline, **arguments)
+    compacted, error, arc, _ = _adaptive_sample_spline(
+        spline, compact=True, **arguments
+    )
+    dense = np.column_stack(splev(np.linspace(0, 1, 10_001), spline))
+    assert 4 <= len(compacted) < len(original)
+    assert np.array_equal(compacted[0], compacted[-1])
+    assert np.max(distance(shapely_points(dense), LineString(compacted))) <= error + 1e-9
+    assert error <= 0.25
+    assert arc <= 8.0
+
+
 def test_smoothing_does_not_materialize_equivalent_dense_curve():
     x = np.linspace(0.0, 20_000.0, 20_001)
     source = np.column_stack(
@@ -196,17 +292,63 @@ def test_deviation_limit_reduces_strength_instead_of_moving_outline_too_far():
     assert result.status == "smoothed"
     assert 0.05 <= result.strength < 1.0
     assert result.max_deviation <= 0.4
+    assert result.max_deviation_upper_bound <= 0.4
+    assert hausdorff_distance(
+        LineString(points), LineString(result.points), densify=0.01
+    ) <= result.max_deviation_upper_bound
 
 
-def test_large_polyline_runs_in_linear_practical_time():
+def test_limit_checks_returned_wubao_outline_not_only_spline_samples():
+    # Translation-normalized real divider: the old sampled limit reported
+    # 0.966px but its final output line moved 1.032px with a 1px limit.
+    source = np.asarray(json.loads(
+        (Path(__file__).parents[1] / "support/wubao_limit_outline.json").read_text()
+    ), dtype=float)
+    result = smooth_polyline(source, SmoothingConfig(max_deviation=1.0))
+    assert result.status == "smoothed"
+    assert result.strength < 0.35
+    assert np.array_equal(result.points[0], result.points[-1])
+    measured = hausdorff_distance(
+        LineString(source), LineString(result.points), densify=0.01
+    )
+    assert measured <= result.max_deviation_upper_bound <= 1.0
+
+
+def test_deviation_bound_checks_segment_interiors_and_both_directions():
+    straight = np.array([[0.0, 0.0], [10.0, 0.0]])
+    bent = np.array([[0.0, 0.0], [5.0, 2.0], [10.0, 0.0]])
+    # The straight line's endpoints are on the bent line; vertex-only checks
+    # in that direction would miss the middle of the segment.
+    for reference, candidate in ((straight, bent), (bent, straight)):
+        maximum, _mean, upper = bounded_polyline_deviation(
+            reference, candidate, 1.0
+        )
+        assert maximum > 1.0
+        assert upper > 1.0
+
+
+def test_unprovable_tight_limit_preserves_source_outline():
+    source = _staircase(12)
+    result = smooth_polyline(
+        source, SmoothingConfig(max_deviation=1e-8, min_strength=1.0)
+    )
+    assert result.status == "unchanged"
+    assert result.reason == "deviation_limit"
+    assert np.array_equal(result.points, source)
+
+
+@pytest.mark.parametrize("max_deviation", [None, 1.0])
+def test_large_polyline_runs_in_linear_practical_time(max_deviation):
     x = np.linspace(0, 20_000, 20_001)
     points = np.column_stack((x, np.sin(x / 20) + (np.arange(len(x)) % 2) * 0.3))
     started = time.monotonic()
     result = smooth_polyline(
         points,
-        SmoothingConfig(curve_sampling_spacing=1.0),
+        SmoothingConfig(curve_sampling_spacing=1.0, max_deviation=max_deviation),
     )
     assert result.status == "smoothed"
+    if max_deviation is not None:
+        assert result.max_deviation_upper_bound <= max_deviation
     assert time.monotonic() - started < 5.0
 
 

@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import json
 import math
-from pathlib import Path
 import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import fiona
 import numpy as np
-from scipy.interpolate import PPoly, splprep, splev
+from scipy.interpolate import PPoly, splev, splprep
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, mapping, shape
+
+from loess_runtime.geometry.bezier_compaction import (
+    compact_bezier_spans,
+    signed_chord_area,
+)
+from loess_runtime.geometry.polyline_deviation import bounded_polyline_deviation
 
 
 class PolylineSmoothingError(RuntimeError):
@@ -72,6 +78,7 @@ class SmoothingResult:
     max_segment_arc_length: float
     curve_evaluation_count: int
     reason: str = ""
+    max_deviation_upper_bound: float | None = None
 
 
 def _sanitize(points: Iterable[Iterable[float]]) -> np.ndarray:
@@ -250,6 +257,8 @@ def _adaptive_sample_spline(
     closed: bool,
     max_chord_error: float,
     max_segment_arc_length: float,
+    compact: bool = False,
+    source_chord_area: float | None = None,
 ) -> tuple[np.ndarray, float, float, int]:
     """Directly linearize a fitted spline using certified Bézier bounds."""
 
@@ -352,6 +361,20 @@ def _adaptive_sample_spline(
         (controls[0, :1], controls[:, -1]),
         axis=0,
     )
+    if compact:
+        compact_points, compact_error, compact_arc = compact_bezier_spans(
+            controls,
+            max_chord_error=max_chord_error,
+            max_segment_arc_length=max_segment_arc_length,
+            area_change=(
+                signed_chord_area(points) - source_chord_area
+                if source_chord_area is not None else None
+            ),
+        )
+        if len(compact_points) >= (4 if closed else 2):
+            points = compact_points
+            observed_error_bound = compact_error
+            observed_arc_bound = compact_arc
     if closed:
         points[-1] = points[0]
         if len(points) < 4:
@@ -399,8 +422,10 @@ def smooth_polyline(
     coordinates, the defaults mean 1 px smoothing and direct linearization
     bounded by 0.25 px chord error and 8 px curve arc length. The 0.5 px
     spacing remains an equivalent-count/reporting baseline and is not
-    materialized on the production path. Deviation is reported but is not
-    limited unless max_deviation is set.
+    materialized on the production path. When max_deviation is set, a
+    bidirectional distance bound verifies the final output line segments.
+    Redundant span joins are merged within the same curve bounds only when
+    this does not increase the area transferred across the source divider.
     """
 
     config = config or SmoothingConfig()
@@ -457,8 +482,9 @@ def smooth_polyline(
             s=smoothing,
             per=closed,
         )
-        candidate, chord_error, arc_length, evaluation_count = (
-            _adaptive_sample_spline(
+
+        def linearize(*, compact: bool):
+            return _adaptive_sample_spline(
                 spline,
                 first_point=values[0],
                 last_point=values[0] if closed else values[-1],
@@ -467,38 +493,55 @@ def smooth_polyline(
                 max_segment_arc_length=float(
                     config.max_segment_arc_length
                 ),
+                compact=compact,
+                source_chord_area=(
+                    signed_chord_area(source_points) if compact else None
+                ),
             )
-        )
-        if config.max_deviation is None:
-            deviation_parameter = fit_parameter
-            deviation_source = fit_source
+
+        candidate, chord_error, arc_length, evaluation_count = linearize(compact=False)
+        upper_bound = None
+        if config.max_deviation is not None:
+            maximum, mean, upper_bound = bounded_polyline_deviation(
+                source_points, candidate, float(config.max_deviation)
+            )
+            # First keep the same accepted fit as the bounded baseline. Then
+            # reduce its joins; compression must not weaken the fit or cap.
+            if upper_bound <= float(config.max_deviation):
+                compact_points, compact_error, compact_arc, extra = linearize(
+                    compact=True
+                )
+                evaluation_count += extra
+                source_area = signed_chord_area(source_points)
+                original_transfer = abs(signed_chord_area(candidate) - source_area)
+                compact_transfer = abs(signed_chord_area(compact_points) - source_area)
+                area_tolerance = max(1e-9, abs(source_area) * 1e-12)
+                if (
+                    len(compact_points) < len(candidate)
+                    and compact_transfer <= original_transfer + area_tolerance
+                ):
+                    compact_max, compact_mean, compact_bound = bounded_polyline_deviation(
+                        source_points, compact_points, float(config.max_deviation)
+                    )
+                    if compact_bound <= float(config.max_deviation):
+                        candidate, chord_error, arc_length = (
+                            compact_points, compact_error, compact_arc
+                        )
+                        maximum, mean, upper_bound = (
+                            compact_max, compact_mean, compact_bound
+                        )
         else:
-            deviation_parameter = np.linspace(
-                0.0,
-                1.0,
-                dense_equivalent_count,
+            fit_candidate = np.column_stack(splev(fit_parameter, spline))
+            fractions = fit_parameter[:, None]
+            fit_candidate += (
+                (1.0 - fractions) * (values[0] - fit_candidate[0])
+                + fractions
+                * (
+                    (values[0] if closed else values[-1])
+                    - fit_candidate[-1]
+                )
             )
-            deviation_source = _resample(
-                source_points,
-                source_parameter,
-                deviation_parameter,
-            )
-        fit_candidate = np.column_stack(
-            splev(deviation_parameter, spline)
-        )
-        fractions = deviation_parameter[:, None]
-        fit_candidate += (
-            (1.0 - fractions) * (values[0] - fit_candidate[0])
-            + fractions
-            * (
-                (values[0] if closed else values[-1])
-                - fit_candidate[-1]
-            )
-        )
-        maximum, mean = _deviation(
-            deviation_source,
-            fit_candidate,
-        )
+            maximum, mean = _deviation(fit_source, fit_candidate)
         return (
             candidate,
             maximum,
@@ -507,6 +550,7 @@ def smooth_polyline(
             chord_error,
             arc_length,
             evaluation_count,
+            upper_bound,
         )
 
     strengths = [1.0]
@@ -540,11 +584,15 @@ def smooth_polyline(
                 chord_error,
                 arc_length,
                 evaluation_count,
+                upper_bound,
             ) = fit_at(strength)
         except (TypeError, ValueError) as error:
             failure = f"spline_failed:{error}"
             continue
-        if config.max_deviation is None or maximum <= float(config.max_deviation):
+        if config.max_deviation is None or (
+            upper_bound is not None
+            and upper_bound <= float(config.max_deviation)
+        ):
             return SmoothingResult(
                 points=candidate,
                 status="smoothed",
@@ -558,6 +606,7 @@ def smooth_polyline(
                 max_chord_error=float(chord_error),
                 max_segment_arc_length=float(arc_length),
                 curve_evaluation_count=int(evaluation_count),
+                max_deviation_upper_bound=upper_bound,
             )
     return _unchanged(values, closed, failure)
 
