@@ -395,6 +395,9 @@ def smooth_common_boundaries(
                             "method": "cubic_bspline_adaptive",
                             "status": "changed",
                             "max_displacement_px": result.max_deviation,
+                            "max_displacement_upper_bound_px": (
+                                result.max_deviation_upper_bound
+                            ),
                             "mean_displacement_px": result.mean_deviation,
                             "point_count_before": result.input_point_count,
                             "point_count_dense": result.dense_point_count,
@@ -521,7 +524,11 @@ def smooth_common_boundaries(
         "curve_sampling_spacing_px": float(
             config.curve_sampling_spacing
         ),
-        "curve_sampling_mode": "direct_adaptive_bezier_bounds",
+        "curve_sampling_mode": (
+            "compacted_adaptive_bezier_bounds"
+            if config.max_deviation is not None
+            else "direct_adaptive_bezier_bounds"
+        ),
         "dense_curve_materialized": False,
         "dense_curve_point_count_kind": (
             "equivalent_at_configured_spacing"
@@ -535,6 +542,20 @@ def smooth_common_boundaries(
         "max_chord_error_limit_px": float(config.max_chord_error),
         "max_segment_arc_length_limit_px": float(
             config.max_segment_arc_length
+        ),
+        "max_deviation_limit_px": config.max_deviation,
+        "deviation_certification": (
+            "output_polyline_lipschitz_bound"
+            if config.max_deviation is not None
+            else None
+        ),
+        "max_displacement_upper_bound_px": (
+            max(
+                item["max_displacement_upper_bound_px"]
+                for item in changed_diagnostics
+            )
+            if changed_diagnostics and config.max_deviation is not None
+            else (0.0 if config.max_deviation is not None else None)
         ),
         "chain_count": len(candidates) + unchanged_count,
         "shared_chain_count": len(candidates) + unchanged_count,

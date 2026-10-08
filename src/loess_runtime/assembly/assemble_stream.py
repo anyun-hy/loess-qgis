@@ -49,6 +49,9 @@ from loess_runtime.assembly.stream_vector_outputs import (
     write_formal_stream_output,
     write_raw_stream_output,
 )
+from loess_runtime.geometry.boundary_fitting.resolution import (
+    resolve_boundary_parameters,
+)
 from loess_runtime.geometry.vector_data_plane import (
     read_boundary_signatures,
     read_geoparquet,
@@ -333,6 +336,13 @@ def _assemble_stream_impl(
             "only divider_cubic_bspline_adaptive_v2 is supported by the current runtime"
         )
     smoothing_enabled = bool(boundary.get("enabled", True))
+    resolution_report = None
+    if smoothing_enabled:
+        boundary, resolution_report = resolve_boundary_parameters(
+            boundary,
+            raster=spec["raster"],
+            processing_extent=spec.get("processing_extent") or {},
+        )
     fit_version = (
         "divider_cubic_bspline_adaptive_v2"
         if smoothing_enabled
@@ -753,6 +763,8 @@ def _assemble_stream_impl(
         "validation": ownership_validation,
         "topology_checks_performed": False,
     }
+    if resolution_report is not None:
+        aggregate["resolution_adaptation"] = resolution_report
 
     staged_edges_path = staged_outputs.fitted_edges
     staged_report_path = staged_outputs.report

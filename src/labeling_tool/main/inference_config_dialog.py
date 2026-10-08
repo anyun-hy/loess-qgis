@@ -318,13 +318,33 @@ class InferenceConfigDialog(QDialog):
             f"Tile 分页 {scaling.get('tile_page_size')}"
         )
         boundary = self._registry.boundary_fitting
+        deviation_limit = boundary.get("max_deviation_px")
+        deviation_text = (
+            f"最大偏移 {deviation_limit} px（超限自动减弱平滑）；"
+            if deviation_limit is not None
+            else "不限制最大偏移；"
+        )
+        resolution = boundary.get("resolution_adaptation") or {}
+        resolution_text = ""
+        if resolution.get("enabled"):
+            reference = float(resolution["reference_resolution_m"])
+            resolution_text = (
+                f"分辨率自适应：以下为 {reference:g} m 参考参数，"
+                "运行时按实际像元尺寸换算；"
+            )
+            if deviation_limit is not None:
+                deviation_text = (
+                    f"最大偏移取 {deviation_limit:g} px 与 "
+                    f"{float(deviation_limit) * reference:g} m 中更严格者；"
+                )
         self.boundary_label.setText(
             "边界拟合参数：公共分界线单次 Cubic B-Spline；两侧 Polygon 共用稀疏拟合线；"
+            f"{resolution_text}"
             f"平滑因子 {boundary.get('smoothing_factor')}；"
             f"曲线采样 {boundary.get('curve_sampling_spacing_px')} px；"
             f"最大弦误差 {boundary.get('max_chord_error_px')} px；"
             f"最大弧长 {boundary.get('max_segment_arc_length_px')} px；"
-            "不限制最大偏移，不执行拓扑修复或 Gap/Overlap 检查"
+            f"{deviation_text}不执行拓扑修复或 Gap/Overlap 检查"
         )
 
     def _clear_draft(self) -> None:

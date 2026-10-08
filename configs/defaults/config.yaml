@@ -68,6 +68,12 @@ boundary_fitting:
   curve_sampling_spacing_px: 0.5
   max_chord_error_px: 0.25
   max_segment_arc_length_px: 8.0
+  max_deviation_px: 1.0
+  resolution_adaptation:
+    enabled: true
+    # Length parameters above are referenced to this scale. Error/sampling
+    # values retain their pixel caps; arc length follows the metre budget.
+    reference_resolution_m: 2.0
   diagnostic_level: changed_and_failed
 
 # Production uses one mandatory columnar vector path; there is no shadow or

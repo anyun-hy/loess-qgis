@@ -233,6 +233,23 @@ approved Fusion 迁移后仍满足相同合同。迁移或接入前必须独立�
 
 - 相邻 Polygon 的公共分界只拟合一次，两侧复用同一坐标；
 - 只允许误差受限的公共分界处理，禁止逐 Polygon 独立平滑；
+- 新 Run 的 `boundary_fitting.max_deviation_px` 默认最多 1 像元，冻结后传入
+  Worker；限制最终稀疏线段相对原始公共边界的双向距离，而不是曲线采样值。
+  超限时减弱平滑，仍无法证明满足上限时保留原始边界；验证探针不增加产物顶点，
+  上限及距离证明记录在拟合报告中。没有该字段的历史 Run 按原冻结参数重放；
+- 有偏移上限的拟合在同一已合格曲线上自适应合并冗余分段；合并仍满足 Bézier
+  弦误差、弧长与最终原始边界距离约束，且不得增加该公共边界的净面积转移绝对值。
+  不能通过这些检查的合并保留原分段，不为减少顶点自动放宽偏移上限；
+- 新 Run 默认启用 `boundary_fitting.resolution_adaptation`，参考分辨率
+  `reference_resolution_m=2.0`。平滑、采样、弦误差和偏移取原像元值与参考米数
+  换算值中较严格者；分段弧长按参考实际长度换算，允许细分辨率的平直边减少冗余点。
+  所有 Unit 与组装根据同一冻结 Affine、CRS 和处理范围解析参数，并在各级报告的
+  `resolution_adaptation` 中记录参考值、有效像元值、米制尺度及距离上限；
+- 距离换算使用像元变换的最大方向尺度，涵盖旋转、非方形与剪切像元。普通投影
+  按 CRS 线性单位换算米数，EPSG:3857 校正纬度尺度，经纬度 CRS 使用椭球弧长上界。
+  没有适配策略的历史 Run 不重新解释参数；显式 `enabled: false` 仍按原像元参数执行。
+  CRS 单位依据 [Rasterio 单位接口](https://rasterio.readthedocs.io/en/stable/api/rasterio.crs.html)，
+  Web Mercator 换算依据 [PROJ 投影定义](https://proj.org/en/stable/operations/projections/webmerc.html)；
 - 不在最后执行整幅 dissolve；跨单元同类对象通过连接关系取得统一身份；
 - 正式组装必须验证完整范围、无效几何、gap、overlap 和 outside coverage；
 - coverage 验收失败的 Stream 不得标记为 ready。

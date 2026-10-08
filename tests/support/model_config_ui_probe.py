@@ -113,6 +113,8 @@ def _report(root: Path) -> dict:
                 "curve_sampling_spacing_px": 4,
                 "max_chord_error_px": 1,
                 "max_segment_arc_length_px": 64,
+                "max_deviation_px": 1,
+                "resolution_adaptation": {"enabled": True, "reference_resolution_m": 2},
             },
         },
     }
@@ -187,6 +189,9 @@ def main() -> None:
             assert "曲线采样 4 px" in dialog.boundary_label.text()
             assert "最大弦误差 1 px" in dialog.boundary_label.text()
             assert "最大弧长 64 px" in dialog.boundary_label.text()
+            assert "分辨率自适应" in dialog.boundary_label.text()
+            assert "2 m 参考参数" in dialog.boundary_label.text()
+            assert "最大偏移取 1 px 与 2 m 中更严格者" in dialog.boundary_label.text()
             assert dialog.model_table.item(0, 0).checkState() == CHECKED
             assert "Alpha 长模型名称" in dialog.selection_summary_label.text()
             assert "不改变模型分类" in dialog.boundary_effect_label.text()

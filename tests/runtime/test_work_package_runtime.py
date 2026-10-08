@@ -1430,6 +1430,9 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     )
     with open(persisted_unit_report["path"], encoding="utf-8") as handle:
         persisted_payload = json.load(handle)
+    resolution = persisted_payload["resolution_adaptation"]
+    assert resolution["enabled"] is True
+    assert resolution["effective_parameters_px"]["max_deviation_px"] <= 1.0
     assert "diagnostics" not in persisted_payload
     assert persisted_payload["diagnostic_storage"] == {
         "mode": "none",
@@ -1450,6 +1453,10 @@ def test_work_package_loads_each_model_once_and_writes_model_and_fusion_parts(
     assembled = assemble_stream(spec_path, "fusion:fixture_fusion")
     assert assembled["status"] == "passed"
     assert assembled["assembly_mode"] == "full"
+    assert assembled["resolution_adaptation"] == resolution
+    assert assembled["max_segment_arc_length_limit_px"] == (
+        resolution["effective_parameters_px"]["max_segment_arc_length_px"]
+    )
     assert assembled["report_queue_capacity"] == 32
     assert assembled["report_summary_source"] == "run_state_database"
     assert assembled["report_processed_count"] == 1

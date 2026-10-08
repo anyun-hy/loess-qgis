@@ -20,6 +20,9 @@ from shapely.geometry import LineString, MultiPolygon, Polygon, mapping, shape
 
 from labeling_tool.shared.contracts.run_spec import load_json
 from labeling_tool.shared.state.run_state_db import run_state_from_spec
+from loess_runtime.geometry.boundary_fitting.resolution import (
+    resolve_boundary_parameters,
+)
 from loess_runtime.geometry.boundary_fitting.unit_errors import UnitRuntimeError
 from loess_runtime.geometry.boundary_fitting.unit_inputs import load_unit_fit_inputs
 from loess_runtime.geometry.common_boundary_smoother import smooth_common_boundaries
@@ -419,7 +422,11 @@ def _smoothing_config(value: Mapping[str, Any]) -> SmoothingConfig:
         curve_sampling_spacing=float(value.get("curve_sampling_spacing_px", 0.5)),
         max_chord_error=float(value.get("max_chord_error_px", 0.25)),
         max_segment_arc_length=float(value.get("max_segment_arc_length_px", 8.0)),
-        max_deviation=None,
+        max_deviation=(
+            float(value["max_deviation_px"])
+            if value.get("max_deviation_px") is not None
+            else None
+        ),
         min_point_count=4,
     )
 
@@ -682,6 +689,23 @@ def _fit_or_subdivide(
         "skipped_invalid_count": sum(
             int(item.get("skipped_invalid_count", 0)) for item in child_reports
         ),
+        "max_deviation_limit_px": (
+            smoothing_config.max_deviation if smoothing_enabled else None
+        ),
+        "deviation_certification": (
+            "output_polyline_lipschitz_bound"
+            if smoothing_enabled and smoothing_config.max_deviation is not None
+            else None
+        ),
+        "max_displacement_upper_bound_px": (
+            max(
+                (float(item.get("max_displacement_upper_bound_px") or 0.0)
+                 for item in child_reports),
+                default=0.0,
+            )
+            if smoothing_enabled and smoothing_config.max_deviation is not None
+            else None
+        ),
         "max_displacement_px": max(
             (float(item.get("max_displacement_px", 0.0)) for item in child_reports),
             default=0.0,
@@ -806,6 +830,13 @@ def run_unit_fit(
             transform.c,
             transform.f,
         )
+        resolution_report = None
+        if smoothing_enabled:
+            boundary, resolution_report = resolve_boundary_parameters(
+                boundary,
+                raster=spec["raster"],
+                processing_extent=spec.get("processing_extent") or {},
+            )
         raw_records, formal_records, report = _fit_or_subdivide(
             labels,
             unit,
@@ -819,6 +850,8 @@ def run_unit_fit(
             smoothing_enabled=smoothing_enabled,
             output_transform=output_transform,
         )
+        if resolution_report is not None:
+            report["resolution_adaptation"] = resolution_report
         _attach_confidence_surface(raw_records, confidence, valid_mask, unit)
         _attach_confidence_surface(formal_records, confidence, valid_mask, unit)
         vertex_count = _vertex_count(raw_records)

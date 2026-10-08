@@ -168,6 +168,10 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
     assert effective["scaling"]["assembly_validation_workers"] == "auto"
     assert effective["scaling"]["max_concurrent_assembly"] == "auto"
     assert effective["boundary_fitting"]["mode"] == "divider_cubic_bspline_adaptive_v2"
+    assert effective["boundary_fitting"]["max_deviation_px"] == 1.0
+    assert effective["boundary_fitting"]["resolution_adaptation"] == {
+        "enabled": True, "reference_resolution_m": 2.0,
+    }
     assert effective["fragmentation_regularization"]["enabled"] is True
     assert (
         effective["fragmentation_regularization"]["policy_id"]
@@ -175,6 +179,34 @@ def test_valid_schema_v2_registry_and_profile(tmp_path):
     )
     assert effective["fragmentation_regularization"]["buffer_pixels"] == 256
     assert effective["fragmentation_regularization"]["max_workers"] >= 1
+
+
+def test_boundary_deviation_limit_is_preserved_and_rejects_invalid_values(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    config["boundary_fitting"]["max_deviation_px"] = 0.5
+    effective, issues = validate_deployment_config(config, scripts_dir=scripts)
+    assert issues == []
+    assert effective["boundary_fitting"]["max_deviation_px"] == 0.5
+    for invalid in (0, -1, float("nan"), float("inf"), "unlimited"):
+        config["boundary_fitting"]["max_deviation_px"] = invalid
+        _effective, issues = validate_deployment_config(config, scripts_dir=scripts)
+        assert any(
+            issue.path == "/boundary_fitting/max_deviation_px" for issue in issues
+        )
+
+
+def test_resolution_policy_is_frozen_and_invalid_policy_is_rejected(tmp_path):
+    scripts, config, _ = _workspace(tmp_path)
+    config["boundary_fitting"]["resolution_adaptation"] = {
+        "enabled": True, "reference_resolution_m": 1.0,
+    }
+    effective, issues = validate_deployment_config(config, scripts_dir=scripts)
+    assert issues == []
+    assert effective["boundary_fitting"]["resolution_adaptation"]["reference_resolution_m"] == 1.0
+    for invalid in ({"enabled": "yes"}, {"reference_resolution_m": 0}, []):
+        config["boundary_fitting"]["resolution_adaptation"] = invalid
+        _, issues = validate_deployment_config(config, scripts_dir=scripts)
+        assert any(issue.path == "/boundary_fitting/resolution_adaptation" for issue in issues)
 
 
 def test_score_cache_budget_accepts_auto_and_rejects_invalid_values(tmp_path):

@@ -12,6 +12,9 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from labeling_tool.shared.contracts.boundary_resolution import (
+    normalize_resolution_policy,
+)
 from labeling_tool.shared.contracts.run_spec import (
     CLASS_NAMES,
     CLASS_ORDER,
@@ -304,7 +307,14 @@ def validate_deployment_config(
         "curve_sampling_spacing_px": 0.5,
         "max_chord_error_px": 0.25,
         "max_segment_arc_length_px": 8.0,
+        "max_deviation_px": 1.0,
     }
+    try:
+        normalized_boundary["resolution_adaptation"] = normalize_resolution_policy(
+            boundary.get("resolution_adaptation")
+        )
+    except ValueError as error:
+        issues.append(ValidationIssue("/boundary_fitting/resolution_adaptation", str(error)))
     for key, default in numeric_defaults.items():
         try:
             value = float(boundary.get(key, default))

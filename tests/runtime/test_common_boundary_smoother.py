@@ -33,6 +33,24 @@ def _adjacent_staircase_polygons():
     ]
 
 
+def test_frozen_deviation_limit_reaches_runtime_and_keeps_shared_coverage():
+    _shared, records = _adjacent_staircase_polygons()
+    config = unit_runtime._smoothing_config({"max_deviation_px": 0.4})
+    assert config.max_deviation == 0.4
+    # Historical frozen Runs without this field retain their original behavior.
+    assert unit_runtime._smoothing_config({}).max_deviation is None
+    fitted, report = smooth_common_boundaries(records, config)
+    before = records[0]["geometry"].union(records[1]["geometry"])
+    after = fitted[0]["geometry"].union(fitted[1]["geometry"])
+    assert report["max_deviation_limit_px"] == 0.4
+    assert report["deviation_certification"] == "output_polyline_lipschitz_bound"
+    assert report["curve_sampling_mode"] == "compacted_adaptive_bezier_bounds"
+    assert report["max_displacement_upper_bound_px"] <= 0.4
+    assert all(item["geometry"].is_valid for item in fitted)
+    assert before.symmetric_difference(after).area == 0
+    assert fitted[0]["geometry"].intersection(fitted[1]["geometry"]).area == 0
+
+
 def _one_line(geometry):
     if isinstance(geometry, LineString):
         return geometry
@@ -383,14 +401,17 @@ def test_forced_subdivision_polygonizes_only_leaf_rasters(monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(unit_runtime, "_polygonize", counted)
-    _fit_or_subdivide(
+    _raw, _formal, report = _fit_or_subdivide(
         labels,
         {"unit_id": "core", "pixel_window": {"x0": 0, "y0": 0, "x1": 8, "y1": 8}},
         [12, 13, 21, 31, 32, 33, 43, 51, 52, 53, 54, 61, 62, 71],
-        smoothing_config=SmoothingConfig(min_point_count=4),
+        smoothing_config=SmoothingConfig(min_point_count=4, max_deviation=1.0),
         max_features=1000,
         max_segments=10000,
         min_core_px=4,
         force_split=True,
     )
     assert calls == [(4, 4), (4, 4), (4, 4), (4, 4)]
+    assert report["max_deviation_limit_px"] == 1.0
+    assert report["max_displacement_upper_bound_px"] <= 1.0
+    assert report["deviation_certification"] == "output_polyline_lipschitz_bound"

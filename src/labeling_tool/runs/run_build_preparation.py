@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ from labeling_tool.runs.run_build_contract import (
     RunBuilderV5Error,
 )
 from labeling_tool.runs.spatial_planner import plan_spatial_units
+from labeling_tool.shared.contracts.boundary_resolution import (
+    normalize_resolution_policy,
+)
 from labeling_tool.shared.contracts.run_spec import CLASS_ORDER, sha256_file
 from labeling_tool.shared.planning.work_package_planner import (
     plan_work_packages,
@@ -49,6 +53,23 @@ def prepare_v5_run_plan(
         raise RunBuilderV5Error(
             "boundary_fitting.mode must equal divider_cubic_bspline_adaptive_v2"
         )
+    try:
+        deviation_limit = float(boundary_value.get("max_deviation_px", 1.0))
+    except (TypeError, ValueError) as error:
+        raise RunBuilderV5Error(
+            "boundary_fitting.max_deviation_px must be finite and positive"
+        ) from error
+    if not math.isfinite(deviation_limit) or deviation_limit <= 0:
+        raise RunBuilderV5Error(
+            "boundary_fitting.max_deviation_px must be finite and positive"
+        )
+    boundary_value["max_deviation_px"] = deviation_limit
+    try:
+        boundary_value["resolution_adaptation"] = normalize_resolution_policy(
+            boundary_value.get("resolution_adaptation")
+        )
+    except ValueError as error:
+        raise RunBuilderV5Error(f"boundary_fitting.{error}") from error
 
     fragmentation_value = dict(fragmentation_regularization or {})
     fragmentation_value.setdefault("enabled", True)

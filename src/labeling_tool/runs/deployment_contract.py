@@ -19,6 +19,8 @@ SHARED_RUNTIME_FILES = {
         "runtime/labeling_tool/shared/__init__.py",
     "src/labeling_tool/shared/contracts/__init__.py":
         "runtime/labeling_tool/shared/contracts/__init__.py",
+    "src/labeling_tool/shared/contracts/boundary_resolution.py":
+        "runtime/labeling_tool/shared/contracts/boundary_resolution.py",
     "src/labeling_tool/shared/contracts/monitor_contract.py":
         "runtime/labeling_tool/shared/contracts/monitor_contract.py",
     "src/labeling_tool/shared/contracts/run_spec.py":

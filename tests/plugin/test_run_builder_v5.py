@@ -23,6 +23,7 @@ def _boundary():
         "curve_sampling_spacing_px": 0.5,
         "max_chord_error_px": 0.25,
         "max_segment_arc_length_px": 8.0,
+        "max_deviation_px": 1.0,
         "diagnostic_level": "changed_and_failed",
     }
 
@@ -112,6 +113,10 @@ def test_v5_run_keeps_100k_tile_details_out_of_json(tmp_path, postgres_database)
 
     assert spec["raster"]["file_identity"] == source_raster_identity(raster)
     assert spec["schema_version"] == 2
+    assert spec["boundary_fitting"]["max_deviation_px"] == 1.0
+    assert spec["boundary_fitting"]["resolution_adaptation"] == {
+        "enabled": True, "reference_resolution_m": 2.0,
+    }
     assert spec["deployment_identity"]["status"] == "manifest_recorded"
     assert spec["deployment_identity"]["git_sha"] == "a" * 40
     assert spec["fragmentation_regularization"] == {
