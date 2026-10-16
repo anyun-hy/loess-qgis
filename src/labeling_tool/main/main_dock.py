@@ -766,6 +766,8 @@ class LabelingDockWidget(QgsDockWidget):
         )
 
     def _update_start_enabled(self):
+        if self._cleaning_up or self.workflow is None:
+            return
         readiness = self._current_start_readiness()
         self.start_btn.setEnabled(readiness.can_start)
         self.start_readiness_label.setText(

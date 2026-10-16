@@ -7,6 +7,7 @@ from qgis.core import QgsApplication
 
 from labeling_tool.main.main_dock import LabelingDockWidget
 from labeling_tool.qgis_support.qt6_api import RIGHT_DOCK_WIDGET_AREA
+from labeling_tool.qgis_support.qt_lifecycle import drain_retired_owners
 
 
 class LabelingTool(QObject):
@@ -18,6 +19,7 @@ class LabelingTool(QObject):
         self.dock_widget = None
         self.toolbar = None
         self.action = None
+        self._unloading = False
 
     def initGui(self):
         self._require_supported_qpa()
@@ -53,8 +55,20 @@ class LabelingTool(QObject):
             )
 
     def unload(self):
+        if self._unloading:
+            return
+        self._unloading = True
+        try:
+            self._unload()
+        finally:
+            self._unloading = False
+
+    def _unload(self):
         if self.dock_widget:
             self.dock_widget.cleanup()
+        # Include previously retired runners, not only the current Run.
+        drain_retired_owners()
+        if self.dock_widget:
             self.iface.removeDockWidget(self.dock_widget)
             self.dock_widget.deleteLater()
             self.dock_widget = None
