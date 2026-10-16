@@ -17,10 +17,12 @@ from labeling_tool.refinement.refinement_task import (
 class ManualRunLoadTask(QgsTask):
     """Validate and publish one copied Run without GUI-thread file scanning."""
 
-    def __init__(self, request_id: int, run_directory) -> None:
+    def __init__(self, request_id: int, run_directory, *, load_scope="classes", for_initialization=False) -> None:
         super().__init__("后台加载已有 Run", QgsTask.Flag.CanCancel)
         self.request_id = int(request_id)
         self.run_directory = str(Path(run_directory).expanduser().resolve())
+        self.load_scope = load_scope
+        self.for_initialization = for_initialization
         self.result_data = None
         self.error_message = ""
         self.progress_message = "等待后台加载"
@@ -55,11 +57,17 @@ class ManualRunLoadTask(QgsTask):
         try:
             bundle = manual_run_loader.prepare_manual_run(
                 self.run_directory,
+                load_scope=self.load_scope,
+                for_initialization=self.for_initialization,
                 is_canceled=self.isCanceled,
                 progress=self._report,
             )
             if self.isCanceled():
                 return False
+            if self.for_initialization:
+                self.result_data = bundle
+                self._report("识别结果读取完成", 100)
+                return True
             self._begin_commit(bundle)
             self._report("正在发布已校验的 Run 元数据，不能取消", 97)
             self.result_data = manual_run_loader.publish_manual_run_bundle(bundle)

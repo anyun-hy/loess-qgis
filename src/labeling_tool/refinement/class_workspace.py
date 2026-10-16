@@ -6,14 +6,13 @@ import datetime
 import hashlib
 import json
 import os
-import sqlite3
 import shutil
+import sqlite3
 import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     Qgis,
     QgsDefaultValue,
@@ -26,6 +25,7 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+from qgis.PyQt.QtCore import QVariant
 
 from labeling_tool.qgis_support.layer_names import LAYER_NAMES
 from labeling_tool.qgis_support.qgis_writer import write_vector_layer
@@ -35,7 +35,6 @@ from labeling_tool.shared.contracts.run_spec import (
     atomic_write_json,
     sha256_file,
 )
-
 
 WORKSPACE_SCHEMA_VERSION = 2
 WORK_FIELDS = (
@@ -434,12 +433,40 @@ def initialize_workspace(
     progress=None,
 ):
     paths = workspace_paths(run_spec)
+    existing_files = list(paths["directory"].glob("class_*.gpkg"))
+    if existing_files and not paths["workspace"].is_file():
+        raise ClassWorkspaceError("classes 文件不完整；禁止初始化覆盖已有类别文件")
     if paths["workspace"].is_file() and not replace:
         return load_workspace(
             run_spec,
             expected_stream_id=stream.get("stream_id"),
             is_canceled=is_canceled,
         )
+    from labeling_tool.refinement.manual_run_loader import (
+        file_identity,
+        prepare_manual_run,
+    )
+    source_paths = stream.get("paths") or {}
+    protected = [paths["workspace"], paths["history"], *existing_files]
+    protected.extend(Path(value) for value in (
+        source_paths.get("semantic_polygons"), source_paths.get("semantic_polygons_raw"),
+        source_paths.get("boundary_fitting_report"), stream.get("review_polygons"),
+        (run_spec.get("fusion") or {}).get("snapshot_path"),
+    ) if value)
+    identities = {str(path): file_identity(path) for path in protected}
+    if replace:
+        # The result panel also accepts copied Runs. Read their current records
+        # again using the selected directory, without publishing rebound paths.
+        previous = (
+            prepare_manual_run(
+                run_spec["run_dir"], for_initialization=True, is_canceled=is_canceled
+            )["workspace"]
+            if run_spec.get("workflow_mode") == "run_refinement"
+            else load_workspace(run_spec, is_canceled=is_canceled)
+        )
+        refresh = workspace_review_refresh_status(run_spec, previous, stream)
+        if not refresh["safe_to_replace"]:
+            raise ClassWorkspaceError("已有人工修改、审核记录或不需要重建，禁止覆盖分类工作区")
     if run_spec.get("manual_only"):
         if (
             stream.get("kind") != "fusion"
@@ -522,6 +549,10 @@ def initialize_workspace(
             raise ClassWorkspaceCancelled("类别工作区初始化已取消")
         # The commit section is intentionally short and non-cancellable: either
         # all 14 final files and workspace.json become visible, or none do.
+        if any(file_identity(path) != identity for path, identity in identities.items()):
+            raise ClassWorkspaceError("初始化期间分类工作区发生变化；已有文件未覆盖")
+        if not replace and any(class_layer_path(run_spec, code).exists() for code in CLASS_ORDER):
+            raise ClassWorkspaceError("初始化期间出现类别文件；已有文件未覆盖")
         for code in CLASS_ORDER:
             os.replace(
                 temporary / f"class_{code}.gpkg",
@@ -719,13 +750,14 @@ class ClassWorkspaceProbeTask(QgsTask):
         self.streams = [dict(stream) for stream in streams]
         self.result_data = None
         self.error_message = ""
+        self.prepared_workspace = None
 
     def run(self):
         try:
             workspace = None
             workspace_path = workspace_paths(self.run_spec)["workspace"]
             if workspace_path.is_file():
-                workspace = load_workspace(
+                workspace = self.prepared_workspace or load_workspace(
                     self.run_spec,
                     is_canceled=self.isCanceled,
                     progress=self.setProgress,

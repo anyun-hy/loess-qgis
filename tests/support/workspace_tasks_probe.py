@@ -304,96 +304,78 @@ def dialog_fixture(root):
 
 def dialog_lifecycle(app, root):
     with dialog_fixture(root) as (dialog, submit, warning, callbacks):
-        dialog.set_run(
-            {"ready_streams": [STREAM, dict(STREAM, status="pending")]},
-            spec(root),
-            {},
-            "",
-        )
-        task = submit.call_args.args[0]
-        assert task.streams == [STREAM]
-        task.progressChanged.emit(35)
-        assert "35%" in dialog.baseline_label.text()
-        task.result_data = {"eligible_fusions": [STREAM], "workspace": None}
-        task.taskCompleted.emit()
-        assert dialog.initialize_btn.isEnabled()
-        dialog._initialize_workspace()
-        initialized = submit.call_args.args[0]
-        initialized.error_message = "bad input identity"
-        initialized.taskTerminated.emit()
-        assert "bad input identity" in dialog.baseline_label.text()
-        assert dialog.initialize_btn.isEnabled() and warning.call_count == 1
-        dialog._initialize_workspace()
+        for manual in (False, True):
+            dialog.set_run(
+                {"ready_streams": [STREAM]},
+                dict(spec(root), manual_only=manual),
+                {},
+                "",
+            )
+            task = submit.call_args.args[0]
+            task.progressChanged.emit(35)
+            assert "35%" in dialog.baseline_label.text()
+            count = submit.call_count
+            task.result_data = {"eligible_fusions": [STREAM], "workspace": None}
+            task.taskCompleted.emit()
+            assert "识别结果区" in dialog.baseline_label.text()
+            assert not hasattr(dialog, "initialize_btn")
+            assert submit.call_count == count, (
+                "Loading must never initialize missing classes"
+            )
+        dialog.set_run({"ready_streams": [STREAM]}, spec(root), {}, "")
         pending = submit.call_args.args[0]
         dialog._cancel_background_load()
-        assert pending.isCanceled() and "已暂停" in dialog.baseline_label.text()
+        assert pending.isCanceled()
         before = dialog.baseline_label.text()
         pending.result_data = {"workspace": {"baseline_stream_id": STREAM["stream_id"]}}
         pending.taskCompleted.emit()
         assert dialog._workspace is None and dialog.baseline_label.text() == before
         callbacks["_load_workspace_layers"].assert_not_called()
-        # A pure manual Run with one valid Fusion still initializes automatically.
-        dialog.set_run(
-            {"ready_streams": [STREAM]},
-            dict(spec(root, "manual"), manual_only=True),
-            {},
-            "",
-        )
-        manual_probe = submit.call_args.args[0]
-        manual_probe.result_data = {"eligible_fusions": [STREAM], "workspace": None}
-        count = submit.call_count
-        manual_probe.taskCompleted.emit()
-        assert submit.call_count == count + 1
-        manual_init = submit.call_args.args[0]
+        dialog.set_run({"ready_streams": [STREAM]}, spec(root), {}, "")
+        ready = submit.call_args.args[0]
         value = {"baseline_stream_id": STREAM["stream_id"], "classes": {}}
-        manual_init.result_data = {"workspace": value, "statistics": {12: 3}}
-        manual_init.taskCompleted.emit()
+        ready.result_data = {"workspace": value, "statistics": {12: 3}}
+        ready.taskCompleted.emit()
         assert dialog._workspace is value and dialog._workspace_statistics == {12: 3}
         callbacks["_load_workspace_layers"].assert_called_once_with()
-        assert not dialog.initialize_btn.isEnabled()
 
 
 def dialog_confirmation(app, root):
-    with dialog_fixture(root) as (dialog, submit, warning, callbacks):
-        dialog.set_run({"ready_streams": [STREAM]}, spec(root, "old"), {}, "")
-        task = submit.call_args.args[0]
+    from labeling_tool.main import results_workspace_panel as results
+
+    with patch.object(ui.QgsApplication, "taskManager") as manager:
+        panel = results.ResultsWorkspacePanel()
+        panel._bundle = {"run_spec": spec(root, "old")}
         value = {"baseline_stream_id": STREAM["stream_id"], "classes": {}}
-        task.result_data = {
-            "eligible_fusions": [STREAM],
-            "workspace": value,
-            "review_refresh": {"required": True, "safe_to_replace": True},
-        }
-        task.taskCompleted.emit()
-        assert dialog.initialize_btn.isEnabled()
-        callbacks["_load_workspace_layers"].assert_not_called()
+        panel._probed(
+            {
+                "eligible_fusions": [STREAM],
+                "workspace": value,
+                "review_refresh": {"required": True, "safe_to_replace": True},
+            }
+        )
+        assert panel.initialize_btn.isEnabled()
         with patch.object(ui.QMessageBox, "question", return_value=ui.NO):
-            dialog._initialize_workspace()
-        assert submit.call_count == 1
+            panel._initialize()
+        manager.return_value.addTask.assert_not_called()
         with patch.object(ui.QMessageBox, "question", return_value=ui.YES):
-            dialog._initialize_workspace()
-        assert submit.call_args.args[0].replace
-        dialog._cancel_background_load(silent=True)
+            panel._initialize()
+        assert manager.return_value.addTask.call_args.args[0].replace
+        panel._tasks.cancel()
 
         def change_run(*args, **kwargs):
-            dialog.set_run({}, spec(root, "new"), {}, "")
+            panel.set_candidate(str(root / "new"))
             return ui.YES
 
-        count = submit.call_count
+        count = manager.return_value.addTask.call_count
         with patch.object(ui.QMessageBox, "question", side_effect=change_run):
-            dialog._initialize_workspace()
-        assert submit.call_count == count + 1, (
-            "An old confirmation cannot initialize the new Run"
+            panel._initialize()
+        assert manager.return_value.addTask.call_count == count, (
+            "An old confirmation cannot initialize a different Run"
         )
-        new = submit.call_args.args[0]
-        assert new.run_spec["run_id"] == "new"
-        dialog.cleanup()
-        assert new.isCanceled()
-        before = dialog.baseline_label.text()
-        new.progressChanged.emit(99)
-        new.result_data = {"workspace": value}
-        new.taskCompleted.emit()
-        assert dialog._workspace is None and dialog.baseline_label.text() == before
-        assert warning.call_count == 0
+        panel.cleanup()
+        panel.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 app = QgsApplication([], False)

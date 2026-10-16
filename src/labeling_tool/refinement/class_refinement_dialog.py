@@ -26,9 +26,9 @@ from qgis.PyQt.QtCore import QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -80,7 +80,10 @@ from labeling_tool.refinement.manual_edit_panel import (
 )
 from labeling_tool.refinement.manual_edit_state import ManualEditTask
 from labeling_tool.refinement.refinement_task import RefinementTask, file_identity
-from labeling_tool.refinement.sam3_worker_runner import Sam3WorkerRunner
+from labeling_tool.refinement.sam3_worker_runner import (
+    Sam3WorkerRunner,
+    sam_configuration_path,
+)
 from labeling_tool.refinement.sam_map_preview import SamMapPreview
 from labeling_tool.refinement.sam_session import SamDecision, SamSession
 from labeling_tool.refinement.sam_session_panel import (
@@ -95,6 +98,8 @@ from labeling_tool.shared.contracts.run_spec import CLASS_NAMES, CLASS_ORDER
 
 class ClassRefinementDialog(QDialog):
     workspace_changed = pyqtSignal(object)
+    workspace_load_status_changed = pyqtSignal(object, str)
+    sam_status_changed = pyqtSignal(str)
 
     def __init__(self, iface, layer_manager, parent=None):
         super().__init__(parent)
@@ -121,13 +126,13 @@ class ClassRefinementDialog(QDialog):
         self._workspace_tasks = WorkspaceTasks(self)
         self._workspace_tasks.progress.connect(self._workspace_task_progress)
         self._workspace_tasks.probed.connect(self._workspace_probe_completed)
-        self._workspace_tasks.initialized.connect(self._workspace_initialize_completed)
         self._workspace_tasks.terminated.connect(self._workspace_task_terminated)
         self._layer_loader = WorkspaceLayerLoader(self._load_workspace_layer, self)
         self._layer_loader.loaded.connect(self._workspace_layer_loaded)
         self._layer_loader.failed.connect(self._workspace_layer_failed)
         self._layer_loader.completed.connect(self._workspace_layer_loading_completed)
-        self._manual_only = False
+        self._run_loading = False
+        self._locked_load_layers = {}
         self._class_layers = {}
         self._qgis_smooth_preview: NativeSmoothingPreview | None = None
         self._qgis_smooth_preview_bands = []
@@ -159,6 +164,12 @@ class ClassRefinementDialog(QDialog):
             self._active_layer_changed
         )
         self._worker = None
+        self._sam_generation = 0
+        self._sam_worker_key = None
+        self._sam_ready_config = {}
+        self._sam_status = "SAM3 尚未加载"
+        self._sam_raster_error = "尚未选择 Run 原始影像"
+        self._sam_raster_relocated = False
         self._active_session: SamSession | None = None
         self._manual_task: ManualEditTask | None = None
         self._manual_reference_band = None
@@ -193,14 +204,6 @@ class ClassRefinementDialog(QDialog):
         root.addWidget(self._scrollable_content(content), stretch=1)
         root = QVBoxLayout(content)
         baseline = QHBoxLayout()
-        fusion_title = QLabel("Fusion 基准:")
-        fusion_title.setMinimumWidth(fusion_title.sizeHint().width())
-        baseline.addWidget(fusion_title)
-        self.fusion_combo = QComboBox()
-        baseline.addWidget(self.fusion_combo, stretch=1)
-        self.initialize_btn = QPushButton("初始化 14 类工作层")
-        self.initialize_btn.clicked.connect(self._initialize_workspace)
-        baseline.addWidget(self.initialize_btn)
         self.cancel_load_btn = QPushButton("取消后台加载")
         self.cancel_load_btn.clicked.connect(self._cancel_background_load)
         self.cancel_load_btn.hide()
@@ -209,6 +212,21 @@ class ClassRefinementDialog(QDialog):
         self.baseline_label.setWordWrap(True)
         baseline.addWidget(self.baseline_label, stretch=2)
         root.addLayout(baseline)
+        sam_state = QHBoxLayout()
+        self.sam_status_label = QLabel(self._sam_status)
+        self.sam_status_label.setWordWrap(True)
+        self.sam_retry_btn = QPushButton("重新加载 SAM3")
+        self.sam_retry_btn.clicked.connect(self._retry_sam_preload)
+        self.locate_raster_btn = QPushButton("定位原始影像")
+        self.locate_raster_btn.clicked.connect(self._locate_sam_raster)
+        sam_state.addWidget(self.sam_status_label, 1)
+        sam_state.addWidget(self.sam_retry_btn)
+        sam_state.addWidget(self.locate_raster_btn)
+        root.addLayout(sam_state)
+        self.raster_status_label = QLabel("尚未选择 Run 原始影像")
+        self.raster_status_label.setWordWrap(True)
+        root.addWidget(self.raster_status_label)
+
 
         self.class_review_panel = ClassReviewPanel(self)
         self.class_review_panel.class_selected.connect(self._select_class_context)
@@ -372,6 +390,13 @@ class ClassRefinementDialog(QDialog):
         return scroll
 
     def set_run(self, result, run_spec, sam_config, scripts_dir):
+        previous_raster = self._run_spec.get("raster") or {}
+        keep_raster_binding = bool(
+            self._sam_raster_relocated
+            and self._run_spec.get("run_dir") == run_spec.get("run_dir")
+            and self._run_spec.get("run_id") == run_spec.get("run_id")
+            and file_identity(previous_raster.get("path", "")) == self._sam_raster_identity
+        )
         self._retire_accepted_task()
         self._cancel_background_load(silent=True)
         self._layer_loader.reset()
@@ -402,10 +427,12 @@ class ClassRefinementDialog(QDialog):
         self._run_spec = dict(run_spec)
         self._sam_config = dict(sam_config or {})
         self._scripts_dir = str(scripts_dir)
-        self._manual_only = bool(self._run_spec.get("manual_only"))
-        self.setWindowTitle(
-            "人工分类整理" if self._manual_only else "分类修整与组装"
-        )
+        self.setWindowTitle("Run 分类修整与组装")
+        self._sam_raster_relocated = keep_raster_binding
+        if keep_raster_binding:
+            self._run_spec["raster"] = {**self._run_spec.get("raster", {}), "path": previous_raster["path"]}
+        self._update_sam_raster_status()
+        self.preload_sam(self._sam_config, self._scripts_dir)
         self._sam_panel.render(SamPanelSnapshot())
         self._confidence_raster = None
         streams = [
@@ -413,9 +440,6 @@ class ClassRefinementDialog(QDialog):
             if item.get("status") == "ready"
         ]
         self._eligible_fusions = []
-        self.fusion_combo.clear()
-        self.fusion_combo.setEnabled(False)
-        self.initialize_btn.setEnabled(False)
         self.baseline_label.setText(
             f"Run {run_spec.get('run_id')}；正在后台校验工作区文件..."
         )
@@ -429,128 +453,34 @@ class ClassRefinementDialog(QDialog):
             f"Run {self._run_spec.get('run_id')}；正在后台{action}... {int(progress)}%"
         )
 
-    def _apply_eligible_fusions(self, streams):
-        self._eligible_fusions = list(streams or [])
-        self.fusion_combo.clear()
-        for stream in self._eligible_fusions:
-            self.fusion_combo.addItem(stream["stream_id"], stream["stream_id"])
-
     def _workspace_probe_completed(self, data: dict) -> None:
-        self._apply_eligible_fusions(data.get("eligible_fusions"))
+        self._eligible_fusions = list(data.get("eligible_fusions") or [])
         self._workspace = data.get("workspace")
         self._workspace_statistics = data.get("statistics") or {}
         self._workspace_refresh = data.get("review_refresh") or {}
-        if self._workspace is not None:
-            self.fusion_combo.setCurrentText(
-                self._workspace["baseline_stream_id"]
-            )
-            self.fusion_combo.setEnabled(False)
-            if self._workspace_refresh.get("required"):
-                safe = bool(self._workspace_refresh.get("safe_to_replace"))
-                self.initialize_btn.setText("重建为 V3 14 类工作层")
-                self.initialize_btn.setEnabled(safe)
-                if safe:
-                    self.cancel_load_btn.hide()
-                    self.baseline_label.setText(
-                        "V3 派生结果已就绪；现有工作区无人工修改，可在后台原子重建"
-                    )
-                    self._refresh_table()
-                    return
-                self.baseline_label.setText(
-                    "V3 派生结果已就绪，但现有工作区含人工修改/确认记录，"
-                    "为防止数据丢失已禁止自动覆盖"
-                )
-            else:
-                self.initialize_btn.setText("初始化 14 类工作层")
-                self.initialize_btn.setEnabled(False)
-            self._load_workspace_layers()
-            return
-        self.cancel_load_btn.hide()
-        self.fusion_combo.setEnabled(bool(self._eligible_fusions))
-        self.initialize_btn.setEnabled(bool(self._eligible_fusions))
-        self.baseline_label.setText(
-            f"Run {self._run_spec.get('run_id')}；"
-            f"可用 Fusion {len(self._eligible_fusions)} 个"
-        )
-        self._refresh_table()
-        if self._manual_only and len(self._eligible_fusions) == 1:
-            self.fusion_combo.setCurrentIndex(0)
-            self._initialize_workspace()
-
-    def _workspace_task_terminated(
-        self,
-        operation: str,
-        error_message: str,
-    ) -> None:
-        self.cancel_load_btn.hide()
-        if error_message:
-            title = (
-                "初始化 14 类工作层失败"
-                if operation == "initialize"
-                else "恢复类别工作区失败"
-            )
-            self.baseline_label.setText(f"后台任务失败：{error_message}")
-            QMessageBox.warning(self, title, error_message)
-        else:
-            self.baseline_label.setText("后台加载已取消；QGIS 主界面仍可继续操作")
-        self.fusion_combo.setEnabled(bool(self._eligible_fusions))
-        self.initialize_btn.setEnabled(bool(self._eligible_fusions))
-        self._refresh_table()
-
-    def _initialize_workspace(self):
-        if self._workspace_tasks.busy:
-            return
-        run_spec = self._run_spec
-        stream_id = str(self.fusion_combo.currentData() or "")
-        if not stream_id:
-            QMessageBox.warning(self, "初始化工作区", "没有通过规则化和审批的 Fusion")
-            return
-        try:
-            stream = class_workspace.stream_by_id(
-                self._eligible_fusions, stream_id
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "初始化 14 类工作层失败", str(exc))
-            return
-        replace = bool(
-            self._workspace_refresh.get("required")
-            and self._workspace_refresh.get("safe_to_replace")
-        )
-        if replace:
-            answer = QMessageBox.question(
-                self,
-                "重建 V3 工作区",
-                "已确认当前 14 类工作区没有人工修改、类别确认或编辑历史。\n\n"
-                "继续后将用 V3 派生结果原子重建 14 个类别文件；"
-                "原始 Fusion 成果和 V3 总成果均保留。是否继续？",
-                YES | NO,
-                NO,
-            )
-            if answer != YES:
-                return
-            if run_spec is not self._run_spec:
-                return
-        self.fusion_combo.setEnabled(False)
-        self.initialize_btn.setEnabled(False)
-        self.cancel_load_btn.show()
-        self.baseline_label.setText("正在后台初始化 14 类工作层... 0%")
-        self._workspace_tasks.initialize(
-            run_spec,
-            stream,
-            replace=replace,
-        )
-
-    def _workspace_initialize_completed(self, data: dict) -> None:
-        self._workspace = data.get("workspace")
-        self._workspace_statistics = data.get("statistics") or {}
-        self._workspace_refresh = {}
-        self.initialize_btn.setText("初始化 14 类工作层")
         if self._workspace is None:
-            self.baseline_label.setText("后台初始化没有返回工作区")
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText("Run 尚未初始化 classes，请到识别结果区初始化分类图层")
+            self._report_workspace_load_status(self.baseline_label.text())
+            self._refresh_table()
             return
-        self.fusion_combo.setEnabled(False)
-        self.initialize_btn.setEnabled(False)
+        if self._workspace_refresh.get("required") and self._workspace_refresh.get("safe_to_replace"):
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText("分类基准有可用更新，请到识别结果区处理；现有工作区未覆盖")
+            self._report_workspace_load_status(self.baseline_label.text())
+            self._refresh_table()
+            return
         self._load_workspace_layers()
+
+    def _workspace_task_terminated(self, operation: str, error_message: str) -> None:
+        self.cancel_load_btn.hide()
+        self.baseline_label.setText(
+            f"类别工作区加载失败：{error_message}" if error_message else "后台加载已取消"
+        )
+        self._report_workspace_load_status(self.baseline_label.text())
+        if error_message:
+            QMessageBox.warning(self, "加载类别工作区失败", error_message)
+        self._refresh_table()
 
     def _load_workspace_layers(self):
         pending_codes = [
@@ -576,8 +506,6 @@ class ClassRefinementDialog(QDialog):
         report_sha = str(self._workspace.get("boundary_report_sha256") or "")
         if report_sha:
             text += f" | report SHA {report_sha[:12]}..."
-        if self._manual_only:
-            text += " | 纯人工模式"
         if self._workspace.get("portable_classes_only"):
             text += " | Fusion 基准离线"
         if suffix:
@@ -622,6 +550,7 @@ class ClassRefinementDialog(QDialog):
     def _workspace_layer_failed(self, code: int, message: str) -> None:
         self.cancel_load_btn.hide()
         self.baseline_label.setText(f"类别 {code} 挂载失败：{message}")
+        self._report_workspace_load_status(self.baseline_label.text())
         QMessageBox.warning(self, f"类别 {code} 挂载失败", message)
         self._refresh_table()
 
@@ -629,6 +558,10 @@ class ClassRefinementDialog(QDialog):
         self.cancel_load_btn.hide()
         self.baseline_label.setText(self._workspace_summary_text("工作层已就绪"))
         self._refresh_table()
+        self._report_workspace_load_status("加载完成，14 类工作层已就绪")
+
+    def _report_workspace_load_status(self, message: str) -> None:
+        self.workspace_load_status_changed.emit(dict(self._result), message)
 
     def _register_workspace_layer(self, code, layer_id):
         layer = QgsProject.instance().mapLayer(layer_id)
@@ -676,16 +609,15 @@ class ClassRefinementDialog(QDialog):
             if not silent:
                 self.baseline_label.setText("正在取消组装/拓扑检查；现有结果不会被覆盖")
                 return
+        was_loading = self._workspace_tasks.busy or bool(self._layer_loader.pending_codes)
         self._workspace_tasks.cancel()
         self._layer_loader.pause()
+        if was_loading:
+            self._report_workspace_load_status("分类工作层加载已暂停，可在整理窗口继续挂载")
         if not silent:
             self.cancel_load_btn.hide()
             self.baseline_label.setText(
                 "后台加载已暂停；点击需要的类别可按需继续挂载"
-            )
-            self.fusion_combo.setEnabled(bool(self._eligible_fusions))
-            self.initialize_btn.setEnabled(
-                self._workspace is None and bool(self._eligible_fusions)
             )
 
     def _layer(self, class_code):
@@ -2173,10 +2105,174 @@ class ClassRefinementDialog(QDialog):
 
     def _sam_available(self):
         return bool(
-            self._sam_config.get("enabled")
-            and self._sam_config.get("checkpoint_sha256")
-            and Path(str(self._sam_config.get("checkpoint") or "")).is_file()
+            self._worker is not None and self._worker.is_ready
+            and not self._sam_raster_error
         )
+
+    def can_change_run(self):
+        locked, reason = self._class_selection_lock()
+        editable = any(
+            layer.customProperty("labeling_tool/workspace_path", "")
+            and layer.isEditable()
+            for layer in QgsProject.instance().mapLayers().values()
+        )
+        if locked or editable or self._workspace_tasks.busy:
+            QMessageBox.warning(
+                self, "切换 Run",
+                reason or "请先结束分类工作层编辑或等待后台校验完成，再切换 Run / 初始化。",
+            )
+            return False
+        return True
+
+    def begin_run_load(self):
+        if not self.can_change_run():
+            return False
+        self._run_loading = True
+        self.setEnabled(False)
+        self._layer_loader.pause()
+        for layer in QgsProject.instance().mapLayers().values():
+            if layer.customProperty("labeling_tool/workspace_path", ""):
+                self._locked_load_layers[layer.id()] = layer.readOnly()
+                layer.setReadOnly(True)
+        self._refresh_table()
+        return True
+
+    def finish_run_load(self):
+        was_loading = self._run_loading
+        self._run_loading = False
+        self.setEnabled(True)
+        for layer_id, read_only in self._locked_load_layers.items():
+            layer = QgsProject.instance().mapLayer(layer_id)
+            if layer is not None:
+                layer.setReadOnly(read_only)
+        self._locked_load_layers.clear()
+        if was_loading:
+            self._layer_loader.start(self._layer_loader.pending_codes)
+            self._refresh_table()
+
+    @property
+    def sam_status(self):
+        return self._sam_status
+
+    def _set_sam_status(self, text):
+        self._sam_status = text
+        self.sam_status_label.setText(text)
+        self.sam_status_changed.emit(text)
+        self._refresh_table()
+
+    def preload_sam(self, sam_config, scripts_dir, *, force=False):
+        """Start the model before any map click, regardless of layer scope."""
+        scripts_dir = str(scripts_dir or "")
+        config = dict(sam_config or {})
+        config_path = sam_configuration_path(scripts_dir)
+        key = (str(Path(scripts_dir).resolve()), file_identity(config_path))
+        if not config_path.is_file():
+            key += (str(sorted(config.items())), file_identity(str(config.get("checkpoint") or "")))
+        self._sam_config = config
+        self._scripts_dir = scripts_dir
+        if not force and key == self._sam_worker_key and self._worker is not None and self._worker.is_running:
+            if self._worker.is_ready:
+                self._sam_config.update(self._sam_ready_config)
+            return
+        self._sam_generation += 1
+        generation = self._sam_generation
+        old = self._worker
+        self._worker = None
+        self._sam_worker_key = key
+        self._set_sam_status("SAM3 加载中…")
+
+        def start():
+            if generation != self._sam_generation:
+                return
+            try:
+                worker = Sam3WorkerRunner(scripts_dir, config, self)
+                self._worker = worker
+                worker.ready.connect(self._sam_worker_ready)
+                worker.event_received.connect(self._worker_event)
+                worker.log_line.connect(self._worker_log)
+                worker.stopped.connect(self._worker_stopped)
+                worker.start()
+            except Exception as exc:
+                self._set_sam_status(f"SAM3 加载失败：{exc}")
+
+        if old is not None:
+            old.stopped.connect(start)
+            retire_after(old, old.stopped)
+            old.stop()
+        else:
+            start()
+
+    def _sam_worker_ready(self, event):
+        if self.sender() is not self._worker:
+            return
+        self._sam_ready_config = {
+            "checkpoint": event.get("checkpoint", self._sam_config.get("checkpoint", "")),
+            "checkpoint_sha256": event.get("checkpoint_sha256", ""),
+            "effective_device": event.get("device", ""),
+            "version": event.get("sam_version", ""),
+            "buffer_px": event.get("buffer_px", self._sam_config.get("buffer_px", 32)),
+        }
+        self._sam_config.update(self._sam_ready_config)
+        self._set_sam_status(f"SAM3 已就绪（{event.get('device', '未知设备')}）")
+        self._submit_pending_worker_request()
+
+    def _retry_sam_preload(self):
+        if self._active_session:
+            QMessageBox.warning(self, "SAM3", "请先结束当前 SAM3 会话再重新加载模型")
+            return
+        self.preload_sam(self._sam_config, self._scripts_dir, force=True)
+
+    def stop_sam_preload(self):
+        self._sam_generation += 1
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            retire_after(worker, worker.stopped)
+            worker.stop()
+
+    def _update_sam_raster_status(self):
+        raster = self._run_spec.get("raster") or {}
+        raw = str(raster.get("path") or "")
+        self._sam_raster_error = ""
+        if not raw or not Path(raw).is_file():
+            self._sam_raster_error = "Run 原始影像不可用，请定位对应影像；SAM3 模型仍会加载"
+        elif raster.get("file_identity") and not self._sam_raster_relocated:
+            from labeling_tool.shared.contracts.run_spec import source_raster_identity
+            if source_raster_identity(raw) != raster["file_identity"]:
+                self._sam_raster_error = "原始影像身份已变化，请定位同一影像的副本；SAM3 模型仍会加载"
+        self._sam_raster_identity = file_identity(raw) if raw else None
+        self.raster_status_label.setText(self._sam_raster_error or f"原始影像：{raw}")
+
+    def _locate_sam_raster(self):
+        if not self._run_spec or self._active_session or self._run_loading:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "定位此 Run 对应的原始影像", "", "Raster (*.tif *.tiff *.vrt)")
+        if not path:
+            return
+        try:
+            from osgeo import gdal
+            raster = self._run_spec.get("raster") or {}
+            layer = QgsRasterLayer(path, "run_source_check")
+            if not layer.isValid() or layer.crs() != QgsCoordinateReferenceSystem(raster.get("crs", "")):
+                raise ValueError("影像不可读或 CRS 与 Run 不匹配")
+            dataset = gdal.Open(path)
+            if dataset is None:
+                raise ValueError("无法读取原始影像")
+            transform = dataset.GetGeoTransform()
+            dataset = None
+            affine = [transform[1], transform[2], transform[0], transform[4], transform[5], transform[3]]
+            expected = list(raster.get("transform") or [])[:6]
+            if len(expected) != 6 or any(not math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-8) for a, b in zip(affine, expected)):
+                raise ValueError("影像位置或分辨率与 Run 不匹配")
+            expected_size = (raster.get("file_identity") or {}).get("size")
+            if expected_size is not None and Path(path).stat().st_size != expected_size:
+                raise ValueError("影像文件大小与 Run 记录不匹配，请选择原始影像副本")
+            self._run_spec["raster"] = {**raster, "path": str(Path(path).resolve())}
+            self._sam_raster_relocated = True
+            self._update_sam_raster_status()
+            self._refresh_table()
+        except Exception as exc:
+            QMessageBox.warning(self, "原始影像不匹配", str(exc))
 
     def _request_sam(self, class_code: int, missed: bool) -> None:
         self._select_class_context(class_code, activate_layer=True)
@@ -2187,7 +2283,7 @@ class ClassRefinementDialog(QDialog):
         if not self._workspace:
             return
         if not self._sam_available():
-            QMessageBox.warning(self, "SAM3", "SAM3 checkpoint、SHA 或环境检查未通过")
+            QMessageBox.warning(self, "SAM3", self._sam_raster_error or self._sam_status)
             return
         if self._active_session or self._manual_task:
             QMessageBox.warning(self, "SAM3", "已有活动 SAM3 或人工操作任务")
@@ -2333,6 +2429,9 @@ class ClassRefinementDialog(QDialog):
         session = self._active_session
         if session is None:
             return
+        if not self._sam_available() or file_identity(self._run_spec["raster"]["path"]) != self._sam_raster_identity:
+            self._session_failed("SAM3 未就绪或原始影像已变化，请重新检查")
+            return
         stream = class_workspace.stream_by_id(
             self._eligible_fusions, self._workspace["baseline_stream_id"]
         )
@@ -2354,22 +2453,11 @@ class ClassRefinementDialog(QDialog):
                 or "cpu"
             ),
         )
-        if self._worker is None:
-            self._worker = Sam3WorkerRunner(
-                self._scripts_dir, self._sam_config, self
-            )
-            self._worker.ready.connect(self._submit_pending_worker_request)
-            self._worker.event_received.connect(self._worker_event)
-            self._worker.log_line.connect(self._worker_log)
-            self._worker.stopped.connect(self._worker_stopped)
-        if self._worker.is_ready:
-            self._submit_pending_worker_request()
-        else:
-            self._worker.start()
+        self._submit_pending_worker_request()
 
     def _submit_pending_worker_request(self) -> None:
         session = self._active_session
-        if session is None or self._worker is None:
+        if session is None or self._worker is None or not self._worker.is_ready:
             return
         request = session.take_pending_request()
         if request is None:
@@ -2380,6 +2468,11 @@ class ClassRefinementDialog(QDialog):
             self._session_failed(str(exc))
 
     def _worker_event(self, event: dict[str, object]) -> None:
+        if self.sender() is not None and self.sender() is not self._worker:
+            return
+        if event.get("event") == "worker_failed":
+            self._set_sam_status(f"SAM3 加载失败：{event.get('error') or '未知错误'}")
+            return
         session = self._active_session
         if not session:
             return
@@ -2440,6 +2533,11 @@ class ClassRefinementDialog(QDialog):
             self._sam_panel.replace_log(message[-6000:])
 
     def _worker_stopped(self, event: dict[str, object]) -> None:
+        if self.sender() is not None and self.sender() is not self._worker:
+            return
+        if not event.get("expected"):
+            if "失败" not in self._sam_status:
+                self._set_sam_status(f"SAM3 进程已退出，returncode={event.get('returncode')}；请重新加载")
         if not event.get("expected") and self._active_session:
             self._session_failed(
                 f"SAM3 worker 意外退出，returncode={event.get('returncode')}"
@@ -2778,9 +2876,9 @@ class ClassRefinementDialog(QDialog):
                             review_text="未初始化",
                             confirmed=False,
                             unsaved=False,
-                            manual_reason="请先初始化 14 类工作层",
-                            sam_reason="请先初始化 14 类工作层",
-                            confirm_reason="请先初始化 14 类工作层",
+                            manual_reason="请到识别结果区初始化分类图层",
+                            sam_reason="请到识别结果区初始化分类图层",
+                            confirm_reason="请到识别结果区初始化分类图层",
                         )
                         for code in CLASS_ORDER
                     )
@@ -2798,12 +2896,7 @@ class ClassRefinementDialog(QDialog):
             if code in self._class_layers:
                 layer = QgsProject.instance().mapLayer(self._class_layers[code])
             stats = self._workspace_statistics.get(code)
-            if stats and self._manual_only:
-                status_text = (
-                    f"原始 {stats.get('fusion', 0)} / "
-                    f"人工 {stats.get('manual_edited', 0)}"
-                )
-            elif stats:
+            if stats:
                 status_text = (
                     f"Fusion {stats.get('fusion', 0)} / SAM3 {stats.get('sam3', 0)} / "
                     f"人工 {stats.get('manual_edited', 0)}"
@@ -2837,11 +2930,9 @@ class ClassRefinementDialog(QDialog):
             elif has_unsaved_edits:
                 sam_reason = "存在未保存编辑，请先保存或回滚"
                 confirm_reason = sam_reason
-            elif self._manual_only:
-                sam_reason = "纯人工模式不提供 SAM 辅助"
             elif not self._sam_available():
-                sam_reason = "SAM3 checkpoint、SHA 或环境检查未通过"
-            sam_base = not self._manual_only and self._sam_available()
+                sam_reason = self._sam_raster_error or self._sam_status
+            sam_base = self._sam_available()
             sam_ready = bool(layer is not None and sam_base and not has_unsaved_edits)
             rows.append(
                 ClassReviewRow(
@@ -2879,6 +2970,8 @@ class ClassRefinementDialog(QDialog):
         self.workspace_changed.emit(dict(self._workspace))
 
     def _class_selection_lock(self):
+        if self._run_loading:
+            return True, "正在切换 Run，请等待加载完成"
         if self._accepted_task is not None:
             return True, "正在后台写入 accepted_labels，不能切换类别"
         if self._refinement_task is not None:
@@ -2944,8 +3037,6 @@ class ClassRefinementDialog(QDialog):
             self._refinement_task = task
             task.taskCompleted.connect(self._refinement_completed)
             task.taskTerminated.connect(self._refinement_terminated)
-            self.fusion_combo.setEnabled(False)
-            self.initialize_btn.setEnabled(False)
             self.topology_btn.setEnabled(False)
             self.cancel_load_btn.setText("取消组装/检查")
             self.cancel_load_btn.show()
@@ -3007,7 +3098,6 @@ class ClassRefinementDialog(QDialog):
 
     def _finish_refinement_task(self):
         self._refinement_task = None
-        self.fusion_combo.setEnabled(self._workspace is None and bool(self._eligible_fusions))
         self.cancel_load_btn.setText("取消后台加载")
         self.cancel_load_btn.hide()
         self._refresh_table()
@@ -3257,6 +3347,7 @@ class ClassRefinementDialog(QDialog):
         )
 
     def cleanup(self):
+        self.finish_run_load()
         self._retire_accepted_task()
         self._cancel_background_load(silent=True)
         self._layer_loader.reset()
@@ -3267,12 +3358,12 @@ class ClassRefinementDialog(QDialog):
         self._cancel_active_session(record=False)
         self._layer_signals.cleanup()
         self._edit_tracker.reset()
-        if self._worker is not None:
-            retire_after(self._worker, self._worker.stopped)
-            self._worker.stop()
-            self._worker = None
+        self.stop_sam_preload()
 
     def closeEvent(self, event):
+        if self._run_loading:
+            event.ignore()
+            return
         if self._editable_modified_layers():
             QMessageBox.warning(
                 self,
@@ -3308,10 +3399,7 @@ class ClassRefinementDialog(QDialog):
         self._cancel_active_session(record=True)
         self._retire_accepted_task()
         self._cancel_background_load(silent=True)
-        if self._worker is not None:
-            retire_after(self._worker, self._worker.stopped)
-            self._worker.stop()
-            self._worker = None
+        self.stop_sam_preload()
         self._clear_qgis_smooth_preview()
         event.ignore()
         self.hide()

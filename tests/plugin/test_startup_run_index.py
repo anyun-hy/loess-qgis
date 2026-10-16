@@ -394,11 +394,11 @@ def test_main_dock_startup_restore_is_metadata_only():
     assert "load_startup_candidates" in restore
 
     open_block = source.split("def _on_open_refinement", 1)[1].split(
-        "def _on_load_manual_run", 1
+        "def _manual_load_is_current", 1
     )[0]
     assert "valid_ready_stream_ids" not in open_block
     assert "approved_fusion_streams" not in open_block
-    assert "将在分类窗口中后台校验" in open_block
+    assert "ManualRunLoadTask(" in open_block
 
 
 def test_v5_runner_updates_index_at_running_and_terminal_boundaries():

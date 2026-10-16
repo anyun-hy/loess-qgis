@@ -83,7 +83,7 @@ def _initialized_workspace(run_root, run_id):
             "confirmed": False,
         }
     workspace = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "baseline_stream_id": "fusion:fixture",
         "baseline_source_path": "/remote/fusion/semantic_polygons.gpkg",
@@ -104,6 +104,7 @@ def _initialized_workspace(run_root, run_id):
 def test_manual_copy_freezes_a_separate_accepted_write_contract(tmp_path):
     run_root, _spec_path, _manifest_path, snapshot = _copied_run(tmp_path)
 
+    _initialized_workspace(run_root, "20260729_200000_manual")
     bundle = load_manual_run(run_root)
 
     spec = bundle["run_spec"]
@@ -163,12 +164,12 @@ def test_initialized_workspace_loads_without_copied_fusion_polygons(tmp_path):
     }
 
 
-def test_uninitialized_workspace_still_requires_copied_fusion_polygons(tmp_path):
+def test_uninitialized_workspace_directs_to_results_area(tmp_path):
     run_root, _spec_path, _manifest_path, _snapshot = _copied_run(tmp_path)
     semantic = run_root / "fusion" / "fixture" / "semantic_polygons.gpkg"
     semantic.unlink()
 
-    with pytest.raises(ManualRunLoadError, match="semantic_polygons.gpkg"):
+    with pytest.raises(ManualRunLoadError, match="识别结果区"):
         load_manual_run(run_root)
 
 
@@ -183,22 +184,16 @@ def test_portable_workspace_rejects_a_missing_class_file(tmp_path):
         load_manual_run(run_root)
 
 
-def test_portable_workspace_syncs_recalculated_class_sha(tmp_path):
-    run_root, _spec_path, _manifest_path, _snapshot = _copied_run(tmp_path)
-    semantic = run_root / "fusion" / "fixture" / "semantic_polygons.gpkg"
-    semantic.unlink()
+def test_portable_workspace_preserves_changed_file_and_rejects_stale_review(tmp_path):
+    run_root, *_ = _copied_run(tmp_path)
     workspace_path = _initialized_workspace(run_root, "20260729_200000_manual")
-
-    # Modify class 12 file on disk
-    class_12_path = run_root / "classes" / "class_12.gpkg"
-    class_12_path.write_bytes(b"modified-class-12-content")
-
-    bundle = load_manual_run(run_root)
-    assert bundle["workspace"]["classes"]["12"]["sha256"] == sha256_file(class_12_path)
-    persist_rebound_workspace(bundle)
-
-    persisted = json.loads(workspace_path.read_text(encoding="utf-8"))
-    assert persisted["classes"]["12"]["sha256"] == sha256_file(class_12_path)
+    original = workspace_path.read_bytes()
+    changed = run_root / "classes" / "class_12.gpkg"
+    changed.write_bytes(b"externally-edited-class")
+    with pytest.raises(ManualRunLoadError, match="SHA256"):
+        load_manual_run(run_root)
+    assert changed.read_bytes() == b"externally-edited-class"
+    assert workspace_path.read_bytes() == original
 
 
 def test_background_prepare_cancels_without_publishing_metadata(tmp_path):
@@ -275,3 +270,94 @@ def test_prepare_rejects_contract_changed_after_read(tmp_path, relative_path):
         prepare_manual_run(run_root, progress=progress)
 
     assert changed
+
+
+def _full_run(tmp_path):
+    run_root, spec_path, manifest_path, _ = _copied_run(tmp_path)
+    _initialized_workspace(run_root, "20260729_200000_manual")
+    manifest = json.loads(manifest_path.read_text())
+    old_root = json.loads(spec_path.read_text())["run_dir"]
+    manifest["streams"].append({
+        "stream_id": "model:fixture", "kind": "model", "model_id": "fixture", "status": "ready",
+        "paths": {},
+    })
+    for stream in manifest["streams"]:
+        relative = "models/fixture" if stream["kind"] == "model" else "fusion/fixture"
+        directory = run_root / relative
+        directory.mkdir(exist_ok=True, parents=True)
+        stream["output_sha256"] = {}
+        for key, suffix in [("mask_mosaic", "tif"), ("confidence_mosaic", "tif"), ("semantic_polygons", "gpkg")]:
+            path = directory / f"{key}.{suffix}"
+            path.write_bytes(f"{relative}-{key}".encode())
+            stream["paths"][key] = f"{old_root}/{relative}/{path.name}"
+            stream["output_sha256"][key] = sha256_file(path)
+    atomic_write_json(manifest_path, manifest)
+    return run_root, spec_path, manifest_path
+
+
+@pytest.mark.parametrize("scope", ["classes", "all"])
+def test_scopes_preserve_human_records_and_original_contracts(tmp_path, scope):
+    run_root, spec_path, manifest_path = _full_run(tmp_path)
+    workspace_path = run_root / "classes/workspace.json"
+    workspace = json.loads(workspace_path.read_text())
+    workspace["classes"]["12"].update(confirmed=True, modified=True, state="confirmed", reviewer="human")
+    atomic_write_json(workspace_path, workspace)
+    history = run_root / "classes/edit_history.jsonl"
+    history.write_text('{"action":"human_confirmed"}\n')
+    before = {path: path.read_bytes() for path in [spec_path, manifest_path, history, *run_root.glob("classes/*.gpkg")]}
+    bundle = load_manual_run(run_root, load_scope=scope)
+    assert bundle["run_spec"]["load_scope"] == scope
+    assert len(bundle["result"]["ready_streams"]) == (2 if scope == "all" else 1)
+    after = bundle["workspace"]["classes"]["12"]
+    assert after["confirmed"] and after["modified"] and after["reviewer"] == "human"
+    assert all(path.read_bytes() == value for path, value in before.items())
+    if scope == "all":
+        model = bundle["result"]["ready_streams"][1]
+        assert model["paths"]["mask_mosaic"] == str(run_root / "models/fixture/mask_mosaic.tif")
+
+
+def test_full_scope_rejects_missing_result_without_downgrading_or_publishing(tmp_path):
+    run_root, *_ = _full_run(tmp_path)
+    workspace = run_root / "classes/workspace.json"
+    original = workspace.read_bytes()
+    (run_root / "models/fixture/confidence_mosaic.tif").unlink()
+    with pytest.raises(ManualRunLoadError, match="confidence_mosaic"):
+        load_manual_run(run_root, load_scope="all")
+    assert workspace.read_bytes() == original
+    assert not (run_root / "classes/accepted_write_run_manifest.json").exists()
+    assert prepare_manual_run(run_root, load_scope="classes")["workspace"]
+
+
+def test_initialization_reader_needs_no_classes_and_does_not_publish(tmp_path):
+    run_root, spec_path, manifest_path, _ = _copied_run(tmp_path)
+    original = {path: path.read_bytes() for path in [spec_path, manifest_path]}
+    bundle = prepare_manual_run(run_root, for_initialization=True)
+    assert bundle["workspace"] is None
+    assert bundle["run_spec"]["manual_only"] is False
+    publish_manual_run_bundle(bundle)
+    assert not (run_root / "classes").exists()
+    assert all(path.read_bytes() == content for path, content in original.items())
+
+
+def test_original_run_keeps_accepted_target_across_scopes(tmp_path):
+    run_root, spec_path, manifest_path = _full_run(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec.update(run_dir=str(run_root), accepted_target_gpkg=str(tmp_path / "shared/accepted.gpkg"))
+    atomic_write_json(spec_path, spec)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["run_spec_sha256"] = sha256_file(spec_path)
+    atomic_write_json(manifest_path, manifest)
+    for scope in ("classes", "all"):
+        bundle = prepare_manual_run(run_root, load_scope=scope)
+        assert bundle["run_spec"]["accepted_target_gpkg"] == spec["accepted_target_gpkg"]
+
+
+def test_partial_classes_without_metadata_cannot_be_initialized(tmp_path):
+    run_root, *_ = _copied_run(tmp_path)
+    directory = run_root / "classes"
+    directory.mkdir()
+    existing = directory / "class_12.gpkg"
+    existing.write_bytes(b"human-edit")
+    with pytest.raises(ManualRunLoadError, match="不完整"):
+        prepare_manual_run(run_root, for_initialization=True)
+    assert existing.read_bytes() == b"human-edit"

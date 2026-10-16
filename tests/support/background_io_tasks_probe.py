@@ -125,11 +125,12 @@ def copied_run(root: Path, *, class_bytes=0) -> Path:
             "layer_name": "class_polygons",
             "feature_count": 0,
             "confirmed": False,
+            "sha256": sha256_file(path),
         }
     atomic_write_json(
         classes / "workspace.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "baseline_stream_id": "fusion:fixture",
             "classes": records,

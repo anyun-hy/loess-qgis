@@ -735,7 +735,7 @@ def dock_integration(app, root):
             }
             h.runners[-1].pipeline_finished.emit(result)
             assert loaded == [result] and grouped == [True]
-            assert dock.open_refinement_btn.isEnabled()
+            assert dock.run_load_btn.isEnabled()
             assert "Fusion 成功" in dock.result_summary_label.text()
             assert dock.progress_bar.format() == "完成"
             assert not dock.stop_btn.isEnabled()
@@ -764,7 +764,7 @@ def dock_integration(app, root):
                 assert loaded == [result] and grouped == [True]
                 assert dock._last_run_result == preserved_result
                 assert dock._recovery_run_spec == preserved_spec
-                assert dock.open_refinement_btn.isEnabled()
+                assert dock.run_load_btn.isEnabled()
                 assert dock.progress_bar.format() == "本地尝试已结束"
                 assert "Run 当前状态以监控同步为准" in notices[-1][2]
 

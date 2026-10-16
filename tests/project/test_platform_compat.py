@@ -375,7 +375,7 @@ def test_main_dock_uses_explicit_sequential_workflow():
         'self.environment_panel = EnvironmentPanel()',
         'self.plan_panel = InferencePlanPanel(',
         'QGroupBox("开始与当前状态")',
-        'QGroupBox("结果")',
+        'QGroupBox("识别结果")',
     ]
     positions = [source.index(group) for group in ordered_groups]
     assert positions == sorted(positions)
@@ -471,7 +471,7 @@ def test_refinement_workspace_open_is_background_cancellable_and_incremental():
         encoding="utf-8"
     )
     opener = dock_source.split("def _on_open_refinement", 1)[1].split(
-        "def _on_load_manual_run", 1
+        "def _manual_load_is_current", 1
     )[0]
     assert "valid_ready_stream_ids(" not in opener
     assert "approved_fusion_streams(" not in opener
@@ -486,10 +486,9 @@ def test_refinement_workspace_open_is_background_cancellable_and_incremental():
     assert "approved_fusion_streams(" not in set_run
     assert "load_workspace(" not in set_run
 
-    initialize = dialog_source.split("def _initialize_workspace", 1)[1].split(
-        "def _workspace_initialize_completed", 1
-    )[0]
-    assert "self._workspace_tasks.initialize(" in initialize
+    initializer_source = (PLUGIN_ROOT / "main" / "results_workspace_panel.py").read_text(encoding="utf-8")
+    initialize = initializer_source.split("def _initialize(self)", 1)[1].split("def _initialized", 1)[0]
+    assert "self._tasks.initialize(" in initialize
     assert "initialize_workspace(" not in initialize
 
     layer_load = dialog_source.split("def _load_workspace_layers", 1)[1].split(
@@ -534,7 +533,7 @@ def test_portable_manual_workspace_does_not_require_fusion_polygon_copy():
     loader_source = (
         PLUGIN_ROOT / "refinement" / "manual_run_loader.py"
     ).read_text(encoding="utf-8")
-    assert "require_semantic=not has_workspace" in loader_source
+    assert "require_semantic=for_initialization or load_scope == LOAD_ALL" in loader_source
     assert 'rebound["portable_classes_only"] = not baseline_available' in loader_source
 
     workspace_source = (
@@ -549,7 +548,7 @@ def test_portable_manual_workspace_does_not_require_fusion_polygon_copy():
     dock_source = (PLUGIN_ROOT / "main" / "main_dock.py").read_text(
         encoding="utf-8"
     )
-    manual_open = dock_source.split("def _on_load_manual_run", 1)[1].split(
+    manual_open = dock_source.split("def _on_open_refinement", 1)[1].split(
         "# ── Helpers", 1
     )[0]
     assert "validate_manual_fusion_stream(" not in manual_open
@@ -1205,8 +1204,7 @@ def test_semantic_colors_have_one_qgis4_source_of_truth():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name in {"load_result_stream", "load_workspace_class"}
     }
-    assert "StyleManager.apply_categorized_style(polygons)" in methods["load_result_stream"]
-    assert "StyleManager.apply_categorized_style(raw_polygons)" in methods["load_result_stream"]
+    assert "StyleManager.apply_categorized_style(layer)" in methods["load_result_stream"]
     assert "StyleManager.apply_categorized_style(layer)" in methods["load_workspace_class"]
     assert all("load_sam_refined_polygons" not in value for value in methods.values())
 
@@ -1221,18 +1219,16 @@ def test_layer_manager_active_loaders_keep_style_group_stream_and_visibility_con
     }
 
     stream = methods["load_result_stream"]
-    assert "StyleManager.apply_semantic_raster_style(mask)" in stream
-    assert "StyleManager.apply_confidence_style(confidence)" in stream
-    assert "self._add_managed_layer(mask, run_id, section, stream_id)" in stream
-    assert "self._add_managed_layer(confidence, run_id, section, stream_id)" in stream
-    assert "self._add_managed_layer(polygons, run_id, section, stream_id)" in stream
-    assert 'loaded["mask"] = mask.id()' in stream
-    assert 'loaded["confidence"] = confidence.id()' in stream
-    assert 'loaded["polygons"] = polygons.id()' in stream
+    assert "StyleManager.apply_semantic_raster_style(layer)" in stream
+    assert "StyleManager.apply_confidence_style(layer)" in stream
+    assert "self._add_managed_layer(layer, run_id, section, stream_id, run_dir=run_dir)" in stream
+    for role in ("mask", "confidence", "polygons"):
+        assert f'("{role}",' in stream
+    assert "loaded[role] = layer.id()" in stream
 
     workspace = methods["load_workspace_class"]
     assert "StyleManager.apply_categorized_style(layer)" in workspace
-    assert 'self._add_managed_layer(layer, run_id, "Classes", f"class:{class_code}")' in workspace
+    assert 'self._add_managed_layer(layer, run_id, "Classes", f"class:{class_code}",' in workspace
     assert "setItemVisibilityChecked(bool(visible))" in workspace
     assert "labeling_tool/workspace_path" in workspace
 

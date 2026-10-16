@@ -2,19 +2,34 @@ import logging
 import os
 from pathlib import Path
 
-from qgis.PyQt.QtCore import QTimer
-from qgis.PyQt.QtWidgets import (
-    QApplication, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QSpinBox,
-    QRadioButton, QCheckBox, QProgressBar,
-    QWidget, QButtonGroup, QFileDialog, QMessageBox, QScrollArea,
-)
-from qgis.gui import QgsDockWidget, QgsMapLayerComboBox
 from qgis.core import (
     Qgis,
     QgsApplication,
-    QgsProject, QgsVectorLayer,
+    QgsProject,
     QgsSettings,
+    QgsVectorLayer,
+)
+from qgis.gui import QgsDockWidget, QgsMapLayerComboBox
+from qgis.PyQt.QtCore import QTimer
+from qgis.PyQt.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
 )
 
 from labeling_tool.qgis_support.layer_names import LAYER_NAMES
@@ -115,21 +130,19 @@ class _ScreenBoundMapLayerComboBox(QgsMapLayerComboBox):
         popup_y = max(available.top(), min(popup_y, maximum_y))
         popup.move(popup_x, popup_y)
 
-from labeling_tool.qgis_support import tile_manager
-from labeling_tool.refinement.background_io_tasks import ManualRunLoadTask
+from labeling_tool.main.environment_panel import EnvironmentPanel
+from labeling_tool.main.environment_report import (
+    first_problem,
+)
 from labeling_tool.main.inference_config import InferenceConfigManager
-from labeling_tool.qgis_support.layer_manager import LayerManager
-
-from labeling_tool.monitor.inference_monitor import InferenceMonitorDialog
 from labeling_tool.main.inference_plan_panel import (
     InferencePlanPanel,
     InferenceSelection,
     resolve_launch_plan,
 )
-from labeling_tool.refinement.class_refinement_dialog import ClassRefinementDialog
 from labeling_tool.main.range_preview import (
-    TileParameters,
     TileGridSummary,
+    TileParameters,
     VectorPreviewController,
     VectorPreviewResult,
 )
@@ -148,17 +161,21 @@ from labeling_tool.main.range_selection import (
     validate_raster_layer,
     validate_vector_layer,
 )
+from labeling_tool.main.results_workspace_panel import ResultsWorkspacePanel
+from labeling_tool.main.run_load_dialog import RunLoadDialog
+from labeling_tool.main.start_readiness import derive_start_readiness
+from labeling_tool.monitor.inference_monitor import InferenceMonitorDialog
+from labeling_tool.qgis_support import tile_manager
+from labeling_tool.qgis_support.layer_manager import LayerManager
 from labeling_tool.qgis_support.qt_lifecycle import retire_after
+from labeling_tool.refinement.background_io_tasks import ManualRunLoadTask
+from labeling_tool.refinement.class_refinement_dialog import ClassRefinementDialog
+from labeling_tool.refinement.workspace_layer_loader import WorkspaceLayerLoader
+from labeling_tool.runs import run_index
 from labeling_tool.runs.run_workflow import (
     RunStartRequest,
     RunWorkflowController,
 )
-from labeling_tool.runs import run_index
-from labeling_tool.main.environment_report import (
-    first_problem,
-)
-from labeling_tool.main.environment_panel import EnvironmentPanel
-from labeling_tool.main.start_readiness import derive_start_readiness
 from labeling_tool.runs.spatial_planner import plan_spatial_units
 
 logger = logging.getLogger("labeling_tool.main_dock")
@@ -192,6 +209,10 @@ class LabelingDockWidget(QgsDockWidget):
         self.refinement_dialog = ClassRefinementDialog(
             self.iface, self.layer_manager, self
         ) if self.iface and self.layer_manager else None
+        if self.refinement_dialog is not None:
+            self.refinement_dialog.workspace_load_status_changed.connect(
+                self._on_workspace_load_status_changed
+            )
         self.range_selection = RangeSelectionController(iface, self)
         self.range_selection.rectangle_finished.connect(self._on_rect_finished)
         self.vector_preview = VectorPreviewController(self)
@@ -212,6 +233,12 @@ class LabelingDockWidget(QgsDockWidget):
         self._startup_recovery_status = None
         self._manual_load_task = None
         self._manual_load_generation = 0
+        self._pending_run_bundle = None
+        self._loaded_result_streams = {}
+        self._new_result_layer_ids = set()
+        self._result_layer_loader = WorkspaceLayerLoader(self._load_run_result_stream, self)
+        self._result_layer_loader.completed.connect(self._complete_loaded_run)
+        self._result_layer_loader.failed.connect(self._reference_layers_failed)
         self._environment_report_current = False
         self._nonblocking_message_boxes = set()
         self.setWindowTitle("地物标注工具")
@@ -467,27 +494,23 @@ class LabelingDockWidget(QgsDockWidget):
         recovery_layout.addWidget(self.retry_failed_btn)
         run_layout.addLayout(recovery_layout)
 
-        self.load_manual_run_btn = QPushButton("加载已有 Run 人工整理")
-        self.load_manual_run_btn.setToolTip(
-            "选择任意位置的 Run 副本；已有完整14类工作区时无需复制 Fusion 大文件，"
-            "不检查推理环境，不运行 SAM3"
-        )
-        run_layout.addWidget(self.load_manual_run_btn)
-
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         run_layout.addWidget(self.progress_bar)
 
-        result_group = QGroupBox("结果")
+        result_group = QGroupBox("识别结果")
         result_group.setObjectName("resultGroup")
         result_layout = QVBoxLayout(result_group)
         self.result_summary_label = QLabel("尚无运行结果")
         self.result_summary_label.setWordWrap(True)
         result_layout.addWidget(self.result_summary_label)
 
-        self.open_refinement_btn = QPushButton("打开分类修整与组装")
-        self.open_refinement_btn.setEnabled(False)
-        result_layout.addWidget(self.open_refinement_btn)
+        self.results_workspace_panel = ResultsWorkspacePanel(
+            self, can_change_run=self._can_change_refinement_run
+        )
+        result_layout.addWidget(self.results_workspace_panel)
+        self.run_load_btn = QPushButton("Run 加载与整理")
+        result_layout.addWidget(self.run_load_btn)
         layout.addWidget(result_group)
 
         layout.addStretch()
@@ -522,8 +545,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.plan_panel.selection_changed.connect(self._on_plan_selection_changed)
         self.browse_output_btn.clicked.connect(self._on_browse_output)
         self.browse_workspace_btn.clicked.connect(self._on_browse_workspace)
-        self.open_refinement_btn.clicked.connect(self._on_open_refinement)
-        self.load_manual_run_btn.clicked.connect(self._on_load_manual_run)
+        self.run_load_btn.clicked.connect(self._on_open_refinement)
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
         self.resume_btn.clicked.connect(lambda: self._resume_existing_run(False))
@@ -580,8 +602,8 @@ class LabelingDockWidget(QgsDockWidget):
         self._recovery_run_spec = None
         self._startup_ready_candidate = None
         self._startup_recovery_status = None
-        self.open_refinement_btn.setEnabled(False)
-        self.open_refinement_btn.setText("打开分类修整与组装")
+        self.run_load_btn.setEnabled(True)
+        self.run_load_btn.setText("Run 加载与整理")
         self.result_summary_label.setText("尚无运行结果")
         self._mark_env_check_required()
 
@@ -611,8 +633,8 @@ class LabelingDockWidget(QgsDockWidget):
         self._recovery_run_spec = None
         self._startup_recovery_status = None
         if not self._last_run_result:
-            self.open_refinement_btn.setEnabled(False)
-            self.open_refinement_btn.setText("打开分类修整与组装")
+            self.run_load_btn.setEnabled(True)
+            self.run_load_btn.setText("Run 加载与整理")
         latest = candidates.get("latest") or {}
         latest_status = str(latest.get("indexed_status") or "")
         if latest_status in run_index.RECOVERABLE_RUN_STATES:
@@ -636,8 +658,8 @@ class LabelingDockWidget(QgsDockWidget):
                         f"发现最近 Ready Run {result['run_id']}；"
                         "打开时再校验正式结果"
                     )
-                self.open_refinement_btn.setText("验证并打开最近 Run")
-                self.open_refinement_btn.setEnabled(True)
+                self.results_workspace_panel.set_candidate(result.get("run_dir", ""))
+                self.run_load_btn.setEnabled(True)
         self._update_recovery_buttons(lightweight=True)
 
     def _render_last_env_report(self, *_args):
@@ -1318,7 +1340,7 @@ class LabelingDockWidget(QgsDockWidget):
         self._last_run_result = dict(result)
         self._startup_ready_candidate = None
         self._startup_recovery_status = None
-        self.open_refinement_btn.setText("打开分类修整与组装")
+        self.run_load_btn.setText("Run 加载与整理")
         try:
             with open(result.get("run_spec", ""), "r", encoding="utf-8") as handle:
                 self._last_run_spec = __import__("json").load(handle)
@@ -1334,7 +1356,8 @@ class LabelingDockWidget(QgsDockWidget):
             f"失败 {failed_count} 个"
         )
         self.result_summary_label.setText(result_summary)
-        self.open_refinement_btn.setEnabled(ready_count > 0)
+        self.run_load_btn.setEnabled(True)
+        self.results_workspace_panel.set_run_directory(result.get("run_dir", ""))
 
         self._update_start_enabled()
         self.stop_btn.setEnabled(False)
@@ -1408,84 +1431,71 @@ class LabelingDockWidget(QgsDockWidget):
             retry_failed=bool(retry_failed),
         )
 
-    def _on_open_refinement(self):
-        if (
-            self._last_run_result is None
-            and self._last_run_spec is None
-            and self._startup_ready_candidate is not None
-        ):
-            result, spec = self._startup_ready_candidate
-            declared_streams = list(result.get("ready_streams") or [])
-            if not declared_streams:
-                QMessageBox.warning(
-                    self,
-                    "最近 Run 不可用",
-                    "最近 Run 没有声明 ready 结果流。\n\n"
-                    "可使用“加载已有 Run 人工整理”明确选择其他 Run。",
-                )
-                return
-            self._last_run_result = result
-            self._last_run_spec = spec
-            self._startup_ready_candidate = None
-            self.open_refinement_btn.setText("打开分类修整与组装")
-            self.result_summary_label.setText(
-                f"Run {result['run_id']} 将在分类窗口中后台校验"
-            )
-        if self.refinement_dialog is None or not self._last_run_result or not self._last_run_spec:
-            QMessageBox.warning(self, "分类修整", "当前没有可用于分类修整的推理结果")
-            return
-        effective = (self.config_manager.last_report or {}).get("effective") or {}
-        self.refinement_dialog.set_run(
-            self._last_run_result,
-            self._last_run_spec,
-            effective.get("sam3") or {},
-            self.environment_panel.scripts_directory,
-        )
-        self.refinement_dialog.show()
-        self.refinement_dialog.raise_()
-        self.refinement_dialog.activateWindow()
+    def _can_change_refinement_run(self):
+        return self.refinement_dialog is None or self.refinement_dialog.can_change_run()
 
-    def _on_load_manual_run(self):
+    def _on_open_refinement(self):
         if self.refinement_dialog is None:
-            QMessageBox.warning(self, "人工分类整理", "分类整理窗口尚未初始化")
+            return
+        if self._pending_run_bundle is not None:
+            self._cancel_reference_load()
+            self.result_summary_label.setText("结果图层加载已取消；原整理上下文保留")
             return
         if self._manual_load_task is not None:
-            task = self._manual_load_task
-            if task.commit_started:
+            if self._manual_load_task.commit_started:
                 self.result_summary_label.setText("正在发布 Run 元数据，不能取消")
                 return
             self._retire_manual_load_task()
             self._manual_load_task = None
-            self.load_manual_run_btn.setText("加载已有 Run 人工整理")
-            self.result_summary_label.setText("已有 Run 加载已取消；界面保持原结果")
+            self.refinement_dialog.finish_run_load()
+            if not self.refinement_dialog.isVisible():
+                self.refinement_dialog.stop_sam_preload()
+            self.run_load_btn.setText("Run 加载与整理")
+            self.result_summary_label.setText("加载已取消；界面保持原结果")
             return
-        settings = QgsSettings()
-        start_dir = settings.value(
-            "plugins/labeling_tool/last_manual_run_dir",
-            self.workspace_edit.text().strip(),
-            type=str,
-        )
-        run_dir = QFileDialog.getExistingDirectory(
-            self, "选择要人工整理的 Run 文件夹", start_dir
-        )
-        if not run_dir:
+        if self.results_workspace_panel.busy:
+            QMessageBox.warning(self, "加载 Run", "请等待识别结果区的后台检查或初始化完成")
             return
-        self._retire_manual_load_task()
+        if not self._can_change_refinement_run():
+            return
+        candidate = self._last_run_result
+        if candidate is None and self._startup_ready_candidate:
+            candidate = self._startup_ready_candidate[0]
+        start_dir = (candidate or {}).get("run_dir") or QgsSettings().value(
+            "plugins/labeling_tool/last_manual_run_dir", self.workspace_edit.text().strip(), type=str
+        )
+        chooser = RunLoadDialog(start_dir, self)
+        effective = (self.config_manager.last_report or {}).get("effective") or {}
+        self.refinement_dialog.preload_sam(
+            effective.get("sam3") or {}, self.environment_panel.scripts_directory
+        )
+        chooser.sam_status_label.setText(self.refinement_dialog.sam_status)
+        self.refinement_dialog.sam_status_changed.connect(chooser.sam_status_label.setText)
+        accepted = chooser.exec()
+        self.refinement_dialog.sam_status_changed.disconnect(chooser.sam_status_label.setText)
+        directory, scope = chooser.run_directory, chooser.load_scope
+        chooser.deleteLater()
+        if not accepted:
+            if not self.refinement_dialog.isVisible():
+                self.refinement_dialog.stop_sam_preload()
+            return
+        if not self.refinement_dialog.begin_run_load():
+            return
         self._manual_load_generation += 1
-        generation = self._manual_load_generation
         try:
-            task = ManualRunLoadTask(generation, run_dir)
+            task = ManualRunLoadTask(self._manual_load_generation, directory, load_scope=scope)
             self._manual_load_task = task
             task.progressChanged.connect(self._manual_load_progress)
             task.taskCompleted.connect(self._manual_load_completed)
             task.taskTerminated.connect(self._manual_load_terminated)
-            self.load_manual_run_btn.setText("取消加载已有 Run")
-            self.load_manual_run_btn.setEnabled(True)
-            self.result_summary_label.setText("正在后台读取并校验已有 Run...")
+            self.run_load_btn.setText("取消 Run 加载")
+            self.run_load_btn.setEnabled(True)
+            self.result_summary_label.setText("正在后台校验 Run 和已有分类工作区…")
             QgsApplication.taskManager().addTask(task)
         except Exception as exc:
             self._manual_load_task = None
-            self.load_manual_run_btn.setText("加载已有 Run 人工整理")
+            self.refinement_dialog.finish_run_load()
+            self.run_load_btn.setText("Run 加载与整理")
             QMessageBox.warning(self, "加载 Run 失败", str(exc))
 
     def _manual_load_is_current(self, task):
@@ -1499,16 +1509,16 @@ class LabelingDockWidget(QgsDockWidget):
         if self._manual_load_is_current(task):
             self.result_summary_label.setText(task.progress_message)
             if task.commit_started:
-                self.load_manual_run_btn.setText("正在发布，不能取消")
-                self.load_manual_run_btn.setEnabled(False)
+                self.run_load_btn.setText("正在发布，不能取消")
+                self.run_load_btn.setEnabled(False)
 
     def _manual_load_completed(self):
         task = self.sender()
         if not self._manual_load_is_current(task):
             return
         self._manual_load_task = None
-        self.load_manual_run_btn.setText("加载已有 Run 人工整理")
-        self.load_manual_run_btn.setEnabled(True)
+        self.run_load_btn.setText("Run 加载与整理")
+        self.run_load_btn.setEnabled(True)
         bundle = task.result_data or {}
         result = bundle.get("result") or {}
         run_spec = bundle.get("run_spec") or {}
@@ -1518,28 +1528,77 @@ class LabelingDockWidget(QgsDockWidget):
             or str(result.get("run_id") or "")
             != str(run_spec.get("run_id") or "")
         ):
+            self.refinement_dialog.finish_run_load()
             QMessageBox.warning(self, "加载 Run 失败", "后台任务未发布有效 Run")
             return
+        self._pending_run_bundle = bundle
+        self._loaded_result_streams = {}
+        self._new_result_layer_ids = set()
+        if result.get("load_scope") == "all":
+            self.run_load_btn.setText("取消结果图层加载")
+            self._result_layer_loader.start(range(len(result["ready_streams"])))
+        else:
+            self._complete_loaded_run()
+
+    def _load_run_result_stream(self, index):
+        bundle = self._pending_run_bundle
+        if bundle is None:
+            return
+        result = bundle["result"]
+        stream = result["ready_streams"][index]
+        before = set(QgsProject.instance().mapLayers())
+        layers = self.layer_manager.load_result_stream(result["run_id"], stream, run_dir=result["run_dir"])
+        self._loaded_result_streams[stream["stream_id"]] = layers
+        self._new_result_layer_ids.update(set(layers.values()) - before)
+        self.result_summary_label.setText(f"正在分批挂载结果图层：{index + 1}/{len(result['ready_streams'])}")
+
+    def _cancel_reference_load(self):
+        self._result_layer_loader.reset()
+        QgsProject.instance().removeMapLayers(list(self._new_result_layer_ids))
+        self._new_result_layer_ids.clear()
+        self._loaded_result_streams.clear()
+        self._pending_run_bundle = None
+        if self.refinement_dialog is not None:
+            self.refinement_dialog.finish_run_load()
+            if not self.refinement_dialog.isVisible():
+                self.refinement_dialog.stop_sam_preload()
+        self.run_load_btn.setText("Run 加载与整理")
+        self.run_load_btn.setEnabled(True)
+
+    def _reference_layers_failed(self, _index, message):
+        self._cancel_reference_load()
+        self.result_summary_label.setText("结果图层加载失败；原整理上下文保留")
+        QMessageBox.warning(self, "加载 Run 失败", message)
+
+    def _complete_loaded_run(self):
+        bundle = self._pending_run_bundle
+        if bundle is None:
+            return
+        result, run_spec = bundle["result"], bundle["run_spec"]
+        scope = result["load_scope"]
+        try:
+            self.layer_manager.apply_load_scope(result, scope, loaded=self._loaded_result_streams)
+        except Exception as exc:
+            self._reference_layers_failed(-1, str(exc))
+            return
+        self._pending_run_bundle = None
+        self._new_result_layer_ids.clear()
+        self._loaded_result_streams.clear()
+        self._result_layer_loader.reset()
+        self.refinement_dialog.finish_run_load()
+        self.run_load_btn.setText("Run 加载与整理")
         self._last_run_result = result
         self._last_run_spec = run_spec
-        self._recovery_run_spec = None
         self._startup_ready_candidate = None
         self._startup_recovery_status = None
-        self.open_refinement_btn.setText("打开分类修整与组装")
-        self.open_refinement_btn.setEnabled(True)
-        mode_text = (
-            "14 类离线工作区"
-            if result.get("portable_classes_only")
-            else "人工工作区"
+        self.results_workspace_panel.set_candidate(result["run_dir"])
+        scope_text = "classes" if scope == "classes" else "fusion、models、classes"
+        self.result_summary_label.setText(f"Run {result['run_id']}：正在加载 {scope_text}")
+        QgsSettings().setValue("plugins/labeling_tool/last_manual_run_dir", result["run_dir"])
+        effective = (self.config_manager.last_report or {}).get("effective") or {}
+        self.refinement_dialog.set_run(
+            result, run_spec, effective.get("sam3") or {}, self.environment_panel.scripts_directory
         )
-        self.result_summary_label.setText(
-            f"已载入 {mode_text} {result['run_id']}；正在后台校验"
-        )
-        QgsSettings().setValue(
-            "plugins/labeling_tool/last_manual_run_dir",
-            task.run_directory,
-        )
-        self.refinement_dialog.set_run(result, run_spec, {}, "")
         self.refinement_dialog.show()
         self.refinement_dialog.raise_()
         self.refinement_dialog.activateWindow()
@@ -1549,8 +1608,11 @@ class LabelingDockWidget(QgsDockWidget):
         if not self._manual_load_is_current(task):
             return
         self._manual_load_task = None
-        self.load_manual_run_btn.setText("加载已有 Run 人工整理")
-        self.load_manual_run_btn.setEnabled(True)
+        self.refinement_dialog.finish_run_load()
+        if not self.refinement_dialog.isVisible():
+            self.refinement_dialog.stop_sam_preload()
+        self.run_load_btn.setText("Run 加载与整理")
+        self.run_load_btn.setEnabled(True)
         if task.isCanceled() and not task.error_message:
             self.result_summary_label.setText("已有 Run 加载已取消；界面保持原结果")
         else:
@@ -1560,6 +1622,22 @@ class LabelingDockWidget(QgsDockWidget):
                 "加载 Run 失败",
                 task.error_message or "后台加载未完成",
             )
+
+    def _on_workspace_load_status_changed(self, result, message):
+        current = self._last_run_result or {}
+        if (
+            self._cleaning_up
+            or self._manual_load_task is not None
+            or self._pending_run_bundle is not None
+            or not current.get("load_scope")
+            or any(
+                result.get(key) != current.get(key)
+                for key in ("run_id", "run_dir", "load_scope")
+            )
+        ):
+            return
+        scope = "classes" if current["load_scope"] == "classes" else "fusion、models、classes"
+        self.result_summary_label.setText(f"Run {current['run_id']}（{scope}）：{message}")
 
     def _retire_manual_load_task(self):
         task = self._manual_load_task
@@ -1921,6 +1999,8 @@ class LabelingDockWidget(QgsDockWidget):
     def cleanup(self):
         self._cleaning_up = True
         self._retire_manual_load_task()
+        self._cancel_reference_load()
+        self.results_workspace_panel.cleanup()
         self.environment_panel.cleanup()
         self.plan_panel.cleanup()
         for dialog in tuple(self._nonblocking_message_boxes):

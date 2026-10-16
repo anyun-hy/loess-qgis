@@ -75,12 +75,13 @@ class Worker(QObject):
     def __init__(self, scripts_dir, config, parent):
         super().__init__(parent)
         self.is_ready = False
+        self.is_running = False
         self.requests = []
         self.cancelled = []
         self.closed = []
 
     def start(self):
-        pass
+        self.is_running = True
 
     def predict(self, request):
         self.requests.append(copy.deepcopy(request))
@@ -92,6 +93,7 @@ class Worker(QObject):
         self.closed.append(session_id)
 
     def stop(self):
+        self.is_running = False
         self.is_ready = False
         self.stopped.emit({"expected": True})
 
@@ -189,6 +191,8 @@ def session_dialog(app, root):
                 side_effect=lambda _, value: sessions.append(copy.deepcopy(value)),
             )
         )
+        dialog._sam_raster_identity = ui.file_identity("synthetic.tif")
+        dialog.preload_sam(dialog._sam_config, "")
         try:
             yield dialog, source, canvas, pan, sessions, warning
         finally:
@@ -205,6 +209,8 @@ def session_dialog(app, root):
 
 
 def begin(dialog, canvas, *, missed=False, ready=True):
+    if dialog._worker is None:
+        dialog.preload_sam(dialog._sam_config, "")
     dialog._begin_sam(12, missed=missed)
     session_id = dialog._workspace["active_sam_session_id"]
     assert session_id and button(dialog, "Cancel").isEnabled()
@@ -215,7 +221,15 @@ def begin(dialog, canvas, *, missed=False, ready=True):
     assert worker is not None
     if ready:
         worker.is_ready = True
-        worker.ready.emit({"event": "worker_ready"})
+        worker.ready.emit(
+            {
+                "event": "worker_ready",
+                "checkpoint_sha256": "a" * 64,
+                "device": "cpu",
+                "sam_version": "probe",
+                "buffer_px": 24,
+            }
+        )
         assert worker.requests[-1]["session_id"] == session_id
     return worker, session_id
 
@@ -359,14 +373,30 @@ def pending_cancel(app, root):
         assert worker.requests == []
         button(dialog, "Cancel").click()
         worker.is_ready = True
-        worker.ready.emit({"event": "worker_ready"})
+        worker.ready.emit(
+            {
+                "event": "worker_ready",
+                "checkpoint_sha256": "a" * 64,
+                "device": "cpu",
+                "sam_version": "probe",
+                "buffer_px": 24,
+            }
+        )
         assert worker.requests == [] and dialog._active_session is None
         assert sessions[-1]["session_id"] == first_id
         worker.is_ready = False
         _, second_id = begin(dialog, canvas, ready=False)
         worker.stopped.emit({"expected": False, "returncode": 7})
         worker.is_ready = True
-        worker.ready.emit({"event": "worker_ready"})
+        worker.ready.emit(
+            {
+                "event": "worker_ready",
+                "checkpoint_sha256": "a" * 64,
+                "device": "cpu",
+                "sam_version": "probe",
+                "buffer_px": 24,
+            }
+        )
         assert worker.requests == [] and button(dialog, "Retry").isEnabled()
         button(dialog, "Retry").click()
         assert len(worker.requests) == 1
@@ -656,7 +686,9 @@ def session_exit(app, root):
         assert canvas.mapTool() is outside and dialog._active_session is None
         if not sip.isdeleted(picker):
             picker.canvasClicked.emit(QgsPointXY(2, 2), Qt.MouseButton.LeftButton)
-        assert dialog._worker is None
+        assert dialog._worker is not None, (
+            "Canceling a session keeps the preloaded model"
+        )
         worker, session_id = begin(dialog, canvas)
         deliver(app, worker, candidate(session_id))
         assert current_band(canvas) is not None and candidate_band(canvas) is not None

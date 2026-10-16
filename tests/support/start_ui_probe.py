@@ -73,7 +73,7 @@ def main() -> None:
             dock.show()
             _drain(app)
             assert dock.start_btn.isVisible() and dock.stop_btn.isVisible()
-            assert dock.load_manual_run_btn.isVisible()
+            assert dock.run_load_btn.isVisible()
             initial = OUTPUT / "start-ui-400x800.png"
             assert dock.grab().save(str(initial))
             assert initial.is_file() and initial.stat().st_size > 0
@@ -132,7 +132,7 @@ def main() -> None:
                 dock.show()
                 _drain(app)
                 assert dock.start_btn.isVisible() and dock.stop_btn.isVisible()
-                assert dock.load_manual_run_btn.isVisible()
+                assert dock.run_load_btn.isVisible()
                 assert dock.findChild(QScrollArea) is not None
                 screenshot = OUTPUT / "start-ui-450x800.png"
                 assert dock.grab().save(str(screenshot))

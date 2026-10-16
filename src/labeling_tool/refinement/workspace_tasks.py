@@ -45,7 +45,7 @@ class WorkspaceTasks(QObject):
         """Return whether a current worker is still owned by this coordinator."""
         return self._task is not None
 
-    def probe(self, run_spec: dict, streams: list[dict]) -> None:
+    def probe(self, run_spec: dict, streams: list[dict], *, workspace=None) -> None:
         """Replace any current worker with a probe for the supplied Run."""
         self.cancel()
         generation = self._next_generation()
@@ -55,6 +55,7 @@ class WorkspaceTasks(QObject):
                 run_spec,
                 streams,
             )
+            task.prepared_workspace = workspace
         except Exception as exc:
             self.terminated.emit("probe", str(exc))
             return
