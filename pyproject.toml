@@ -8,6 +8,7 @@ target-version = "py312"
 line-length = 88
 src = ["src"]
 include = [
+    "src/labeling_tool/shared/state/artifact_dependencies.py",
     "src/labeling_tool/shared/state/run_state_db.py",
     "src/labeling_tool/shared/state/monitor_read_repository.py",
     "src/labeling_tool/shared/state/acceptance_read_repository.py",
@@ -174,6 +175,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 python_version = "3.12"
 mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 files = [
+    "src/labeling_tool/shared/state/artifact_dependencies.py",
     "src/labeling_tool/shared/state/monitor_read_repository.py",
     "src/labeling_tool/shared/state/acceptance_read_repository.py",
     "src/loess_runtime/system/deployment_validation.py",

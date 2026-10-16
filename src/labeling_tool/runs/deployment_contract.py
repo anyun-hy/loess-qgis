@@ -7,10 +7,8 @@ import json
 import os
 import re
 import uuid
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
-
 
 SHARED_RUNTIME_FILES = {
     "src/labeling_tool/__init__.py":
@@ -33,6 +31,8 @@ SHARED_RUNTIME_FILES = {
         "runtime/labeling_tool/shared/planning/work_package_planner.py",
     "src/labeling_tool/shared/state/__init__.py":
         "runtime/labeling_tool/shared/state/__init__.py",
+    "src/labeling_tool/shared/state/artifact_dependencies.py":
+        "runtime/labeling_tool/shared/state/artifact_dependencies.py",
     "src/labeling_tool/shared/state/artifact_repository.py":
         "runtime/labeling_tool/shared/state/artifact_repository.py",
     "src/labeling_tool/shared/state/job_repository.py":

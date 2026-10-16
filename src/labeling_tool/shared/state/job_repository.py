@@ -7,6 +7,9 @@ import uuid
 from collections.abc import Iterator
 from typing import Any, Iterable, Mapping, Sequence
 
+from labeling_tool.shared.state.artifact_dependencies import (
+    release_job_artifact_inputs,
+)
 from labeling_tool.shared.state.run_state_session import RunStateError, RunStateSession
 from labeling_tool.shared.state.state_values import bounded_utf8 as _bounded_utf8
 from labeling_tool.shared.state.state_values import json_value as _json
@@ -905,10 +908,7 @@ class JobRepository:
             ).rowcount
             if changed != 1:
                 return False
-            connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=%s",
-                (int(job_id),),
-            )
+            release_job_artifact_inputs(connection, job_id)
             return True
 
     def work_package_job_holds_lease(

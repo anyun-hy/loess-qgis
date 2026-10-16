@@ -11,6 +11,10 @@ from typing import Any, Mapping, Sequence
 from labeling_tool.shared.state.acceptance_read_repository import (
     AcceptanceReadRepository,
 )
+from labeling_tool.shared.state.artifact_dependencies import (
+    lock_job_artifact_inputs,
+    release_job_artifact_inputs,
+)
 from labeling_tool.shared.state.artifact_repository import ArtifactRepository
 from labeling_tool.shared.state.job_repository import JobRepository
 from labeling_tool.shared.state.monitor_history_repository import (
@@ -149,6 +153,10 @@ class RunStateDB:
         before entering this scope.  Artifact publication and Job completion
         then use only the yielded facade, so an expired or superseded lease
         cannot expose a mixed pair of staged Artifacts.
+
+        All retained inputs are locked in Artifact-ID order before publication
+        can pin its owner baseline for finalize. This order must span the whole
+        transaction, not just the later dependency release.
         """
 
         with self.session.transaction() as connection:
@@ -176,6 +184,15 @@ class RunStateDB:
                     raise RunStateError(
                         "fragmentation V3.3 attempt does not match scoped identity"
                     )
+            lock_job_artifact_inputs(connection, job_id)
+            # The Job row stays locked, but its lease can expire while input
+            # locks are awaited. Finalize may replace canonical files as soon
+            # as the facade is yielded, so fence again before handing it out.
+            if float(job["lease_expires"]) < time.time():
+                raise RunStateError(
+                    "fragmentation V3.3 lease expired while waiting for artifact inputs"
+                )
+            if self.session.is_scoped_transaction:
                 yield self
                 return
             scoped_session = self.session.scoped(
@@ -491,8 +508,5 @@ class RunStateDB:
             ).rowcount
             if changed != 1:
                 return False
-            connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=%s",
-                (int(job_id),),
-            )
+            release_job_artifact_inputs(connection, job_id)
             return True

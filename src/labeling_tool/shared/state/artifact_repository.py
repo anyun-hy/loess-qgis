@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from labeling_tool.shared.state.artifact_dependencies import (
+    release_job_artifact_inputs,
+)
 from labeling_tool.shared.state.postgres_state import PostgresConnection
 from labeling_tool.shared.state.run_state_session import RunStateError, RunStateSession
 from labeling_tool.shared.state.state_values import row_dict as _row_dict
@@ -763,31 +766,7 @@ class ArtifactRepository:
     @staticmethod
     def _release_job_artifacts(connection: PostgresConnection, job_id: int) -> int:
         """Release inputs inside the caller's atomic publication transaction."""
-        artifact_ids = [
-            int(row["artifact_id"])
-            for row in connection.execute(
-                """SELECT artifact_id FROM artifact_dependencies
-                   WHERE job_id=%s ORDER BY artifact_id""",
-                (int(job_id),),
-            ).fetchall()
-        ]
-        if artifact_ids:
-            placeholders = ",".join("%s" for _ in artifact_ids)
-            # Every releaser locks shared Artifact rows in the same order
-            # before DELETE triggers decrement ref_count. This prevents
-            # cross-unit deadlocks without reducing worker concurrency.
-            connection.execute(
-                f"""SELECT artifact_id FROM artifacts
-                    WHERE artifact_id IN ({placeholders})
-                    ORDER BY artifact_id FOR UPDATE""",
-                artifact_ids,
-            ).fetchall()
-        return int(
-            connection.execute(
-                "DELETE FROM artifact_dependencies WHERE job_id=%s",
-                (int(job_id),),
-            ).rowcount
-        )
+        return release_job_artifact_inputs(connection, job_id)
 
     def cleanup_candidates(
         self,
