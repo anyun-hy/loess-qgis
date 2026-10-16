@@ -353,6 +353,50 @@ def preview_autostart(app, root):
         h.close()
 
 
+def preview_failures(app, root):
+    h = PreviewHarness(root)
+    start_errors = []
+    h.controller.auto_start_failed.connect(start_errors.append)
+    try:
+        request = h.request()
+        h.controller.queue(request, immediate=True)
+        failed = h.tasks[-1]
+        failed.error_message = "范围无法生成完整切片"
+        failed.taskTerminated.emit()
+        assert h.controller.error_for(request) == failed.error_message
+        assert not start_errors and not h.starts
+
+        # Passive previews retain the blocker without displaying repeated notices.
+        h.controller.queue(request, immediate=True)
+        assert len(h.tasks) == 1 and not start_errors
+        h.controller.queue(request, immediate=True, auto_start=True)
+        assert start_errors == [failed.error_message] and not h.controller.start_pending
+
+        # Failure before a task is constructed must also end the pending start.
+        h.controller.invalidate()
+        assert not h.controller.error_for(request)
+        with patch.object(
+            tile_manager,
+            "snapshot_vector_geometries",
+            side_effect=ValueError("无面要素"),
+        ):
+            h.controller.queue(request, immediate=True, auto_start=True)
+        assert start_errors[-1] == "无面要素" and not h.controller.start_pending
+        assert h.controller.error_for(request) == "无面要素"
+
+        # Editing tile parameters clears the previous failure and can start once.
+        changed = h.request(128)
+        h.controller.queue(changed, immediate=True, auto_start=True)
+        assert not h.controller.error_for(changed) and h.controller.start_pending
+        failed.taskTerminated.emit()
+        assert len(start_errors) == 2
+        h.tasks[-1].complete()
+        drain(app)
+        assert h.starts == [True] and not h.controller.start_pending
+    finally:
+        h.close()
+
+
 def preview_shutdown(app, root):
     from qgis.PyQt.QtTest import QTest
 
@@ -552,6 +596,53 @@ def dock_range_inputs(app, root):
             assert request.range_selection["clip_outputs"] is True
             assert len(request.active_tiles) == 2 < len(request.grid_tiles)
             assert request.get_valid_range_layer() is inputs.layer
+
+            # A real grid failure after clicking Start must be visible even
+            # while advanced tile settings are collapsed. No Run may start.
+            started.clear()
+            invalid = QgsVectorLayer("Polygon?crs=EPSG:3857", "full image", "memory")
+            feature = QgsFeature()
+            feature.setGeometry(QgsGeometry.fromRect(inputs.raster.extent()))
+            assert invalid.dataProvider().addFeatures([feature])[0]
+            invalid.updateExtents()
+            QgsProject.instance().addMapLayer(invalid)
+            dock.show()
+            dock.vector_range_combo.setLayer(invalid)
+            assert not dock.tile_details_widget.isVisible()
+            dock.start_btn.click()
+            failed = tasks[-1]
+            assert not failed.worker.run()
+            failed.error_message = failed.worker.error_message
+            assert "完整切片网格" in failed.error_message
+            failed.taskTerminated.emit()
+            drain(app)
+            assert not started
+            assert "完整切片网格" in dock.start_readiness_label.text()
+            assert dock.start_readiness_label.isVisible()
+            assert not dock.start_btn.isEnabled()
+            notices = list(dock._nonblocking_message_boxes)
+            assert len(notices) == 1 and notices[0].isVisible()
+            assert "任务未启动" in notices[0].text()
+            notices[0].close()
+            drain(app)
+
+            # Refreshes of the same failed request do not silently retry it.
+            count = len(tasks)
+            dock._refresh_processing_extent_preview()
+            drain(app)
+            assert len(tasks) == count
+            assert "完整切片网格" in dock.start_readiness_label.text()
+
+            # A corrected range clears only that error; stale failure delivery
+            # cannot overwrite the current request or cause a new popup.
+            dock.vector_range_combo.setLayer(inputs.layer)
+            assert dock.start_btn.isEnabled()
+            dock.start_btn.click()
+            failed.taskTerminated.emit()
+            tasks[-1].complete()
+            drain(app)
+            assert len(started) == 1 and not dock._nonblocking_message_boxes
+            assert "完整切片网格" not in dock.start_readiness_label.text()
             dock.cleanup()
             dock.deleteLater()
             drain(app)

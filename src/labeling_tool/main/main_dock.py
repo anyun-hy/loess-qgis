@@ -204,6 +204,7 @@ class LabelingDockWidget(QgsDockWidget):
             self._on_vector_range_data_changed
         )
         self.vector_preview.auto_start_ready.connect(self._on_start)
+        self.vector_preview.auto_start_failed.connect(self._on_range_start_failed)
         self._last_run_result = None
         self._last_run_spec = None
         self._recovery_run_spec = None
@@ -723,7 +724,23 @@ class LabelingDockWidget(QgsDockWidget):
                 VECTOR_MODE, layer.extent(), layer.crs(), layer
             )
         try:
-            resolve_raster_extent(selection, raster)
+            extent = resolve_raster_extent(selection, raster)
+            if self.radio_vector.isChecked():
+                request = self.vector_preview.make_request(
+                    raster,
+                    layer,
+                    extent,
+                    TileParameters(
+                        self.tile_width_spin.value(),
+                        self.tile_height_spin.value(),
+                        self.overlap_spin.value(),
+                    ),
+                )
+                error = self.vector_preview.error_for(request)
+                if error:
+                    return f"范围无法生成完整切片：{error}", ()
+                if self.vector_preview.start_pending:
+                    return "正在检查切片范围，通过后自动开始", ()
         except ValueError as exc:
             return str(exc), ()
         return "", ()
@@ -965,6 +982,7 @@ class LabelingDockWidget(QgsDockWidget):
                     request, immediate=True, auto_start=True
                 )
                 if preview is None:
+                    self._update_start_enabled()
                     return
             grid_tiles = preview.grid_tiles
             current_tiles = preview.selected_tiles
@@ -1727,12 +1745,24 @@ class LabelingDockWidget(QgsDockWidget):
         try:
             raster = validate_raster_layer(self.raster_combo.currentLayer())
             self._set_processing_extent_summary(result, raster)
+            self._update_start_enabled()
         except ValueError:
             return
 
     def _on_vector_preview_failed(self, message):
         self.processing_extent_status_label.setText(f"无法计算: {message}")
         self.processing_extent_status_label.setStyleSheet("color: #b42318;")
+        self._update_start_enabled()
+
+    def _on_range_start_failed(self, message):
+        self._set_progress_terminal("未启动：范围校验失败")
+        self._update_start_enabled()
+        if not self._cleaning_up:
+            self._show_nonblocking_notice(
+                WARNING,
+                "无法开始标注",
+                "范围无法生成完整切片，任务未启动。\n\n" + str(message),
+            )
 
     def _set_processing_extent_status(self, tiles, raster, *, grid_tiles=None):
         full_grid = list(grid_tiles or tiles)
@@ -1843,6 +1873,8 @@ class LabelingDockWidget(QgsDockWidget):
                 preview = self.vector_preview.queue(request)
                 if preview is not None:
                     self._set_processing_extent_summary(preview, raster)
+                elif self.vector_preview.error_for(request):
+                    self._on_vector_preview_failed(self.vector_preview.error_for(request))
                 else:
                     self.processing_extent_status_label.setText(
                         "正在后台计算矢量范围 Tile..."
@@ -1864,6 +1896,8 @@ class LabelingDockWidget(QgsDockWidget):
         except ValueError as exc:
             self.processing_extent_status_label.setText(f"无法计算: {exc}")
             self.processing_extent_status_label.setStyleSheet("color: #b42318;")
+        finally:
+            self._update_start_enabled()
 
     def _on_tile_parameters_changed(self, *_args):
         self.vector_preview.invalidate()

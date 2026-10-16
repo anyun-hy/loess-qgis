@@ -101,6 +101,7 @@ class VectorPreviewController(QObject):
     preview_failed = pyqtSignal(str)
     source_changed = pyqtSignal()
     auto_start_ready = pyqtSignal()
+    auto_start_failed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -120,6 +121,7 @@ class VectorPreviewController(QObject):
         self._pending: VectorPreviewRequest | None = None
         self._requested_key: PreviewKey | None = None
         self._cache: VectorPreviewResult | None = None
+        self._error = ""
         self._task: Any | None = None
         self._auto_start = False
         self._auto_start_token = 0
@@ -146,6 +148,13 @@ class VectorPreviewController(QObject):
         cache = self._cache
         return cache if cache is not None and cache.key == request.key else None
 
+    def error_for(self, request: VectorPreviewRequest) -> str:
+        return self._error if request.key == self._requested_key else ""
+
+    @property
+    def start_pending(self) -> bool:
+        return self._auto_start
+
     def queue(
         self,
         request: VectorPreviewRequest,
@@ -160,7 +169,12 @@ class VectorPreviewController(QObject):
             return cache
 
         same_key = request.key == self._requested_key
+        if same_key and self._error:
+            if auto_start:
+                self.auto_start_failed.emit(self._error)
+            return None
         if not same_key:
+            self._error = ""
             self._auto_start = bool(auto_start)
             self._auto_start_token += 1
         elif auto_start:
@@ -199,6 +213,7 @@ class VectorPreviewController(QObject):
         self._pending = None
         self._requested_key = None
         self._cache = None
+        self._error = ""
         self._auto_start = False
         self._auto_start_token += 1
         task = self._task
@@ -242,8 +257,7 @@ class VectorPreviewController(QObject):
                 geometries,
             )
         except ValueError as exc:
-            self._auto_start = False
-            self.preview_failed.emit(str(exc))
+            self._fail(str(exc))
             return
 
         self._task = task
@@ -276,10 +290,11 @@ class VectorPreviewController(QObject):
             selected_count=int(raw_result["selected_count"]),
         )
         self._cache = result
+        auto_start = self._auto_start
+        token = self._auto_start_token
+        self._auto_start = False
         self.preview_ready.emit(result)
-        if self._auto_start:
-            self._auto_start = False
-            token = self._auto_start_token
+        if auto_start:
             QTimer.singleShot(0, lambda: self._emit_auto_start(token))
 
     def _on_task_terminated(self) -> None:
@@ -289,8 +304,15 @@ class VectorPreviewController(QObject):
         self._task = None
         if task.isCanceled():
             return
+        self._fail(task.error_message or "矢量范围 Tile 计算失败")
+
+    def _fail(self, message: str) -> None:
+        auto_start = self._auto_start
         self._auto_start = False
-        self.preview_failed.emit(task.error_message or "矢量范围 Tile 计算失败")
+        self._error = message
+        self.preview_failed.emit(message)
+        if auto_start:
+            self.auto_start_failed.emit(message)
 
     def _emit_auto_start(self, token: int) -> None:
         if self._closed or token != self._auto_start_token:

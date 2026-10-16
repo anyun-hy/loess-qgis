@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
         "preview_replacement",
         "preview_source_changes",
         "preview_autostart",
+        "preview_failures",
         "preview_shutdown",
         "preview_native_task",
         "dock_range_inputs",
