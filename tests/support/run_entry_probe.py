@@ -82,10 +82,12 @@ def entry(app, root, scenario):
         if scenario == "entry_class_failure":
             stack.enter_context(
                 patch.object(
-                    dock.layer_manager, "load_workspace_class",
+                    dock.layer_manager,
+                    "load_workspace_class",
                     side_effect=RuntimeError("test class mount failure"),
                 )
             )
+        reviewed_classes = None
         try:
             assert (
                 dock.run_load_btn.text() == "Run 加载与整理"
@@ -129,12 +131,18 @@ def entry(app, root, scenario):
             assert "加载完成，14 类工作层已就绪" in summary, summary
             assert ("fusion、models、classes" in summary) == (scenario == "entry_all")
             dialog.workspace_load_status_changed.emit(
-                {**dialog._result, "run_dir": str(root / "another-run")}, "旧 Run 加载失败"
+                {**dialog._result, "run_dir": str(root / "another-run")},
+                "旧 Run 加载失败",
             )
             assert dock.result_summary_label.text() == summary
             assert dialog._sam_available() and dialog._worker.requests == []
             assert not dialog._run_loading and dialog.isEnabled()
+            assert dialog.isVisible(), "The real Run entry must open its editor"
             assert dialog._workspace["classes"]["12"]["confirmed"]
+            reviewed_classes = {
+                code: dict(record)
+                for code, record in dialog._workspace["classes"].items()
+            }
             sections = {
                 layer.customProperty("labeling_tool/section", "")
                 for layer in QgsProject.instance().mapLayers().values()
@@ -146,10 +154,20 @@ def entry(app, root, scenario):
             )
             assert warnings.call_count == 0, warnings.call_args_list
         finally:
-            dock.cleanup()
-            app.processEvents()
-            QgsProject.instance().removeAllMapLayers()
-            canvas.close()
+            try:
+                # cleanup() releases work but intentionally keeps this reusable
+                # editor alive. Close its window before QApplication teardown,
+                # while the platform input context and Qt thread storage exist.
+                dialog = dock.refinement_dialog
+                dialog.close()
+                assert not dialog.isVisible(), "Run editor remained open at exit"
+                if reviewed_classes is not None:
+                    assert dialog._workspace["classes"] == reviewed_classes
+            finally:
+                dock.cleanup()
+                app.processEvents()
+                QgsProject.instance().removeAllMapLayers()
+                canvas.close()
 
 
 def image_binding(app, root):
@@ -198,17 +216,24 @@ def image_binding(app, root):
             canvas.close()
 
 
-app = QgsApplication([], False)
-app.initQgis()
-try:
-    with tempfile.TemporaryDirectory(prefix="loess-run-entry-") as directory:
-        if sys.argv[2] == "image_binding":
-            image_binding(app, Path(directory))
-        else:
-            entry(app, Path(directory), sys.argv[2])
+def main():
+    with tempfile.TemporaryDirectory(prefix="loess-run-entry-profile-") as profile:
+        app = QgsApplication([], False, profile)
+        app.initQgis()
+        try:
+            with tempfile.TemporaryDirectory(prefix="loess-run-entry-") as directory:
+                if sys.argv[2] == "image_binding":
+                    image_binding(app, Path(directory))
+                else:
+                    entry(app, Path(directory), sys.argv[2])
+        except Exception:
+            traceback.print_exc()
+            raise SystemExit(1)
+        finally:
+            app.exitQgis()
+        print(sys.argv[2] + ": qgis_shutdown_complete", flush=True)
         print(sys.argv[2] + ": passed", flush=True)
-except Exception:
-    traceback.print_exc()
-    raise SystemExit(1)
-finally:
-    app.exitQgis()
+
+
+if __name__ == "__main__":
+    main()

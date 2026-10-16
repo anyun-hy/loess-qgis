@@ -26,10 +26,15 @@ def test_unified_run_loading(scenario):
 
 
 @pytest.mark.parametrize(
-    "scenario", [
-        "entry_classes", "entry_all", "entry_cancel", "entry_class_failure",
-        "entry_class_pause", "image_binding",
-    ]
+    "scenario",
+    [
+        "entry_classes",
+        "entry_all",
+        "entry_cancel",
+        "entry_class_failure",
+        "entry_class_pause",
+        "image_binding",
+    ],
 )
 def test_unified_run_entry(scenario):
     _run_probe("run_entry_probe.py", scenario)
@@ -57,4 +62,6 @@ def _run_probe(script, scenario):
     if result.returncode == 77 and "LOESS_TEST_QGIS_PYTHON" not in env:
         pytest.skip("Native QGIS unavailable; set LOESS_TEST_QGIS_PYTHON")
     assert result.returncode == 0, result.stdout + result.stderr
+    if script == "run_entry_probe.py":
+        assert scenario + ": qgis_shutdown_complete" in result.stdout, result.stdout
     assert result.stdout.strip().endswith(scenario + ": passed")
