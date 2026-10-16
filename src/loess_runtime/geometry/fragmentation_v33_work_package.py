@@ -22,6 +22,12 @@ import rasterio
 from affine import Affine
 
 from labeling_tool.shared.contracts.run_spec import CLASS_ORDER, load_json, sha256_file
+from labeling_tool.shared.state.publication_diagnostics import (
+    capture_publication_failure,
+    publication_failure_payload,
+    publication_phase,
+    v33_job_diagnostics,
+)
 from labeling_tool.shared.state.run_state_db import RunStateDB, run_state_from_spec
 from loess_runtime.geometry.fragmentation_v33_artifact_io import (
     ready_artifact_index,
@@ -625,6 +631,7 @@ class _Heartbeat:
 def _finish_or_requeue_v33(
     database: RunStateDB, job: Mapping[str, Any], error: Exception
 ) -> None:
+    capture_publication_failure(error)
     if database.jobs.finish_job(
         int(job["job_id"]), str(job["lease_token"]), status="failed", error=str(error)
     ):
@@ -681,6 +688,7 @@ def _run_durable_partition_job(
         with database.fragmentation_v33_attempt_commit(
             int(job["job_id"]), str(job["lease_token"])
         ) as publication:
+            publication_phase("staged_publish", job_id=int(job["job_id"]))
             publication.artifacts.publish_fragmentation_v33_output_pair(
                 output_pair["run_id"],
                 output_pair["stream_id"],
@@ -699,6 +707,7 @@ def _run_durable_partition_job(
                 raise FragmentationV33WorkPackageError(
                     "V3.3 partition lease expired before commit"
                 )
+        publication_phase("commit_complete", job_id=int(job["job_id"]))
         return {
             "status": "ready",
             "stage": "partition",
@@ -721,6 +730,7 @@ def _run_durable_finalize_job(
 ) -> dict[str, Any]:
     """Audit the stitched domain, then cross the single publication barrier."""
 
+    publication_phase("prepare_finalize", job_id=int(job["job_id"]))
     run_id = str(spec["run_id"])
     unit = database.control_graph.get_spatial_unit(run_id, str(job["unit_id"]))
     if unit is None or str(unit.get("unit_type")) != "FragmentationV33Finalize":
@@ -817,28 +827,31 @@ def run_worker(
             "status": "ready" if counts.get("ready") else "not_ready",
             "job_counts": counts,
         }
-    durable_unit = database.control_graph.get_spatial_unit(run_id, str(job["unit_id"]))
-    if durable_unit is not None:
-        durable_type = str(durable_unit.get("unit_type") or "")
-        if durable_type == "FragmentationV33Partition":
-            if not production:
-                raise FragmentationV33WorkPackageError(
-                    "durable V3.3 partition jobs require production policy"
+    with v33_job_diagnostics(job):
+        durable_unit = database.control_graph.get_spatial_unit(
+            run_id, str(job["unit_id"])
+        )
+        if durable_unit is not None:
+            durable_type = str(durable_unit.get("unit_type") or "")
+            if durable_type == "FragmentationV33Partition":
+                if not production:
+                    raise FragmentationV33WorkPackageError(
+                        "durable V3.3 partition jobs require production policy"
+                    )
+                return _run_durable_partition_job(
+                    spec, database, job, contract, lease_seconds=lease_seconds
                 )
-            return _run_durable_partition_job(
-                spec, database, job, contract, lease_seconds=lease_seconds
-            )
-        if durable_type == "FragmentationV33Finalize":
-            if not production:
-                raise FragmentationV33WorkPackageError(
-                    "durable V3.3 finalize requires production policy"
+            if durable_type == "FragmentationV33Finalize":
+                if not production:
+                    raise FragmentationV33WorkPackageError(
+                        "durable V3.3 finalize requires production policy"
+                    )
+                return _run_durable_finalize_job(
+                    spec, database, job, lease_seconds=lease_seconds
                 )
-            return _run_durable_finalize_job(
-                spec, database, job, lease_seconds=lease_seconds
-            )
-    raise FragmentationV33WorkPackageError(
-        "V3.3 production requires a durable partition or finalize unit"
-    )
+        raise FragmentationV33WorkPackageError(
+            "V3.3 production requires a durable partition or finalize unit"
+        )
 
 
 def main() -> int:
@@ -869,7 +882,7 @@ def main() -> int:
     except Exception as error:
         print(
             json.dumps(
-                {"status": "failed", "error": str(error)},
+                publication_failure_payload(error),
                 ensure_ascii=False,
                 sort_keys=True,
             ),

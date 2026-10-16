@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from labeling_tool.shared.state.postgres_state import PostgresConnection
+from labeling_tool.shared.state.publication_diagnostics import publication_phase
 
 
 def lock_job_artifact_inputs(connection: PostgresConnection, job_id: int) -> None:
@@ -24,7 +25,9 @@ def lock_job_artifact_inputs(connection: PostgresConnection, job_id: int) -> Non
 
 def release_job_artifact_inputs(connection: PostgresConnection, job_id: int) -> int:
     """Release inputs in the caller's transaction, using the same lock order."""
+    publication_phase("release_input_lock", job_id=job_id)
     lock_job_artifact_inputs(connection, job_id)
+    publication_phase("dependency_release", job_id=job_id)
     return int(
         connection.execute(
             "DELETE FROM artifact_dependencies WHERE job_id=%s",

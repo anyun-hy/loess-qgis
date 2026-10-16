@@ -29,6 +29,7 @@ from labeling_tool.shared.state.postgres_state import (
     is_postgres_location,
     postgres_health,
 )
+from labeling_tool.shared.state.publication_diagnostics import publication_phase
 from labeling_tool.shared.state.run_archive_repository import RunArchiveRepository
 from labeling_tool.shared.state.run_control_graph_repository import (
     RunControlGraphRepository,
@@ -159,7 +160,9 @@ class RunStateDB:
         transaction, not just the later dependency release.
         """
 
+        publication_phase("attempt_transaction", job_id=job_id)
         with self.session.transaction() as connection:
+            publication_phase("job_lock", job_id=job_id)
             job = connection.execute(
                 """SELECT * FROM jobs
                    WHERE job_id=%s AND job_type='fragmentation_v33'
@@ -184,7 +187,9 @@ class RunStateDB:
                     raise RunStateError(
                         "fragmentation V3.3 attempt does not match scoped identity"
                     )
+            publication_phase("input_lock", job_id=job_id)
             lock_job_artifact_inputs(connection, job_id)
+            publication_phase("lease_recheck", job_id=job_id)
             # The Job row stays locked, but its lease can expire while input
             # locks are awaited. Finalize may replace canonical files as soon
             # as the facade is yielded, so fence again before handing it out.
@@ -193,7 +198,9 @@ class RunStateDB:
                     "fragmentation V3.3 lease expired while waiting for artifact inputs"
                 )
             if self.session.is_scoped_transaction:
+                publication_phase("publication", job_id=job_id)
                 yield self
+                publication_phase("commit_pending", job_id=job_id)
                 return
             scoped_session = self.session.scoped(
                 connection,
@@ -204,7 +211,9 @@ class RunStateDB:
                 ),
             )
             try:
+                publication_phase("publication", job_id=job_id)
                 yield self._from_session(scoped_session)
+                publication_phase("commit_pending", job_id=job_id)
             finally:
                 scoped_session.invalidate()
 
@@ -283,6 +292,7 @@ class RunStateDB:
         authority set in the control plane.
         """
 
+        publication_phase("finalize_metadata", job_id=job_id)
         token = str(lease_token)
         normalized: list[dict[str, Any]] = []
         seen: set[str] = set()

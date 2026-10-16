@@ -16,6 +16,7 @@ from affine import Affine  # type: ignore[import-untyped]
 
 from labeling_tool.shared.contracts.run_spec import CLASS_ORDER, load_json, sha256_file
 from labeling_tool.shared.state.artifact_repository import ArtifactRepository
+from labeling_tool.shared.state.publication_diagnostics import publication_phase
 from loess_runtime.geometry.fragmentation_global_connectivity import (
     GlobalConnectivityError,
     audit_partitioned_connectivity,
@@ -502,10 +503,12 @@ def finalize_authoritative_v33(
         # Long copies and hashing are complete.  Lock the Run publication file,
         # then lock and validate the exact finalize lease before the first
         # canonical replacement; both scopes share one database transaction.
+        publication_phase("owner_publication", job_id=int(job["job_id"]))
         with store.owner_publication(run_id, Path(str(spec["run_dir"]))) as owner:
             with owner.fragmentation_v33_attempt_commit(
                 int(job["job_id"]), str(job["lease_token"])
             ) as publication:
+                publication_phase("canonical_replace", job_id=int(job["job_id"]))
                 for prepared_path, canonical_path in prepared_replacements:
                     _publish_prepared(prepared_path, canonical_path)
                 _publish_prepared(prepared_report, report_path)
@@ -520,10 +523,13 @@ def finalize_authoritative_v33(
                     raise FragmentationV33WorkPackageError(
                         "V3.3 finalize lease expired before publish"
                     )
+        publication_phase("commit_complete", job_id=int(job["job_id"]))
+        publication_phase("prepared_cleanup", job_id=int(job["job_id"]))
     finally:
         for prepared_path, _canonical_path in prepared_replacements:
             prepared_path.unlink(missing_ok=True)
         prepared_report.unlink(missing_ok=True)
+    publication_phase("staged_cleanup", job_id=int(job["job_id"]))
     _release_staged_outputs(
         store,
         artifacts,

@@ -55,6 +55,8 @@ SHARED_RUNTIME_FILES = {
         "runtime/labeling_tool/shared/state/monitor_history_repository.py",
     "src/labeling_tool/shared/state/postgres_state.py":
         "runtime/labeling_tool/shared/state/postgres_state.py",
+    "src/labeling_tool/shared/state/publication_diagnostics.py":
+        "runtime/labeling_tool/shared/state/publication_diagnostics.py",
     "src/labeling_tool/shared/state/run_state_db.py":
         "runtime/labeling_tool/shared/state/run_state_db.py",
     "src/labeling_tool/shared/state/run_state_session.py":

@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from labeling_tool.shared.state.artifact_dependencies import (
     release_job_artifact_inputs,
 )
+from labeling_tool.shared.state.publication_diagnostics import publication_phase
 from labeling_tool.shared.state.run_state_session import RunStateError, RunStateSession
 from labeling_tool.shared.state.state_values import bounded_utf8 as _bounded_utf8
 from labeling_tool.shared.state.state_values import json_value as _json
@@ -787,6 +788,7 @@ class JobRepository:
     ) -> bool:
         """Atomically complete V3.3 and release all retained owner inputs."""
 
+        publication_phase("completion_validation", job_id=job_id)
         now = _now()
         fence_time = time.time()
         with self._session.transaction() as connection:
