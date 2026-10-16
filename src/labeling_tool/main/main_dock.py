@@ -620,12 +620,17 @@ class LabelingDockWidget(QgsDockWidget):
         self._update_start_enabled()
 
     def _on_env_report_ready(self, report):
+        if self._cleaning_up or self.workflow is None:
+            return
         self._environment_report_current = True
         self.plan_panel.set_environment(report)
         self._render_env_report(report, check_finished=True)
         self._restore_latest_ready_run()
 
     def _restore_latest_ready_run(self):
+        # Final unload drains queued events after cleanup has begun.
+        if self._cleaning_up or self.workflow is None:
+            return
         if self.workflow.is_active:
             return
         output_root = self.workspace_edit.text().strip()
