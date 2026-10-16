@@ -354,12 +354,17 @@ def _memory_class_layer(
         LAYER_NAMES.CLASS_POLYGONS,
         "memory",
     )
-    provider = memory.dataProvider()
-    provider.addAttributes(list(source.fields()))
+    # Use the layer-owned edit buffer; borrowed provider wrappers can become
+    # invalid while temporary layers are repeatedly destroyed in a worker.
+    if not memory.startEditing():
+        raise ClassWorkspaceError("cannot start class workspace editing")
+    for field in source.fields():
+        if not memory.addAttribute(field):
+            raise ClassWorkspaceError(f"cannot stage class workspace field: {field.name()}")
     existing = {field.name() for field in memory.fields()}
-    provider.addAttributes([
-        QgsField(name, field_type) for name, field_type in WORK_FIELDS if name not in existing
-    ])
+    for name, field_type in WORK_FIELDS:
+        if name not in existing and not memory.addAttribute(QgsField(name, field_type)):
+            raise ClassWorkspaceError(f"cannot stage class workspace field: {name}")
     memory.updateFields()
     fields = memory.fields()
     request = QgsFeatureRequest().setFilterExpression(f'"class_code" = {int(class_code)}')
@@ -395,7 +400,7 @@ def _memory_class_layer(
         features.append(feature)
         count += 1
         if len(features) >= 4096:
-            added = provider.addFeatures(features)
+            added = memory.addFeatures(features)
             added_ok = added[0] if isinstance(added, tuple) else added
             if not added_ok:
                 raise ClassWorkspaceError(
@@ -403,12 +408,16 @@ def _memory_class_layer(
                 )
             features = []
     if features:
-        added = provider.addFeatures(features)
+        added = memory.addFeatures(features)
         added_ok = added[0] if isinstance(added, tuple) else added
         if not added_ok:
             raise ClassWorkspaceError(
                 f"cannot stage class {class_code} workspace features"
             )
+    if not memory.commitChanges():
+        raise ClassWorkspaceError(
+            "cannot commit class workspace features: " + "; ".join(memory.commitErrors())
+        )
     memory.updateExtents()
     apply_class_constraints(memory, class_code)
     return memory, count
