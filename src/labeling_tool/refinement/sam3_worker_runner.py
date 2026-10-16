@@ -6,10 +6,24 @@ import json
 import os
 import shlex
 import signal
+from pathlib import Path
 
 from qgis.PyQt.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
-from labeling_tool.qgis_support.process_runtime import configure_process, process_is_running
+from labeling_tool.qgis_support.process_runtime import (
+    configure_process,
+    process_is_running,
+)
+
+
+def sam_configuration_path(scripts_dir):
+    """Use the same generated/source layouts as the shared Bash launcher."""
+    directory = Path(scripts_dir).expanduser().resolve()
+    config = directory / "config.yaml"
+    source_config = directory.parent.parent / "configs" / "defaults" / "config.yaml"
+    if not config.is_file() and (directory.parent.parent / "src" / "loess_runtime").is_dir():
+        return source_config
+    return config
 
 
 class Sam3WorkerRunner(QObject):
@@ -50,9 +64,11 @@ class Sam3WorkerRunner(QObject):
         script = os.path.join(self.scripts_dir, "run_sam3_interactive_worker.sh")
         if not os.path.isfile(script):
             raise FileNotFoundError(script)
+        config_path = sam_configuration_path(self.scripts_dir)
         checkpoint = str(self.sam_config.get("checkpoint") or "")
         checkpoint_sha = str(self.sam_config.get("checkpoint_sha256") or "")
-        if not os.path.isfile(checkpoint) or len(checkpoint_sha) != 64:
+        has_config = config_path.is_file()
+        if not has_config and (not os.path.isfile(checkpoint) or len(checkpoint_sha) != 64):
             raise RuntimeError("SAM3 checkpoint or SHA256 is unavailable")
         device = str(
             self.sam_config.get("effective_device")
@@ -66,6 +82,10 @@ class Sam3WorkerRunner(QObject):
             "--device", device,
             "--sam-version", str(self.sam_config.get("version") or ""),
         ]
+        if has_config:
+            # Read only SAM settings in the isolated runtime. Loading an existing
+            # Run does not require probing unrelated semantic inference models.
+            args = [script]
         self.log_line.emit("system", "[cmd] " + shlex.join(["/bin/bash", *args]))
         process = QProcess(self)
         self._owns_process_group = configure_process(
@@ -78,12 +98,17 @@ class Sam3WorkerRunner(QObject):
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
         process.finished.connect(self._finished)
+        process.errorOccurred.connect(self._process_error)
         self._stdout_pending = bytearray()
         self._stderr_pending = bytearray()
         self._ready = False
         self._stopping = False
         self._process = process
         process.start()
+
+    def _process_error(self, _error):
+        if self._process is not None:
+            self.event_received.emit({"event": "worker_failed", "error": self._process.errorString()})
 
     def predict(self, request):
         if not self.is_ready:
@@ -192,6 +217,8 @@ class Sam3WorkerRunner(QObject):
             if event["event"] == "worker_ready":
                 self._ready = True
                 self.ready.emit(event)
+            elif event["event"] == "worker_failed":
+                self._ready = False
             self.event_received.emit(event)
 
     def _finished(self, exit_code, _exit_status):

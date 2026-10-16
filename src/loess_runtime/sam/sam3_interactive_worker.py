@@ -21,8 +21,11 @@ from rasterio.windows import Window, from_bounds
 from shapely import affinity
 from shapely.geometry import Point, mapping
 
-from loess_runtime.sam.sam3_refine import load_sam3, predict_sam3_candidates, resolve_sam3_device
-
+from loess_runtime.sam.sam3_refine import (
+    load_sam3,
+    predict_sam3_candidates,
+    resolve_sam3_device,
+)
 
 _WRITE_LOCK = threading.Lock()
 
@@ -157,7 +160,7 @@ def _predict(runtime, request):
         }
 
 
-def run_worker(checkpoint, expected_sha, device, sam_version):
+def run_worker(checkpoint, expected_sha, device, sam_version, *, buffer_px=32):
     checkpoint = str(Path(checkpoint).resolve())
     actual_sha = sha256_file(checkpoint)
     if expected_sha and actual_sha != expected_sha:
@@ -175,9 +178,11 @@ def run_worker(checkpoint, expected_sha, device, sam_version):
     }
     emit(
         "worker_ready",
+        checkpoint=checkpoint,
         checkpoint_sha256=actual_sha,
         device=resolved_device,
         sam_version=sam_version,
+        buffer_px=buffer_px,
         pid=os.getpid(),
     )
 
@@ -251,17 +256,38 @@ def run_worker(checkpoint, expected_sha, device, sam_version):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Persistent interactive SAM3 JSONL worker")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--checkpoint-sha256", required=True)
+    parser.add_argument("--config")
+    parser.add_argument("--asset-base-dir")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--checkpoint-sha256")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--sam-version", default="")
     args = parser.parse_args(argv)
     try:
+        buffer_px = 32
+        if args.config:
+            from loess_runtime.system.deployment_config import load_yaml, resolve_path
+            from loess_runtime.system.deployment_validation import is_valid_sha256
+
+            config_path = Path(args.config).resolve()
+            sam = load_yaml(config_path).get("sam3") or {}
+            args.checkpoint = str(resolve_path(sam.get("checkpoint"), args.asset_base_dir or config_path.parent))
+            args.checkpoint_sha256 = str(sam.get("sha256") or "")
+            if not is_valid_sha256(args.checkpoint_sha256):
+                raise ValueError("SAM3 配置缺少可信的 sha256")
+            args.device = str(sam.get("device") or "auto")
+            args.sam_version = str(sam.get("version") or "")
+            buffer_px = int(sam.get("buffer_px", 32))
+            if buffer_px < 0:
+                raise ValueError("SAM3 buffer_px 必须非负")
+        elif not args.checkpoint or not args.checkpoint_sha256:
+            raise ValueError("需要 --config 或 checkpoint 及其 SHA256")
         run_worker(
             args.checkpoint,
             args.checkpoint_sha256,
             args.device,
             args.sam_version,
+            buffer_px=buffer_px,
         )
         return 0
     except Exception as exc:
