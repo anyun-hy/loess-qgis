@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 """Exercise the real unified main-panel entry and staged layer cancellation."""
 
+import hashlib
+import json
 import sys
 import tempfile
 import traceback
@@ -47,7 +49,16 @@ class Monitor(QDialog):
 
 
 def entry(app, root, scenario):
-    spec, _ = fixture(root / "run")
+    spec, _ = fixture(root / "run", initialized=scenario != "entry_uninitialized")
+    original_classes = {
+        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in (root / "run/classes").glob("*.gpkg")
+    }
+    original_reviews = (
+        json.loads((root / "run/classes/workspace.json").read_text())["classes"]
+        if original_classes
+        else None
+    )
     canvas = QgsMapCanvas()
     iface = SimpleNamespace(
         mapCanvas=lambda: canvas,
@@ -70,15 +81,13 @@ def entry(app, root, scenario):
         dock.refinement_dialog._layer_loader._LOAD_INTERVAL_MS = 1
         warnings = stack.enter_context(patch.object(main_dock.QMessageBox, "warning"))
 
-        def choose(chooser):
-            assert dock.refinement_dialog._worker.is_running, (
-                "SAM must start before any prediction"
+        choose_directory = stack.enter_context(
+            patch.object(
+                main_dock.QFileDialog,
+                "getExistingDirectory",
+                return_value=spec["run_dir"],
             )
-            chooser.directory_edit.setText(spec["run_dir"])
-            chooser.all_radio.setChecked(scenario != "entry_classes")
-            return 1
-
-        stack.enter_context(patch.object(main_dock.RunLoadDialog, "exec", choose))
+        )
         if scenario == "entry_class_failure":
             stack.enter_context(
                 patch.object(
@@ -90,16 +99,56 @@ def entry(app, root, scenario):
         reviewed_classes = None
         try:
             assert (
-                dock.run_load_btn.text() == "Run 加载与整理"
+                dock.run_load_btn.text() == "加载到 QGIS 并打开整理"
                 and dock.run_load_btn.isEnabled()
             )
             assert not hasattr(dock, "load_manual_run_btn") and not hasattr(
                 dock, "open_refinement_btn"
             )
-            dock._on_open_refinement()
+            assert "尚未加载" in dock.loaded_run_label.text()
+            if scenario == "entry_no_selection":
+                with patch.object(main_dock.QMessageBox, "information") as info:
+                    dock.run_load_btn.click()
+                assert info.call_count == 1
+                assert not choose_directory.called and dock._manual_load_task is None
+                assert dock.refinement_dialog._worker is None
+                return
+            dock.results_workspace_panel.choose_btn.click()
+            wait(app, lambda: not dock.results_workspace_panel.busy)
+            assert not QgsProject.instance().mapLayers(), (
+                "Selection must not mount layers"
+            )
+            assert "选中 Run" in dock.results_workspace_panel.run_label.text()
+            assert choose_directory.call_count == 1
+            # A second directory request is a regression, including on reload.
+            choose_directory.side_effect = AssertionError(
+                "Run must only be selected once"
+            )
+            dock.run_scope_combo.setCurrentIndex(
+                0 if scenario == "entry_classes" else 1
+            )
+            dock.run_load_btn.click()
+            assert dock.refinement_dialog._worker.is_running, (
+                "Both scopes must proactively start SAM3"
+            )
+            assert choose_directory.call_count == 1
             assert dock.refinement_dialog._run_loading
             assert not dock.refinement_dialog.isEnabled()
+            if scenario == "entry_uninitialized":
+                wait(app, lambda: warnings.call_count > 0)
+                assert not (root / "run/classes").exists(), (
+                    "Loading must not initialize classes"
+                )
+                assert dock.results_workspace_panel.initialize_btn.isEnabled()
+                assert "尚未加载" in dock.loaded_run_label.text()
+                return
             if scenario == "entry_cancel":
+                dock.results_workspace_panel.choose_btn.click()
+                assert choose_directory.call_count == 1
+                assert warnings.call_count == 1, (
+                    "Changing Run must wait for loading or cancellation"
+                )
+                warnings.reset_mock()
                 wait(app, lambda: bool(dock._new_result_layer_ids))
                 user = QgsVectorLayer(
                     "Polygon?crs=EPSG:3857", "user_added_during_load", "memory"
@@ -129,6 +178,9 @@ def entry(app, root, scenario):
             dialog = dock.refinement_dialog
             summary = dock.result_summary_label.text()
             assert "加载完成，14 类工作层已就绪" in summary, summary
+            assert dock.run_load_btn.text() == "加载到 QGIS 并打开整理"
+            assert "加载完成" in dock.loaded_run_label.text()
+            assert "SAM3 已就绪" in dock.run_sam_status_label.text()
             assert ("fusion、models、classes" in summary) == (scenario == "entry_all")
             dialog.workspace_load_status_changed.emit(
                 {**dialog._result, "run_dir": str(root / "another-run")},
@@ -139,6 +191,16 @@ def entry(app, root, scenario):
             assert not dialog._run_loading and dialog.isEnabled()
             assert dialog.isVisible(), "The real Run entry must open its editor"
             assert dialog._workspace["classes"]["12"]["confirmed"]
+            for code, record in original_reviews.items():
+                assert {
+                    k: v
+                    for k, v in dialog._workspace["classes"][code].items()
+                    if k != "path"
+                } == {k: v for k, v in record.items() if k != "path"}
+            assert {
+                p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in (root / "run/classes").glob("*.gpkg")
+            } == original_classes
             reviewed_classes = {
                 code: dict(record)
                 for code, record in dialog._workspace["classes"].items()
@@ -216,13 +278,123 @@ def image_binding(app, root):
             canvas.close()
 
 
+def selection(app, root, scenario):
+    old, _ = fixture(root / "old_run")
+    selected, _ = fixture(root / "selected_run")
+    old["run_dir"] = str(Path(old["run_dir"]).resolve())
+    selected["run_dir"] = str(Path(selected["run_dir"]).resolve())
+    canvas = QgsMapCanvas()
+    iface = SimpleNamespace(
+        mapCanvas=lambda: canvas,
+        activeLayer=lambda: None,
+        setActiveLayer=lambda _: None,
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(ui, "Sam3WorkerRunner", Worker))
+        stack.enter_context(patch.object(main_dock, "InferenceMonitorDialog", Monitor))
+        stack.enter_context(patch.object(main_dock, "QgsSettings", Settings))
+        stack.enter_context(
+            patch.object(
+                main_dock.run_index, "load_startup_candidates", return_value={}
+            )
+        )
+        for name in ("_save_settings", "_load_settings_and_defaults"):
+            stack.enter_context(
+                patch.object(main_dock.LabelingDockWidget, name, lambda *_: None)
+            )
+        dock = main_dock.LabelingDockWidget(iface=iface)
+        dock.refinement_dialog._layer_loader._LOAD_INTERVAL_MS = 1
+        try:
+            if scenario == "startup_selection":
+                dock.results_workspace_panel.set_run_directory(selected["run_dir"])
+                wait(app, lambda: not dock.results_workspace_panel.busy)
+                summary = dock.result_summary_label.text()
+                assert "selected_run" in summary and "加载完成" not in summary
+                with (
+                    patch.object(
+                        main_dock.run_index,
+                        "load_startup_candidates",
+                        return_value={"latest_ready": {"spec": old}},
+                    ),
+                    patch.object(
+                        main_dock.run_index,
+                        "lightweight_ready_result",
+                        return_value={
+                            "run_id": old["run_id"],
+                            "run_dir": old["run_dir"],
+                        },
+                    ),
+                ):
+                    dock._restore_latest_ready_run()
+                assert Path(dock.results_workspace_panel._candidate_dir) == Path(
+                    selected["run_dir"]
+                )
+                assert dock.result_summary_label.text() == summary
+                return
+
+            dock.results_workspace_panel.set_run_directory(old["run_dir"])
+            wait(app, lambda: not dock.results_workspace_panel.busy)
+            dock._on_open_refinement()
+            wait(app, lambda: len(dock.refinement_dialog._class_layers) == 14)
+            original_layers = set(QgsProject.instance().mapLayers())
+            old_result = dict(dock.refinement_dialog._result)
+            old_loaded_status = dock.loaded_run_label.text()
+            dock.results_workspace_panel.set_run_directory(selected["run_dir"] + "/")
+            wait(app, lambda: not dock.results_workspace_panel.busy)
+            summary = dock.result_summary_label.text()
+            assert "selected_run" in summary and "加载完成" not in summary
+            assert dock.loaded_run_label.text() == old_loaded_status
+            assert dock.loaded_run_label.toolTip() == old["run_dir"]
+            dock.refinement_dialog.workspace_load_status_changed.emit(
+                old_result, "加载完成，14 类工作层已就绪"
+            )
+            assert dock.result_summary_label.text() == summary
+
+            assert dock.results_workspace_panel.run_directory == selected["run_dir"]
+            if scenario == "selection_cancel":
+                dock.run_scope_combo.setCurrentIndex(1)
+                dock._on_open_refinement()
+                wait(app, lambda: bool(dock._new_result_layer_ids))
+                dock._on_open_refinement()
+                assert dock._last_run_result["run_dir"] == old["run_dir"]
+                assert dock.loaded_run_label.text() == old_loaded_status
+                dock.results_workspace_panel.set_candidate(old["run_dir"])
+                assert "old_run" in dock.result_summary_label.text()
+            else:
+                dock._on_open_refinement()
+                wait(
+                    app,
+                    lambda: dock.refinement_dialog._run_spec.get("run_dir")
+                    == selected["run_dir"]
+                    and len(dock.refinement_dialog._class_layers) == 14,
+                )
+                assert dock._last_run_result["run_dir"] == selected["run_dir"]
+                assert "加载完成" in dock.result_summary_label.text()
+                assert dock.loaded_run_label.toolTip() == selected["run_dir"]
+                assert dock.results_workspace_panel._probe.get("workspace")
+                assert not dock.results_workspace_panel.initialize_btn.isEnabled()
+            assert original_layers.issubset(QgsProject.instance().mapLayers())
+        finally:
+            dock.refinement_dialog.close()
+            dock.cleanup()
+            app.processEvents()
+            QgsProject.instance().removeAllMapLayers()
+            canvas.close()
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="loess-run-entry-profile-") as profile:
         app = QgsApplication([], False, profile)
         app.initQgis()
         try:
             with tempfile.TemporaryDirectory(prefix="loess-run-entry-") as directory:
-                if sys.argv[2] == "image_binding":
+                if sys.argv[2] in {
+                    "selection_sync",
+                    "selection_cancel",
+                    "startup_selection",
+                }:
+                    selection(app, Path(directory), sys.argv[2])
+                elif sys.argv[2] == "image_binding":
                     image_binding(app, Path(directory))
                 else:
                     entry(app, Path(directory), sys.argv[2])

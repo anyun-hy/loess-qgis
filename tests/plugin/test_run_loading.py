@@ -33,10 +33,19 @@ def test_unified_run_loading(scenario):
         "entry_cancel",
         "entry_class_failure",
         "entry_class_pause",
+        "entry_no_selection",
+        "entry_uninitialized",
         "image_binding",
     ],
 )
 def test_unified_run_entry(scenario):
+    _run_probe("run_entry_probe.py", scenario)
+
+
+@pytest.mark.parametrize(
+    "scenario", ["selection_sync", "selection_cancel", "startup_selection"]
+)
+def test_run_selection_matches_entry_and_status(scenario):
     _run_probe("run_entry_probe.py", scenario)
 
 
