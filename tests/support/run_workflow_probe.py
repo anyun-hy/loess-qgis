@@ -734,14 +734,17 @@ def dock_integration(app, root):
                 "ready_streams": [{"kind": "fusion", "stream_id": "fusion:test"}],
             }
             h.runners[-1].pipeline_finished.emit(result)
-            assert loaded == [result] and grouped == [True]
+            assert loaded == [] and grouped == [], (
+                "Run completion must not mount result layers"
+            )
             assert dock.run_load_btn.isEnabled()
             assert "Fusion 成功" in dock.result_summary_label.text()
+            assert "按需加载" in dock.result_summary_label.text()
             assert dock.progress_bar.format() == "完成"
             assert not dock.stop_btn.isEnabled()
             assert notices[-1][1] == "完成"
             h.runners[-1].pipeline_finished.emit(result)
-            assert len(loaded) == 1
+            assert loaded == [] and grouped == []
 
             preserved_result = dock._last_run_result
             preserved_spec = dock._recovery_run_spec
@@ -761,7 +764,7 @@ def dock_integration(app, root):
                         "run_spec": str(path),
                     }
                 )
-                assert loaded == [result] and grouped == [True]
+                assert loaded == [] and grouped == []
                 assert dock._last_run_result == preserved_result
                 assert dock._recovery_run_spec == preserved_spec
                 assert dock.run_load_btn.isEnabled()

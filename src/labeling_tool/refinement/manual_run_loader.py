@@ -33,8 +33,32 @@ class ManualRunLoadCancelled(ManualRunLoadError):
 CancelCheck = Callable[[], bool] | None
 ProgressCallback = Callable[[str, float], None] | None
 LOAD_CLASSES = "classes"
+LOAD_FUSION = "fusion"
+LOAD_MODELS = "models"
 LOAD_ALL = "all"
-LOAD_SCOPES = (LOAD_CLASSES, LOAD_ALL)
+LOAD_KINDS = (LOAD_CLASSES, LOAD_FUSION, LOAD_MODELS)
+
+
+def selected_load_kinds(scope: str) -> frozenset[str]:
+    """Expand a Run loading choice into its independent layer sections."""
+
+    if scope == LOAD_ALL:
+        return frozenset(LOAD_KINDS)
+    parts = scope.split("+") if isinstance(scope, str) else []
+    if not parts or len(parts) != len(set(parts)) or not set(parts) <= set(LOAD_KINDS):
+        raise ManualRunLoadError(f"未知加载范围: {scope}")
+    return frozenset(parts)
+
+
+def load_scope_from_kinds(kinds) -> str:
+    """Give equivalent checkbox selections one stable Run identity."""
+
+    selected = frozenset(kinds)
+    if not selected or not selected <= set(LOAD_KINDS):
+        raise ManualRunLoadError(f"未知加载范围: {sorted(selected)}")
+    if selected == set(LOAD_KINDS):
+        return LOAD_ALL
+    return "+".join(kind for kind in LOAD_KINDS if kind in selected)
 
 
 def _check_canceled(is_canceled: CancelCheck) -> None:
@@ -324,8 +348,9 @@ def prepare_manual_run(
 ) -> dict:
     """Validate/hash a copied Run without changing any file."""
 
-    if load_scope not in LOAD_SCOPES:
-        raise ManualRunLoadError(f"未知加载范围: {load_scope}")
+    selected = selected_load_kinds(load_scope)
+    load_scope = load_scope_from_kinds(selected)
+    needs_workspace = for_initialization or LOAD_CLASSES in selected
     run_root = Path(run_directory).expanduser().resolve()
     if not run_root.is_dir():
         raise ManualRunLoadError(f"Run 文件夹不存在: {run_root}")
@@ -370,50 +395,55 @@ def prepare_manual_run(
             f"Run 尚未完成，run_manifest 状态为 {manifest.get('status') or '<empty>'}"
         )
 
-    _progress(progress, "正在核对 Fusion 结果", 15)
+    _progress(progress, "正在核对所选结果", 15)
     old_root_value = str(original_spec.get("run_dir") or "").strip()
     old_root = Path(old_root_value).expanduser() if old_root_value else None
     has_workspace = (run_root / "classes" / "workspace.json").is_file()
-    if not has_workspace and not for_initialization:
+    if not has_workspace and needs_workspace and not for_initialization:
         raise ManualRunLoadError("Run 尚未初始化 classes，请到识别结果区初始化分类图层")
-    if not has_workspace and (run_root / "classes").is_dir():
+    if needs_workspace and not has_workspace and (run_root / "classes").is_dir():
         if any((run_root / "classes").glob("class_*.gpkg")):
             raise ManualRunLoadError("classes 文件不完整：缺少 workspace.json；现有人工文件保持不变")
     fusion_streams = []
     result_streams = []
     for stream in manifest.get("streams") or []:
         _check_canceled(is_canceled)
+        kind = stream.get("kind")
         if stream.get("status") == "ready" and (
-            stream.get("kind") == "fusion"
-            or (load_scope == LOAD_ALL and stream.get("kind") == "model")
+            (kind == LOAD_FUSION and (needs_workspace or LOAD_FUSION in selected))
+            or (kind == "model" and LOAD_MODELS in selected)
         ):
+            requested = (
+                LOAD_FUSION in selected if kind == LOAD_FUSION
+                else LOAD_MODELS in selected
+            )
             rebound = _rebind_stream(
                     stream,
                     old_root,
                     run_root,
                     run_id,
-                    require_semantic=for_initialization or load_scope == LOAD_ALL,
+                    require_semantic=for_initialization or requested,
                 )
             result_streams.append(rebound)
-            if stream.get("kind") == "fusion":
+            if kind == LOAD_FUSION:
                 fusion_streams.append(rebound)
-            if load_scope == LOAD_ALL:
+            if requested:
                 _validate_result_files(rebound, is_canceled=is_canceled, input_identities=input_identities)
             review_path = str(rebound.get("review_polygons") or "")
             if review_path:
                 input_identities[str(Path(review_path).resolve())] = file_identity(
                     review_path
                 )
-    if not fusion_streams:
+    if (needs_workspace or LOAD_FUSION in selected) and not fusion_streams:
         raise ManualRunLoadError("run_manifest.json 中没有 ready Fusion 结果")
     stream_ids = [stream.get("stream_id") for stream in result_streams]
     if len(set(stream_ids)) != len(stream_ids):
         raise ManualRunLoadError("Run 中存在重复的结果流身份，未加载")
-    if load_scope == LOAD_ALL:
+    if LOAD_MODELS in selected:
         model_ids = {item.get("model_id") for item in result_streams if item.get("kind") == "model"}
         expected = {item.get("model_id") for item in original_spec.get("models") or []}
         if not model_ids or not expected.issubset(model_ids):
-            raise ManualRunLoadError("Models 结果不完整，不能按 fusion、models、classes 全量加载")
+            raise ManualRunLoadError("Models 结果不完整，不能加载所选 Models 图层")
 
     spec = copy.deepcopy(original_spec)
     spec["run_dir"] = str(run_root)
@@ -431,7 +461,7 @@ def prepare_manual_run(
     snapshot = _rebound_candidate(
         original_spec.get("accepted_gpkg"), old_root, run_root, run_id
     )
-    if snapshot is not None and snapshot.is_file():
+    if needs_workspace and snapshot is not None and snapshot.is_file():
         _progress(progress, "正在校验 accepted 快照", 20)
         spec["accepted_gpkg"] = str(snapshot)
         spec["accepted_gpkg_sha256"] = _stable_sha256(
@@ -451,14 +481,17 @@ def prepare_manual_run(
         )
     spec["fusion"] = fusion
 
-    workspace = _prepare_workspace(
-        run_root,
-        run_id,
-        fusion_streams,
-        old_root=old_root,
-        is_canceled=is_canceled,
-        progress=progress,
-        input_identities=input_identities,
+    workspace = (
+        _prepare_workspace(
+            run_root,
+            run_id,
+            fusion_streams,
+            old_root=old_root,
+            is_canceled=is_canceled,
+            progress=progress,
+            input_identities=input_identities,
+        )
+        if needs_workspace else None
     )
     spec.pop("run_spec_content_sha256", None)
     accepted_write_spec = run_root / "classes" / "accepted_write_run_spec.json"
@@ -517,6 +550,10 @@ def publish_manual_run_bundle(bundle: dict) -> dict:
     if not manual_run_inputs_unchanged(bundle):
         raise ManualRunLoadError("后台校验后 Run 文件发生变化，结果未发布")
     if bundle.get("for_initialization"):
+        return bundle
+    if LOAD_CLASSES not in selected_load_kinds(bundle["result"]["load_scope"]):
+        # A reference-only load never publishes a class workspace or creates
+        # accepted-write helpers. Class data may not exist at all.
         return bundle
     persist_rebound_workspace(bundle)
     spec = copy.deepcopy(bundle["run_spec"])

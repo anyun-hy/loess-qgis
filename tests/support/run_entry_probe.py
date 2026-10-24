@@ -49,7 +49,22 @@ class Monitor(QDialog):
 
 
 def entry(app, root, scenario):
-    spec, _ = fixture(root / "run", initialized=scenario != "entry_uninitialized")
+    spec, _ = fixture(
+        root / "run",
+        initialized=scenario
+        not in {
+            "entry_uninitialized",
+            "entry_uninitialized_models",
+            "entry_models_no_fusion",
+        },
+    )
+    if scenario == "entry_models_no_fusion":
+        manifest_path = root / "run/run_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["streams"] = [
+            stream for stream in manifest["streams"] if stream["kind"] == "model"
+        ]
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False))
     original_classes = {
         p.name: hashlib.sha256(p.read_bytes()).hexdigest()
         for p in (root / "run/classes").glob("*.gpkg")
@@ -124,9 +139,27 @@ def entry(app, root, scenario):
             choose_directory.side_effect = AssertionError(
                 "Run must only be selected once"
             )
-            dock.run_scope_combo.setCurrentIndex(
-                0 if scenario == "entry_classes" else 1
-            )
+            selected = {
+                "entry_classes": {"classes"},
+                "entry_fusion": {"fusion"},
+                "entry_models": {"models"},
+                "entry_fusion_models": {"fusion", "models"},
+                "entry_classes_fusion": {"classes", "fusion"},
+                "entry_classes_models": {"classes", "models"},
+                "entry_uninitialized_models": {"models"},
+                "entry_models_no_fusion": {"models"},
+            }.get(scenario, {"classes", "fusion", "models"})
+            if scenario == "entry_zero_selection":
+                selected = set()
+            for check, kind in dock.run_scope_checks:
+                check.setChecked(kind in selected)
+            if scenario == "entry_zero_selection":
+                assert not dock.run_load_btn.isEnabled()
+                with patch.object(main_dock.QMessageBox, "information") as info:
+                    dock._on_open_refinement()
+                assert info.call_count == 1 and dock._manual_load_task is None
+                assert choose_directory.call_count == 1
+                return
             dock.run_load_btn.click()
             assert dock.refinement_dialog._worker.is_running, (
                 "Both scopes must proactively start SAM3"
@@ -141,6 +174,39 @@ def entry(app, root, scenario):
                 )
                 assert dock.results_workspace_panel.initialize_btn.isEnabled()
                 assert "尚未加载" in dock.loaded_run_label.text()
+                return
+            if "classes" not in selected:
+                wait(
+                    app,
+                    lambda: dock._manual_load_task is None
+                    and dock._pending_run_bundle is None
+                    and "结果图层加载完成" in dock.result_summary_label.text(),
+                )
+                wait(app, lambda: dock.refinement_dialog._worker.is_ready)
+                assert not dock.refinement_dialog.isVisible()
+                assert dock.refinement_dialog._class_layers == {}
+                assert dock.refinement_dialog._workspace is None
+                assert dock.run_load_btn.text() == "加载到 QGIS"
+                assert "已就绪" in dock.run_sam_status_label.text()
+                sections = {
+                    layer.customProperty("labeling_tool/section", "")
+                    for layer in QgsProject.instance().mapLayers().values()
+                }
+                expected = {
+                    "Fusion" if kind == "fusion" else "Models" for kind in selected
+                }
+                assert sections == expected, (sections, expected)
+                if scenario in {"entry_uninitialized_models", "entry_models_no_fusion"}:
+                    assert not (root / "run/classes").exists()
+                else:
+                    assert {
+                        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in (root / "run/classes").glob("*.gpkg")
+                    } == original_classes
+                    assert not (
+                        root / "run/classes/accepted_write_run_manifest.json"
+                    ).exists()
+                assert warnings.call_count == 0, warnings.call_args_list
                 return
             if scenario == "entry_cancel":
                 dock.results_workspace_panel.choose_btn.click()
@@ -178,10 +244,13 @@ def entry(app, root, scenario):
             dialog = dock.refinement_dialog
             summary = dock.result_summary_label.text()
             assert "加载完成，14 类工作层已就绪" in summary, summary
+            scope_text = "、".join(
+                kind for kind in ("fusion", "models", "classes") if kind in selected
+            )
+            assert scope_text in summary, summary
             assert dock.run_load_btn.text() == "加载到 QGIS 并打开整理"
             assert "加载完成" in dock.loaded_run_label.text()
             assert "SAM3 已就绪" in dock.run_sam_status_label.text()
-            assert ("fusion、models、classes" in summary) == (scenario == "entry_all")
             dialog.workspace_load_status_changed.emit(
                 {**dialog._result, "run_dir": str(root / "another-run")},
                 "旧 Run 加载失败",
@@ -209,12 +278,34 @@ def entry(app, root, scenario):
                 layer.customProperty("labeling_tool/section", "")
                 for layer in QgsProject.instance().mapLayers().values()
             }
-            assert sections == (
-                {"Classes"}
-                if scenario == "entry_classes"
-                else {"Classes", "Models", "Fusion"}
-            )
+            expected = {"Classes"}
+            if "fusion" in selected:
+                expected.add("Fusion")
+            if "models" in selected:
+                expected.add("Models")
+            assert sections == expected, (sections, expected)
             assert warnings.call_count == 0, warnings.call_args_list
+            if scenario == "entry_scope_switch":
+                workspace_file = root / "run/classes/workspace.json"
+                workspace_before = workspace_file.read_bytes()
+                for check, kind in dock.run_scope_checks:
+                    check.setChecked(kind == "models")
+                dock.run_load_btn.click()
+                wait(
+                    app,
+                    lambda: dock._manual_load_task is None
+                    and dock._pending_run_bundle is None
+                    and "结果图层加载完成" in dock.result_summary_label.text(),
+                )
+                assert {
+                    layer.customProperty("labeling_tool/section", "")
+                    for layer in QgsProject.instance().mapLayers().values()
+                } == {"Models"}
+                assert dialog._class_layers == {} and dialog._workspace is None
+                assert not dialog.isVisible()
+                assert workspace_file.read_bytes() == workspace_before
+                assert dialog._worker.is_ready
+                reviewed_classes = None
         finally:
             try:
                 # cleanup() releases work but intentionally keeps this reusable
@@ -352,7 +443,8 @@ def selection(app, root, scenario):
 
             assert dock.results_workspace_panel.run_directory == selected["run_dir"]
             if scenario == "selection_cancel":
-                dock.run_scope_combo.setCurrentIndex(1)
+                for check, _kind in dock.run_scope_checks:
+                    check.setChecked(True)
                 dock._on_open_refinement()
                 wait(app, lambda: bool(dock._new_result_layer_ids))
                 dock._on_open_refinement()

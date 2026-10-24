@@ -68,8 +68,11 @@ class ManualRunLoadTask(QgsTask):
                 self.result_data = bundle
                 self._report("识别结果读取完成", 100)
                 return True
-            self._begin_commit(bundle)
-            self._report("正在发布已校验的 Run 元数据，不能取消", 97)
+            if "classes" in manual_run_loader.selected_load_kinds(self.load_scope):
+                self._begin_commit(bundle)
+                self._report("正在发布已校验的 Run 元数据，不能取消", 97)
+            else:
+                self._report("正在完成所选结果校验", 97)
             self.result_data = manual_run_loader.publish_manual_run_bundle(bundle)
             self.published = True
             self._report("已有 Run 加载完成", 100)

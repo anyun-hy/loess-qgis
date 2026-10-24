@@ -389,7 +389,7 @@ class ClassRefinementDialog(QDialog):
         scroll.setWidget(content)
         return scroll
 
-    def set_run(self, result, run_spec, sam_config, scripts_dir):
+    def set_run(self, result, run_spec, sam_config, scripts_dir, *, load_classes=True):
         previous_raster = self._run_spec.get("raster") or {}
         keep_raster_binding = bool(
             self._sam_raster_relocated
@@ -416,6 +416,11 @@ class ClassRefinementDialog(QDialog):
         self._clear_qgis_smooth_preview()
         self._manual_smoothing_timer.stop()
         self._cancel_manual_task(silent=True)
+        if not load_classes:
+            # The selected scope may already have unmounted the old class
+            # layers. Release their editor IDs before refreshing the table.
+            self._workspace = None
+            self._class_layers = {}
         self._cancel_active_session(record=False)
         self._layer_signals.clear_layers()
         self._edit_tracker.reset()
@@ -440,6 +445,11 @@ class ClassRefinementDialog(QDialog):
             if item.get("status") == "ready"
         ]
         self._eligible_fusions = []
+        if not load_classes:
+            self.cancel_load_btn.hide()
+            self.baseline_label.setText("本次未选择 Classes；分类工作层没有加载")
+            self._refresh_table()
+            return
         self.baseline_label.setText(
             f"Run {run_spec.get('run_id')}；正在后台校验工作区文件..."
         )
@@ -2805,7 +2815,9 @@ class ClassRefinementDialog(QDialog):
             session.cancel()
         self._sam_preview.cleanup()
         self._active_session = None
-        if self._workspace is not None:
+        if self._workspace is not None and (
+            session is not None or self._workspace.get("active_sam_session_id")
+        ):
             self._workspace["active_sam_session_id"] = ""
             self._workspace = class_workspace.save_workspace(
                 self._run_spec, self._workspace, changed_class_codes=()

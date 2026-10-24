@@ -1,4 +1,5 @@
 import json
+import shutil
 
 import pytest
 
@@ -295,7 +296,7 @@ def _full_run(tmp_path):
     return run_root, spec_path, manifest_path
 
 
-@pytest.mark.parametrize("scope", ["classes", "all"])
+@pytest.mark.parametrize("scope", ["classes", "classes+fusion", "classes+models", "all"])
 def test_scopes_preserve_human_records_and_original_contracts(tmp_path, scope):
     run_root, spec_path, manifest_path = _full_run(tmp_path)
     workspace_path = run_root / "classes/workspace.json"
@@ -307,13 +308,57 @@ def test_scopes_preserve_human_records_and_original_contracts(tmp_path, scope):
     before = {path: path.read_bytes() for path in [spec_path, manifest_path, history, *run_root.glob("classes/*.gpkg")]}
     bundle = load_manual_run(run_root, load_scope=scope)
     assert bundle["run_spec"]["load_scope"] == scope
-    assert len(bundle["result"]["ready_streams"]) == (2 if scope == "all" else 1)
+    assert len(bundle["result"]["ready_streams"]) == (2 if "models" in scope or scope == "all" else 1)
     after = bundle["workspace"]["classes"]["12"]
     assert after["confirmed"] and after["modified"] and after["reviewer"] == "human"
     assert all(path.read_bytes() == value for path, value in before.items())
     if scope == "all":
         model = bundle["result"]["ready_streams"][1]
         assert model["paths"]["mask_mosaic"] == str(run_root / "models/fixture/mask_mosaic.tif")
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected_kinds"),
+    [
+        ("fusion", ["fusion"]),
+        ("models", ["model"]),
+        ("fusion+models", ["fusion", "model"]),
+    ],
+)
+def test_reference_scopes_do_not_require_or_create_classes(tmp_path, scope, expected_kinds):
+    run_root, *_ = _full_run(tmp_path)
+    shutil.rmtree(run_root / "classes")
+    if scope == "fusion":
+        shutil.rmtree(run_root / "models")
+    elif scope == "models":
+        shutil.rmtree(run_root / "fusion")
+    before = {path.relative_to(run_root): sha256_file(path)
+              for path in run_root.rglob("*") if path.is_file()}
+
+    bundle = load_manual_run(run_root, load_scope=scope)
+
+    assert bundle["workspace"] is None
+    assert bundle["result"]["load_scope"] == scope
+    assert [stream["kind"] for stream in bundle["result"]["ready_streams"]] == expected_kinds
+    assert not (run_root / "classes").exists()
+    assert {path.relative_to(run_root): sha256_file(path)
+            for path in run_root.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("scope", ["classes", "classes+fusion", "classes+models", "all"])
+def test_class_scopes_require_explicit_initialization(tmp_path, scope):
+    run_root, *_ = _full_run(tmp_path)
+    shutil.rmtree(run_root / "classes")
+    with pytest.raises(ManualRunLoadError, match="尚未初始化 classes"):
+        load_manual_run(run_root, load_scope=scope)
+    assert not (run_root / "classes").exists()
+
+
+@pytest.mark.parametrize("scope", ["", "classes+classes", "all+fusion", "unknown"])
+def test_rejects_empty_or_invalid_layer_selection(tmp_path, scope):
+    run_root, *_ = _full_run(tmp_path)
+    with pytest.raises(ManualRunLoadError, match="未知加载范围"):
+        prepare_manual_run(run_root, load_scope=scope)
 
 
 def test_full_scope_rejects_missing_result_without_downgrading_or_publishing(tmp_path):

@@ -268,7 +268,12 @@ class ResultsWorkspacePanel(QWidget):
 
     def _failed(self, _operation, message):
         self._set_busy(False)
-        self.status_label.setText(f"分类工作区检查失败：{message}")
+        if "没有 ready Fusion" in message:
+            self.status_label.setText(
+                "没有 ready Fusion，不能初始化 Classes；仍可按需加载已完成的 Models"
+            )
+        else:
+            self.status_label.setText(f"分类工作区检查失败：{message}")
 
     def cancel(self):
         self._generation += 1

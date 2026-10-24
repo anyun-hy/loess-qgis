@@ -9,6 +9,7 @@ from qgis.PyQt.QtCore import QObject
 
 from labeling_tool.qgis_support.layer_names import LAYER_NAMES
 from labeling_tool.qgis_support.style_manager import StyleManager
+from labeling_tool.refinement.manual_run_loader import selected_load_kinds
 
 ANNOTATION_LAYER_PREFIXES = (
     "semantic_mask_preview",
@@ -140,34 +141,47 @@ class LayerManager(QObject):
             loaded[role] = layer.id()
         return loaded
 
-    def load_run_results(self, result):
+    def load_run_results(self, result, *, kinds=("model", "fusion")):
         before = set(self.project.mapLayers())
+        kinds = set(kinds)
         try:
             return {
                 stream["stream_id"]: self.load_result_stream(
                     str(result.get("run_id") or ""), stream, run_dir=result.get("run_dir", "")
                 )
                 for stream in result.get("ready_streams") or []
-                if stream.get("kind") in {"model", "fusion"}
+                if stream.get("kind") in kinds
             }
         except Exception:
             self.project.removeMapLayers(list(set(self.project.mapLayers()) - before))
             raise
 
     def apply_load_scope(self, result, scope, *, loaded=None):
-        if scope not in {"classes", "all"}:
-            raise ValueError(f"未知加载范围: {scope}")
+        selected = selected_load_kinds(scope)
         previous = [layer for layer in self.project.mapLayers().values()
                     if self._belongs_to_run(layer, result["run_id"], result["run_dir"])
                     and str(layer.customProperty("labeling_tool/stream_id", "")).startswith(("model:", "fusion:"))]
         if any(isinstance(layer, QgsVectorLayer) and layer.isEditable() and layer.isModified() for layer in previous):
             raise RuntimeError("结果图层存在未保存编辑，请先保存或回滚后切换加载范围")
+        previous_classes = [layer for layer in self.project.mapLayers().values()
+                            if self._belongs_to_run(layer, result["run_id"], result["run_dir"])
+                            and str(layer.customProperty("labeling_tool/stream_id", "")).startswith("class:")]
+        if "classes" not in selected and any(layer.isEditable() for layer in previous_classes):
+            raise RuntimeError("类别图层仍在编辑，不能卸载 Classes")
         if loaded is None:
-            loaded = self.load_run_results(result) if scope == "all" else {}
+            reference_kinds = set()
+            if "models" in selected:
+                reference_kinds.add("model")
+            if "fusion" in selected:
+                reference_kinds.add("fusion")
+            loaded = self.load_run_results(result, kinds=reference_kinds)
         retained = {layer_id for layers in loaded.values() for layer_id in layers.values()}
-        self.project.removeMapLayers([layer.id() for layer in previous if layer.id() not in retained])
+        removals = [layer.id() for layer in previous if layer.id() not in retained]
+        if "classes" not in selected:
+            removals.extend(layer.id() for layer in previous_classes)
+        self.project.removeMapLayers(removals)
         for group in reversed(self.project.layerTreeRoot().findGroups()):
-            if group.name() in {"Models", "Fusion"} and not group.children():
+            if group.name() in {"Models", "Fusion", "Classes"} and not group.children():
                 parent = group.parent()
                 if parent and str(parent.customProperty("labeling_tool/run_dir", "")) == self._directory(result["run_dir"]):
                     parent.removeChildNode(group)
