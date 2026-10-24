@@ -280,12 +280,13 @@ def dock_gate(app, root):
             patch.object(dock.config_manager, "is_stale", return_value=False)
         )
         try:
-            layout = dock.widget().layout()
-            assert [
+            layout = dock._main_scroll_area.widget().layout()
+            sections = [
                 layout.itemAt(index).widget().title()
                 for index in range(layout.count())
                 if isinstance(layout.itemAt(index).widget(), QGroupBox)
-            ] == ["开始与当前状态"]
+            ]
+            assert sections.index("开始与当前状态") + 1 == sections.index("识别结果")
             panel.scripts_directory = str(root)
             dock.workspace_edit.setText(str(root / "workspace"))
             dock.output_path_edit.setText(str(root / "accepted.gpkg"))

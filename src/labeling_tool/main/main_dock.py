@@ -498,6 +498,7 @@ class LabelingDockWidget(QgsDockWidget):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         run_layout.addWidget(self.progress_bar)
+        layout.addWidget(run_group)
 
         result_group = QGroupBox("识别结果")
         result_group.setObjectName("resultGroup")
@@ -531,7 +532,6 @@ class LabelingDockWidget(QgsDockWidget):
         dock_layout.setContentsMargins(0, 0, 0, 0)
         dock_layout.setSpacing(6)
         dock_layout.addWidget(scroll_area, stretch=1)
-        dock_layout.addWidget(run_group)
         self.setWidget(dock_widget)
 
     def _build_run_load_controls(self, layout):
