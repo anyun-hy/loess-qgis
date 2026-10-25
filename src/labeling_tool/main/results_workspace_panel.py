@@ -23,6 +23,7 @@ from labeling_tool.refinement.workspace_tasks import WorkspaceTasks
 
 class ResultsWorkspacePanel(QWidget):
     run_selection_changed = pyqtSignal(str)
+    busy_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None, *, can_change_run=lambda: True):
         super().__init__(parent)
@@ -32,6 +33,7 @@ class ResultsWorkspacePanel(QWidget):
         self._bundle = None
         self._probe = {}
         self._candidate_dir = ""
+        self._ui_busy = False
         self._tasks = WorkspaceTasks(self)
         self._tasks.probed.connect(self._probed)
         self._tasks.initialized.connect(self._initialized)
@@ -69,7 +71,7 @@ class ResultsWorkspacePanel(QWidget):
 
     @property
     def busy(self):
-        return self._reader is not None or self._tasks.busy
+        return self._ui_busy or self._reader is not None or self._tasks.busy
 
     @property
     def run_directory(self):
@@ -143,10 +145,14 @@ class ResultsWorkspacePanel(QWidget):
             self._failed("read", str(exc))
 
     def _set_busy(self, busy):
+        changed = self._ui_busy != busy
+        self._ui_busy = busy
         self.choose_btn.setEnabled(not busy)
         self.initialize_btn.setEnabled(False)
         self.fusion_combo.setEnabled(False)
         self.cancel_btn.setVisible(busy)
+        if changed:
+            self.busy_changed.emit(busy)
 
     def _read_progress(self, _value):
         if self.sender() is self._reader:

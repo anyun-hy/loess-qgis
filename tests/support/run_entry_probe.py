@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
 import traceback
 from contextlib import ExitStack
 from pathlib import Path
@@ -26,6 +27,7 @@ from run_loading_probe import Worker, fixture, wait
 from labeling_tool.main import main_dock
 from labeling_tool.qgis_support.layer_manager import LayerManager
 from labeling_tool.refinement import class_refinement_dialog as ui
+from labeling_tool.refinement import class_workspace
 from labeling_tool.refinement.manual_run_loader import load_manual_run
 
 
@@ -54,6 +56,7 @@ def entry(app, root, scenario):
         initialized=scenario
         not in {
             "entry_uninitialized",
+            "entry_initializing",
             "entry_uninitialized_models",
             "entry_models_no_fusion",
         },
@@ -129,6 +132,9 @@ def entry(app, root, scenario):
                 assert dock.refinement_dialog._worker is None
                 return
             dock.results_workspace_panel.choose_btn.click()
+            assert not dock.run_load_btn.isEnabled(), (
+                "Run loading must be disabled while the selected Run is checked"
+            )
             wait(app, lambda: not dock.results_workspace_panel.busy)
             assert not QgsProject.instance().mapLayers(), (
                 "Selection must not mount layers"
@@ -139,6 +145,39 @@ def entry(app, root, scenario):
             choose_directory.side_effect = AssertionError(
                 "Run must only be selected once"
             )
+            if scenario == "entry_initializing":
+                started = threading.Event()
+                release = threading.Event()
+                original_initialize = class_workspace.initialize_workspace
+
+                def held_initialize(*args, **kwargs):
+                    started.set()
+                    if not release.wait(10):
+                        raise AssertionError("initialization hold timed out")
+                    return original_initialize(*args, **kwargs)
+
+                with patch.object(
+                    class_workspace, "initialize_workspace", new=held_initialize
+                ):
+                    try:
+                        dock.results_workspace_panel.initialize_btn.click()
+                        wait(app, started.is_set)
+                        assert dock.results_workspace_panel.busy
+                        assert not dock.run_load_btn.isEnabled()
+                        for check, kind in dock.run_scope_checks:
+                            check.setChecked(kind == "models")
+                        assert not dock.run_load_btn.isEnabled(), (
+                            "Changing load scope must not unlock loading during initialization"
+                        )
+                        dock.run_load_btn.click()
+                        assert dock._manual_load_task is None
+                    finally:
+                        release.set()
+                    wait(app, lambda: not dock.results_workspace_panel.busy)
+                assert dock.run_load_btn.isEnabled()
+                assert (root / "run/classes/workspace.json").is_file()
+                assert not QgsProject.instance().mapLayers()
+                return
             selected = {
                 "entry_classes": {"classes"},
                 "entry_fusion": {"fusion"},

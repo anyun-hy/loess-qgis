@@ -584,7 +584,9 @@ class LabelingDockWidget(QgsDockWidget):
         self.run_load_btn.setText(
             "加载到 QGIS 并打开整理" if classes else "加载到 QGIS"
         )
-        self.run_load_btn.setEnabled(bool(selected))
+        self.run_load_btn.setEnabled(
+            bool(selected) and not self.results_workspace_panel.busy
+        )
 
     def _set_run_scope_enabled(self, enabled):
         for check, _kind in self.run_scope_checks:
@@ -605,6 +607,9 @@ class LabelingDockWidget(QgsDockWidget):
         self.browse_output_btn.clicked.connect(self._on_browse_output)
         self.browse_workspace_btn.clicked.connect(self._on_browse_workspace)
         self.run_load_btn.clicked.connect(self._on_open_refinement)
+        self.results_workspace_panel.busy_changed.connect(
+            self._update_run_load_button
+        )
         if self.refinement_dialog is not None:
             self.refinement_dialog.sam_status_changed.connect(
                 self.run_sam_status_label.setText

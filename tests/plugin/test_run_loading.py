@@ -41,6 +41,7 @@ def test_unified_run_loading(scenario):
         "entry_no_selection",
         "entry_zero_selection",
         "entry_uninitialized",
+        "entry_initializing",
         "entry_uninitialized_models",
         "entry_models_no_fusion",
         "entry_scope_switch",
