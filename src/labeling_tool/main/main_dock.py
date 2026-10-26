@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from pathlib import Path
@@ -646,14 +647,20 @@ class LabelingDockWidget(QgsDockWidget):
     # ── Slots ──
 
     def _on_browse_output(self):
-        project_dir = os.path.dirname(QgsProject.instance().fileName()) or ""
-        path, _ = QFileDialog.getSaveFileName(self, "选择输出 GPKG", os.path.join(project_dir, "output"), "GeoPackage (*.gpkg)")
+        initial = self.output_path_edit.text().strip() or os.path.join(
+            self._project_directory(), "output", "accepted_labels.gpkg"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择输出 GPKG", initial, "GeoPackage (*.gpkg)"
+        )
         if path:
             self.output_path_edit.setText(path)
 
     def _on_browse_workspace(self):
-        project_dir = os.path.dirname(QgsProject.instance().fileName()) or ""
-        path = QFileDialog.getExistingDirectory(self, "选择运行输出工作区", project_dir)
+        initial = self.workspace_edit.text().strip() or os.path.join(
+            self._project_directory(), "output"
+        )
+        path = QFileDialog.getExistingDirectory(self, "选择运行输出工作区", initial)
         if path:
             self.workspace_edit.setText(path)
 
@@ -1759,10 +1766,41 @@ class LabelingDockWidget(QgsDockWidget):
 
     # ── Helpers ──
 
+    @staticmethod
+    def _project_directory():
+        """Use the deployment root for a project stored in its qgis folder."""
+        project_path = QgsProject.instance().fileName()
+        if not project_path:
+            return ""
+        directory = Path(project_path).expanduser().resolve().parent
+        for candidate in (directory, directory.parent):
+            manifest_path = candidate / "project_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                logger.warning("无法读取项目路径清单 %s", manifest_path)
+                continue
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("deployment_kind") != "loess_project"
+            ):
+                continue
+            declared = manifest.get("project_root")
+            if (
+                isinstance(declared, str)
+                and Path(declared).is_absolute()
+                and Path(declared).resolve() == candidate
+            ):
+                return str(candidate)
+        return str(directory)
+
     def _load_settings_and_defaults(self):
         settings = QgsSettings()
         project_path = QgsProject.instance().fileName()
-        project_dir = os.path.dirname(project_path) if project_path else ""
+        project_dir = self._project_directory()
+        default_workspace = os.path.join(project_dir, "output") if project_dir else ""
 
         inference_path = settings.value(
             "plugins/labeling_tool/inference_path", "", type=str
@@ -1785,8 +1823,20 @@ class LabelingDockWidget(QgsDockWidget):
         workspace = settings.value(
             "plugins/labeling_tool/output_workspace", "", type=str
         )
+        if project_path and project_dir != str(Path(project_path).resolve().parent):
+            old_workspace = str(Path(project_path).resolve().parent / "output")
+            if workspace == old_workspace:
+                workspace = default_workspace
+                logger.info(
+                    "已修正默认输出工作区为 %s；已有 Run 保留在 %s",
+                    workspace,
+                    old_workspace,
+                )
+            old_accepted = os.path.join(old_workspace, "accepted_labels.gpkg")
+            if output_path == old_accepted and not os.path.lexists(old_accepted):
+                output_path = os.path.join(default_workspace, "accepted_labels.gpkg")
         if not workspace:
-            workspace = os.path.dirname(output_path) if output_path else os.path.join(project_dir, "output")
+            workspace = default_workspace or os.path.dirname(output_path)
 
         selected = settings.value("plugins/labeling_tool/selected_models", [], type=list)
         fusion_profile_id = settings.value(

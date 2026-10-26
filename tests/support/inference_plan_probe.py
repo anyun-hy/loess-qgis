@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import traceback
@@ -313,6 +314,195 @@ def settings_roundtrip(app, root):
             dock.cleanup()
             dock.deleteLater()
             drain(app)
+
+
+def project_output_paths(app, root):
+    from labeling_tool.main import main_dock
+
+    root = root.resolve()
+    project = root / "loess-project"
+    qgis = project / "qgis"
+    scripts = project / "inference_scripts"
+    qgis.mkdir(parents=True)
+    scripts.mkdir()
+    manifest = project / "project_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "deployment_kind": "loess_project",
+                "project_root": str(project),
+                "paths": {"output": "output"},
+            }
+        )
+    )
+    output = project / "output"
+    old_output = qgis / "output"
+    workspace_key = "plugins/labeling_tool/output_workspace"
+    accepted_key = "plugins/labeling_tool/output_path"
+
+    class Settings:
+        def value(self, key, default, type=None):
+            return deepcopy(saved.get(key, default))
+
+        def setValue(self, key, value):
+            saved[key] = deepcopy(value)
+
+    class Monitor(QDialog):
+        stop_requested = pyqtSignal()
+        request_main_run_handling = pyqtSignal(object)
+
+        def detach(self):
+            pass
+
+        def shutdown(self):
+            self.close()
+
+    cases = [
+        ("fresh", qgis / "loess.qgz", {}, output, output / "accepted_labels.gpkg"),
+        (
+            "root_project",
+            project / "loess.qgz",
+            {},
+            output,
+            output / "accepted_labels.gpkg",
+        ),
+        (
+            "saved_wrong_defaults",
+            qgis / "loess.qgz",
+            {
+                workspace_key: str(old_output),
+                accepted_key: str(old_output / "accepted_labels.gpkg"),
+            },
+            output,
+            output / "accepted_labels.gpkg",
+        ),
+        (
+            "workspace_already_correct",
+            qgis / "loess.qgz",
+            {
+                workspace_key: str(output),
+                accepted_key: str(old_output / "accepted_labels.gpkg"),
+            },
+            output,
+            output / "accepted_labels.gpkg",
+        ),
+        (
+            "custom",
+            qgis / "loess.qgz",
+            {
+                workspace_key: str(root / "custom-runs"),
+                accepted_key: str(root / "custom-labels.gpkg"),
+            },
+            root / "custom-runs",
+            root / "custom-labels.gpkg",
+        ),
+        (
+            "custom_accepted_only",
+            qgis / "loess.qgz",
+            {
+                accepted_key: str(root / "labels" / "accepted.gpkg"),
+            },
+            output,
+            root / "labels" / "accepted.gpkg",
+        ),
+        (
+            "ordinary_qgis_folder",
+            root / "ordinary" / "qgis" / "map.qgz",
+            {},
+            root / "ordinary" / "qgis" / "output",
+            root / "ordinary" / "qgis" / "output" / "accepted_labels.gpkg",
+        ),
+        ("unsaved_project", None, {}, "", ""),
+    ]
+
+    with ExitStack() as patches:
+        patches.enter_context(patch.object(main_dock, "QgsSettings", Settings))
+        patches.enter_context(
+            patch.object(main_dock, "InferenceMonitorDialog", Monitor)
+        )
+        patches.enter_context(
+            patch.object(
+                main_dock.LabelingDockWidget,
+                "_restore_latest_ready_run",
+                lambda _: None,
+            )
+        )
+        for name, project_file, initial, expected_workspace, expected_accepted in cases:
+            saved = deepcopy(initial)
+            with patch.object(
+                main_dock.QgsProject.instance(),
+                "fileName",
+                return_value=str(project_file) if project_file else "",
+            ):
+                dock = main_dock.LabelingDockWidget()
+                try:
+                    assert dock.workspace_edit.text() == str(expected_workspace), (
+                        name,
+                        dock.workspace_edit.text(),
+                        expected_workspace,
+                    )
+                    assert dock.output_path_edit.text() == str(expected_accepted), (
+                        name,
+                        dock.output_path_edit.text(),
+                        expected_accepted,
+                    )
+                    expected_scripts = (
+                        str(scripts)
+                        if project_file and project_file.is_relative_to(project)
+                        else ""
+                    )
+                    assert (
+                        dock.environment_panel.scripts_directory == expected_scripts
+                    ), name
+                    with patch.object(
+                        main_dock.QFileDialog, "getSaveFileName", return_value=("", "")
+                    ) as choose_file:
+                        dock._on_browse_output()
+                        assert choose_file.call_args.args[2] == (
+                            str(expected_accepted) or "output/accepted_labels.gpkg"
+                        ), name
+                    with patch.object(
+                        main_dock.QFileDialog, "getExistingDirectory", return_value=""
+                    ) as choose_directory:
+                        dock._on_browse_workspace()
+                        assert choose_directory.call_args.args[2] == (
+                            str(expected_workspace) or "output"
+                        ), name
+                    dock._save_settings()
+                    assert saved[workspace_key] == str(expected_workspace), name
+                    assert saved[accepted_key] == str(expected_accepted), name
+                    assert not old_output.exists(), name
+                finally:
+                    dock.cleanup()
+                    dock.deleteLater()
+                    drain(app)
+
+        # Correcting the workspace must never move a Run or hide an existing
+        # accepted-label database by silently choosing a new empty target.
+        old_run = old_output / "runs" / "existing-run" / "run_spec.json"
+        old_run.parent.mkdir(parents=True)
+        old_run.write_bytes(b"existing-run-identity")
+        accepted = old_output / "accepted_labels.gpkg"
+        accepted.write_bytes(b"existing-manual-labels-and-audit-records")
+        saved = {workspace_key: str(old_output), accepted_key: str(accepted)}
+        with patch.object(
+            main_dock.QgsProject.instance(),
+            "fileName",
+            return_value=str(qgis / "loess.qgz"),
+        ):
+            dock = main_dock.LabelingDockWidget()
+            try:
+                assert dock.workspace_edit.text() == str(output)
+                assert dock.output_path_edit.text() == str(accepted)
+                assert (
+                    accepted.read_bytes() == b"existing-manual-labels-and-audit-records"
+                )
+                assert old_run.read_bytes() == b"existing-run-identity"
+                assert not output.exists()
+            finally:
+                dock.cleanup()
+                dock.deleteLater()
+                drain(app)
 
 
 if __name__ == "__main__":

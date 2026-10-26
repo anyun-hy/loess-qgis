@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
         "invalidation",
         "launch_plan_validation",
         "settings_roundtrip",
+        "project_output_paths",
     ],
 )
 def test_native_inference_plan(scenario):
