@@ -2109,22 +2109,9 @@ class LabelingDockWidget(QgsDockWidget):
             self._refresh_processing_extent_preview()
 
     def cleanup(self):
+        if self._cleaning_up:
+            return
         self._cleaning_up = True
-        self._retire_manual_load_task()
-        self._cancel_reference_load()
-        self.results_workspace_panel.cleanup()
-        self.environment_panel.cleanup()
-        self.plan_panel.cleanup()
-        for dialog in tuple(self._nonblocking_message_boxes):
-            try:
-                dialog.close()
-            except RuntimeError:
-                pass
-        self._nonblocking_message_boxes.clear()
-        self._save_settings()
-        self.config_manager.cleanup()
-        self.vector_preview.close()
-
         workflow = self.workflow
         for signal, slot in (
             (workflow.state_changed, self._on_workflow_state_changed),
@@ -2146,19 +2133,36 @@ class LabelingDockWidget(QgsDockWidget):
             except (TypeError, RuntimeError):
                 pass
 
-        if self.monitor_dialog is not None:
-            try:
-                self.monitor_dialog.detach()
-            except (TypeError, RuntimeError):
-                pass
-        if self.refinement_dialog is not None:
-            self.refinement_dialog.cleanup()
-        if self.monitor_dialog is not None:
-            self.monitor_dialog.shutdown()
-
+        # Detach native thread owners before any fallible widget cleanup.
+        # A completed Run still owns its runtime/log event-loop threads.
         retire_after(workflow, workflow.shutdown_finished)
         workflow.shutdown()
-        self.workflow = None
 
-        self.range_selection.close()
+        def finish_step(name, callback):
+            try:
+                callback()
+            except Exception:
+                logger.exception("QGIS 插件退出清理失败：%s", name)
+
+        if self.monitor_dialog is not None:
+            finish_step("monitor detach", self.monitor_dialog.detach)
+            finish_step("monitor shutdown", self.monitor_dialog.shutdown)
+        for name, callback in (
+            ("manual load", self._retire_manual_load_task),
+            ("reference load", self._cancel_reference_load),
+            ("results workspace", self.results_workspace_panel.cleanup),
+            ("environment panel", self.environment_panel.cleanup),
+            ("inference plan", self.plan_panel.cleanup),
+            ("settings", self._save_settings),
+            ("environment check", self.config_manager.cleanup),
+            ("range preview", self.vector_preview.close),
+        ):
+            finish_step(name, callback)
+        for dialog in tuple(self._nonblocking_message_boxes):
+            finish_step("notice", dialog.close)
+        self._nonblocking_message_boxes.clear()
+        if self.refinement_dialog is not None:
+            finish_step("refinement", self.refinement_dialog.cleanup)
+        finish_step("range selection", self.range_selection.close)
+        self.workflow = None
         self.monitor_dialog = None

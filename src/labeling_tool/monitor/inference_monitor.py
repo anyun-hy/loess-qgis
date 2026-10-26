@@ -1512,17 +1512,19 @@ class InferenceMonitorDialog(QDialog):
         if getattr(self, "_shutting_down", False):
             return
         self._shutting_down = True
-        self.detail_page.set_active(False)
-        self.events_page.set_active(False)
-        self.overview_page.stop_transient_actions()
-        self.detail_page.stop_transient_actions()
-        self.events_page.stop_transient_actions()
-        self._sync_timer.stop()
-        self._poll_timer.stop()
-        self.hide()
-        self.unbind_state_database()
-        retire_after(self, self.shutdown_finished)
-        self._query_client.shutdown()
+        try:
+            self.detail_page.set_active(False)
+            self.events_page.set_active(False)
+            self.overview_page.stop_transient_actions()
+            self.detail_page.stop_transient_actions()
+            self.events_page.stop_transient_actions()
+            self._sync_timer.stop()
+            self._poll_timer.stop()
+            self.hide()
+            self.unbind_state_database()
+        finally:
+            retire_after(self, self.shutdown_finished)
+            self._query_client.shutdown()
 
     def _on_query_shutdown_finished(self):
         if self._shutdown_emitted:

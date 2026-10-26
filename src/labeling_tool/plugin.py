@@ -1,9 +1,9 @@
 import sys
 
-from qgis.PyQt.QtCore import QObject
-from qgis.PyQt.QtWidgets import QAction, QToolBar
-from qgis.PyQt.QtGui import QGuiApplication, QIcon
 from qgis.core import QgsApplication
+from qgis.PyQt.QtCore import QObject
+from qgis.PyQt.QtGui import QGuiApplication, QIcon
+from qgis.PyQt.QtWidgets import QAction
 
 from labeling_tool.main.main_dock import LabelingDockWidget
 from labeling_tool.qgis_support.qt6_api import RIGHT_DOCK_WIDGET_AREA
@@ -20,6 +20,8 @@ class LabelingTool(QObject):
         self.toolbar = None
         self.action = None
         self._unloading = False
+        self._application = None
+        self._quit_callback = None
 
     def initGui(self):
         self._require_supported_qpa()
@@ -32,6 +34,9 @@ class LabelingTool(QObject):
         self.toolbar.addAction(self.action)
 
         self.dock_widget = LabelingDockWidget(self.iface.mainWindow(), iface=self.iface)
+        self._application = QgsApplication.instance()
+        self._quit_callback = self.unload
+        self._application.aboutToQuit.connect(self._quit_callback)
         self.iface.addDockWidget(
             RIGHT_DOCK_WIDGET_AREA,
             self.dock_widget,
@@ -61,13 +66,22 @@ class LabelingTool(QObject):
         try:
             self._unload()
         finally:
+            if self._application is not None:
+                try:
+                    self._application.aboutToQuit.disconnect(self._quit_callback)
+                except (TypeError, RuntimeError):
+                    pass
+                self._application = None
+                self._quit_callback = None
             self._unloading = False
 
     def _unload(self):
-        if self.dock_widget:
-            self.dock_widget.cleanup()
-        # Include previously retired runners, not only the current Run.
-        drain_retired_owners()
+        try:
+            if self.dock_widget:
+                self.dock_widget.cleanup()
+        finally:
+            # Include previously retired runners, even if UI cleanup failed.
+            drain_retired_owners()
         if self.dock_widget:
             self.iface.removeDockWidget(self.dock_widget)
             self.dock_widget.deleteLater()
